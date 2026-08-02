@@ -1,0 +1,620 @@
+"""Two-stage fact extractor for auto-extraction after each turn.
+
+Stage 1 — Generic syntactic regex patterns (fast, local, zero latency).
+    Matches the *syntactic shape* of durable statements, not topic-specific
+    keywords.  Works across ANY domain: personal life, work, tech, hobbies,
+    finance, health, etc.  Catches ~80% of durable facts.
+
+Stage 2 — LLM fallback (higher recall, adds latency + token cost).
+    If Stage 1 found zero or very few facts AND the user's message is
+    substantial, sends the message to the host's LLM via
+    ``agent.auxiliary_client.call_llm`` with a structured extraction prompt.
+    Returns JSON facts.  Falls back gracefully if the LLM is unavailable.
+
+The agent's ``memory_save`` tool is the primary, high-quality extraction path.
+This auto-extractor is a bonus safety net that catches things the agent might
+not explicitly save.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Minimum content length to bother extracting.
+_MIN_LENGTH = 15
+# Maximum sentences per turn to avoid extracting from walls of text.
+_MAX_SENTENCES = 25
+# If Stage 1 finds fewer than this many facts, try LLM fallback.
+_LLM_FALLBACK_THRESHOLD = 1
+# Minimum user message length to justify an LLM call (avoid wasting tokens
+# on short chit-chat).
+_LLM_MIN_CONTENT_LENGTH = 60
+# LLM call timeout in seconds.
+_LLM_TIMEOUT = 15.0
+
+
+# ---------------------------------------------------------------------------
+# Junk filter — prevents low-quality memories from being stored
+# ---------------------------------------------------------------------------
+
+# Phrases that indicate the extracted text is actually agent output, not a
+# user fact.  These appear when the regex accidentally matches text the
+# assistant said (e.g. "I'll search authoritative sources").
+_AGENT_SPEAK_PATTERNS = re.compile(
+    r'(?:i\'ll\s+search|i\'ll\s+look|i\'ll\s+check|let me|authoritative\s+sources'
+    r'|i\'ll\s+find|i\'ll\s+research|searching\s+for|looking\s+up)',
+    re.IGNORECASE,
+)
+
+# Trivial facts that aren't worth storing — the agent can infer these from
+# context or they add no value to future conversations.
+_TRIVIAL_FACTS = frozenset({
+    "literally glm 5", "literally glm5", "a human", "a person",
+    "typing", "using a keyboard", "on a computer", "online",
+    "here", "there", "ready", "done", "back",
+})
+
+# Content that looks like a sentence fragment (starts with lowercase,
+# no subject, or is a partial clause).
+_FRAGMENT_RE = re.compile(
+    r'^(?:the item|the\s+list|i\'ll\s|let me|so\s+now|that\'s\s+why'
+    r'|which\s+means|because\s+|so\s+that|in\s+order\s+to)',
+    re.IGNORECASE,
+)
+
+
+def _is_junk(fact: Dict[str, Any]) -> bool:
+    """Return True if a fact is low-quality and should not be stored.
+
+    Checks for:
+    - Agent-speak fragments (text from the assistant's output, not the user)
+    - Trivial facts that add no value
+    - Sentence fragments with no complete meaning
+    - Content that is too short to be useful
+    """
+    content = fact.get("content", "").strip()
+    if not content or len(content) < 10:
+        return True
+
+    content_lower = content.lower()
+
+    # Check for agent-speak — the extractor sometimes grabs the assistant's
+    # output when it contains "I" statements.
+    if _AGENT_SPEAK_PATTERNS.search(content):
+        return True
+
+    # Check for trivial facts.
+    # "User is X" → check X part.
+    if content_lower.startswith("user is "):
+        detail = content_lower[8:].strip()
+        if detail in _TRIVIAL_FACTS or detail.split()[0] in _TRIVIAL_FACTS:
+            return True
+    # "User uses/has: X" → check if X is trivial.
+    if content_lower.startswith("user uses/has: "):
+        thing = content_lower[14:].strip()
+        if thing in _TRIVIAL_FACTS or len(thing) < 5:
+            return True
+
+    # Check for sentence fragments.
+    if _FRAGMENT_RE.search(content):
+        return True
+
+    # Check for content that is just a partial clause ending abruptly.
+    # E.g. "User uses/has: the item list, I'll search authoritative sources (e"
+    if content.rstrip().endswith("(") or content.rstrip().endswith(","):
+        return True
+    # Unmatched parenthesis at end — sign of a truncated fragment.
+    if content.count("(") > content.count(")"):
+        return True
+
+    return False
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences, keeping it simple."""
+    text = re.sub(r'\s+', ' ', text).strip()
+    parts = re.split(r'(?<=[.!?])\s+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Generic syntactic patterns (topic-agnostic)
+# ---------------------------------------------------------------------------
+#
+# These patterns match the *structural shape* of durable statements, not
+# specific topics.  "I use React" and "I take Item-E" both match the same
+# "I use/take X" pattern.  This makes the extractor general-purpose.
+
+# "I am/is a <something>" — identity, role, profession.
+_IDENTITY_RE = re.compile(
+    r'\b(?:i\s+am|i\'m)\s+(?:a\s+|an\s+)?(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I have/own/use/take <something>" — possession, usage, tools.
+_HAVE_USE_RE = re.compile(
+    r'\b(?:i\s+(?:have|own|use|take|\'ve\s+got|\'m\s+using))\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I work at/for <something>" / "I'm a <job>" — work context.
+_WORK_RE = re.compile(
+    r'\b(?:i\s+work\s+(?:at|for|with)|i\'m\s+(?:working\s+at|employed\s+at))\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I prefer/like/love/hate/enjoy <something>" — preferences.
+_PREFERENCE_RE = re.compile(
+    r'\b(?:i\s+(?:prefer|like|love|hate|enjoy|can\'t\s+stand|don\'t\s+like)'
+    r'|i\'d\s+rather|i\'m\s+a\s+fan\s+of)\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I always/never/usually <something>" — habits and patterns.
+_HABIT_RE = re.compile(
+    r'\b(?:i\s+(?:always|never|usually|typically|generally|rarely|often))\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I'm working on/trying to/going to/need to/want to <something>" — goals.
+_GOAL_RE = re.compile(
+    r'\b(?:i\'m\s+working\s+on|i\s+want\s+to|i\'m\s+trying\s+to'
+    r'|i\'m\s+going\s+to|i\s+need\s+to|i\'m\s+planning\s+to'
+    r'|i\'m\s+learning|i\'m\s+studying)\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I switched from X to Y" / "I moved from X to Y" — transitions.
+_SWITCH_RE = re.compile(
+    r'\b(?:i\s+(?:switched|moved|migrated|transitioned)\s+from\s+(.+?)\s+to\s+(.+?))(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I started/began/stopped/quit/resumed <something>" — events.
+_EVENT_RE = re.compile(
+    r'\bi\s+(started|began|stopped|quit|resumed|finished|completed|launched)\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I tend to/struggle with/realized/noticed" — insights, self-observations.
+# "i've been noticing", "i think i", "i feel like i" are top-level alternatives.
+_INSIGHT_RE = re.compile(
+    r'\b(?:'
+    r'i\s+(?:tend\s+to|struggle\s+with|realized|noticed|found\s+that|learned\s+that)'
+    r'|i\'ve\s+been\s+noticing'
+    r'|i\s+think\s+i'
+    r'|i\s+feel\s+like\s+i'
+    r')\s+'
+    r'(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "X is my <relation>" — relationship introduction (any relationship).
+_RELATIONSHIP_RE = re.compile(
+    r'\b([A-Z][a-z]+)\s+is\s+(?:my|the)\s+(\w+(?:\s+\w+)?)\b',
+)
+
+# "My <thing> is <value>" — attributes, config, ownership.
+_MY_X_IS_RE = re.compile(
+    r'\bmy\s+(\w+(?:\s+\w+)?)\s+is\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I live in/am based in/am from <place>" — location.
+_LOCATION_RE = re.compile(
+    r'\b(?:i\s+live\s+in|i\'m\s+(?:based\s+in|from)|i\s+reside\s+in)\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I've been doing X for Y" / "I've been on X for Y" — ongoing states.
+_ONGOING_RE = re.compile(
+    r'\b(?:i\'ve\s+been)\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# "I was attributeed with X" — still useful but now just one of many patterns.
+_ATTRIBUTE_RE = re.compile(
+    r'\b(?:i\s+(?:was\s+attributeed\s+with|\'ve\s+been\s+attributeed\s+with)\s+)'
+    r'(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+
+# Words that are not valid names for relationship extraction.
+_NOT_A_NAME = frozenset({
+    "this", "that", "it", "there", "here", "what", "who", "where",
+    "today", "tomorrow", "yesterday", "now", "then",
+})
+
+
+def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
+    """Classify a single sentence into a memory category, or None if not durable.
+
+    Tries patterns in priority order. Returns the first match.
+    """
+    # Relationship: "Sam is my role" / "Entity-C is my manager"
+    m = _RELATIONSHIP_RE.search(sentence)
+    if m:
+        name = m.group(1).strip()
+        relation = m.group(2).strip().lower()
+        if name.lower() not in _NOT_A_NAME:
+            return {
+                "category": "relationship",
+                "content": f"{name} is the user's {relation}",
+                "tags": ["relationship", name.lower(), relation],
+                "payload": {"name": name, "relation": relation},
+            }
+
+    # Switch/transition: "I switched from X to Y"
+    m = _SWITCH_RE.search(sentence)
+    if m:
+        old = m.group(1).strip().rstrip('.')
+        new = m.group(2).strip().rstrip('.')
+        if len(old) > 2 and len(new) > 2:
+            return {
+                "category": "event",
+                "content": f"User switched from {old} to {new}",
+                "tags": ["event", "transition"],
+                "payload": {"old": old, "new": new, "event_type": "switch"},
+            }
+
+    # Attributeis (checked before generic "I have" to get the more specific tag).
+    m = _ATTRIBUTE_RE.search(sentence)
+    if m:
+        condition = m.group(1).strip().rstrip('.')
+        if len(condition) > 3:
+            return {
+                "category": "personal_fact",
+                "content": f"User has: {condition}",
+                "tags": ["personal_fact"],
+                "payload": { "attribute": condition, "fact_type": "attribute"},
+            }
+
+    # Work context: "I work at Google" / "I'm working at a startup"
+    m = _WORK_RE.search(sentence)
+    if m:
+        workplace = m.group(1).strip().rstrip('.')
+        if len(workplace) > 2:
+            return {
+                "category": "personal_fact",
+                "content": f"User works at: {workplace}",
+                "tags": ["personal_fact", "work"],
+                "payload": {"workplace": workplace, "fact_type": "work"},
+            }
+
+    # Location: "I live in Berlin" / "I'm from Tokyo"
+    m = _LOCATION_RE.search(sentence)
+    if m:
+        place = m.group(1).strip().rstrip('.')
+        if len(place) > 2:
+            return {
+                "category": "personal_fact",
+                "content": f"User location: {place}",
+                "tags": ["personal_fact", "location"],
+                "payload": {"location": place, "fact_type": "location"},
+            }
+
+    # Have/use/take: "I have a dog" / "I use Vim" / "I take Item-E"
+    m = _HAVE_USE_RE.search(sentence)
+    if m:
+        thing = m.group(1).strip().rstrip('.')
+        if len(thing) > 3:
+            return {
+                "category": "personal_fact",
+                "content": f"User uses/has: {thing}",
+                "tags": ["personal_fact"],
+                "payload": {"thing": thing, "fact_type": "have_use"},
+            }
+
+    # My X is Y: "My favorite editor is Vim" / "My wife is Sam"
+    m = _MY_X_IS_RE.search(sentence)
+    if m:
+        attr = m.group(1).strip().lower()
+        value = m.group(2).strip().rstrip('.')
+        if len(attr) > 2 and len(value) > 2:
+            # If it looks like a relationship ("my role is Sam"), tag it.
+            if attr in ("wife", "husband", "partner", "boyfriend", "girlfriend",
+                        "boss", "advisor", "doctor", "teacher", "mentor",
+                        "friend", "colleague", "manager", "supervisor"):
+                return {
+                    "category": "relationship",
+                    "content": f"User's {attr} is {value}",
+                    "tags": ["relationship", attr],
+                    "payload": {"relation": attr, "name": value},
+                }
+            return {
+                "category": "personal_fact",
+                "content": f"User's {attr}: {value}",
+                "tags": ["personal_fact", attr],
+                "payload": {"attribute": attr, "value": value, "fact_type": "attribute"},
+            }
+
+    # Preference: "I prefer dark mode" / "I love Python"
+    m = _PREFERENCE_RE.search(sentence)
+    if m:
+        pref = m.group(1).strip().rstrip('.')
+        if len(pref) > 3:
+            return {
+                "category": "preference",
+                "content": f"User prefers: {pref}",
+                "tags": ["preference"],
+                "payload": {"preference": pref},
+            }
+
+    # Habit: "I always test before deploying" / "I never push to main"
+    m = _HABIT_RE.search(sentence)
+    if m:
+        habit = m.group(1).strip().rstrip('.')
+        if len(habit) > 5:
+            return {
+                "category": "preference",
+                "content": f"User habit: {habit}",
+                "tags": ["preference", "habit"],
+                "payload": {"habit": habit},
+            }
+
+    # Goal: "I'm working on a side project" / "I want to learn Rust"
+    m = _GOAL_RE.search(sentence)
+    if m:
+        goal = m.group(1).strip().rstrip('.')
+        if len(goal) > 5:
+            return {
+                "category": "goal",
+                "content": f"User goal: {goal}",
+                "tags": ["goal"],
+                "payload": {"goal": goal},
+            }
+
+    # Insight / self-observation: "I tend to overthink" / "I realized I need breaks"
+    m = _INSIGHT_RE.search(sentence)
+    if m:
+        insight = m.group(1).strip().rstrip('.')
+        if len(insight) > 5:
+            return {
+                "category": "insight",
+                "content": f"User self-observation: {insight}",
+                "tags": ["insight", "self_observation"],
+                "payload": {"insight": insight},
+            }
+
+    # Event: "I started a new job" / "I quit smoking" / "I launched the app"
+    m = _EVENT_RE.search(sentence)
+    if m:
+        verb = m.group(1).strip().lower()
+        event = m.group(2).strip().rstrip('.')
+        if len(event) > 5:
+            return {
+                "category": "event",
+                "content": f"Life event: user {verb} {event}",
+                "tags": ["event"],
+                "payload": {"event": event, "verb": verb},
+            }
+
+    # Ongoing: "I've been feeling anxious" / "I've been using Docker"
+    m = _ONGOING_RE.search(sentence)
+    if m:
+        ongoing = m.group(1).strip().rstrip('.')
+        if len(ongoing) > 5:
+            return {
+                "category": "context_note",
+                "content": f"User has been {ongoing}",
+                "tags": ["context_note", "ongoing"],
+                "payload": {"ongoing": ongoing},
+            }
+
+    # Identity (last — most generic "I am X"): "I am a developer" / "I'm 34"
+    m = _IDENTITY_RE.search(sentence)
+    if m:
+        detail = m.group(1).strip().rstrip('.')
+        # Filter out transient states ("I am tired", "I am here", "I am ready",
+        # "I am tired and hungry right now"). Check both exact match and
+        # whether the detail starts with a transient word.
+        _TRANSIENT_WORDS = frozenset({
+            "tired", "hungry", "thirsty", "here", "there", "ready", "done",
+            "fine", "ok", "okay", "good", "great", "busy", "free", "back",
+            "sorry", "glad", "happy", "sad", "angry", "confused", "stuck",
+            "not sure", "not certain", "not really", "not happy",
+            "sick", "bored", "excited", "worried", "anxious", "stressed",
+            "exhausted", "overwhelmed", "frustrated", "annoyed", "grateful",
+        })
+        detail_lower = detail.lower()
+        first_word = detail_lower.split()[0] if detail_lower else ""
+        is_transient = (
+            detail_lower in _TRANSIENT_WORDS
+            or first_word in _TRANSIENT_WORDS
+        )
+        if len(detail) > 5 and not is_transient:
+            return {
+                "category": "personal_fact",
+                "content": f"User is {detail}",
+                "tags": ["personal_fact", "identity"],
+                "payload": {"detail": detail, "fact_type": "identity"},
+            }
+
+    return None
+
+
+def _extract_facts_regex(user_content: str) -> List[Dict[str, Any]]:
+    """Stage 1: Extract candidate facts using generic syntactic patterns."""
+    facts: List[Dict[str, Any]] = []
+    if not user_content or len(user_content.strip()) < _MIN_LENGTH:
+        return facts
+
+    sentences = _split_sentences(user_content)[:_MAX_SENTENCES]
+    for sentence in sentences:
+        if len(sentence) < _MIN_LENGTH:
+            continue
+        fact = _classify_sentence(sentence)
+        if fact:
+            facts.append(fact)
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: LLM fallback extraction
+# ---------------------------------------------------------------------------
+
+_LLM_SYSTEM_PROMPT = """You are a memory extraction assistant. Your job is to extract durable facts from the user's message that would be worth remembering for future conversations.
+
+Extract facts that are:
+- Durable (will still be true tomorrow, not transient)
+- Self-contained (make sense without the original conversation)
+- About the user or things in the user's life
+
+Do NOT extract:
+- Transient states ("I'm tired", "I'm busy right now")
+- Questions or requests
+- Opinions about the assistant
+- Greetings or chit-chat
+
+Return a JSON array of objects with these keys:
+- "category": one of "personal_fact", "preference", "insight", "event", "relationship", "goal", "context_note"
+- "content": a clear, self-contained statement of the fact
+- "tags": array of 1-3 short lowercase tags
+
+If there are no durable facts, return an empty array: []
+
+Examples:
+User: "I just got a new job at Stripe, I'll be starting next Monday as a backend engineer"
+Output: [{"category": "event", "content": "User got a new job at Stripe as a backend engineer, starting next Monday", "tags": ["work", "job", "stripe"]}]
+
+User: "My contact suggested I try journaling every morning"
+Output: [{"category": "context_note", "content": "User's contact suggested morning journaling", "tags": [ "journaling"]}]
+
+User: "I've been deploying with Kubernetes lately, it's way better than Docker Swarm for our scale"
+Output: [{"category": "preference", "content": "User prefers Kubernetes over Docker Swarm for deployment at scale", "tags": ["devops", "kubernetes"]}, {"category": "personal_fact", "content": "User deploys with Kubernetes", "tags": ["devops", "kubernetes"]}]
+
+User: "hey how are you"
+Output: []
+"""
+
+
+def _extract_facts_llm(user_content: str) -> List[Dict[str, Any]]:
+    """Stage 2: Extract facts using the host's LLM via call_llm.
+
+    Returns a list of fact dicts, or empty list on any failure.
+    Never raises — all errors are caught and logged.
+    """
+    if not user_content or len(user_content.strip()) < _LLM_MIN_CONTENT_LENGTH:
+        return []
+
+    try:
+        from agent.auxiliary_client import call_llm
+    except ImportError:
+        logger.debug("LLM fallback unavailable: agent.auxiliary_client not importable")
+        return []
+    except Exception as e:
+        logger.debug("LLM fallback unavailable: %s", e)
+        return []
+
+    messages = [
+        {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        response = call_llm(
+            task="memory_extraction",
+            messages=messages,
+            temperature=0.0,
+            max_tokens=800,
+            timeout=_LLM_TIMEOUT,
+        )
+    except Exception as e:
+        logger.debug("LLM extraction call failed: %s", e)
+        return []
+
+    if response is None:
+        return []
+
+    try:
+        text = response.choices[0].message.content
+    except (AttributeError, IndexError, KeyError):
+        return []
+
+    if not text or not text.strip():
+        return []
+
+    # Parse JSON — handle both raw JSON and JSON wrapped in markdown code fences.
+    text = text.strip()
+    if text.startswith("```"):
+        # Strip markdown code fences.
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        text = text.strip()
+
+    try:
+        facts = json.loads(text)
+    except json.JSONDecodeError:
+        logger.debug("LLM extraction returned non-JSON: %s", text[:100])
+        return []
+
+    if not isinstance(facts, list):
+        return []
+
+    # Validate and normalize each fact.
+    valid_categories = {
+        "personal_fact", "preference", "insight",
+        "event", "relationship", "goal", "context_note",
+    }
+    result: List[Dict[str, Any]] = []
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        category = fact.get("category", "context_note")
+        if category not in valid_categories:
+            category = "context_note"
+        content = fact.get("content", "").strip()
+        if not content or len(content) < 5:
+            continue
+        tags = fact.get("tags", [])
+        if not isinstance(tags, list):
+            tags = [str(tags)] if tags else []
+        tags = [str(t).lower().strip() for t in tags if t][:5]
+        result.append({
+            "category": category,
+            "content": content,
+            "tags": tags,
+            "payload": {"source": "llm_extraction"},
+        })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def extract_from_turn(
+    user_content: str,
+    assistant_content: str,
+    *,
+    use_llm_fallback: bool = True,
+) -> List[Dict[str, Any]]:
+    """Extract candidate facts from a completed turn.
+
+    Two-stage extraction:
+    1. Fast regex patterns (always run, zero latency).
+    2. LLM fallback (only if Stage 1 found < threshold facts AND the
+       message is substantial AND use_llm_fallback is True).
+
+    Only extracts from the USER's content — the assistant's content is
+    the agent's own output and not a source of durable user facts.
+    """
+    # Stage 1: regex patterns.
+    facts = _extract_facts_regex(user_content)
+
+    # Stage 2: LLM fallback if regex didn't find enough.
+    if use_llm_fallback and len(facts) < _LLM_FALLBACK_THRESHOLD:
+        llm_facts = _extract_facts_llm(user_content)
+        if llm_facts:
+            facts.extend(llm_facts)
+
+    # Filter out junk from both stages.
+    facts = [f for f in facts if not _is_junk(f)]
+
+    return facts

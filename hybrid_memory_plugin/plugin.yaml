@@ -1,0 +1,13 @@
+name: hybrid_memory
+version: 1.0.0
+description: "Hybrid local memory — DuckDB vector search + Kuzu relationship graph + local sentence-transformers embeddings. Fully offline, works across any topic: personal, work, tech, relationships, goals."
+pip_dependencies:
+  - duckdb
+  - kuzu
+  - sentence-transformers
+requires_env: []
+hooks:
+  - on_turn_start
+  - sync_turn
+  - on_session_end
+  - on_session_switch

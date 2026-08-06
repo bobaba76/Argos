@@ -589,9 +589,9 @@ class HybridMemoryProvider(MemoryProvider):
             }
             final_status = decision_map.get(decision, "pending_user_confirmation")
             self._store.review_candidate(
-                candidate["candidate_id"],
-                final_status,
-                review.get("reason", ""),
+                candidate_id=candidate["candidate_id"],
+                decision=final_status,
+                reason=review.get("reason", ""),
                 review_confidence=review.get("confidence"),
                 review_model=review.get("review_model", "memory_review"),
                 durability=review.get("durability"),
@@ -804,7 +804,7 @@ class HybridMemoryProvider(MemoryProvider):
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
-            deleted = self._store.delete_memory(memory_id)
+            deleted = self._store.delete_memory(memory_id=memory_id)
             if not deleted:
                 return tool_error(f"Memory not found: {memory_id}")
             return json.dumps({"status": "deleted", "memory_id": memory_id})
@@ -830,7 +830,9 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: candidate_id or decision")
             try:
                 result = self._store.review_candidate(
-                    candidate_id, decision, args.get("reason", "")
+                    candidate_id=candidate_id,
+                    decision=decision,
+                    reason=args.get("reason", ""),
                 )
             except ValueError as exc:
                 return tool_error(str(exc))

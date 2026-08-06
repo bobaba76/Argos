@@ -209,6 +209,9 @@ class SharedMemoryStore:
     def record_feedback(self, **kwargs: Any) -> bool:
         return bool(self._rpc.call("store", "record_feedback", **kwargs))
 
+    def delete_memory(self, **kwargs: Any) -> bool:
+        return bool(self._rpc.call("store", "delete_memory", **kwargs))
+
     def cleanup_junk(self) -> int:
         return int(self._rpc.call("store", "cleanup_junk") or 0)
 

@@ -2700,29 +2700,47 @@ function forceKillProcessTree(pid) {
     // By the time we kill on quit, the launcher (the PID we tracked) is already
     // dead and taskkill /T finds nothing to tree-kill — leaving the real Python
     // process orphaned, holding the DuckDB file lock forever (WAL never
-    // checkpoints). Fall back to finding any python.exe whose command line
-    // contains "hermes_cli.main serve" and killing those directly.
+    // checkpoints). Find detached `hermes_cli.main serve` processes directly.
+    let processOutput = ''
     try {
-      const wmicOut = execFileSync(
+      processOutput = execFileSync(
         'wmic',
         ['process', 'where', "name='python.exe'", 'get', 'ProcessId,CommandLine', '/format:csv'],
         hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
       )
-      for (const line of wmicOut.split(/\r?\n/)) {
-        if (line.includes('hermes_cli.main') && line.includes('serve')) {
-          const parts = line.split(',')
-          const orphanPid = parseInt(parts[parts.length - 1], 10)
-          if (Number.isInteger(orphanPid) && orphanPid > 0) {
-            try {
-              execFileSync('taskkill', ['/PID', String(orphanPid), '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
-            } catch {
-              // Already gone — best effort.
-            }
-          }
+    } catch {
+      try {
+        processOutput = execFileSync(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | " +
+              "Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'hermes_cli\\.main\\s+serve' } | " +
+              'Select-Object -ExpandProperty ProcessId'
+          ],
+          hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
+        )
+      } catch {
+        processOutput = ''
+      }
+    }
+
+    for (const line of String(processOutput).split(/\r?\n/)) {
+      const trimmed = line.trim()
+      const parts = trimmed.split(',')
+      const orphanPid = /^\d+$/.test(trimmed)
+        ? parseInt(trimmed, 10)
+        : parseInt(parts[parts.length - 1], 10)
+      const isTargeted = /^\d+$/.test(trimmed) || (trimmed.includes('hermes_cli.main') && trimmed.includes('serve'))
+      if (Number.isInteger(orphanPid) && orphanPid > 0 && isTargeted) {
+        try {
+          execFileSync('taskkill', ['/PID', String(orphanPid), '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
+        } catch {
+          // Already gone — best effort.
         }
       }
-    } catch {
-      // wmic not available or failed — nothing more we can do.
     }
   }
 }

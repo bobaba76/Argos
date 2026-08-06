@@ -38,9 +38,9 @@ def review_pending(home: Path, limit: int) -> dict[str, int]:
             decision = result.get("decision", "pending_user_confirmation")
             status = _DECISION_MAP.get(decision, "pending_user_confirmation")
             store.review_candidate(
-                candidate["candidate_id"],
-                status,
-                result.get("reason", ""),
+                candidate_id=candidate["candidate_id"],
+                decision=status,
+                reason=result.get("reason", ""),
                 review_confidence=result.get("confidence"),
                 review_model=result.get("review_model", "memory_review"),
                 durability=result.get("durability"),

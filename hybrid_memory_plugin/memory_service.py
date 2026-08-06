@@ -105,6 +105,8 @@ class MemoryService:
             return self.store.restore_memory(**args)
         if method == "record_feedback":
             return self.store.record_feedback(**args)
+        if method == "delete_memory":
+            return self.store.delete_memory(**args)
         if method == "cleanup_junk":
             return self.store.cleanup_junk()
         if method == "count":

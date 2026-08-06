@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -165,18 +166,30 @@ class KuzuGraphStore:
 
     # -- read operations ------------------------------------------------------
 
+    @staticmethod
+    def _visible_attributes(raw: Any) -> bool:
+        try:
+            attrs = json.loads(raw) if isinstance(raw, str) and raw else (raw or {})
+        except Exception:
+            attrs = {}
+        return not isinstance(attrs, dict) or attrs.get("status") != "quarantined"
+
     def query_graph(self, entity_id: str) -> List[Dict[str, Any]]:
-        """Find all outgoing edges from entity_id."""
+        """Find visible outgoing edges from entity_id."""
         query = """
         MATCH (a:Entity {id: $id})-[r:RelatesTo]->(b:Entity)
         RETURN a.id AS source, r.relation_type AS relation,
-               b.id AS target, b.entity_type AS target_type
+               b.id AS target, b.entity_type AS target_type,
+               a.attributes AS source_attrs, b.attributes AS target_attrs,
+               r.attributes AS relation_attrs
         """
         with self._shared_conn_lock:
             results = self.conn.execute(query, parameters={"id": entity_id})
         edges: List[Dict[str, Any]] = []
         while results.has_next():
             row = results.get_next()
+            if not all(self._visible_attributes(value) for value in row[4:7]):
+                continue
             edges.append({
                 "source": row[0], "relation": row[1],
                 "target": row[2], "target_type": row[3],
@@ -184,17 +197,21 @@ class KuzuGraphStore:
         return edges
 
     def search_graph(self, term: str) -> List[Dict[str, Any]]:
-        """Bidirectional fuzzy search — edges where term appears in source or target."""
+        """Bidirectional fuzzy search over visible edges."""
         term_lower = term.lower()
         query = """
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        RETURN a.id AS source, r.relation_type AS relation, b.id AS target
+        RETURN a.id AS source, r.relation_type AS relation, b.id AS target,
+               a.attributes AS source_attrs, b.attributes AS target_attrs,
+               r.attributes AS relation_attrs
         """
         with self._shared_conn_lock:
             results = self.conn.execute(query)
         edges: List[Dict[str, Any]] = []
         while results.has_next():
             row = results.get_next()
+            if not all(self._visible_attributes(value) for value in row[3:6]):
+                continue
             src, rel, tgt = row[0], row[1], row[2]
             if term_lower in str(src).lower() or term_lower in str(tgt).lower():
                 edges.append({"source": src, "relation": rel, "target": tgt})
@@ -217,6 +234,8 @@ class KuzuGraphStore:
                 attrs = json.loads(row[2]) if row[2] else {}
             except Exception:
                 pass
+            if not self._visible_attributes(attrs):
+                continue
             nodes.append({"id": row[0], "entity_type": row[1], "attributes": attrs})
         return nodes
 
@@ -245,47 +264,109 @@ class KuzuGraphStore:
         "can", "could", "should", "about", "into", "for", "with",
     })
 
-    def purge_junk_entities(self) -> int:
-        """Delete graph nodes (and their edges) whose id is a stop word or nonsense.
-
-        Returns the count of nodes deleted.
-        """
+    def _quarantine_node(self, node_id: str, reason: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
         with self._shared_conn_lock:
-            results = self.conn.execute("MATCH (n:Entity) RETURN n.id AS id")
-        ids_to_delete: List[str] = []
-        while results.has_next():
-            row = results.get_next()
-            node_id = str(row[0])
+            result = self.conn.execute(
+                "MATCH (n:Entity {id: $id}) RETURN n.attributes",
+                parameters={"id": node_id},
+            )
+            if not result.has_next():
+                return False
+            raw = result.get_next()[0]
+            try:
+                attrs = json.loads(raw) if raw else {}
+            except Exception:
+                attrs = {}
+            attrs.update({
+                "status": "quarantined",
+                "quarantine_reason": reason,
+                "quarantined_at": now,
+            })
+            self.conn.execute(
+                "MATCH (n:Entity {id: $id}) SET n.attributes = $attrs",
+                parameters={"id": node_id, "attrs": json.dumps(attrs)},
+            )
+        return True
+
+    def _quarantine_edge(self, source: str, target: str, relation: str, reason: str) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._shared_conn_lock:
+            result = self.conn.execute(
+                """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
+                   WHERE r.relation_type = $relation
+                   RETURN r.attributes""",
+                parameters={"source": source, "target": target, "relation": relation},
+            )
+            if not result.has_next():
+                return False
+            raw = result.get_next()[0]
+            try:
+                attrs = json.loads(raw) if raw else {}
+            except Exception:
+                attrs = {}
+            attrs.update({
+                "status": "quarantined",
+                "quarantine_reason": reason,
+                "quarantined_at": now,
+            })
+            self.conn.execute(
+                """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
+                   WHERE r.relation_type = $relation
+                   SET r.attributes = $attrs""",
+                parameters={
+                    "source": source, "target": target,
+                    "relation": relation, "attrs": json.dumps(attrs),
+                },
+            )
+        return True
+
+    def quarantine_junk_entities(self) -> int:
+        """Hide obviously malformed nodes/edges without deleting graph data."""
+        with self._shared_conn_lock:
+            node_results = self.conn.execute(
+                "MATCH (n:Entity) RETURN n.id AS id, n.attributes AS attributes"
+            )
+            nodes = []
+            while node_results.has_next():
+                nodes.append(node_results.get_next())
+            edge_results = self.conn.execute(
+                """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+                   RETURN a.id, r.relation_type, b.id, r.attributes"""
+            )
+            edges = []
+            while edge_results.has_next():
+                edges.append(edge_results.get_next())
+
+        changed = 0
+        for node_id, raw_attrs in nodes:
+            if not self._visible_attributes(raw_attrs):
+                continue
+            node_id = str(node_id)
             first_word = node_id.split()[0].lower() if node_id.split() else ""
-            is_junk = (
+            if (
                 first_word in self._JUNK_ENTITY_PREFIXES
                 or len(node_id.strip()) <= 2
                 or re.match(r'^e\d+$', node_id.strip())
-            )
-            if is_junk:
-                ids_to_delete.append(node_id)
-        deleted = 0
-        for node_id in ids_to_delete:
-            try:
-                with self._shared_conn_lock:
-                    self.conn.execute(
-                        "MATCH (a:Entity {id: $id})-[r:RelatesTo]->(b:Entity) DELETE r",
-                        parameters={"id": node_id},
-                    )
-                    self.conn.execute(
-                        "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity {id: $id}) DELETE r",
-                        parameters={"id": node_id},
-                    )
-                    self.conn.execute(
-                        "MATCH (n:Entity {id: $id}) DELETE n",
-                        parameters={"id": node_id},
-                    )
-                deleted += 1
-            except Exception:
-                pass
-        if deleted:
+            ) and self._quarantine_node(node_id, "junk entity review"):
+                changed += 1
+
+        for source, relation, target, raw_attrs in edges:
+            if not self._visible_attributes(raw_attrs):
+                continue
+            if not re.match(r"^[A-Za-z0-9_]+$", str(relation)):
+                if self._quarantine_edge(
+                    str(source), str(target), str(relation), "malformed relation label"
+                ):
+                    changed += 1
+
+        if changed:
             self._flush()
-        return deleted
+        return changed
+
+    def purge_junk_entities(self) -> int:
+        """Compatibility alias; graph maintenance is now reversible quarantine."""
+        return self.quarantine_junk_entities()
 
     # -- lifecycle ------------------------------------------------------------
 

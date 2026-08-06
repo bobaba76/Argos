@@ -114,6 +114,62 @@ def _is_junk(fact: Dict[str, Any]) -> bool:
     return False
 
 
+# These checks are intentionally advisory for proposals. A candidate can be
+# retained for review without becoming active memory, while clearly malformed
+# candidates are kept out of retrieval by the status gate in the store.
+_META_REFERENCE_RE = re.compile(
+    r"\b(?:previous session|new chat|this chat|this conversation|continue in|"
+    r"chat dump|assistant response|you brought|symmetric with it)\b",
+    re.IGNORECASE,
+)
+_SECOND_PERSON_RE = re.compile(r"\b(?:you|your|we|our)\b", re.IGNORECASE)
+_FRAGMENT_START_RE = re.compile(r"^(?:or|and|but|because|so|which)\b", re.IGNORECASE)
+_FRAGMENT_END_RE = re.compile(r"(?:\bto|\bwith|\bbecause|\band|\bbut|\bof|\bfor)$", re.IGNORECASE)
+_WRONG_SUBJECT_RE = re.compile(
+    r"^user\s+is\s+(?:an?\s+)?(?:ai|the assistant|the agent)\b",
+    re.IGNORECASE,
+)
+_ASSISTANT_INSTRUCTION_RE = re.compile(
+    r"\b(?:stop|help|ask|tell|remind)\s+you\b",
+    re.IGNORECASE,
+)
+
+
+def quality_flags_for_fact(fact: Dict[str, Any]) -> List[str]:
+    """Return explainable quality flags without mutating the candidate."""
+    content = str(fact.get("content", "")).strip()
+    category = str(fact.get("category", "context_note"))
+    flags: List[str] = []
+    if _is_junk(fact):
+        flags.append("syntax_junk")
+    if _AGENT_SPEAK_PATTERNS.search(content):
+        flags.append("assistant_language")
+    if _META_REFERENCE_RE.search(content):
+        flags.append("conversation_meta")
+    if _WRONG_SUBJECT_RE.search(content):
+        flags.append("wrong_subject")
+    if _ASSISTANT_INSTRUCTION_RE.search(content):
+        flags.append("assistant_instruction")
+    if _FRAGMENT_START_RE.search(content) or _FRAGMENT_END_RE.search(content):
+        flags.append("sentence_fragment")
+    if "?" in content or content.lower().startswith(("who ", "what ", "why ", "how ")):
+        flags.append("question_or_request")
+    if _SECOND_PERSON_RE.search(content):
+        flags.append("second_person_reference")
+    if category in {"context_note", "event"}:
+        flags.append("short_lived_category")
+    return sorted(set(flags))
+
+
+def hard_quality_flags(flags: List[str]) -> List[str]:
+    """Flags strong enough to keep a candidate out of active memory."""
+    hard = {
+        "syntax_junk", "assistant_language", "assistant_instruction",
+        "wrong_subject", "sentence_fragment",
+    }
+    return [flag for flag in flags if flag in hard]
+
+
 def _split_sentences(text: str) -> List[str]:
     """Split text into sentences, keeping it simple."""
     text = re.sub(r'\s+', ' ', text).strip()
@@ -450,6 +506,13 @@ def _extract_facts_regex(user_content: str) -> List[Dict[str, Any]]:
             continue
         fact = _classify_sentence(sentence)
         if fact:
+            fact.setdefault("source", "regex_extraction")
+            fact.setdefault("confidence", 0.75)
+            fact.setdefault(
+                "durability",
+                "temporary" if fact.get("category") in {"context_note", "event", "goal"} else "durable",
+            )
+            fact.setdefault("scope", "profile")
             facts.append(fact)
     return facts
 
@@ -475,6 +538,9 @@ Return a JSON array of objects with these keys:
 - "category": one of "personal_fact", "preference", "insight", "event", "relationship", "goal", "context_note"
 - "content": a clear, self-contained statement of the fact
 - "tags": array of 1-3 short lowercase tags
+- "confidence": number from 0 to 1
+- "durability": "permanent", "durable", or "temporary"
+- "scope": "profile", "project", or "session"
 
 If there are no durable facts, return an empty array: []
 
@@ -575,10 +641,24 @@ def _extract_facts_llm(user_content: str) -> List[Dict[str, Any]]:
         if not isinstance(tags, list):
             tags = [str(tags)] if tags else []
         tags = [str(t).lower().strip() for t in tags if t][:5]
+        try:
+            confidence = max(0.0, min(1.0, float(fact.get("confidence", 0.45))))
+        except (TypeError, ValueError):
+            confidence = 0.45
+        durability = str(fact.get("durability", "durable")).lower()
+        if durability not in {"permanent", "durable", "temporary"}:
+            durability = "durable"
+        scope = str(fact.get("scope", "profile")).lower()
+        if scope not in {"profile", "project", "session"}:
+            scope = "profile"
         result.append({
             "category": category,
             "content": content,
             "tags": tags,
+            "source": "llm_extraction",
+            "confidence": confidence,
+            "durability": durability,
+            "scope": scope,
             "payload": {"source": "llm_extraction"},
         })
 
@@ -614,7 +694,21 @@ def extract_from_turn(
         if llm_facts:
             facts.extend(llm_facts)
 
-    # Filter out junk from both stages.
-    facts = [f for f in facts if not _is_junk(f)]
+    # Filter only irrecoverably malformed candidates here. Other quality flags
+    # travel with the proposal so a reviewer can make an informed decision.
+    normalized: List[Dict[str, Any]] = []
+    for fact in facts:
+        if _is_junk(fact):
+            continue
+        payload = dict(fact.get("payload") or {})
+        flags = quality_flags_for_fact(fact)
+        if flags:
+            payload["quality_flags"] = flags
+        fact["payload"] = payload
+        fact.setdefault("source", "regex_extraction")
+        fact.setdefault("confidence", 0.75 if fact["source"] == "regex_extraction" else 0.45)
+        fact.setdefault("durability", "durable")
+        fact.setdefault("scope", "profile")
+        normalized.append(fact)
 
-    return facts
+    return normalized

@@ -36,12 +36,15 @@ from .embeddings import LocalEmbedder
 from .store import DuckDBMemoryStore, VALID_CATEGORIES
 from .graph import KuzuGraphStore
 from .extractor import extract_from_turn
+from .routing import resolve_storage_names
+from .service_client import SharedGraphStore, SharedMemoryStore
 
 logger = logging.getLogger(__name__)
 
 _PREFETCH_WAIT_SECS = 3.0
 _DEFAULT_MAX_INJECTED = 8
 _DEFAULT_MODEL = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
+_AUTO_EXTRACT_PAUSE_MARKER = "hybrid_memory.auto_extract.paused"
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +61,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
     config = {
         "database_filename": "hybrid_memory.duckdb",
         "graph_dirname": "hybrid_memory_kuzu",
+        "storage_mode": "shared_service",
         "max_injected_items": str(_DEFAULT_MAX_INJECTED),
         "local_embedding_model": _DEFAULT_MODEL,
         "auto_extract": "true",
@@ -197,6 +201,72 @@ GRAPH_SEARCH_SCHEMA = {
     },
 }
 
+CANDIDATE_LIST_SCHEMA = {
+    "name": "memory_candidate_list",
+    "description": (
+        "List pending memory proposals created by automatic extraction. These are "
+        "not active memories until reviewed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "pending, approved, rejected, or quarantined (default: pending).",
+            },
+            "limit": {"type": "integer", "description": "Maximum proposals to return (default: 20)."},
+        },
+    },
+}
+
+CANDIDATE_REVIEW_SCHEMA = {
+    "name": "memory_candidate_review",
+    "description": (
+        "Review a pending memory proposal. Approve only facts that are correct, "
+        "durable, about the user, and scoped appropriately."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "candidate_id": {"type": "string", "description": "Candidate ID from memory_candidate_list."},
+            "decision": {
+                "type": "string",
+                "description": "approved, rejected, or quarantined.",
+            },
+            "reason": {"type": "string", "description": "Short review explanation (optional)."},
+        },
+        "required": ["candidate_id", "decision"],
+    },
+}
+
+RESTORE_SCHEMA = {
+    "name": "memory_restore",
+    "description": "Restore a quarantined memory to active retrieval after review.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Memory ID to restore."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
+FEEDBACK_SCHEMA = {
+    "name": "memory_feedback",
+    "description": "Mark an active memory helpful, dismissed, or incorrect.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Memory ID from a search result."},
+            "feedback": {
+                "type": "string",
+                "description": "helpful, dismissed, or incorrect.",
+            },
+        },
+        "required": ["memory_id", "feedback"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -217,6 +287,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._max_injected: int = _DEFAULT_MAX_INJECTED
         self._auto_extract: bool = True
         self._llm_fallback: bool = True
+        self._auto_extract_paused: bool = False
         self._initialized: bool = False
         # Prefetch state.
         self._prefetch_thread: Optional[threading.Thread] = None
@@ -260,7 +331,7 @@ class HybridMemoryProvider(MemoryProvider):
             },
             {
                 "key": "auto_extract",
-                "description": "Enable automatic fact extraction after each turn",
+                "description": "Enable automatic candidate extraction after each turn; proposals require review before becoming active memory",
                 "default": "true",
                 "choices": ["true", "false"],
                 "required": False,
@@ -299,20 +370,14 @@ class HybridMemoryProvider(MemoryProvider):
         db_filename = self._config.get("database_filename", "hybrid_memory.duckdb")
         graph_dirname = self._config.get("graph_dirname", "hybrid_memory_kuzu")
 
-        # Gateway processes (telegram, discord, slack, etc.) run in a separate
-        # Python process from the desktop/CLI. DuckDB on Windows only allows
-        # one writer per file, so two processes opening the same .duckdb file
-        # causes a lock conflict and the second process falls back to read-only
-        # (or fails entirely). To avoid this, gateway processes use a separate
-        # database file with a "_gateway" suffix. The trade-off: memories saved
-        # from Telegram won't be visible from the desktop and vice versa. This
-        # is the simplest fix — a shared service layer would be the proper
-        # solution but requires more infrastructure.
-        if self._platform and self._platform != "cli":
-            if not db_filename.endswith("_gateway.duckdb"):
-                db_filename = db_filename.replace(".duckdb", "_gateway.duckdb")
-            if not graph_dirname.endswith("_gateway"):
-                graph_dirname = graph_dirname + "_gateway"
+        storage_mode = str(self._config.get("storage_mode", "shared_service")).lower()
+        use_shared_service = storage_mode not in {"local", "direct"}
+
+        # Local fallback routing. The shared service path below always owns the
+        # canonical primary files, regardless of the caller's platform.
+        db_filename, graph_dirname = resolve_storage_names(
+            self._platform, db_filename, graph_dirname
+        )
 
         model_name = self._config.get("local_embedding_model", _DEFAULT_MODEL)
 
@@ -330,28 +395,48 @@ class HybridMemoryProvider(MemoryProvider):
         self._llm_fallback = (
             llm_fb.lower() in ("true", "1", "yes") if isinstance(llm_fb, str) else bool(llm_fb)
         )
+        pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
+        env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
+        self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
+            "1", "true", "yes", "on"
+        }
 
         # Embedder (lazy — model loads on first embed call).
         self._embedder = LocalEmbedder(model_name)
 
-        # DuckDB store.
-        db_path = home / db_filename
-        self._store = DuckDBMemoryStore(db_path, user_id=self._user_id, embedder=self._embedder)
-
-        # Kuzu graph (optional — degrade gracefully if kuzu unavailable).
-        try:
-            graph_path = home / graph_dirname
-            self._graph = KuzuGraphStore(graph_path, user_id=self._user_id)
-        except Exception as e:
-            logger.warning("Kuzu graph unavailable, continuing without it: %s", e)
-            self._graph = None
+        if use_shared_service:
+            # One local service owns the canonical DuckDB/Kùzu files. The
+            # provider process never opens those files directly in this mode.
+            self._store = SharedMemoryStore(
+                home, user_id=self._user_id, embedder=self._embedder
+            )
+            try:
+                self._graph = SharedGraphStore(home, user_id=self._user_id)
+            except Exception as e:
+                logger.warning("Shared Kùzu graph unavailable, continuing without it: %s", e)
+                self._graph = None
+        else:
+            db_path = home / db_filename
+            self._store = DuckDBMemoryStore(
+                db_path, user_id=self._user_id, embedder=self._embedder
+            )
+            try:
+                graph_path = home / graph_dirname
+                self._graph = KuzuGraphStore(graph_path, user_id=self._user_id)
+            except Exception as e:
+                logger.warning("Kuzu graph unavailable, continuing without it: %s", e)
+                self._graph = None
 
         self._initialized = True
         logger.info(
-            "HybridMemory initialized: %d memories, graph=%s, embeddings=%s",
+            "HybridMemory initialized: %d memories, graph=%s, embeddings=%s, "
+            "auto_extract=%s, paused=%s, storage=%s, proposals=on",
             self._store.count(),
             "on" if self._graph else "off",
             "pending" if not self._embedder.is_available else "on",
+            self._auto_extract,
+            self._auto_extract_paused,
+            "shared_service" if use_shared_service else "direct",
         )
 
     # -- system prompt -------------------------------------------------------
@@ -374,7 +459,10 @@ class HybridMemoryProvider(MemoryProvider):
             "relationship (people in their life), goal (what they're working toward), "
             "context_note (situational context).\n"
             "When the user states a durable fact, preference, or insight — about "
-            "ANY topic — call memory_save immediately — don't wait to be asked.\n"
+            "ANY topic — call memory_save immediately — don't wait to be asked. "
+            "Automatic extraction creates pending proposals, not active memories. "
+            "Review them with memory_candidate_list and memory_candidate_review; "
+            "never approve a proposal merely because another model produced it.\n"
             "\n"
             "## Save reasoning, not just conclusions\n"
             "When you work through a non-trivial topic with the user — technical reasoning, "
@@ -476,7 +564,7 @@ class HybridMemoryProvider(MemoryProvider):
         # Skip writes for non-primary contexts (cron, subagent, flush).
         if self._agent_context != "primary":
             return
-        if not self._auto_extract:
+        if not self._auto_extract or self._auto_extract_paused:
             return
         if self._store is None:
             return
@@ -487,34 +575,31 @@ class HybridMemoryProvider(MemoryProvider):
                     user_content, assistant_content,
                     use_llm_fallback=self._llm_fallback,
                 )
-                saved = 0
+                proposed = 0
                 for fact in facts:
-                    rec = self._store.remember(
+                    payload = dict(fact.get("payload") or {})
+                    candidate = self._store.save_candidate(
                         category=fact["category"],
                         content=fact["content"],
                         tags=fact.get("tags", []),
-                        payload=fact.get("payload", {}),
+                        payload=payload,
+                        source=fact.get("source", payload.get("source", "regex_extraction")),
+                        confidence=fact.get("confidence", 0.45),
+                        durability=fact.get("durability", "durable"),
+                        scope=fact.get("scope", "profile"),
+                        project_id=fact.get("project_id"),
+                        session_id=session_id,
                         dedup=True,
                     )
-                    if rec:
-                        saved += 1
-                        # Also add to graph if it's a relationship.
-                        if fact["category"] == "relationship" and self._graph:
-                            payload = fact.get("payload", {})
-                            name = payload.get("name", "")
-                            relation = payload.get("relation", "")
-                            if name:
-                                self._graph.add_relationship(
-                                    source="user",
-                                    source_type="person",
-                                    relation=f"has_{relation}",
-                                    target=name,
-                                    target_type="person",
-                                )
-                if saved:
-                    logger.debug("Auto-extracted %d facts from turn", saved)
+                    if candidate:
+                        proposed += 1
+                if proposed:
+                    logger.info(
+                        "Created %d pending memory proposals; no automatic active writes",
+                        proposed,
+                    )
             except Exception as e:
-                logger.warning("Sync turn extraction failed: %s", e)
+                logger.warning("Sync turn proposal failed: %s", e)
 
         with self._sync_lock:
             if self._sync_thread and self._sync_thread.is_alive():
@@ -535,14 +620,14 @@ class HybridMemoryProvider(MemoryProvider):
                     logger.debug("Purged %d junk graph entities at session end", deleted)
             except Exception as e:
                 logger.debug("Junk purge failed: %s", e)
-        # Clean up junk memories (fragments, duplicates, trivial facts).
+        # Quarantine questionable memories at session end; never delete silently.
         if self._store:
             try:
-                deleted = self._store.cleanup_junk()
-                if deleted:
-                    logger.info("Cleaned up %d junk memories at session end", deleted)
+                quarantined = self._store.cleanup_junk()
+                if quarantined:
+                    logger.info("Quarantined %d questionable memories at session end", quarantined)
             except Exception as e:
-                logger.debug("Memory cleanup failed: %s", e)
+                logger.debug("Memory quarantine failed: %s", e)
 
     # -- session switch ------------------------------------------------------
 
@@ -599,7 +684,16 @@ class HybridMemoryProvider(MemoryProvider):
             pass
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        schemas = [SEARCH_SCHEMA, SAVE_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
+        schemas = [
+            SEARCH_SCHEMA,
+            SAVE_SCHEMA,
+            UPDATE_SCHEMA,
+            DELETE_SCHEMA,
+            CANDIDATE_LIST_SCHEMA,
+            CANDIDATE_REVIEW_SCHEMA,
+            RESTORE_SCHEMA,
+            FEEDBACK_SCHEMA,
+        ]
         if self._graph:
             schemas.append(GRAPH_SEARCH_SCHEMA)
         return schemas
@@ -661,6 +755,56 @@ class HybridMemoryProvider(MemoryProvider):
             if not deleted:
                 return tool_error(f"Memory not found: {memory_id}")
             return json.dumps({"status": "deleted", "memory_id": memory_id})
+
+        elif tool_name == "memory_candidate_list":
+            status = args.get("status", "pending")
+            if status not in {"pending", "approved", "rejected", "quarantined", "deduplicated"}:
+                return tool_error("Invalid candidate status")
+            try:
+                limit = max(1, min(int(args.get("limit", 20)), 100))
+            except (ValueError, TypeError):
+                limit = 20
+            candidates = self._store.list_candidates(status=status, limit=limit)
+            return json.dumps({"status": status, "count": len(candidates), "candidates": candidates})
+
+        elif tool_name == "memory_candidate_review":
+            candidate_id = args.get("candidate_id", "")
+            decision = args.get("decision", "")
+            if not candidate_id or not decision:
+                return tool_error("Missing required parameter: candidate_id or decision")
+            try:
+                result = self._store.review_candidate(
+                    candidate_id, decision, args.get("reason", "")
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
+            if result is None:
+                return tool_error(f"Candidate not found: {candidate_id}")
+            memory = result.get("memory")
+            if memory and memory.get("category") == "relationship" and self._graph:
+                self._try_graph_relationship(memory.get("content", ""))
+            return json.dumps(result)
+
+        elif tool_name == "memory_restore":
+            memory_id = args.get("memory_id", "")
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            if not self._store.restore_memory(memory_id):
+                return tool_error(f"Memory not found: {memory_id}")
+            return json.dumps({"status": "restored", "memory_id": memory_id})
+
+        elif tool_name == "memory_feedback":
+            memory_id = args.get("memory_id", "")
+            feedback = args.get("feedback", "")
+            if not memory_id or not feedback:
+                return tool_error("Missing required parameter: memory_id or feedback")
+            try:
+                recorded = self._store.record_feedback(memory_id, feedback)
+            except ValueError as exc:
+                return tool_error(str(exc))
+            if not recorded:
+                return tool_error(f"Memory not found: {memory_id}")
+            return json.dumps({"status": "recorded", "memory_id": memory_id, "feedback": feedback})
 
         elif tool_name == "memory_graph_search":
             if self._graph is None:

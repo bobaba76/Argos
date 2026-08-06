@@ -8,6 +8,9 @@ data/
 *.pid
 *.log
 hybrid_memory_plugin/_mh_analysis.txt
+hybrid_memory_service.json
+hybrid_memory_service.starting
+hybrid_memory.auto_extract.paused
 
 # Python artifacts
 __pycache__/

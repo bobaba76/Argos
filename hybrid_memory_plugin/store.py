@@ -19,7 +19,7 @@ import json
 import logging
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +37,12 @@ VALID_CATEGORIES = frozenset({
     "context_note",
 })
 
+_DEFAULT_TTL_DAYS = {
+    "context_note": 30,
+    "event": 180,
+    "goal": 180,
+}
+
 
 class MemoryRecord:
     """In-memory representation of a stored memory row."""
@@ -44,6 +50,9 @@ class MemoryRecord:
     __slots__ = (
         "memory_id", "category", "content", "tags", "payload",
         "created_at", "updated_at", "expires_at", "embedding", "similarity",
+        "status", "source", "confidence", "durability", "scope", "project_id",
+        "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
+        "quarantine_reason", "quarantined_at",
     )
 
     def __init__(
@@ -58,6 +67,18 @@ class MemoryRecord:
         expires_at: str | None = None,
         embedding: List[float] | None = None,
         similarity: float = 0.0,
+        status: str = "active",
+        source: str = "explicit",
+        confidence: float | None = None,
+        durability: str = "durable",
+        scope: str = "profile",
+        project_id: str | None = None,
+        retrieval_count: int = 0,
+        last_retrieved_at: str | None = None,
+        helpful_count: int = 0,
+        dismissed_count: int = 0,
+        quarantine_reason: str | None = None,
+        quarantined_at: str | None = None,
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -69,6 +90,18 @@ class MemoryRecord:
         self.expires_at = expires_at
         self.embedding = embedding
         self.similarity = similarity
+        self.status = status or "active"
+        self.source = source or "explicit"
+        self.confidence = confidence
+        self.durability = durability or "durable"
+        self.scope = scope or "profile"
+        self.project_id = project_id
+        self.retrieval_count = int(retrieval_count or 0)
+        self.last_retrieved_at = last_retrieved_at
+        self.helpful_count = int(helpful_count or 0)
+        self.dismissed_count = int(dismissed_count or 0)
+        self.quarantine_reason = quarantine_reason
+        self.quarantined_at = quarantined_at
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -80,6 +113,18 @@ class MemoryRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "similarity": round(self.similarity, 4),
+            "status": self.status,
+            "source": self.source,
+            "confidence": self.confidence,
+            "durability": self.durability,
+            "scope": self.scope,
+            "project_id": self.project_id,
+            "retrieval_count": self.retrieval_count,
+            "last_retrieved_at": self.last_retrieved_at,
+            "helpful_count": self.helpful_count,
+            "dismissed_count": self.dismissed_count,
+            "quarantine_reason": self.quarantine_reason,
+            "quarantined_at": self.quarantined_at,
         }
 
 
@@ -124,17 +169,94 @@ class DuckDBMemoryStore:
             self.connection.execute("""
                 CREATE SEQUENCE IF NOT EXISTS seq_memory_id;
                 CREATE TABLE IF NOT EXISTS memory_records (
-                    memory_id   VARCHAR PRIMARY KEY,
-                    category    VARCHAR,
-                    content     VARCHAR,
-                    tags        VARCHAR[],
-                    payload     JSON,
-                    created_at  VARCHAR,
-                    updated_at  VARCHAR,
-                    expires_at  VARCHAR,
-                    embedding   DOUBLE[]
+                    memory_id          VARCHAR PRIMARY KEY,
+                    category           VARCHAR,
+                    content            VARCHAR,
+                    tags               VARCHAR[],
+                    payload            JSON,
+                    created_at         VARCHAR,
+                    updated_at         VARCHAR,
+                    expires_at         VARCHAR,
+                    embedding          DOUBLE[],
+                    status             VARCHAR DEFAULT 'active',
+                    source             VARCHAR DEFAULT 'explicit',
+                    confidence         DOUBLE DEFAULT 1.0,
+                    durability         VARCHAR DEFAULT 'durable',
+                    scope              VARCHAR DEFAULT 'profile',
+                    project_id         VARCHAR,
+                    retrieval_count    INTEGER DEFAULT 0,
+                    last_retrieved_at  VARCHAR,
+                    helpful_count      INTEGER DEFAULT 0,
+                    dismissed_count    INTEGER DEFAULT 0,
+                    quarantine_reason  VARCHAR,
+                    quarantined_at     VARCHAR
+                );
+                CREATE TABLE IF NOT EXISTS memory_candidates (
+                    candidate_id       VARCHAR PRIMARY KEY,
+                    category           VARCHAR,
+                    content            VARCHAR,
+                    tags               VARCHAR[],
+                    payload            JSON,
+                    source             VARCHAR,
+                    confidence         DOUBLE,
+                    durability         VARCHAR,
+                    scope              VARCHAR,
+                    project_id         VARCHAR,
+                    session_id         VARCHAR,
+                    status             VARCHAR DEFAULT 'pending',
+                    created_at         VARCHAR,
+                    updated_at         VARCHAR,
+                    reviewed_at        VARCHAR,
+                    review_reason      VARCHAR
                 );
             """)
+            # Additive migration for databases created by earlier versions.
+            columns = {
+                "status": "VARCHAR DEFAULT 'active'",
+                "source": "VARCHAR DEFAULT 'explicit'",
+                "confidence": "DOUBLE DEFAULT 1.0",
+                "durability": "VARCHAR DEFAULT 'durable'",
+                "scope": "VARCHAR DEFAULT 'profile'",
+                "project_id": "VARCHAR",
+                "retrieval_count": "INTEGER DEFAULT 0",
+                "last_retrieved_at": "VARCHAR",
+                "helpful_count": "INTEGER DEFAULT 0",
+                "dismissed_count": "INTEGER DEFAULT 0",
+                "quarantine_reason": "VARCHAR",
+                "quarantined_at": "VARCHAR",
+            }
+            for name, definition in columns.items():
+                try:
+                    self.connection.execute(
+                        f"ALTER TABLE memory_records ADD COLUMN IF NOT EXISTS {name} {definition}"
+                    )
+                except Exception as exc:
+                    logger.warning("Memory schema migration for %s failed: %s", name, exc)
+
+            try:
+                self.connection.execute("""
+                    UPDATE memory_records
+                    SET source = COALESCE(
+                            NULLIF(json_extract_string(payload, '$.source'), ''),
+                            NULLIF(source, ''), 'explicit'
+                        ),
+                        status = COALESCE(NULLIF(status, ''), 'active'),
+                        durability = CASE
+                            WHEN category IN ('context_note', 'event') THEN 'temporary'
+                            ELSE COALESCE(NULLIF(durability, ''), 'durable')
+                        END,
+                        scope = COALESCE(NULLIF(scope, ''), 'profile'),
+                        confidence = CASE
+                            WHEN json_extract_string(payload, '$.source') = 'llm_extraction'
+                                 AND (confidence IS NULL OR confidence >= 0.99) THEN 0.45
+                            ELSE COALESCE(confidence, 0.75)
+                        END,
+                        retrieval_count = COALESCE(retrieval_count, 0),
+                        helpful_count = COALESCE(helpful_count, 0),
+                        dismissed_count = COALESCE(dismissed_count, 0)
+                """)
+            except Exception as exc:
+                logger.warning("Memory metadata backfill failed: %s", exc)
 
     # -- helpers --------------------------------------------------------------
 
@@ -163,16 +285,28 @@ class DuckDBMemoryStore:
 
     def _row_to_record(self, row: dict, similarity: float = 0.0) -> MemoryRecord:
         return MemoryRecord(
-            memory_id=row["memory_id"],
-            category=row["category"],
-            content=row["content"],
-            tags=row["tags"] if row["tags"] is not None else [],
-            payload=json.loads(row["payload"]) if row["payload"] else {},
+            memory_id=row.get("memory_id", ""),
+            category=row.get("category", "context_note"),
+            content=row.get("content", ""),
+            tags=row.get("tags") if row.get("tags") is not None else [],
+            payload=json.loads(row.get("payload")) if row.get("payload") else {},
             created_at=row.get("created_at"),
             updated_at=row.get("updated_at"),
             expires_at=row.get("expires_at"),
             embedding=row.get("embedding"),
             similarity=similarity,
+            status=row.get("status", "active"),
+            source=row.get("source", "explicit"),
+            confidence=row.get("confidence"),
+            durability=row.get("durability", "durable"),
+            scope=row.get("scope", "profile"),
+            project_id=row.get("project_id"),
+            retrieval_count=row.get("retrieval_count", 0),
+            last_retrieved_at=row.get("last_retrieved_at"),
+            helpful_count=row.get("helpful_count", 0),
+            dismissed_count=row.get("dismissed_count", 0),
+            quarantine_reason=row.get("quarantine_reason"),
+            quarantined_at=row.get("quarantined_at"),
         )
 
     def _fetch_records(
@@ -211,7 +345,11 @@ class DuckDBMemoryStore:
         if not tokens:
             return []
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
-        sql = f"SELECT * FROM memory_records WHERE ({conditions}) LIMIT 200"
+        sql = (
+            "SELECT * FROM memory_records "
+            "WHERE COALESCE(status, 'active') = 'active' AND ("
+            f"{conditions}) LIMIT 200"
+        )
         results = self._fetch_records(sql, tokens)
         out: List[MemoryRecord] = []
         for r in results:
@@ -221,7 +359,33 @@ class DuckDBMemoryStore:
                 continue
             if self._matches_scope(r.payload) and not self._is_expired(r.expires_at):
                 out.append(r)
-        return out[:limit]
+        selected = out[:limit]
+        self._record_retrieval(selected)
+        return selected
+
+    def _record_retrieval(self, records: List[MemoryRecord]) -> None:
+        """Record only memories that were actually returned to the caller."""
+        if not records:
+            return
+        now = self._now()
+        ids = [record.memory_id for record in records]
+        try:
+            with self._lock:
+                assert self.connection is not None
+                for memory_id in ids:
+                    self.connection.execute(
+                        """UPDATE memory_records
+                           SET retrieval_count = COALESCE(retrieval_count, 0) + 1,
+                               last_retrieved_at = ?
+                           WHERE memory_id = ? AND COALESCE(status, 'active') = 'active'""",
+                        [now, memory_id],
+                    )
+            for record in records:
+                record.retrieval_count += 1
+                record.last_retrieved_at = now
+        except Exception as exc:
+            # A read-only fallback connection must still be able to search.
+            logger.debug("Could not record memory retrieval: %s", exc)
 
     def search(
         self,
@@ -254,7 +418,8 @@ class DuckDBMemoryStore:
             sql = """
                 SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim
                 FROM memory_records
-                WHERE embedding IS NOT NULL
+                WHERE COALESCE(status, 'active') = 'active'
+                  AND embedding IS NOT NULL
                 ORDER BY sim DESC
                 LIMIT ?
             """
@@ -262,6 +427,7 @@ class DuckDBMemoryStore:
                 results = self._fetch_records(sql, [emb, limit * 4], sim_col="sim")
                 filtered = _apply_filters(results)
                 if filtered:
+                    self._record_retrieval(filtered)
                     return filtered
                 # Vector search returned nothing after filtering — try text.
                 return self._text_search(query, limit, excluded, category_filter)
@@ -308,6 +474,13 @@ class DuckDBMemoryStore:
         tags: List[str] | None = None,
         payload: Dict[str, Any] | None = None,
         dedup: bool = True,
+        *,
+        source: str = "explicit",
+        confidence: float | None = 1.0,
+        durability: str | None = None,
+        scope: str = "profile",
+        project_id: str | None = None,
+        status: str = "active",
     ) -> MemoryRecord | None:
         """Insert a memory record. Returns None if deduped away."""
         if not content or not content.strip():
@@ -318,6 +491,17 @@ class DuckDBMemoryStore:
 
         record_payload = dict(payload or {})
         record_payload.setdefault("user_scope", self.user_id)
+        source = str(source or record_payload.get("source") or "explicit")
+        durability = str(
+            durability or (
+                "temporary" if category in {"context_note", "event", "goal"} else "durable"
+            )
+        )
+        scope = str(scope or "profile")
+        status = str(status or "active")
+        if status not in {"active", "quarantined"}:
+            status = "active"
+        record_payload.setdefault("source", source)
 
         if dedup and self._content_exists(content, category):
             logger.debug("Deduped memory: %s", content[:60])
@@ -325,14 +509,22 @@ class DuckDBMemoryStore:
 
         memory_id = f"mem-{uuid.uuid4().hex}"
         now = self._now()
+        if not record_payload.get("expires_at") and durability == "temporary":
+            ttl_days = _DEFAULT_TTL_DAYS.get(category)
+            if ttl_days:
+                record_payload["expires_at"] = (
+                    datetime.now(timezone.utc) + timedelta(days=ttl_days)
+                ).isoformat()
         emb: List[float] = []
         if self.embedder and hasattr(self.embedder, "embed"):
             emb = self.embedder.embed(content)
 
         sql = """
             INSERT INTO memory_records
-                (memory_id, category, content, tags, payload, created_at, updated_at, expires_at, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (memory_id, category, content, tags, payload, created_at, updated_at,
+                 expires_at, embedding, status, source, confidence, durability, scope,
+                 project_id, retrieval_count, helpful_count, dismissed_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
         """
         with self._lock:
             assert self.connection is not None
@@ -341,11 +533,245 @@ class DuckDBMemoryStore:
                 json.dumps(record_payload), now, now,
                 record_payload.get("expires_at"),
                 emb if emb else None,
+                status, source, confidence, durability, scope, project_id,
             ])
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
         )
         return fetched[0] if fetched else None
+
+    # -- candidate/proposal queue ---------------------------------------------
+
+    @staticmethod
+    def _candidate_payload(raw: Any) -> dict:
+        if isinstance(raw, str):
+            try:
+                value = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                value = {}
+        else:
+            value = raw or {}
+        return value if isinstance(value, dict) else {}
+
+    def _candidate_row_to_dict(self, row: tuple) -> dict:
+        (
+            candidate_id, category, content, tags, payload, source, confidence,
+            durability, scope, project_id, session_id, status, created_at,
+            updated_at, reviewed_at, review_reason,
+        ) = row
+        return {
+            "candidate_id": candidate_id,
+            "category": category,
+            "content": content,
+            "tags": list(tags or []),
+            "payload": self._candidate_payload(payload),
+            "source": source,
+            "confidence": confidence,
+            "durability": durability,
+            "scope": scope,
+            "project_id": project_id,
+            "session_id": session_id,
+            "status": status,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "reviewed_at": reviewed_at,
+            "review_reason": review_reason,
+        }
+
+    def save_candidate(
+        self,
+        category: str,
+        content: str,
+        tags: List[str] | None = None,
+        payload: Dict[str, Any] | None = None,
+        *,
+        source: str = "llm_extraction",
+        confidence: float | None = 0.5,
+        durability: str = "durable",
+        scope: str = "profile",
+        project_id: str | None = None,
+        session_id: str = "",
+        dedup: bool = True,
+    ) -> dict | None:
+        """Store a pending proposal without making it retrievable memory."""
+        if not content or not content.strip():
+            return None
+        if category not in VALID_CATEGORIES:
+            category = "context_note"
+        if dedup:
+            with self._lock:
+                assert self.connection is not None
+                existing = self.connection.execute(
+                    """SELECT candidate_id FROM memory_candidates
+                       WHERE category = ? AND content = ? AND status = 'pending'
+                       LIMIT 1""",
+                    [category, content.strip()],
+                ).fetchone()
+            if existing:
+                return None
+
+        candidate_id = f"cand-{uuid.uuid4().hex}"
+        now = self._now()
+        candidate_payload = dict(payload or {})
+        candidate_payload.setdefault("user_scope", self.user_id)
+        candidate_payload.setdefault("source", source)
+        try:
+            normalized_confidence = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            normalized_confidence = 0.5
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute(
+                """INSERT INTO memory_candidates
+                   (candidate_id, category, content, tags, payload, source,
+                    confidence, durability, scope, project_id, session_id,
+                    status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                [
+                    candidate_id, category, content.strip(), tags or [],
+                    json.dumps(candidate_payload), source, normalized_confidence,
+                    durability or "durable", scope or "profile", project_id,
+                    session_id or "", now, now,
+                ],
+            )
+        return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
+
+    def list_candidates(
+        self,
+        status: str = "pending",
+        *,
+        candidate_id: str | None = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        conditions = [
+            "(json_extract_string(payload, '$.user_scope') IS NULL OR "
+            "json_extract_string(payload, '$.user_scope') = ?)"
+        ]
+        params: list[Any] = [self.user_id]
+        if candidate_id:
+            conditions.append("candidate_id = ?")
+            params.append(candidate_id)
+        elif status:
+            conditions.append("status = ?")
+            params.append(status)
+        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason FROM memory_candidates"
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(sql, params).fetchall()
+        return [self._candidate_row_to_dict(row) for row in rows]
+
+    def review_candidate(
+        self, candidate_id: str, decision: str, reason: str = ""
+    ) -> dict | None:
+        """Approve, reject, or quarantine a pending proposal."""
+        decision = decision.strip().lower()
+        if decision not in {"approved", "rejected", "quarantined"}:
+            raise ValueError("decision must be approved, rejected, or quarantined")
+        candidates = self.list_candidates(candidate_id=candidate_id, limit=1)
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        if candidate["status"] != "pending":
+            return {"candidate": candidate, "memory": None}
+        now = self._now()
+        memory = None
+        final_status = decision
+        if decision == "approved":
+            memory = self.remember(
+                category=candidate["category"],
+                content=candidate["content"],
+                tags=candidate["tags"],
+                payload=candidate["payload"],
+                source=candidate["source"],
+                confidence=candidate["confidence"],
+                durability=candidate["durability"],
+                scope=candidate["scope"],
+                project_id=candidate["project_id"],
+            )
+            if memory is None:
+                final_status = "deduplicated"
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute(
+                """UPDATE memory_candidates
+                   SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?
+                   WHERE candidate_id = ?""",
+                [final_status, now, now, reason or "", candidate_id],
+            )
+        return {
+            "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
+            "memory": memory.to_dict() if memory else None,
+        }
+
+    def quarantine_memory(self, memory_id: str, reason: str) -> bool:
+        """Hide a memory from retrieval without deleting its record."""
+        now = self._now()
+        with self._lock:
+            assert self.connection is not None
+            check = self.connection.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+            ).fetchone()
+            if not check or check[0] == 0:
+                return False
+            self.connection.execute(
+                """UPDATE memory_records
+                   SET status = 'quarantined', quarantine_reason = ?, quarantined_at = ?, updated_at = ?
+                   WHERE memory_id = ?""",
+                [reason or "manual review", now, now, memory_id],
+            )
+        return True
+
+    def restore_memory(self, memory_id: str) -> bool:
+        """Restore a quarantined memory to active retrieval."""
+        now = self._now()
+        with self._lock:
+            assert self.connection is not None
+            check = self.connection.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+            ).fetchone()
+            if not check or check[0] == 0:
+                return False
+            self.connection.execute(
+                """UPDATE memory_records
+                   SET status = 'active', quarantine_reason = NULL,
+                       quarantined_at = NULL, updated_at = ?
+                   WHERE memory_id = ?""",
+                [now, memory_id],
+            )
+        return True
+
+    def record_feedback(self, memory_id: str, feedback: str) -> bool:
+        """Record helpful/dismissed/incorrect feedback; incorrect hides the memory."""
+        feedback = feedback.strip().lower()
+        if feedback not in {"helpful", "dismissed", "incorrect"}:
+            raise ValueError("feedback must be helpful, dismissed, or incorrect")
+        now = self._now()
+        with self._lock:
+            assert self.connection is not None
+            exists = self.connection.execute(
+                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+            ).fetchone()
+            if not exists or exists[0] == 0:
+                return False
+            if feedback == "helpful":
+                sql = "UPDATE memory_records SET helpful_count = COALESCE(helpful_count, 0) + 1, updated_at = ? WHERE memory_id = ?"
+                params = [now, memory_id]
+            elif feedback == "dismissed":
+                sql = "UPDATE memory_records SET dismissed_count = COALESCE(dismissed_count, 0) + 1, updated_at = ? WHERE memory_id = ?"
+                params = [now, memory_id]
+            else:
+                sql = """UPDATE memory_records
+                         SET dismissed_count = COALESCE(dismissed_count, 0) + 1,
+                             status = 'quarantined', quarantine_reason = 'marked incorrect',
+                             quarantined_at = ?, updated_at = ?
+                         WHERE memory_id = ?"""
+                params = [now, now, memory_id]
+            self.connection.execute(sql, params)
+            return True
 
     def update_memory(
         self,
@@ -417,12 +843,12 @@ class DuckDBMemoryStore:
     # -- listing --------------------------------------------------------------
 
     def list_recent(self, limit: int = 10) -> List[MemoryRecord]:
-        sql = "SELECT * FROM memory_records ORDER BY created_at DESC LIMIT ?"
+        sql = "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active' ORDER BY created_at DESC LIMIT ?"
         results = self._fetch_records(sql, [limit])
         return [r for r in results if self._matches_scope(r.payload) and not self._is_expired(r.expires_at)]
 
     def list_by_category(self, category: str, limit: int = 50) -> List[MemoryRecord]:
-        sql = "SELECT * FROM memory_records WHERE category = ? ORDER BY created_at DESC LIMIT ?"
+        sql = "SELECT * FROM memory_records WHERE category = ? AND COALESCE(status, 'active') = 'active' ORDER BY created_at DESC LIMIT ?"
         results = self._fetch_records(sql, [category, limit])
         return [r for r in results if self._matches_scope(r.payload) and not self._is_expired(r.expires_at)]
 
@@ -442,26 +868,22 @@ class DuckDBMemoryStore:
     # -- junk cleanup ---------------------------------------------------------
 
     def cleanup_junk(self) -> int:
-        """Identify and delete low-quality memories.
+        """Quarantine low-quality memories without deleting their records.
 
-        Removes:
-        - Memories with content shorter than 10 chars
-        - Memories with agent-speak fragments
-        - Memories with unmatched parentheses (truncated fragments)
-        - Near-duplicate memories (same category, >80% content overlap)
-
-        Returns the number of memories deleted.
+        This method name remains for lifecycle compatibility, but cleanup is now
+        reversible: questionable records are marked ``quarantined`` and hidden
+        from search/injection. Reviewers can restore or delete them later.
         """
-        from .extractor import _is_junk
+        try:
+            from .extractor import hard_quality_flags, quality_flags_for_fact
+        except ImportError:
+            from extractor import hard_quality_flags, quality_flags_for_fact
 
-        # Fetch all memories.
         all_records = self._fetch_records(
-            "SELECT memory_id, category, content, tags, payload, created_at "
-            "FROM memory_records"
+            "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active'"
         )
-
-        to_delete: List[str] = []
-        seen_content: Dict[str, str] = {}  # normalized content -> memory_id
+        to_quarantine: Dict[str, str] = {}
+        seen_content: Dict[tuple[str, str], str] = {}
 
         for rec in all_records:
             fact = {
@@ -470,43 +892,34 @@ class DuckDBMemoryStore:
                 "tags": rec.tags,
                 "payload": rec.payload,
             }
-
-            # Check junk filter.
-            if _is_junk(fact):
-                to_delete.append(rec.memory_id)
+            flags = hard_quality_flags(quality_flags_for_fact(fact))
+            if flags:
+                to_quarantine[rec.memory_id] = "; ".join(flags)
                 continue
 
-            # Check for near-duplicates (same category, very similar content).
-            normalized = rec.content.lower().strip()
-            # Use first 60 chars as a fingerprint for dedup.
-            fingerprint = normalized[:60]
-            if fingerprint in seen_content and rec.category == all_records[0].category:
-                # Keep the longer one, delete the shorter.
-                existing_id = seen_content[fingerprint]
-                # Find existing content length.
+            fingerprint = rec.content.lower().strip()[:60]
+            key = (rec.category, fingerprint)
+            if key in seen_content:
+                existing_id = seen_content[key]
                 existing_rec = next(
                     (r for r in all_records if r.memory_id == existing_id), None
                 )
                 if existing_rec and len(rec.content) > len(existing_rec.content):
-                    # New one is longer — delete the old one, keep this one.
-                    if existing_id not in to_delete:
-                        to_delete.append(existing_id)
-                    seen_content[fingerprint] = rec.memory_id
+                    to_quarantine[existing_id] = "near_duplicate_shorter"
+                    seen_content[key] = rec.memory_id
                 else:
-                    # Old one is longer (or equal) — delete this one.
-                    to_delete.append(rec.memory_id)
+                    to_quarantine[rec.memory_id] = "near_duplicate_shorter"
             else:
-                seen_content[fingerprint] = rec.memory_id
+                seen_content[key] = rec.memory_id
 
-        # Delete junk memories.
-        deleted = 0
-        for mid in to_delete:
-            if self.delete_memory(mid):
-                deleted += 1
+        quarantined = 0
+        for memory_id, reason in to_quarantine.items():
+            if self.quarantine_memory(memory_id, reason):
+                quarantined += 1
 
-        if deleted:
-            logger.info("Cleaned up %d junk memories", deleted)
-        return deleted
+        if quarantined:
+            logger.info("Quarantined %d questionable memories", quarantined)
+        return quarantined
 
     # -- lifecycle ------------------------------------------------------------
 

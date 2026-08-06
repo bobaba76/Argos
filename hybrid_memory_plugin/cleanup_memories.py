@@ -4,8 +4,8 @@
 Run this with Hermes CLOSED (the database is locked while Hermes is running).
 
 Usage:
-    python cleanup_memories.py           # Dry run — shows what would be deleted
-    python cleanup_memories.py --apply   # Actually deletes junk memories
+    python cleanup_memories.py               # Dry run — shows review candidates
+    python cleanup_memories.py --quarantine # Hides candidates without deleting them
 """
 import argparse
 import json
@@ -19,21 +19,28 @@ HERMES_HOME = PLUGIN_DIR.parent.parent  # plugins/ -> hermes/ -> parent
 # Add plugin dir to path so we can import the modules.
 sys.path.insert(0, str(PLUGIN_DIR))
 
-from extractor import _is_junk
+from extractor import hard_quality_flags, quality_flags_for_fact
 import duckdb
 
 
 def main():
     parser = argparse.ArgumentParser(description="Clean up junk memories")
     parser.add_argument(
+        "--quarantine", action="store_true",
+        help="Hide candidates from retrieval without deleting them",
+    )
+    parser.add_argument(
         "--apply", action="store_true",
-        help="Actually delete memories (default: dry run)",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--db", default=str(HERMES_HOME / "hybrid_memory.duckdb"),
         help="Path to the DuckDB database file",
     )
     args = parser.parse_args()
+    if args.apply:
+        print("ERROR: --apply is disabled. Use --quarantine; records will not be deleted.")
+        sys.exit(2)
 
     db_path = Path(args.db)
     if not db_path.exists():
@@ -50,7 +57,8 @@ def main():
 
     rows = conn.execute(
         "SELECT memory_id, category, content, tags, payload, created_at "
-        "FROM memory_records ORDER BY created_at DESC"
+        "FROM memory_records WHERE COALESCE(status, 'active') = 'active' "
+        "ORDER BY created_at DESC"
     ).fetchall()
 
     print(f"Total memories: {len(rows)}")
@@ -58,7 +66,7 @@ def main():
 
     # Identify junk.
     junk_ids = []
-    seen_fingerprints = {}  # normalized[:60] -> (memory_id, content)
+    seen_fingerprints = {}  # (category, normalized[:60]) -> (memory_id, content)
 
     for row in rows:
         mid, cat, content, tags, payload, created = row
@@ -69,22 +77,22 @@ def main():
             "payload": json.loads(payload) if payload else {},
         }
 
-        # Check junk filter.
-        if _is_junk(fact):
-            junk_ids.append((mid, cat, content, "junk filter"))
+        flags = hard_quality_flags(quality_flags_for_fact(fact))
+        if flags:
+            junk_ids.append((mid, cat, content, "; ".join(flags)))
             continue
 
-        # Check for near-duplicates.
         normalized = content.lower().strip()[:60]
-        if normalized in seen_fingerprints:
-            existing_id, existing_content = seen_fingerprints[normalized]
+        key = (cat, normalized)
+        if key in seen_fingerprints:
+            existing_id, existing_content = seen_fingerprints[key]
             if len(content) > len(existing_content):
                 junk_ids.append((existing_id, cat, existing_content, "duplicate (shorter)"))
-                seen_fingerprints[normalized] = (mid, content)
+                seen_fingerprints[key] = (mid, content)
             else:
                 junk_ids.append((mid, cat, content, "duplicate (shorter)"))
         else:
-            seen_fingerprints[normalized] = (mid, content)
+            seen_fingerprints[key] = (mid, content)
 
     if not junk_ids:
         print("No junk memories found. Database is clean.")
@@ -99,14 +107,22 @@ def main():
         print(f"{mid:<20} {cat:<16} {reason:<25} {display}")
 
     print()
-    if not args.apply:
-        print("DRY RUN — no memories were deleted.")
-        print("Run with --apply to actually delete them.")
+    if not args.quarantine:
+        print("DRY RUN — no memories were changed.")
+        print("Run with --quarantine to hide these records without deleting them.")
     else:
-        for mid, _, _, _ in junk_ids:
-            conn.execute("DELETE FROM memory_records WHERE memory_id = ?", [mid])
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        for mid, _, _, reason in junk_ids:
+            conn.execute(
+                """UPDATE memory_records
+                   SET status = 'quarantined', quarantine_reason = ?,
+                       quarantined_at = ?, updated_at = ?
+                   WHERE memory_id = ?""",
+                [reason, now, now, mid],
+            )
         conn.close()
-        print(f"Deleted {len(junk_ids)} junk memories.")
+        print(f"Quarantined {len(junk_ids)} memories; no records were deleted.")
 
 
 if __name__ == "__main__":

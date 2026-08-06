@@ -62,6 +62,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="auto_review",
+            label="Automatic proposal review",
+            kind=KIND_BOOL,
+            default="true",
+            description="Have the auxiliary LLM review new proposals.",
+            info="Obvious junk is quarantined automatically; sensitive or contextless proposals stay pending for confirmation.",
+            inline=True,
+            group="Extraction",
+        ),
+        ProviderField(
             key="storage_mode",
             label="Storage mode",
             kind=KIND_SELECT,

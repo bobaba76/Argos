@@ -207,7 +207,12 @@ class DuckDBMemoryStore:
                     created_at         VARCHAR,
                     updated_at         VARCHAR,
                     reviewed_at        VARCHAR,
-                    review_reason      VARCHAR
+                    review_reason      VARCHAR,
+                    evidence_text     VARCHAR,
+                    evidence_role     VARCHAR DEFAULT 'user_turn',
+                    source_timestamp   VARCHAR,
+                    review_confidence  DOUBLE,
+                    review_model       VARCHAR
                 );
             """)
             # Additive migration for databases created by earlier versions.
@@ -225,6 +230,13 @@ class DuckDBMemoryStore:
                 "quarantine_reason": "VARCHAR",
                 "quarantined_at": "VARCHAR",
             }
+            candidate_columns = {
+                "evidence_text": "VARCHAR",
+                "evidence_role": "VARCHAR DEFAULT 'user_turn'",
+                "source_timestamp": "VARCHAR",
+                "review_confidence": "DOUBLE",
+                "review_model": "VARCHAR",
+            }
             for name, definition in columns.items():
                 try:
                     self.connection.execute(
@@ -232,6 +244,13 @@ class DuckDBMemoryStore:
                     )
                 except Exception as exc:
                     logger.warning("Memory schema migration for %s failed: %s", name, exc)
+            for name, definition in candidate_columns.items():
+                try:
+                    self.connection.execute(
+                        f"ALTER TABLE memory_candidates ADD COLUMN IF NOT EXISTS {name} {definition}"
+                    )
+                except Exception as exc:
+                    logger.warning("Candidate schema migration for %s failed: %s", name, exc)
 
             try:
                 self.connection.execute("""
@@ -557,7 +576,8 @@ class DuckDBMemoryStore:
         (
             candidate_id, category, content, tags, payload, source, confidence,
             durability, scope, project_id, session_id, status, created_at,
-            updated_at, reviewed_at, review_reason,
+            updated_at, reviewed_at, review_reason, evidence_text, evidence_role,
+            source_timestamp, review_confidence, review_model,
         ) = row
         return {
             "candidate_id": candidate_id,
@@ -576,6 +596,11 @@ class DuckDBMemoryStore:
             "updated_at": updated_at,
             "reviewed_at": reviewed_at,
             "review_reason": review_reason,
+            "evidence_text": evidence_text,
+            "evidence_role": evidence_role,
+            "source_timestamp": source_timestamp,
+            "review_confidence": review_confidence,
+            "review_model": review_model,
         }
 
     def save_candidate(
@@ -591,6 +616,9 @@ class DuckDBMemoryStore:
         scope: str = "profile",
         project_id: str | None = None,
         session_id: str = "",
+        evidence_text: str = "",
+        evidence_role: str = "user_turn",
+        source_timestamp: str | None = None,
         dedup: bool = True,
     ) -> dict | None:
         """Store a pending proposal without making it retrievable memory."""
@@ -612,6 +640,8 @@ class DuckDBMemoryStore:
 
         candidate_id = f"cand-{uuid.uuid4().hex}"
         now = self._now()
+        evidence_text = (evidence_text or "")[:8000]
+        source_timestamp = source_timestamp or now
         candidate_payload = dict(payload or {})
         candidate_payload.setdefault("user_scope", self.user_id)
         candidate_payload.setdefault("source", source)
@@ -625,13 +655,15 @@ class DuckDBMemoryStore:
                 """INSERT INTO memory_candidates
                    (candidate_id, category, content, tags, payload, source,
                     confidence, durability, scope, project_id, session_id,
-                    status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                    status, created_at, updated_at, evidence_text, evidence_role,
+                    source_timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
                 [
                     candidate_id, category, content.strip(), tags or [],
                     json.dumps(candidate_payload), source, normalized_confidence,
                     durability or "durable", scope or "profile", project_id,
-                    session_id or "", now, now,
+                    session_id or "", now, now, evidence_text,
+                    evidence_role or "user_turn", source_timestamp,
                 ],
             )
         return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
@@ -654,7 +686,7 @@ class DuckDBMemoryStore:
         elif status:
             conditions.append("status = ?")
             params.append(status)
-        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason FROM memory_candidates"
+        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model FROM memory_candidates"
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
@@ -665,17 +697,29 @@ class DuckDBMemoryStore:
         return [self._candidate_row_to_dict(row) for row in rows]
 
     def review_candidate(
-        self, candidate_id: str, decision: str, reason: str = ""
+        self,
+        candidate_id: str,
+        decision: str,
+        reason: str = "",
+        *,
+        review_confidence: float | None = None,
+        review_model: str = "",
+        durability: str | None = None,
+        scope: str | None = None,
     ) -> dict | None:
-        """Approve, reject, or quarantine a pending proposal."""
+        """Approve, reject, quarantine, or classify a pending proposal."""
         decision = decision.strip().lower()
-        if decision not in {"approved", "rejected", "quarantined"}:
-            raise ValueError("decision must be approved, rejected, or quarantined")
+        allowed = {
+            "approved", "rejected", "quarantined", "reviewed_approved",
+            "pending_user_confirmation",
+        }
+        if decision not in allowed:
+            raise ValueError("invalid candidate review decision")
         candidates = self.list_candidates(candidate_id=candidate_id, limit=1)
         if not candidates:
             return None
         candidate = candidates[0]
-        if candidate["status"] != "pending":
+        if candidate["status"] not in {"pending", "reviewed_approved", "pending_user_confirmation"}:
             return {"candidate": candidate, "memory": None}
         now = self._now()
         memory = None
@@ -698,9 +742,14 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             self.connection.execute(
                 """UPDATE memory_candidates
-                   SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?
+                   SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?,
+                       review_confidence = ?, review_model = ?,
+                       durability = COALESCE(?, durability), scope = COALESCE(?, scope)
                    WHERE candidate_id = ?""",
-                [final_status, now, now, reason or "", candidate_id],
+                [
+                    final_status, now, now, reason or "", review_confidence,
+                    review_model or "", durability, scope, candidate_id,
+                ],
             )
         return {
             "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],

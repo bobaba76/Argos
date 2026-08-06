@@ -38,6 +38,7 @@ from .graph import KuzuGraphStore
 from .extractor import extract_from_turn
 from .routing import resolve_storage_names
 from .service_client import SharedGraphStore, SharedMemoryStore
+from .reviewer import review_candidate_with_llm
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "local_embedding_model": _DEFAULT_MODEL,
         "auto_extract": "true",
         "llm_fallback": "true",
+        "auto_review": "true",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -212,7 +214,7 @@ CANDIDATE_LIST_SCHEMA = {
         "properties": {
             "status": {
                 "type": "string",
-                "description": "pending, approved, rejected, or quarantined (default: pending).",
+                "description": "pending, reviewed_approved, pending_user_confirmation, approved, rejected, or quarantined (default: pending).",
             },
             "limit": {"type": "integer", "description": "Maximum proposals to return (default: 20)."},
         },
@@ -287,6 +289,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._max_injected: int = _DEFAULT_MAX_INJECTED
         self._auto_extract: bool = True
         self._llm_fallback: bool = True
+        self._auto_review: bool = True
         self._auto_extract_paused: bool = False
         self._initialized: bool = False
         # Prefetch state.
@@ -343,6 +346,13 @@ class HybridMemoryProvider(MemoryProvider):
                 "choices": ["true", "false"],
                 "required": False,
             },
+            {
+                "key": "auto_review",
+                "description": "Automatically review new memory proposals with the LLM",
+                "default": "true",
+                "choices": ["true", "false"],
+                "required": False,
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -395,6 +405,11 @@ class HybridMemoryProvider(MemoryProvider):
         self._llm_fallback = (
             llm_fb.lower() in ("true", "1", "yes") if isinstance(llm_fb, str) else bool(llm_fb)
         )
+        auto_review = self._config.get("auto_review", "true")
+        self._auto_review = (
+            auto_review.lower() in ("true", "1", "yes")
+            if isinstance(auto_review, str) else bool(auto_review)
+        )
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
         env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
         self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
@@ -430,11 +445,12 @@ class HybridMemoryProvider(MemoryProvider):
         self._initialized = True
         logger.info(
             "HybridMemory initialized: %d memories, graph=%s, embeddings=%s, "
-            "auto_extract=%s, paused=%s, storage=%s, proposals=on",
+            "auto_extract=%s, auto_review=%s, paused=%s, storage=%s, proposals=on",
             self._store.count(),
             "on" if self._graph else "off",
             "pending" if not self._embedder.is_available else "on",
             self._auto_extract,
+            self._auto_review,
             self._auto_extract_paused,
             "shared_service" if use_shared_service else "direct",
         )
@@ -551,6 +567,30 @@ class HybridMemoryProvider(MemoryProvider):
             return cached
         return ""
 
+    def _review_candidate(self, candidate: Dict[str, Any]) -> None:
+        """Run the conservative automatic reviewer for one new proposal."""
+        try:
+            review = review_candidate_with_llm(candidate)
+            decision = review.get("decision", "pending_user_confirmation")
+            decision_map = {
+                "approve": "reviewed_approved",
+                "reject": "rejected",
+                "quarantine": "quarantined",
+                "pending_user_confirmation": "pending_user_confirmation",
+            }
+            final_status = decision_map.get(decision, "pending_user_confirmation")
+            self._store.review_candidate(
+                candidate["candidate_id"],
+                final_status,
+                review.get("reason", ""),
+                review_confidence=review.get("confidence"),
+                review_model=review.get("review_model", "memory_review"),
+                durability=review.get("durability"),
+                scope=review.get("scope"),
+            )
+        except Exception as exc:
+            logger.warning("Automatic memory proposal review failed: %s", exc)
+
     # -- sync_turn (auto-extract after each turn) ----------------------------
 
     def sync_turn(
@@ -589,10 +629,14 @@ class HybridMemoryProvider(MemoryProvider):
                         scope=fact.get("scope", "profile"),
                         project_id=fact.get("project_id"),
                         session_id=session_id,
+                        evidence_text=user_content,
+                        evidence_role="user_turn",
                         dedup=True,
                     )
                     if candidate:
                         proposed += 1
+                        if self._auto_review:
+                            self._review_candidate(candidate)
                 if proposed:
                     logger.info(
                         "Created %d pending memory proposals; no automatic active writes",
@@ -758,7 +802,10 @@ class HybridMemoryProvider(MemoryProvider):
 
         elif tool_name == "memory_candidate_list":
             status = args.get("status", "pending")
-            if status not in {"pending", "approved", "rejected", "quarantined", "deduplicated"}:
+            if status not in {
+                "pending", "reviewed_approved", "pending_user_confirmation",
+                "approved", "rejected", "quarantined", "deduplicated",
+            }:
                 return tool_error("Invalid candidate status")
             try:
                 limit = max(1, min(int(args.get("limit", 20)), 100))

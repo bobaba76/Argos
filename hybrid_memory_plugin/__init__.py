@@ -35,6 +35,7 @@ from tools.registry import tool_error
 from .embeddings import LocalEmbedder
 from .store import DuckDBMemoryStore, VALID_CATEGORIES
 from .graph import KuzuGraphStore
+from .confirmation import build_confirmation_block
 from .extractor import extract_from_turn
 from .routing import resolve_storage_names
 from .service_client import SharedGraphStore, SharedMemoryStore
@@ -521,8 +522,15 @@ class HybridMemoryProvider(MemoryProvider):
             self._prefetch_done = False
 
         def _run() -> None:
-            body = ""
+            sections = []
             try:
+                confirmation_candidates = store.list_candidates(
+                    status="pending_user_confirmation", limit=1
+                )
+                confirmation = build_confirmation_block(confirmation_candidates)
+                if confirmation:
+                    sections.append(confirmation)
+
                 results = store.search(query, limit=max_items)
                 if results:
                     lines = []
@@ -531,7 +539,8 @@ class HybridMemoryProvider(MemoryProvider):
                         content = r.content
                         sim = f" (score: {r.similarity:.2f})" if r.similarity > 0 else ""
                         lines.append(f"- [{cat}] {content}{sim}")
-                    body = "## Recalled Memories\n" + "\n".join(lines)
+                    sections.append("## Recalled Memories\n" + "\n".join(lines))
+                body = "\n\n".join(sections)
             except Exception as e:
                 logger.debug("Prefetch failed: %s", e)
             with self._prefetch_lock:

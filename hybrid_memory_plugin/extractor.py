@@ -126,7 +126,7 @@ def _split_sentences(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 #
 # These patterns match the *structural shape* of durable statements, not
-# specific topics.  "I use React" and "I take Item-E" both match the same
+# specific topics.  "I use React" and "I take FocusTool" both match the same
 # "I use/take X" pattern.  This makes the extractor general-purpose.
 
 # "I am/is a <something>" — identity, role, profession.
@@ -236,7 +236,7 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
 
     Tries patterns in priority order. Returns the first match.
     """
-    # Relationship: "Sam is my role" / "Entity-C is my manager"
+    # Relationship: "Pat is my role" / "Entity-C is my manager"
     m = _RELATIONSHIP_RE.search(sentence)
     if m:
         name = m.group(1).strip()
@@ -298,7 +298,7 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
                 "payload": {"location": place, "fact_type": "location"},
             }
 
-    # Have/use/take: "I have a dog" / "I use Vim" / "I take Item-E"
+    # Have/use/take: "I have a dog" / "I use Vim" / "I take FocusTool"
     m = _HAVE_USE_RE.search(sentence)
     if m:
         thing = m.group(1).strip().rstrip('.')
@@ -310,13 +310,13 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
                 "payload": {"thing": thing, "fact_type": "have_use"},
             }
 
-    # My X is Y: "My favorite editor is Vim" / "My wife is Sam"
+    # My X is Y: "My favorite editor is Vim" / "My wife is Pat"
     m = _MY_X_IS_RE.search(sentence)
     if m:
         attr = m.group(1).strip().lower()
         value = m.group(2).strip().rstrip('.')
         if len(attr) > 2 and len(value) > 2:
-            # If it looks like a relationship ("my role is Sam"), tag it.
+            # If it looks like a relationship ("my role is Pat"), tag it.
             if attr in ("wife", "husband", "partner", "boyfriend", "girlfriend",
                         "boss", "advisor", "doctor", "teacher", "mentor",
                         "friend", "colleague", "manager", "supervisor"):

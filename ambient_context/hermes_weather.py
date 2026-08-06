@@ -6,7 +6,7 @@ string (e.g. ``"14°C, light rain"``) for the user's configured location.
 
 Uses Open-Meteo (https://open-meteo.com/) — free, no API key, no signup.
 Two endpoints:
-  1. Geocoding: https://geocoding-api.open-meteo.com/v1/search?name=City-X
+  1. Geocoding: https://geocoding-api.open-meteo.com/v1/search?name=Example City
   2. Forecast:  https://api.open-meteo.com/v1/forecast?latitude=...&current=...
 
 Caching strategy (keeps it off the time-to-first-token critical path):
@@ -26,7 +26,7 @@ Resolution order for the location to look up:
 
 Set the location with::
 
-    hermes config set location  "City-X"
+    hermes config set location "Example City"
 
 Disable with::
 

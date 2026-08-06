@@ -1779,10 +1779,10 @@ DEFAULT_CONFIG = {
     # Empty string means use server-local time.
     "timezone": "",
 
-    # User's location (free-form city/place name, e.g.  "City-X", "Riverton, ZA").
+    # User's location (free-form city/place name, e.g. "Example City", "Another City, ZA").
     # Empty string means no location hint is injected. Used for ambient context
     # so the agent can reason about "your morning" / local relevance without
-    # asking. Set with: hermes config set location  "City-X"
+    # asking. Set with: hermes config set location "Example City"
     "location": "",
 
     # Weather ambient context. When enabled (default) and a location is set,

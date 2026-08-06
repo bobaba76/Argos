@@ -1,0 +1,38 @@
+# Hermes runtime state and personal data
+database/
+data/
+*.duckdb
+*.duckdb.wal
+*.wal
+*_kuzu/
+*.pid
+*.log
+hybrid_memory_plugin/_mh_analysis.txt
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Node/Electron artifacts
+node_modules/
+dist/
+build/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config.local.yaml
+
+# Editor and OS artifacts
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -185,13 +185,13 @@ GRAPH_SEARCH_SCHEMA = {
     "description": (
         "Search the relationship graph for connections between people, tools, "
         "concepts, and entities in the user's life. Use this to find how things "
-        "relate (e.g., 'who is Sam' or 'what tools does the user use'). "
+        "relate (e.g., 'who is Pat' or 'what tools does the user use'). "
         "Returns edges showing source -> relation -> target."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "term": {"type": "string", "description": "Entity name to search for (e.g., 'Sam', 'Item-E')."},
+            "term": {"type": "string", "description": "Entity name to search for (e.g., 'Pat', 'FocusTool')."},
         },
         "required": ["term"],
     },

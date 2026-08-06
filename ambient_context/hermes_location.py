@@ -2,9 +2,9 @@
 Location resolution for Hermes.
 
 Provides a single ``get_location()`` helper that returns the user's configured
-location string (e.g. `` "City-X"``, ``"Riverton, ZA"``) for ambient context
+location string (e.g. ``"Example City"``, ``"Another City, ZA"``) for ambient context
 injection. Free-form by design — no geocoding, no coordinates — so the agent
-gets a human-readable place name it can reason about ("you're in City-X,
+gets a human-readable place name it can reason about ("you're in Example City,
 your morning") without any external service dependency.
 
 Resolution order:
@@ -18,7 +18,7 @@ crashes due to a bad location string.
 
 Set it with::
 
-    hermes config set location  "City-X"
+    hermes config set location "Example City"
 """
 
 import logging

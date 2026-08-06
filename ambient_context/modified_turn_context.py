@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def _build_timestamp_hint() -> str:
-    """Render the per-turn local-time line, e.g. ``Current time: Friday 2026-07-31 19:55 SAST``.
+    """Render the per-turn local-time line, e.g. ``Current time: Friday 2026-07-31 19:55 UTC``.
 
     Uses ``hermes_time.now()`` so the user's configured IANA timezone wins
     (``HERMES_TIMEZONE`` env → ``config.yaml`` ``timezone`` → server-local).
@@ -67,11 +67,11 @@ def _build_timestamp_hint() -> str:
 
 
 def _build_location_hint() -> str:
-    """Render the per-turn location line, e.g. ``Location: City-X``.
+    """Render the per-turn location line, e.g. ``Location: Example City``.
 
     Resolves the location fresh each turn via ``hermes_location._resolve_location_name()``
     (bypassing the module-level cache) so that a mid-session
-    ``hermes config set location "Riverton"`` is picked up on the very next
+    ``hermes config set location "Another City"`` is picked up on the very next
     turn — even in a long-lived CLI session. The resolution is cheap: env
     var check first, then ``read_raw_config()`` which is mtime/size-cached
     (just a ``stat()`` per call, no YAML parse unless config.yaml changed).

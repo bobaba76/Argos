@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 _PREFETCH_WAIT_SECS = 3.0
 _DEFAULT_MAX_INJECTED = 8
-_DEFAULT_MODEL = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
+_DEFAULT_MODEL = "sentence-transformers/bge-small-en-v1.5"
 _AUTO_EXTRACT_PAUSE_MARKER = "hybrid_memory.auto_extract.paused"
 
 

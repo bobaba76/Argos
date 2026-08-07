@@ -188,6 +188,9 @@ class SharedMemoryStore:
     def remember(self, **kwargs: Any) -> MemoryRecord | None:
         return _record_from_dict(self._rpc.call("store", "remember", **kwargs))
 
+    def update_memory(self, **kwargs: Any) -> MemoryRecord | None:
+        return _record_from_dict(self._rpc.call("store", "update_memory", **kwargs))
+
     def save_candidate(self, **kwargs: Any) -> dict | None:
         return self._rpc.call("store", "save_candidate", **kwargs)
 
@@ -245,6 +248,10 @@ class SharedGraphStore:
 
     def quarantine_junk_entities(self) -> int:
         return int(self._rpc.call("graph", "quarantine_junk_entities") or 0)
+
+    def purge_junk_entities(self) -> int:
+        """Alias for quarantine_junk_entities — matches KuzuGraphStore's method name."""
+        return self.quarantine_junk_entities()
 
     def close(self) -> None:
         return None

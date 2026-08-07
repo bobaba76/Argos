@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -356,13 +357,20 @@ class DuckDBMemoryStore:
             or "vss" in msg
         )
 
-    def _text_search(
+    def _text_search_raw(
         self, query: str, limit: int, excluded: set[str],
         category_filter: str | None = None,
     ) -> List[MemoryRecord]:
-        tokens = [f"%{t}%" for t in query.split() if len(t) > 2][:4]
-        if not tokens:
+        """ILIKE text search. Returns filtered records ranked by token overlap.
+
+        Does NOT record retrieval — the caller is responsible for that.
+        Sets ``similarity`` to a text-match score (fraction of query tokens
+        that matched the content) so downstream fusion has a comparable signal.
+        """
+        words = [t for t in query.split() if len(t) > 2][:4]
+        if not words:
             return []
+        tokens = [f"%{t}%" for t in words]
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
         sql = (
             "SELECT * FROM memory_records "
@@ -376,11 +384,122 @@ class DuckDBMemoryStore:
                 continue
             if category_filter and r.category != category_filter:
                 continue
-            if self._matches_scope(r.payload) and not self._is_expired(r.expires_at):
-                out.append(r)
-        selected = out[:limit]
-        self._record_retrieval(selected)
-        return selected
+            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at):
+                continue
+            # Text-match score: fraction of query tokens found in content.
+            content_lower = (r.content or "").lower()
+            matched = sum(1 for w in words if w.lower() in content_lower)
+            r.similarity = matched / len(words) if words else 0.0
+            out.append(r)
+        # Sort by text-match score descending.
+        out.sort(key=lambda r: r.similarity, reverse=True)
+        return out
+
+    def _vector_search_raw(
+        self, emb: List[float], limit: int, excluded: set[str],
+        category_filter: str | None = None,
+    ) -> List[MemoryRecord]:
+        """Vector similarity search. Returns filtered records ranked by cosine.
+
+        Does NOT record retrieval — the caller is responsible for that.
+        Raises on vector search errors so the caller can fall back.
+        """
+        sql = """
+            SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim
+            FROM memory_records
+            WHERE COALESCE(status, 'active') = 'active'
+              AND embedding IS NOT NULL
+            ORDER BY sim DESC
+            LIMIT ?
+        """
+        results = self._fetch_records(sql, [emb, limit * 4], sim_col="sim")
+        out: List[MemoryRecord] = []
+        for r in results:
+            if excluded and r.category.lower() in excluded:
+                continue
+            if category_filter and r.category != category_filter:
+                continue
+            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at):
+                continue
+            out.append(r)
+        return out
+
+    # -- ranking: RRF + feedback + recency -----------------------------------
+
+    _RRF_K = 60  # Standard Reciprocal Rank Fusion constant.
+
+    @classmethod
+    def _rrf_fuse(
+        cls,
+        vector_results: List[MemoryRecord],
+        text_results: List[MemoryRecord],
+    ) -> List[MemoryRecord]:
+        """Fuse vector and text rankings via Reciprocal Rank Fusion.
+
+        RRF score(d) = sum over lists: 1 / (k + rank_in_list)
+        A document appearing at rank 1 in both lists scores higher than
+        one appearing at rank 1 in only one list.  The fused score is
+        stored in ``similarity`` so callers see a single relevance number.
+        """
+        scores: Dict[str, float] = {}
+        records_by_id: Dict[str, MemoryRecord] = {}
+
+        for rank, record in enumerate(vector_results):
+            rrf = 1.0 / (cls._RRF_K + rank + 1)
+            scores[record.memory_id] = scores.get(record.memory_id, 0.0) + rrf
+            records_by_id[record.memory_id] = record
+
+        for rank, record in enumerate(text_results):
+            rrf = 1.0 / (cls._RRF_K + rank + 1)
+            scores[record.memory_id] = scores.get(record.memory_id, 0.0) + rrf
+            # Prefer the vector record if it exists (has cosine sim);
+            # otherwise use the text record.
+            if record.memory_id not in records_by_id:
+                records_by_id[record.memory_id] = record
+
+        # Normalize: max possible is 2/(k+1) (rank 1 in both lists).
+        max_rrf = 2.0 / (cls._RRF_K + 1)
+        for mid, score in scores.items():
+            records_by_id[mid].similarity = score / max_rrf  # 0.0 - 1.0
+
+        fused = list(records_by_id.values())
+        fused.sort(key=lambda r: r.similarity, reverse=True)
+        return fused
+
+    @staticmethod
+    def _recency_boost(created_at: str | None) -> float:
+        """Exponential decay: +0.10 today, ~0.037 at 90 days, ~0.014 at 180.
+
+        Returns 0.0 if the timestamp is missing or unparseable.
+        """
+        if not created_at:
+            return 0.0
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            days_old = max(0, (datetime.now(timezone.utc) - created).days)
+            return 0.10 * math.exp(-days_old / 90.0)
+        except Exception:
+            return 0.0
+
+    @classmethod
+    def _apply_feedback_and_recency(cls, records: List[MemoryRecord]) -> None:
+        """Adjust ``similarity`` in-place using feedback, confidence, and recency.
+
+        Adjustments are additive on a 0-1 scale:
+          - helpful_count:  +0.03 per vote (boosts memories the user found useful)
+          - dismissed_count: -0.05 per vote (penalises dismissed memories)
+          - confidence:     +0.05 * (confidence - 0.5) (rewards high-confidence)
+          - recency:        0 to +0.10 based on age (recent memories get a boost)
+        """
+        for r in records:
+            adj = 0.0
+            adj += 0.03 * r.helpful_count
+            adj -= 0.05 * r.dismissed_count
+            if r.confidence is not None:
+                adj += 0.05 * (r.confidence - 0.5)
+            adj += cls._recency_boost(r.created_at)
+            r.similarity = max(0.0, r.similarity + adj)
+        records.sort(key=lambda r: r.similarity, reverse=True)
 
     def _record_retrieval(self, records: List[MemoryRecord]) -> None:
         """Record only memories that were actually returned to the caller."""
@@ -413,49 +532,50 @@ class DuckDBMemoryStore:
         exclude_categories: List[str] | None = None,
         category_filter: str | None = None,
     ) -> List[MemoryRecord]:
-        """Hybrid search: vector similarity if embeddings available, else text."""
+        """Hybrid search: RRF-fused vector + text, with feedback and recency.
+
+        When embeddings are available, runs vector and text search in
+        parallel and fuses results via Reciprocal Rank Fusion.  When
+        embeddings are unavailable, falls back to text-only search.  In
+        both cases, the final ranking is adjusted by feedback signals
+        (helpful/dismissed), confidence, and recency.
+        """
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
         if self.embedder and hasattr(self.embedder, "embed"):
-            emb = self.embedder.embed(query)
+            emb = self.embedder.embed(query, is_query=True)
 
-        def _apply_filters(records: List[MemoryRecord]) -> List[MemoryRecord]:
-            out: List[MemoryRecord] = []
-            for r in records:
-                if excluded and r.category.lower() in excluded:
-                    continue
-                if category_filter and r.category != category_filter:
-                    continue
-                if not self._matches_scope(r.payload):
-                    continue
-                if self._is_expired(r.expires_at):
-                    continue
-                out.append(r)
-            return out[:limit]
+        # Gather candidate results from both paths.
+        vector_results: List[MemoryRecord] = []
+        text_results: List[MemoryRecord] = self._text_search_raw(
+            query, limit, excluded, category_filter
+        )
 
         if emb:
-            sql = """
-                SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim
-                FROM memory_records
-                WHERE COALESCE(status, 'active') = 'active'
-                  AND embedding IS NOT NULL
-                ORDER BY sim DESC
-                LIMIT ?
-            """
             try:
-                results = self._fetch_records(sql, [emb, limit * 4], sim_col="sim")
-                filtered = _apply_filters(results)
-                if filtered:
-                    self._record_retrieval(filtered)
-                    return filtered
-                # Vector search returned nothing after filtering — try text.
-                return self._text_search(query, limit, excluded, category_filter)
+                vector_results = self._vector_search_raw(
+                    emb, limit, excluded, category_filter
+                )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):
                     logger.warning("Vector search error: %s", exc)
-                return self._text_search(query, limit, excluded, category_filter)
+                vector_results = []
+
+        # Fuse or select.
+        if vector_results and text_results:
+            fused = self._rrf_fuse(vector_results, text_results)
+        elif vector_results:
+            fused = vector_results
+        elif text_results:
+            fused = text_results
         else:
-            return self._text_search(query, limit, excluded, category_filter)
+            return []
+
+        # Apply feedback weighting and recency boost, then truncate.
+        self._apply_feedback_and_recency(fused)
+        final = fused[:limit]
+        self._record_retrieval(final)
+        return final
 
     # -- write operations -----------------------------------------------------
 

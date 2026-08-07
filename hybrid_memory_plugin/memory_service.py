@@ -64,7 +64,7 @@ class MemoryService:
         model_name = str(
             config.get(
                 "local_embedding_model",
-                "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
+                "sentence-transformers/bge-small-en-v1.5",
             )
         )
         self.embedder = LocalEmbedder(model_name)
@@ -93,6 +93,8 @@ class MemoryService:
             ]
         if method == "remember":
             return _record_to_dict(self.store.remember(**args))
+        if method == "update_memory":
+            return _record_to_dict(self.store.update_memory(**args))
         if method == "save_candidate":
             return self.store.save_candidate(**args)
         if method == "list_candidates":

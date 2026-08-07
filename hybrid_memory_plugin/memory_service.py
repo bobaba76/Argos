@@ -132,8 +132,18 @@ class MemoryService:
             return self.graph.search_graph(args.get("term", ""))
         if method == "query_graph":
             return self.graph.query_graph(args.get("entity_id", ""))
+        if method == "traverse_graph":
+            return self.graph.traverse_graph(
+                args.get("entity_id", ""),
+                depth=args.get("depth", 2),
+                limit=args.get("limit", 100),
+            )
         if method == "add_relationship":
             return self.graph.add_relationship(**args)
+        if method == "index_memory":
+            return self.graph.index_memory(**args)
+        if method == "remove_memory":
+            return self.graph.remove_memory(**args)
         if method == "quarantine_junk_entities":
             return self.graph.quarantine_junk_entities()
         raise ValueError(f"Unsupported graph method: {method}")

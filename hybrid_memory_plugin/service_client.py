@@ -256,8 +256,25 @@ class SharedGraphStore:
     def query_graph(self, entity_id: str) -> List[dict]:
         return self._rpc.call("graph", "query_graph", entity_id=entity_id) or []
 
+    def traverse_graph(
+        self,
+        entity_id: str,
+        depth: int = 2,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        return self._rpc.call(
+            "graph", "traverse_graph",
+            entity_id=entity_id, depth=depth, limit=limit,
+        ) or {"entity_id": entity_id, "depth": depth, "nodes": [], "edges": []}
+
     def add_relationship(self, **kwargs: Any) -> None:
         self._rpc.call("graph", "add_relationship", **kwargs)
+
+    def index_memory(self, **kwargs: Any) -> int:
+        return int(self._rpc.call("graph", "index_memory", **kwargs) or 0)
+
+    def remove_memory(self, memory_id: str) -> bool:
+        return bool(self._rpc.call("graph", "remove_memory", memory_id=memory_id))
 
     def quarantine_junk_entities(self) -> int:
         return int(self._rpc.call("graph", "quarantine_junk_entities") or 0)

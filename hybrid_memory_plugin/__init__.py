@@ -204,6 +204,25 @@ GRAPH_SEARCH_SCHEMA = {
     },
 }
 
+GRAPH_QUERY_SCHEMA = {
+    "name": "memory_graph_query",
+    "description": (
+        "Traverse the memory graph around an entity and return connected nodes, "
+        "relationships, and supporting memories. Use this after memory_graph_search "
+        "when you need context such as what an entity is connected to or which "
+        "saved memories mention it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity_id": {"type": "string", "description": "Entity name or ID to start from (e.g., 'Pat', 'memory:<id>')."},
+            "depth": {"type": "integer", "description": "Traversal depth from 1 to 4 (default: 2)."},
+            "limit": {"type": "integer", "description": "Maximum nodes/edges to return (default: 100)."},
+        },
+        "required": ["entity_id"],
+    },
+}
+
 CANDIDATE_LIST_SCHEMA = {
     "name": "memory_candidate_list",
     "description": (
@@ -701,11 +720,35 @@ class HybridMemoryProvider(MemoryProvider):
 
     # -- tools ---------------------------------------------------------------
 
+    def _index_memory_graph(
+        self,
+        memory_id: str,
+        category: str,
+        content: str,
+        tags: List[str] | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Index any saved memory in the graph, regardless of category."""
+        if not self._graph or not memory_id or not content:
+            return
+        try:
+            self._graph.index_memory(
+                memory_id=memory_id,
+                category=category,
+                content=content,
+                tags=tags or [],
+                created_at=created_at,
+            )
+        except Exception as exc:
+            # Graph indexing is an enrichment path; a graph failure must not
+            # make a successful memory write fail.
+            logger.debug("Graph indexing failed for memory %s: %s", memory_id, exc)
+
     def _try_graph_relationship(self, content: str) -> None:
         """Attempt to extract a relationship from content text and add to graph.
 
-        Tries the extractor's relationship regex first, then falls back to
-        a simple 'X is the user's Y' pattern.
+        Retained for compatibility with older callers; new memory writes use
+        _index_memory_graph() so every category participates in the graph.
         """
         if not self._graph:
             return
@@ -748,7 +791,7 @@ class HybridMemoryProvider(MemoryProvider):
             FEEDBACK_SCHEMA,
         ]
         if self._graph:
-            schemas.append(GRAPH_SEARCH_SCHEMA)
+            schemas.extend([GRAPH_SEARCH_SCHEMA, GRAPH_QUERY_SCHEMA])
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -784,9 +827,15 @@ class HybridMemoryProvider(MemoryProvider):
             rec = self._store.remember(category=category, content=content, tags=tags, dedup=True)
             if rec is None:
                 return json.dumps({"status": "deduplicated", "message": "Similar memory already exists"})
-            # Populate graph for relationship memories.
-            if category == "relationship" and self._graph:
-                self._try_graph_relationship(content)
+            # Index every memory category; entity links are additive and
+            # graph failures do not affect the successful memory write.
+            self._index_memory_graph(
+                rec.memory_id,
+                rec.category,
+                rec.content,
+                rec.tags,
+                rec.created_at,
+            )
             return json.dumps({"status": "saved", "memory_id": rec.memory_id})
 
         elif tool_name == "memory_update":
@@ -798,6 +847,18 @@ class HybridMemoryProvider(MemoryProvider):
             rec = self._store.update_memory(memory_id, content=content, tags=tags)
             if rec is None:
                 return tool_error(f"Memory not found: {memory_id}")
+            if self._graph:
+                try:
+                    self._graph.remove_memory(rec.memory_id)
+                except Exception as exc:
+                    logger.debug("Graph evidence cleanup failed for %s: %s", rec.memory_id, exc)
+                self._index_memory_graph(
+                    rec.memory_id,
+                    rec.category,
+                    rec.content,
+                    rec.tags,
+                    rec.created_at,
+                )
             return json.dumps({"status": "updated", "memory_id": rec.memory_id})
 
         elif tool_name == "memory_delete":
@@ -807,6 +868,11 @@ class HybridMemoryProvider(MemoryProvider):
             deleted = self._store.delete_memory(memory_id=memory_id)
             if not deleted:
                 return tool_error(f"Memory not found: {memory_id}")
+            if self._graph:
+                try:
+                    self._graph.remove_memory(memory_id)
+                except Exception as exc:
+                    logger.debug("Graph evidence cleanup failed for %s: %s", memory_id, exc)
             return json.dumps({"status": "deleted", "memory_id": memory_id})
 
         elif tool_name == "memory_candidate_list":
@@ -839,8 +905,14 @@ class HybridMemoryProvider(MemoryProvider):
             if result is None:
                 return tool_error(f"Candidate not found: {candidate_id}")
             memory = result.get("memory")
-            if memory and memory.get("category") == "relationship" and self._graph:
-                self._try_graph_relationship(memory.get("content", ""))
+            if memory and self._graph:
+                self._index_memory_graph(
+                    memory.get("memory_id", ""),
+                    memory.get("category", "context_note"),
+                    memory.get("content", ""),
+                    memory.get("tags", []),
+                    memory.get("created_at"),
+                )
             return json.dumps(result)
 
         elif tool_name == "memory_restore":
@@ -872,6 +944,20 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: term")
             edges = self._graph.search_graph(term)
             return json.dumps({"term": term, "count": len(edges), "edges": edges})
+
+        elif tool_name == "memory_graph_query":
+            if self._graph is None:
+                return tool_error("Relationship graph is not available")
+            entity_id = args.get("entity_id", "")
+            if not entity_id:
+                return tool_error("Missing required parameter: entity_id")
+            try:
+                depth = max(1, min(int(args.get("depth", 2)), 4))
+                limit = max(1, min(int(args.get("limit", 100)), 250))
+            except (TypeError, ValueError):
+                depth, limit = 2, 100
+            result = self._graph.traverse_graph(entity_id, depth=depth, limit=limit)
+            return json.dumps(result)
 
         return tool_error(f"Unknown tool: {tool_name}")
 

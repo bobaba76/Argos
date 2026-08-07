@@ -113,6 +113,15 @@ class MemoryService:
             return self.store.cleanup_junk()
         if method == "count":
             return self.store.count()
+        if method == "get_insights":
+            return [
+                _record_to_dict(record)
+                for record in self.store.get_insights(
+                    tags=args.get("tags"),
+                    since=args.get("since"),
+                    limit=int(args.get("limit", 50)),
+                )
+            ]
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str) -> Any:

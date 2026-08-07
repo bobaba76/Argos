@@ -1056,6 +1056,65 @@ class DuckDBMemoryStore:
             return self.list_by_category(category, limit)
         return self.list_recent(limit)
 
+    def get_insights(
+        self,
+        tags: List[str] | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> List[MemoryRecord]:
+        """Retrieve insight-category memories, newest-first.
+
+        Args:
+            tags: If provided, only return insights whose tags list
+                contains at least one of the given tags (OR semantics).
+            since: ISO timestamp; only return insights created at or
+                after this time.
+            limit: Maximum number of results (default 50).
+
+        Returns:
+            List of MemoryRecords with category='insight', sorted
+            newest-first by created_at.
+        """
+        conditions = ["category = 'insight'", "COALESCE(status, 'active') = 'active'"]
+        params: list = []
+        if since:
+            conditions.append("created_at >= ?")
+            params.append(since)
+        if tags:
+            # DuckDB list_contains checks if a tag is in the tags array.
+            placeholders = ", ".join(["?" for _ in tags])
+            conditions.append(f"EXISTS (SELECT 1 FROM range(0, list_length(tags)) AS i WHERE list_contains(tags, i, t) IN ({placeholders}))")
+            # Simpler: use OR of list_contains per tag.
+            # Actually DuckDB's list_contains is: list_contains(list, value)
+            # Let's use the simpler approach.
+            conditions = conditions[:-1]  # remove the complex one
+            tag_conditions = " OR ".join(["list_contains(tags, ?)" for _ in tags])
+            conditions.append(f"({tag_conditions})")
+            params.extend(tags)
+        where = " AND ".join(conditions)
+        sql = (
+            f"SELECT * FROM memory_records WHERE {where} "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        try:
+            return self._fetch_records(sql, params)
+        except Exception as exc:
+            logger.debug("get_insights query failed: %s", exc)
+            # Fallback: filter in Python (tags column might not be queryable).
+            sql_simple = (
+                "SELECT * FROM memory_records WHERE category = 'insight' "
+                "AND COALESCE(status, 'active') = 'active' "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+            results = self._fetch_records(sql_simple, [limit])
+            if tags:
+                tag_set = {t.lower() for t in tags}
+                results = [r for r in results if tag_set & {t.lower() for t in (r.tags or [])}]
+            if since:
+                results = [r for r in results if r.created_at and r.created_at >= since]
+            return results
+
     def count(self) -> int:
         with self._lock:
             assert self.connection is not None

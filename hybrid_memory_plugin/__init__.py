@@ -909,7 +909,11 @@ class HybridMemoryProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
-    """Register HybridMemory as a memory provider plugin."""
+    """Register HybridMemory as a memory provider plugin.
+
+    Also registers the insight-log skill and /insights + /revisit slash
+    commands if the plugin context supports them.
+    """
     try:
         ctx.register_memory_provider(HybridMemoryProvider())
         logging.getLogger("hybrid_memory").info(
@@ -920,3 +924,139 @@ def register(ctx) -> None:
             "hybrid_memory: register() failed: %s\n%s", _e, traceback.format_exc()
         )
         raise
+
+    # Register the insight-log skill (if the context supports skill registration).
+    try:
+        skill_md = Path(__file__).parent / "skills" / "insight-log" / "SKILL.md"
+        if skill_md.exists() and hasattr(ctx, "register_skill"):
+            ctx.register_skill("insight-log", skill_md)
+            logging.getLogger("hybrid_memory").info(
+                "hybrid_memory: registered insight-log skill"
+            )
+    except Exception as _e:
+        logging.getLogger("hybrid_memory").debug(
+            "hybrid_memory: skill registration skipped: %s", _e
+        )
+
+    # Register /insights and /revisit slash commands (if supported).
+    try:
+        if hasattr(ctx, "register_command"):
+            ctx.register_command(
+                "insights",
+                _handle_insights_command,
+                description="List saved insights (newest first)",
+                args_hint="[tag]",
+            )
+            ctx.register_command(
+                "revisit",
+                _handle_revisit_command,
+                description="Surface a random older insight for re-engagement",
+            )
+            logging.getLogger("hybrid_memory").info(
+                "hybrid_memory: registered /insights and /revisit commands"
+            )
+    except Exception as _e:
+        logging.getLogger("hybrid_memory").debug(
+            "hybrid_memory: command registration skipped: %s", _e
+        )
+
+
+def _get_insight_store():
+    """Get the active memory store for insight queries.
+
+    Returns the SharedMemoryStore if the service is running, otherwise
+    falls back to a direct DuckDBMemoryStore. Returns None on failure.
+    """
+    try:
+        from service_client import SharedMemoryStore
+        try:
+            from hermes_constants import get_hermes_home
+            home = Path(get_hermes_home())
+        except Exception:
+            home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+        return SharedMemoryStore(home, user_id="default_user")
+    except Exception:
+        return None
+
+
+def _handle_insights_command(raw_args: str) -> str:
+    """Handle /insights — list saved insights, newest first.
+
+    Usage:
+        /insights          — all insights, newest first (up to 20)
+        /insights work     — insights tagged 'work'
+        /insights ex shame — insights tagged 'ex' OR 'shame'
+    """
+    store = _get_insight_store()
+    if store is None:
+        return "Memory store is not available. Make sure Hermes is running."
+
+    tags = [t.strip() for t in raw_args.split() if t.strip()] if raw_args else None
+    try:
+        insights = store.get_insights(tags=tags, limit=20)
+    except Exception as e:
+        return f"Could not retrieve insights: {e}"
+    finally:
+        store.close()
+
+    if not insights:
+        if tags:
+            return f"No insights found with tags: {', '.join(tags)}"
+        return "No insights saved yet. Share a realization in chat and it'll be captured automatically."
+
+    lines = [f"**Insight Log** ({len(insights)} entries, newest first)\n"]
+    for i, rec in enumerate(insights, 1):
+        date = (rec.created_at or "")[:10]
+        tag_str = ", ".join(rec.tags) if rec.tags else ""
+        content_preview = rec.content[:120]
+        if len(rec.content) > 120:
+            content_preview += "..."
+        lines.append(f"{i}. **[{date}]** {content_preview}")
+        if tag_str:
+            lines.append(f"   _tags: {tag_str}_")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _handle_revisit_command(raw_args: str) -> str:
+    """Handle /revisit — surface a random older insight.
+
+    Picks a random insight from at least 3 days ago (if available),
+    falling back to any insight. Presents it conversationally for
+    re-engagement.
+    """
+    import random
+    from datetime import datetime, timezone, timedelta
+
+    store = _get_insight_store()
+    if store is None:
+        return "Memory store is not available. Make sure Hermes is running."
+
+    # Try to get older insights first (at least 3 days old).
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    try:
+        older = store.get_insights(since=None, limit=50)
+        recent = store.get_insights(since=cutoff, limit=50)
+        # Prefer insights NOT in the recent set.
+        recent_ids = {r.memory_id for r in recent}
+        candidates = [r for r in older if r.memory_id not in recent_ids]
+        if not candidates:
+            candidates = older
+    except Exception as e:
+        return f"Could not retrieve insights: {e}"
+    finally:
+        store.close()
+
+    if not candidates:
+        return "No insights to revisit yet. Share a realization in chat and it'll be captured automatically."
+
+    picked = random.choice(candidates)
+    date = (picked.created_at or "")[:10]
+    tag_str = ", ".join(picked.tags) if picked.tags else "none"
+
+    return (
+        f"**Revisiting an insight from {date}:**\n\n"
+        f"> {picked.content}\n\n"
+        f"_tags: {tag_str}_\n\n"
+        f"Does this still resonate? Has anything shifted since then?"
+    )

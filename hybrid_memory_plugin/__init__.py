@@ -911,7 +911,7 @@ class HybridMemoryProvider(MemoryProvider):
 def register(ctx) -> None:
     """Register HybridMemory as a memory provider plugin.
 
-    Also registers the insight-log skill and /insights + /revisit slash
+    Also registers the insight-log skill and /ilog + /revisit slash
     commands if the plugin context supports them.
     """
     try:
@@ -938,13 +938,15 @@ def register(ctx) -> None:
             "hybrid_memory: skill registration skipped: %s", _e
         )
 
-    # Register /insights and /revisit slash commands (if supported).
+    # Register /ilog and /revisit slash commands (if supported).
+    # Note: /ilog is used instead of /insights to avoid conflicting
+    # with the built-in usage-analytics /insights command.
     try:
         if hasattr(ctx, "register_command"):
             ctx.register_command(
-                "insights",
-                _handle_insights_command,
-                description="List saved insights (newest first)",
+                "ilog",
+                _handle_ilog_command,
+                description="List saved personal insights (newest first)",
                 args_hint="[tag]",
             )
             ctx.register_command(
@@ -953,7 +955,7 @@ def register(ctx) -> None:
                 description="Surface a random older insight for re-engagement",
             )
             logging.getLogger("hybrid_memory").info(
-                "hybrid_memory: registered /insights and /revisit commands"
+                "hybrid_memory: registered /ilog and /revisit commands"
             )
     except Exception as _e:
         logging.getLogger("hybrid_memory").debug(
@@ -979,13 +981,16 @@ def _get_insight_store():
         return None
 
 
-def _handle_insights_command(raw_args: str) -> str:
-    """Handle /insights — list saved insights, newest first.
+def _handle_ilog_command(raw_args: str) -> str:
+    """Handle /ilog — list saved personal insights, newest first.
 
     Usage:
-        /insights          — all insights, newest first (up to 20)
-        /insights work     — insights tagged 'work'
-        /insights ex shame — insights tagged 'ex' OR 'shame'
+        /ilog              — all insights, newest first (up to 20)
+        /ilog work         — insights tagged 'work'
+        /ilog ex shame     — insights tagged 'ex' OR 'shame'
+
+    Note: /ilog is used instead of /insights to avoid conflicting with
+    the built-in usage-analytics /insights command.
     """
     store = _get_insight_store()
     if store is None:

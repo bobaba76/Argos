@@ -250,8 +250,8 @@ class SharedGraphStore:
         self.user_id = user_id or "default_user"
         self._rpc.user_id = self.user_id
 
-    def search_graph(self, term: str) -> List[dict]:
-        return self._rpc.call("graph", "search_graph", term=term) or []
+    def search_graph(self, term: str, limit: int = 100) -> List[dict]:
+        return self._rpc.call("graph", "search_graph", term=term, limit=limit) or []
 
     def query_graph(self, entity_id: str) -> List[dict]:
         return self._rpc.call("graph", "query_graph", entity_id=entity_id) or []

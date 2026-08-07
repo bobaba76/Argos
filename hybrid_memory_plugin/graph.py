@@ -20,7 +20,7 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +273,7 @@ def extract_graph_relations(
     if preference:
         verb, preferred, alternative = preference.groups()
         relation = "dislikes" if verb.lower().startswith(("hate",)) else "prefers"
-        add("user", "person", relation, preferred, "concept")
+        add("user", "person", relation, preferred, evidence="preference")
         if alternative:
             add(_clean_graph_entity(preferred), "concept", "preferred_over", alternative, "concept", "comparison")
 
@@ -345,6 +345,176 @@ def extract_graph_relations(
         add("user", "person", proper_relation, entity, "concept", "proper_noun")
 
     return relations
+
+
+# ---------------------------------------------------------------------------
+# LLM-assisted entity extraction (Stage 2 for graph)
+# ---------------------------------------------------------------------------
+
+_GRAPH_LLM_MIN_LENGTH = 60
+_GRAPH_LLM_TIMEOUT = 15.0
+
+_GRAPH_LLM_PROMPT = """You are a knowledge-graph entity extractor. Given a stored memory, extract typed relationships between the user and entities mentioned.
+
+Return a JSON array of objects with these keys:
+- "source": entity name (usually "user")
+- "source_type": "person", "memory", "concept", etc.
+- "relation": snake_case relation (e.g. "works_at", "uses", "prefers", "has_attribute", "uses", "lives_in", "knows", "insight_about")
+- "target": the related entity name
+- "target_type": one of "person", "organization", "place", "item", "attribute", "technology", "tool", "concept", "event", "goal", "insight"
+
+Only extract real, specific entities — not pronouns, stop words, or generic terms like "thing", "something", "people".
+If the memory has no clear entities, return an empty array: []
+
+Examples:
+Memory: "User works at Stripe and uses Kubernetes"
+Output: [{"source":"user","source_type":"person","relation":"works_at","target":"Stripe","target_type":"organization"},{"source":"user","source_type":"person","relation":"uses","target":"Kubernetes","target_type":"technology"}]
+
+Memory: "I just realized shame shapes my work patterns"
+Output: [{"source":"user","source_type":"person","relation":"insight_about","target":"shame","target_type":"concept"}]
+
+Memory: "User prefers dark mode"
+Output: [{"source":"user","source_type":"person","relation":"prefers","target":"dark mode","target_type":"concept"}]
+
+Memory: "hey how are you"
+Output: []
+"""
+
+
+def extract_graph_relations_llm(
+    content: str,
+    category: str = "context_note",
+) -> List[Dict[str, Any]]:
+    """LLM-assisted entity extraction for graph indexing.
+
+    Uses the host's auxiliary LLM to extract typed relations. All results
+    pass through the same _valid_graph_entity / _GRAPH_STOP_ENTITIES gate
+    as the regex extractor, so junk is rejected before it reaches the graph.
+    Never raises — returns [] on any failure.
+    """
+    if not content or len(content.strip()) < _GRAPH_LLM_MIN_LENGTH:
+        return []
+
+    try:
+        from agent.auxiliary_client import call_llm
+    except ImportError:
+        logger.debug("Graph LLM extraction unavailable: agent.auxiliary_client not importable")
+        return []
+    except Exception as e:
+        logger.debug("Graph LLM extraction unavailable: %s", e)
+        return []
+
+    messages = [
+        {"role": "system", "content": _GRAPH_LLM_PROMPT},
+        {"role": "user", "content": f"Memory ({category}): {content}"},
+    ]
+
+    try:
+        response = call_llm(
+            task="graph_entity_extraction",
+            messages=messages,
+            temperature=0.0,
+            max_tokens=600,
+            timeout=_GRAPH_LLM_TIMEOUT,
+        )
+    except Exception as e:
+        logger.debug("Graph LLM extraction call failed: %s", e)
+        return []
+
+    if response is None:
+        return []
+
+    try:
+        text = response.choices[0].message.content
+    except (AttributeError, IndexError, KeyError):
+        return []
+
+    if not text or not text.strip():
+        return []
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+        text = text.strip()
+
+    try:
+        raw_items = json.loads(text)
+    except json.JSONDecodeError:
+        logger.debug("Graph LLM extraction returned non-JSON: %s", text[:100])
+        return []
+
+    if not isinstance(raw_items, list):
+        return []
+
+    relations: List[Dict[str, Any]] = []
+    seen: set = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        source = _clean_graph_entity(str(item.get("source", "user")))
+        target = _clean_graph_entity(str(item.get("target", "")))
+        relation = _slug_relation(str(item.get("relation", "")))
+        if not source or not _valid_graph_entity(target):
+            continue
+        key = (source.casefold(), relation, target.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        target_type = str(item.get("target_type", "")).strip() or _infer_graph_type(target, relation)
+        source_type = str(item.get("source_type", "person")).strip() or "person"
+        relations.append({
+            "source": source,
+            "source_type": source_type,
+            "relation": relation,
+            "target": target,
+            "target_type": target_type,
+            "attributes": {
+                "category": str(category or "context_note").lower(),
+                "extractor": "llm",
+                "evidence": "llm",
+            },
+        })
+    return relations
+
+
+def extract_graph_relations_hybrid(
+    content: str,
+    category: str = "context_note",
+    tags: List[str] | None = None,
+    use_llm: bool = True,
+) -> List[Dict[str, Any]]:
+    """Regex-first, LLM-supplemented entity extraction with junk gating.
+
+    Stage 1: deterministic regex patterns (fast, zero cost).
+    Stage 2: if regex found few relations and content is substantial,
+    supplement with LLM extraction. All results — regex and LLM — pass
+    through the same stop-word / validity gate.
+    """
+    regex_relations = extract_graph_relations(content, category, tags)
+    if not use_llm:
+        return regex_relations
+
+    # Only invoke LLM when regex found little and the message is substantial.
+    if len(regex_relations) >= 3 or len(content.strip()) < _GRAPH_LLM_MIN_LENGTH:
+        return regex_relations
+
+    llm_relations = extract_graph_relations_llm(content, category)
+    if not llm_relations:
+        return regex_relations
+
+    # Merge, dedup by (source, relation, target). Regex takes priority.
+    merged: List[Dict[str, Any]] = list(regex_relations)
+    existing = {
+        (r["source"].casefold(), r["relation"], r["target"].casefold())
+        for r in regex_relations
+    }
+    for r in llm_relations:
+        key = (r["source"].casefold(), r["relation"], r["target"].casefold())
+        if key not in existing:
+            merged.append(r)
+            existing.add(key)
+    return merged
 
 
 class KuzuGraphStore:
@@ -542,12 +712,17 @@ class KuzuGraphStore:
         content: str,
         tags: List[str] | None = None,
         created_at: str | None = None,
+        use_llm: bool = True,
     ) -> int:
         """Index one memory and its extracted entities in the graph.
 
         A memory node provides an explicit bridge back to the source record;
         shared entity nodes provide cross-memory linking. Re-indexing the
         same memory is safe because edges retain a memory-id evidence list.
+
+        Extraction is regex-first, LLM-supplemented when regex finds few
+        relations and the content is substantial. All entities pass through
+        the stop-word / validity gate before reaching the graph.
         """
         if not memory_id or not content:
             return 0
@@ -570,7 +745,7 @@ class KuzuGraphStore:
             {"memory_id": str(memory_id), "category": category},
         )
 
-        relations = extract_graph_relations(content, category, tags)
+        relations = extract_graph_relations_hybrid(content, category, tags, use_llm=use_llm)
         for relation in relations:
             attributes = dict(relation.get("attributes") or {})
             attributes["memory_id"] = str(memory_id)
@@ -701,13 +876,67 @@ class KuzuGraphStore:
             })
         return edges
 
-    def search_graph(self, term: str) -> List[Dict[str, Any]]:
-        """Bidirectional fuzzy search over visible entity edges."""
+    def search_graph(self, term: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """Bidirectional fuzzy search over visible entity edges.
+
+        Filtering is pushed into Kuzu (WHERE CONTAINS + LIMIT) so the
+        query is O(matching edges), not O(all edges). The quarantine
+        visibility guard remains in Python because it inspects a JSON
+        attribute field that Kuzu cannot filter natively.
+        """
         term_lower = str(term or "").lower().strip()
         if not term_lower:
             return []
+        try:
+            limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        # Kuzu CONTAINS is case-sensitive, so we can't use it directly for
+        # case-insensitive matching. Instead we filter on lowercased ids
+        # by checking both the original and a lowercased comparison. Kuzu
+        # supports toLower() in Cypher.
         query = """
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+        WHERE toLower(a.id) CONTAINS $term OR toLower(b.id) CONTAINS $term
+        RETURN a.id AS source, a.entity_type AS source_type,
+               r.relation_type AS relation, b.id AS target,
+               b.entity_type AS target_type, a.attributes AS source_attrs,
+               b.attributes AS target_attrs, r.attributes AS relation_attrs
+        LIMIT $limit
+        """
+        with self._shared_conn_lock:
+            results = self.conn.execute(query, parameters={"term": term_lower, "limit": limit * 3})
+        edges: List[Dict[str, Any]] = []
+        while results.has_next():
+            row = results.get_next()
+            if not all(self._visible_attributes(value) for value in row[5:8]):
+                continue
+            edges.append({
+                "source": row[0], "source_type": row[1],
+                "relation": row[2], "target": row[3],
+                "target_type": row[4],
+                "attributes": self._parse_attributes(row[7]),
+            })
+            if len(edges) >= limit:
+                break
+        return edges
+
+    def _query_edges_for_nodes(
+        self, node_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Fetch all visible edges touching any of the given node ids.
+
+        Uses a parameterized IN-list so Kuzu does the filtering, not Python.
+        """
+        if not node_ids:
+            return []
+        # Kuzu doesn't support parameterized IN-lists reliably across
+        # versions, so we build the list literal safely.
+        safe_ids = [str(n).replace("'", "\\'") for n in node_ids]
+        id_list = "[" + ", ".join(f"'{n}'" for n in safe_ids) + "]"
+        query = f"""
+        MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+        WHERE a.id IN {id_list} OR b.id IN {id_list}
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
@@ -720,15 +949,42 @@ class KuzuGraphStore:
             row = results.get_next()
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
-            src, rel, tgt = row[0], row[2], row[3]
-            if term_lower in str(src).lower() or term_lower in str(tgt).lower():
-                edges.append({
-                    "source": src, "source_type": row[1],
-                    "relation": rel, "target": tgt,
-                    "target_type": row[4],
-                    "attributes": self._parse_attributes(row[7]),
-                })
+            source, target = str(row[0]), str(row[3])
+            edges.append({
+                "source": source,
+                "source_type": row[1],
+                "relation": row[2],
+                "target": target,
+                "target_type": row[4],
+                "attributes": self._parse_attributes(row[7]),
+            })
         return edges
+
+    def _query_node(self, entity_id: str) -> Dict[str, Any] | None:
+        """Fetch a single node by exact or fuzzy id match."""
+        with self._shared_conn_lock:
+            # Try exact match first.
+            result = self.conn.execute(
+                "MATCH (n:Entity {id: $id}) RETURN n.id, n.entity_type, n.attributes",
+                parameters={"id": entity_id},
+            )
+            if result.has_next():
+                row = result.get_next()
+                attrs = self._parse_attributes(row[2])
+                if self._visible_attributes(attrs):
+                    return {"id": str(row[0]), "entity_type": row[1], "attributes": attrs}
+            # Fuzzy match on substring.
+            result = self.conn.execute(
+                "MATCH (n:Entity) WHERE toLower(n.id) CONTAINS $term "
+                "RETURN n.id, n.entity_type, n.attributes LIMIT 1",
+                parameters={"term": entity_id.lower()},
+            )
+            if result.has_next():
+                row = result.get_next()
+                attrs = self._parse_attributes(row[2])
+                if self._visible_attributes(attrs):
+                    return {"id": str(row[0]), "entity_type": row[1], "attributes": attrs}
+        return None
 
     def traverse_graph(
         self,
@@ -738,11 +994,9 @@ class KuzuGraphStore:
     ) -> Dict[str, Any]:
         """Return a bounded bidirectional neighborhood around an entity.
 
-        Kuzu's graph syntax varies across supported releases, so traversal is
-        performed with one stable edge query followed by a small in-memory BFS.
-        This keeps the RPC response bounded and supports incoming as well as
-        outgoing links, which is useful for finding the memories that mention
-        an entity.
+        Uses targeted per-hop queries (WHERE node IN frontier) instead of
+        loading all edges. This keeps each query O(frontier edges) rather
+        than O(all edges), making traversal practical as the graph grows.
         """
         requested = str(entity_id or "").strip()
         if not requested:
@@ -756,75 +1010,47 @@ class KuzuGraphStore:
         except (TypeError, ValueError):
             limit = 100
 
-        query = """
-        MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        RETURN a.id AS source, a.entity_type AS source_type,
-               r.relation_type AS relation, b.id AS target,
-               b.entity_type AS target_type, a.attributes AS source_attrs,
-               b.attributes AS target_attrs, r.attributes AS relation_attrs
-        """
-        with self._shared_conn_lock:
-            results = self.conn.execute(query)
-        all_edges: List[Dict[str, Any]] = []
-        node_data: Dict[str, Dict[str, Any]] = {}
-        while results.has_next():
-            row = results.get_next()
-            if not all(self._visible_attributes(value) for value in row[5:8]):
-                continue
-            source, target = str(row[0]), str(row[3])
-            node_data[source] = {
-                "id": source,
-                "entity_type": row[1],
-                "attributes": self._parse_attributes(row[5]),
-            }
-            node_data[target] = {
-                "id": target,
-                "entity_type": row[4],
-                "attributes": self._parse_attributes(row[6]),
-            }
-            all_edges.append({
-                "source": source,
-                "source_type": row[1],
-                "relation": row[2],
-                "target": target,
-                "target_type": row[4],
-                "attributes": self._parse_attributes(row[7]),
-            })
-
-        exact = [node for node in node_data if node.casefold() == requested.casefold()]
-        if exact:
-            seeds = exact[:1]
-        else:
-            seeds = [node for node in node_data if requested.casefold() in node.casefold()][:1]
-        if not seeds:
+        seed = self._query_node(requested)
+        if seed is None:
             return {"entity_id": requested, "depth": depth, "nodes": [], "edges": []}
 
-        adjacency: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
-        for edge in all_edges:
-            adjacency.setdefault(edge["source"], []).append((edge["target"], edge))
-            adjacency.setdefault(edge["target"], []).append((edge["source"], edge))
+        # Verify the seed has at least one visible edge. A node with all
+        # edges quarantined (e.g. after remove_memory) should not appear
+        # in traversal results, matching the old edge-driven behavior.
+        seed_edges = self._query_edges_for_nodes([seed["id"]])
+        if not seed_edges:
+            return {"entity_id": seed["id"], "depth": depth, "nodes": [], "edges": []}
 
-        distances = {seeds[0]: 0}
-        queue = [seeds[0]]
+        # BFS with targeted per-hop edge queries.
+        node_data: Dict[str, Dict[str, Any]] = {seed["id"]: seed}
+        distances: Dict[str, int] = {seed["id"]: 0}
         selected_edges: List[Dict[str, Any]] = []
-        selected_keys: set[tuple[str, str, str]] = set()
-        while queue and len(distances) <= limit:
-            current = queue.pop(0)
-            current_depth = distances[current]
-            if current_depth >= depth:
-                continue
-            for neighbor, edge in adjacency.get(current, []):
+        selected_keys: set = set()
+        frontier: List[str] = [seed["id"]]
+
+        for hop in range(depth):
+            if not frontier or len(node_data) >= limit:
+                break
+            edges = self._query_edges_for_nodes(frontier)
+            next_frontier: List[str] = []
+            for edge in edges:
                 key = (edge["source"], edge["relation"], edge["target"])
                 if key not in selected_keys and len(selected_edges) < limit:
                     selected_keys.add(key)
                     selected_edges.append(edge)
-                if neighbor not in distances and len(distances) < limit:
-                    distances[neighbor] = current_depth + 1
-                    queue.append(neighbor)
+                for endpoint in (edge["source"], edge["target"]):
+                    if endpoint not in node_data:
+                        # Fetch node details for newly discovered nodes.
+                        node = self._query_node(endpoint)
+                        if node and len(node_data) < limit:
+                            node_data[endpoint] = node
+                            distances[endpoint] = hop + 1
+                            next_frontier.append(endpoint)
+            frontier = next_frontier
 
-        selected_nodes = [node_data[node] for node in distances if node in node_data]
+        selected_nodes = [node_data[n] for n in distances if n in node_data]
         return {
-            "entity_id": seeds[0],
+            "entity_id": seed["id"],
             "depth": depth,
             "nodes": selected_nodes[:limit],
             "edges": selected_edges[:limit],

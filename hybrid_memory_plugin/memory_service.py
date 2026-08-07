@@ -129,7 +129,10 @@ class MemoryService:
             raise RuntimeError("Relationship graph is unavailable")
         self.graph.set_user_scope(user_id)
         if method == "search_graph":
-            return self.graph.search_graph(args.get("term", ""))
+            return self.graph.search_graph(
+                args.get("term", ""),
+                limit=int(args.get("limit", 100)),
+            )
         if method == "query_graph":
             return self.graph.query_graph(args.get("entity_id", ""))
         if method == "traverse_graph":

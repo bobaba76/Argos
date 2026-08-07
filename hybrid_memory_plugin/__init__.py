@@ -607,7 +607,7 @@ class HybridMemoryProvider(MemoryProvider):
                 "pending_user_confirmation": "pending_user_confirmation",
             }
             final_status = decision_map.get(decision, "pending_user_confirmation")
-            self._store.review_candidate(
+            result = self._store.review_candidate(
                 candidate_id=candidate["candidate_id"],
                 decision=final_status,
                 reason=review.get("reason", ""),
@@ -616,6 +616,17 @@ class HybridMemoryProvider(MemoryProvider):
                 durability=review.get("durability"),
                 scope=review.get("scope"),
             )
+            # Index the promoted memory in the graph. This closes the gap
+            # where auto-approved candidates never reached the graph.
+            if result and result.get("memory"):
+                mem = result["memory"]
+                self._index_memory_graph(
+                    mem.get("memory_id", ""),
+                    mem.get("category", "context_note"),
+                    mem.get("content", ""),
+                    mem.get("tags", []),
+                    mem.get("created_at"),
+                )
         except Exception as exc:
             logger.warning("Automatic memory proposal review failed: %s", exc)
 
@@ -728,16 +739,23 @@ class HybridMemoryProvider(MemoryProvider):
         tags: List[str] | None = None,
         created_at: str | None = None,
     ) -> None:
-        """Index any saved memory in the graph, regardless of category."""
-        if not self._graph or not memory_id or not content:
+        """Index any saved memory in the graph, regardless of category.
+
+        Uses regex-first, LLM-supplemented extraction. The LLM path only
+        fires when regex finds few relations and content is substantial,
+        so short memories don't pay the token cost.
+        """
+        graph = getattr(self, "_graph", None)
+        if not graph or not memory_id or not content:
             return
         try:
-            self._graph.index_memory(
+            graph.index_memory(
                 memory_id=memory_id,
                 category=category,
                 content=content,
                 tags=tags or [],
                 created_at=created_at,
+                use_llm=self._llm_fallback,
             )
         except Exception as exc:
             # Graph indexing is an enrichment path; a graph failure must not
@@ -847,7 +865,7 @@ class HybridMemoryProvider(MemoryProvider):
             rec = self._store.update_memory(memory_id, content=content, tags=tags)
             if rec is None:
                 return tool_error(f"Memory not found: {memory_id}")
-            if self._graph:
+            if getattr(self, "_graph", None):
                 try:
                     self._graph.remove_memory(rec.memory_id)
                 except Exception as exc:
@@ -868,7 +886,7 @@ class HybridMemoryProvider(MemoryProvider):
             deleted = self._store.delete_memory(memory_id=memory_id)
             if not deleted:
                 return tool_error(f"Memory not found: {memory_id}")
-            if self._graph:
+            if getattr(self, "_graph", None):
                 try:
                     self._graph.remove_memory(memory_id)
                 except Exception as exc:
@@ -905,7 +923,7 @@ class HybridMemoryProvider(MemoryProvider):
             if result is None:
                 return tool_error(f"Candidate not found: {candidate_id}")
             memory = result.get("memory")
-            if memory and self._graph:
+            if memory and getattr(self, "_graph", None):
                 self._index_memory_graph(
                     memory.get("memory_id", ""),
                     memory.get("category", "context_note"),

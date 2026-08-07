@@ -28,8 +28,13 @@ logger = logging.getLogger(__name__)
 _MIN_LENGTH = 15
 # Maximum sentences per turn to avoid extracting from walls of text.
 _MAX_SENTENCES = 25
-# If Stage 1 finds fewer than this many facts, try LLM fallback.
-_LLM_FALLBACK_THRESHOLD = 1
+# LLM fallback triggers when regex finds fewer facts than this AND the
+# message is substantial.  We use a ratio-based heuristic rather than a
+# fixed count: a 200-word message with 1 regex fact probably has more
+# durable facts the regex missed; a 20-word message with 1 fact is likely
+# complete.  See _should_try_llm_fallback() for the full logic.
+_LLM_FALLBACK_MIN_FACTS = 2  # Below this many facts, always try LLM (if message is long enough).
+_LLM_FALLBACK_WORDS_PER_FACT = 80  # If words/facts > this ratio, regex likely missed things.
 # Minimum user message length to justify an LLM call (avoid wasting tokens
 # on short chit-chat).
 _LLM_MIN_CONTENT_LENGTH = 60
@@ -666,6 +671,54 @@ def _extract_facts_llm(user_content: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# LLM fallback decision + cross-stage dedup
+# ---------------------------------------------------------------------------
+
+def _should_try_llm_fallback(user_content: str, fact_count: int) -> bool:
+    """Decide whether to invoke the LLM fallback after regex extraction.
+
+    The LLM call costs latency + tokens, so we only invoke it when regex
+    extraction looks insufficient for the message length:
+
+    - If regex found 0 facts and the message is substantial: always try LLM.
+    - If regex found fewer than _LLM_FALLBACK_MIN_FACTS facts: try LLM
+      (the message might have more durable facts the regex missed).
+    - If the words-per-fact ratio is high (message is long but regex found
+      few facts): try LLM — regex likely missed things.
+    - Otherwise (regex found several facts from a short message): skip LLM.
+    """
+    if not user_content or len(user_content.strip()) < _LLM_MIN_CONTENT_LENGTH:
+        return False
+    if fact_count == 0:
+        return True
+    if fact_count < _LLM_FALLBACK_MIN_FACTS:
+        return True
+    word_count = len(user_content.split())
+    if word_count / max(1, fact_count) > _LLM_FALLBACK_WORDS_PER_FACT:
+        return True
+    return False
+
+
+def _text_overlap(a: str, b: str) -> bool:
+    """Check if two text strings are near-duplicates (high token overlap).
+
+    Uses Jaccard similarity on word sets — fast and dependency-free.
+    Threshold of 0.6 means 60% of words are shared (order-independent).
+    Used to dedup LLM-extracted facts against regex-extracted facts so
+    we don't store the same fact twice with different phrasing.
+    """
+    if not a or not b:
+        return False
+    words_a = set(a.split())
+    words_b = set(b.split())
+    if not words_a or not words_b:
+        return False
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union) >= 0.6
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -689,10 +742,18 @@ def extract_from_turn(
     facts = _extract_facts_regex(user_content)
 
     # Stage 2: LLM fallback if regex didn't find enough.
-    if use_llm_fallback and len(facts) < _LLM_FALLBACK_THRESHOLD:
+    # The LLM is expensive (latency + tokens), so we only call it when
+    # regex extraction looks insufficient for the message length.
+    if use_llm_fallback and _should_try_llm_fallback(user_content, len(facts)):
         llm_facts = _extract_facts_llm(user_content)
         if llm_facts:
-            facts.extend(llm_facts)
+            # Dedup LLM facts against regex facts by content similarity.
+            existing_contents = [f["content"].lower() for f in facts]
+            for lf in llm_facts:
+                lf_lower = lf["content"].lower()
+                # Skip if an existing regex fact is a near-duplicate.
+                if not any(_text_overlap(lf_lower, ec) for ec in existing_contents):
+                    facts.append(lf)
 
     # Filter only irrecoverably malformed candidates here. Other quality flags
     # travel with the proposal so a reviewer can make an informed decision.

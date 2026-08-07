@@ -579,18 +579,29 @@ class DuckDBMemoryStore:
 
     # -- write operations -----------------------------------------------------
 
+    # Semantic dedup threshold: cosine similarity above this means "same fact".
+    _DEDUP_SIMILARITY_THRESHOLD = 0.85
+
     def _content_exists(self, content: str, category: str) -> bool:
-        """Check if a very similar content already exists (dedup)."""
+        """Check if a very similar content already exists (dedup).
+
+        Three-layer check:
+        1. Exact match (case-sensitive, same category).
+        2. Substring containment (case-insensitive, for >20 char strings).
+        3. Semantic similarity (cosine similarity on embeddings, when an
+           embedder is available).  Catches paraphrased duplicates like
+           "User is related to Entity-B" vs "Entity-B is the user's role".
+        """
         with self._lock:
             assert self.connection is not None
-            # Exact match check.
+            # Layer 1: exact match.
             result = self.connection.execute(
                 "SELECT COUNT(*) FROM memory_records WHERE content = ? AND category = ?",
                 [content, category],
             ).fetchone()
             if result and result[0] > 0:
                 return True
-            # Fuzzy: check if existing content contains or is contained by this content.
+            # Layer 2: substring containment (case-insensitive).
             result = self.connection.execute(
                 "SELECT content FROM memory_records WHERE category = ? LIMIT 500",
                 [category],
@@ -604,6 +615,23 @@ class DuckDBMemoryStore:
                 if len(content_lower) > 20 and len(existing_lower) > 20:
                     if content_lower in existing_lower or existing_lower in content_lower:
                         return True
+            # Layer 3: semantic similarity via embeddings.
+            if self.embedder and hasattr(self.embedder, "embed"):
+                emb = self.embedder.embed(content)
+                if emb:
+                    try:
+                        result = self.connection.execute(
+                            """SELECT memory_id FROM memory_records
+                               WHERE category = ? AND embedding IS NOT NULL
+                                 AND list_cosine_similarity(embedding, ?::DOUBLE[]) > ?
+                               LIMIT 1""",
+                            [category, emb, self._DEDUP_SIMILARITY_THRESHOLD],
+                        ).fetchone()
+                        if result:
+                            return True
+                    except Exception as exc:
+                        if not self._is_vector_search_unavailable(exc):
+                            logger.debug("Semantic dedup check failed: %s", exc)
             return False
 
     def remember(

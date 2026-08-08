@@ -853,9 +853,17 @@ class KuzuGraphStore:
         return not attrs or attrs.get("status") != "quarantined"
 
     def query_graph(self, entity_id: str) -> List[Dict[str, Any]]:
-        """Find visible outgoing edges from an entity id."""
+        """Find visible edges touching an entity id (bidirectional).
+
+        Matches both outgoing (entity as source) and incoming (entity as
+        target) edges, so concepts that only appear as targets (e.g.
+        "shame" in a memory->concept mentions edge) are found. Without
+        the incoming half, query_graph under-reports because the extractor
+        mostly creates edges as memory -> concept.
+        """
         query = """
-        MATCH (a:Entity {id: $id})-[r:RelatesTo]->(b:Entity)
+        MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+        WHERE a.id = $id OR b.id = $id
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,

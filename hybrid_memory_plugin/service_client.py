@@ -273,6 +273,17 @@ class SharedGraphStore:
             entity_id=entity_id, depth=depth, limit=limit,
         ) or {"entity_id": entity_id, "depth": depth, "nodes": [], "edges": []}
 
+    def count_nodes(self) -> int:
+        return int(self._rpc.call("graph", "count_nodes") or 0)
+
+    def count_edges(self) -> int:
+        return int(self._rpc.call("graph", "count_edges") or 0)
+
+    def list_nodes(self, node_type: str | None = None, limit: int = 100) -> List[dict]:
+        return self._rpc.call(
+            "graph", "list_nodes", node_type=node_type, limit=limit,
+        ) or []
+
     def add_relationship(self, **kwargs: Any) -> None:
         self._rpc.call("graph", "add_relationship", **kwargs)
 

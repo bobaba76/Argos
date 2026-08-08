@@ -113,6 +113,13 @@ class MemoryService:
             return self.store.cleanup_junk()
         if method == "count":
             return self.store.count()
+        if method == "list_recent":
+            return [
+                _record_to_dict(record)
+                for record in self.store.list_recent(
+                    limit=int(args.get("limit", 100)),
+                )
+            ]
         if method == "get_insights":
             return [
                 _record_to_dict(record)
@@ -140,6 +147,15 @@ class MemoryService:
                 args.get("entity_id", ""),
                 depth=args.get("depth", 2),
                 limit=args.get("limit", 100),
+            )
+        if method == "count_nodes":
+            return self.graph.count_nodes()
+        if method == "count_edges":
+            return self.graph.count_edges()
+        if method == "list_nodes":
+            return self.graph.list_nodes(
+                node_type=args.get("node_type"),
+                limit=int(args.get("limit", 100)),
             )
         if method == "add_relationship":
             return self.graph.add_relationship(**args)

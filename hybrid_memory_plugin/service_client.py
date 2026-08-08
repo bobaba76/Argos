@@ -221,6 +221,12 @@ class SharedMemoryStore:
     def count(self) -> int:
         return int(self._rpc.call("store", "count") or 0)
 
+    def list_recent(self, limit: int = 100) -> List[MemoryRecord]:
+        return [
+            _record_from_dict(value)
+            for value in (self._rpc.call("store", "list_recent", limit=limit) or [])
+        ]
+
     def get_insights(
         self,
         tags: List[str] | None = None,

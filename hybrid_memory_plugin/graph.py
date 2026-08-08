@@ -1103,6 +1103,13 @@ class KuzuGraphStore:
         "can", "could", "should", "about", "into", "for", "with",
     })
 
+    # Exact entity ids known to be extractor leaks (short fragments that the
+    # generic heuristics can't separate from legitimate names). Additions here
+    # are quarantined reversibly; they can be restored if ever mis-tagged.
+    _CURATED_JUNK_ENTITY_IDS = frozenset({
+        "Location", "children and", "and", "the user", "a lot",
+    })
+
     def _quarantine_node(self, node_id: str, reason: str) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._shared_conn_lock:
@@ -1183,10 +1190,23 @@ class KuzuGraphStore:
                 continue
             node_id = str(node_id)
             first_word = node_id.split()[0].lower() if node_id.split() else ""
+            word_count = len(node_id.split())
+            # Whole-sentence / paragraph payloads are not valid entity names.
+            # Real entities are short noun phrases (a few words); anything
+            # running on for many words or a long string is extracted junk.
+            sentence_payload = (
+                word_count >= 6
+                or len(node_id.strip()) >= 80
+            )
+            # Recognized extractor-leak payloads that the generic heuristics
+            # can't isolate from legitimate short names (e.g. "Tom").
+            curated_leak = str(node_id).strip() in self._CURATED_JUNK_ENTITY_IDS
             if (
                 first_word in self._JUNK_ENTITY_PREFIXES
                 or len(node_id.strip()) <= 2
                 or re.match(r'^e\d+$', node_id.strip())
+                or sentence_payload
+                or curated_leak
             ) and self._quarantine_node(node_id, "junk entity review"):
                 changed += 1
 

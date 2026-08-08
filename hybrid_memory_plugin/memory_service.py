@@ -249,6 +249,17 @@ def serve(home: Path, port: int = 0) -> None:
     endpoint = endpoint_path(home)
     _write_endpoint(endpoint, int(server.server_address[1]), token)
 
+    # Opportunistic one-time graph hygiene at startup: quarantine junk/leak
+    # entity nodes so noise fades from graph-aware recall. Runs off the hot
+    # path so it never delays first RPC. Safe to re-run (MERGE + reversible).
+    if service.graph is not None:
+        def _sweep() -> None:
+            try:
+                service.graph.quarantine_junk_entities()
+            except Exception:
+                pass  # graph hygiene is non-fatal; do not block service boot
+        threading.Thread(target=_sweep, daemon=True).start()
+
     def _stop(_signum, _frame) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()
 

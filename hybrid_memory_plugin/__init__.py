@@ -69,6 +69,11 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "auto_extract": "true",
         "llm_fallback": "true",
         "auto_review": "true",
+        "graph_aware_retrieval": "true",
+        "graph_retrieval_boost": "0.12",
+        "consolidation_enabled": "false",
+        "consolidation_min_age_days": "30",
+        "consolidation_max_actions": "25",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -289,6 +294,23 @@ FEEDBACK_SCHEMA = {
     },
 }
 
+MAINTENANCE_SCHEMA = {
+    "name": "memory_maintenance",
+    "description": (
+        "Preview or apply conservative, reversible memory maintenance. It can "
+        "quarantine expired or stale temporary memories and lower-quality duplicates. "
+        "Dry-run is the default; it never permanently deletes records."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "dry_run": {"type": "boolean", "description": "Preview only (default true)."},
+            "max_actions": {"type": "integer", "description": "Maximum records to quarantine (default 25)."},
+            "min_age_days": {"type": "integer", "description": "Age threshold for stale temporary memories (default 30)."},
+        },
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -310,6 +332,11 @@ class HybridMemoryProvider(MemoryProvider):
         self._auto_extract: bool = True
         self._llm_fallback: bool = True
         self._auto_review: bool = True
+        self._graph_aware_retrieval: bool = True
+        self._graph_retrieval_boost: float = 0.12
+        self._consolidation_enabled: bool = False
+        self._consolidation_min_age_days: int = 30
+        self._consolidation_max_actions: int = 25
         self._auto_extract_paused: bool = False
         self._initialized: bool = False
         # Prefetch state.
@@ -373,6 +400,26 @@ class HybridMemoryProvider(MemoryProvider):
                 "choices": ["true", "false"],
                 "required": False,
             },
+            {
+                "key": "graph_aware_retrieval",
+                "description": "Boost memory results supported by graph entities",
+                "default": "true",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "graph_retrieval_boost",
+                "description": "Maximum graph-supported retrieval boost",
+                "default": "0.12",
+                "required": False,
+            },
+            {
+                "key": "consolidation_enabled",
+                "description": "Allow automatic reversible memory maintenance at session end",
+                "default": "false",
+                "choices": ["true", "false"],
+                "required": False,
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -430,6 +477,34 @@ class HybridMemoryProvider(MemoryProvider):
             auto_review.lower() in ("true", "1", "yes")
             if isinstance(auto_review, str) else bool(auto_review)
         )
+        graph_aware = self._config.get("graph_aware_retrieval", "true")
+        self._graph_aware_retrieval = (
+            graph_aware.lower() in ("true", "1", "yes")
+            if isinstance(graph_aware, str) else bool(graph_aware)
+        )
+        try:
+            self._graph_retrieval_boost = max(
+                0.0, min(float(self._config.get("graph_retrieval_boost", 0.12)), 0.5)
+            )
+        except (TypeError, ValueError):
+            self._graph_retrieval_boost = 0.12
+        consolidation_enabled = self._config.get("consolidation_enabled", "false")
+        self._consolidation_enabled = (
+            consolidation_enabled.lower() in ("true", "1", "yes")
+            if isinstance(consolidation_enabled, str) else bool(consolidation_enabled)
+        )
+        try:
+            self._consolidation_min_age_days = max(
+                1, int(self._config.get("consolidation_min_age_days", 30))
+            )
+        except (TypeError, ValueError):
+            self._consolidation_min_age_days = 30
+        try:
+            self._consolidation_max_actions = max(
+                1, min(int(self._config.get("consolidation_max_actions", 25)), 500)
+            )
+        except (TypeError, ValueError):
+            self._consolidation_max_actions = 25
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
         env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
         self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
@@ -521,6 +596,47 @@ class HybridMemoryProvider(MemoryProvider):
             "and concepts in the user's life."
         )
 
+    # -- retrieval ------------------------------------------------------------
+
+    def _search_memories(
+        self,
+        query: str,
+        limit: int,
+        category_filter: str | None = None,
+    ) -> List[Any]:
+        """Run hybrid search and apply a bounded graph-supported boost."""
+        if self._store is None:
+            return []
+        candidate_limit = min(50, max(limit, limit * 4))
+        results = self._store.search(
+            query,
+            limit=candidate_limit,
+            category_filter=category_filter,
+        )
+        if not self._graph or not self._graph_aware_retrieval:
+            return results[:limit]
+        try:
+            graph_ids = self._graph.memory_ids_for_query(
+                query, limit=max(10, candidate_limit)
+            )
+            if graph_ids:
+                existing = {record.memory_id for record in results}
+                graph_records = self._store.get_memories_by_ids(graph_ids)
+                for record in graph_records:
+                    if record.memory_id not in existing:
+                        results.append(record)
+                graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
+                for record in results:
+                    rank = graph_rank.get(record.memory_id)
+                    if rank is None:
+                        continue
+                    decay = 1.0 - (rank / max(len(graph_ids), 1))
+                    record.similarity += self._graph_retrieval_boost * max(0.0, decay)
+                results.sort(key=lambda record: record.similarity, reverse=True)
+        except Exception as exc:
+            logger.debug("Graph-aware retrieval failed: %s", exc)
+        return results[:limit]
+
     # -- prefetch (auto-inject context before each turn) ---------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -550,7 +666,7 @@ class HybridMemoryProvider(MemoryProvider):
                 if confirmation:
                     sections.append(confirmation)
 
-                results = store.search(query, limit=max_items)
+                results = self._search_memories(query, limit=max_items)
                 if results:
                     lines = []
                     for r in results:
@@ -711,6 +827,20 @@ class HybridMemoryProvider(MemoryProvider):
                     logger.info("Quarantined %d questionable memories at session end", quarantined)
             except Exception as e:
                 logger.debug("Memory quarantine failed: %s", e)
+            if self._consolidation_enabled:
+                try:
+                    report = self._store.consolidate(
+                        dry_run=False,
+                        max_actions=self._consolidation_max_actions,
+                        min_age_days=self._consolidation_min_age_days,
+                    )
+                    if report.get("quarantined_count"):
+                        logger.info(
+                            "Consolidation quarantined %d memories",
+                            report["quarantined_count"],
+                        )
+                except Exception as e:
+                    logger.debug("Consolidation failed: %s", e)
 
     # -- session switch ------------------------------------------------------
 
@@ -807,6 +937,7 @@ class HybridMemoryProvider(MemoryProvider):
             CANDIDATE_REVIEW_SCHEMA,
             RESTORE_SCHEMA,
             FEEDBACK_SCHEMA,
+            MAINTENANCE_SCHEMA,
         ]
         if self._graph:
             schemas.extend([GRAPH_SEARCH_SCHEMA, GRAPH_QUERY_SCHEMA])
@@ -827,7 +958,9 @@ class HybridMemoryProvider(MemoryProvider):
             category = args.get("category")
             if category and category not in VALID_CATEGORIES:
                 return tool_error(f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
-            results = self._store.search(query, limit=top_k, category_filter=category)
+            results = self._search_memories(
+                query, limit=top_k, category_filter=category
+            )
             return json.dumps({
                 "query": query,
                 "count": len(results),
@@ -958,6 +1091,25 @@ class HybridMemoryProvider(MemoryProvider):
             if not recorded:
                 return tool_error(f"Memory not found: {memory_id}")
             return json.dumps({"status": "recorded", "memory_id": memory_id, "feedback": feedback})
+
+        elif tool_name == "memory_maintenance":
+            try:
+                max_actions = max(1, min(int(args.get("max_actions", self._consolidation_max_actions)), 500))
+            except (TypeError, ValueError):
+                max_actions = self._consolidation_max_actions
+            try:
+                min_age_days = max(1, int(args.get("min_age_days", self._consolidation_min_age_days)))
+            except (TypeError, ValueError):
+                min_age_days = self._consolidation_min_age_days
+            dry_run = args.get("dry_run", True)
+            if isinstance(dry_run, str):
+                dry_run = dry_run.lower() not in {"false", "0", "no"}
+            report = self._store.consolidate(
+                dry_run=bool(dry_run),
+                max_actions=max_actions,
+                min_age_days=min_age_days,
+            )
+            return json.dumps(report)
 
         elif tool_name == "memory_graph_search":
             if self._graph is None:

@@ -185,6 +185,19 @@ class SharedMemoryStore:
         )
         return [_record_from_dict(value) for value in (values or [])]
 
+    def get_memories_by_ids(
+        self,
+        memory_ids: List[str],
+        *,
+        include_quarantined: bool = False,
+    ) -> List[MemoryRecord]:
+        values = self._rpc.call(
+            "store", "get_memories_by_ids",
+            memory_ids=memory_ids,
+            include_quarantined=include_quarantined,
+        ) or []
+        return [_record_from_dict(value) for value in values]
+
     def remember(self, **kwargs: Any) -> MemoryRecord | None:
         return _record_from_dict(self._rpc.call("store", "remember", **kwargs))
 
@@ -217,6 +230,9 @@ class SharedMemoryStore:
 
     def cleanup_junk(self) -> int:
         return int(self._rpc.call("store", "cleanup_junk") or 0)
+
+    def consolidate(self, **kwargs: Any) -> dict:
+        return self._rpc.call("store", "consolidate", **kwargs) or {}
 
     def count(self) -> int:
         return int(self._rpc.call("store", "count") or 0)
@@ -258,6 +274,11 @@ class SharedGraphStore:
 
     def search_graph(self, term: str, limit: int = 100) -> List[dict]:
         return self._rpc.call("graph", "search_graph", term=term, limit=limit) or []
+
+    def memory_ids_for_query(self, query: str, limit: int = 100) -> List[str]:
+        return self._rpc.call(
+            "graph", "memory_ids_for_query", query=query, limit=limit,
+        ) or []
 
     def query_graph(self, entity_id: str) -> List[dict]:
         return self._rpc.call("graph", "query_graph", entity_id=entity_id) or []

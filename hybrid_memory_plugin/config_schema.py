@@ -72,6 +72,23 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="graph_aware_retrieval",
+            label="Graph-aware retrieval",
+            kind=KIND_BOOL,
+            default="true",
+            description="Boost memories supported by graph entities during normal search.",
+            group="Retrieval",
+        ),
+        ProviderField(
+            key="consolidation_enabled",
+            label="Automatic consolidation",
+            kind=KIND_BOOL,
+            default="false",
+            description="Enable reversible maintenance of expired and duplicate memories at session end.",
+            info="Disabled by default; use memory_maintenance with dry_run=true to preview candidates.",
+            group="Maintenance",
+        ),
+        ProviderField(
             key="storage_mode",
             label="Storage mode",
             kind=KIND_SELECT,

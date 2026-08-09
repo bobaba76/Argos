@@ -525,6 +525,27 @@ class DuckDBMemoryStore:
             # A read-only fallback connection must still be able to search.
             logger.debug("Could not record memory retrieval: %s", exc)
 
+    def get_memories_by_ids(
+        self,
+        memory_ids: List[str],
+        *,
+        include_quarantined: bool = False,
+    ) -> List[MemoryRecord]:
+        """Fetch visible, in-scope memories by ID for graph-aware retrieval."""
+        ids = [str(memory_id) for memory_id in memory_ids if str(memory_id).strip()]
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        status_clause = "" if include_quarantined else " AND COALESCE(status, 'active') = 'active'"
+        records = self._fetch_records(
+            f"SELECT * FROM memory_records WHERE memory_id IN ({placeholders}){status_clause}",
+            ids,
+        )
+        by_id = {record.memory_id: record for record in records}
+        return [by_id[memory_id] for memory_id in ids if memory_id in by_id
+                and self._matches_scope(by_id[memory_id].payload)
+                and not self._is_expired(by_id[memory_id].expires_at)]
+
     def search(
         self,
         query: str,
@@ -1176,6 +1197,123 @@ class DuckDBMemoryStore:
         if quarantined:
             logger.info("Quarantined %d questionable memories", quarantined)
         return quarantined
+
+    # -- consolidation / forgetting -----------------------------------------
+
+    @staticmethod
+    def _memory_quality_score(record: MemoryRecord) -> float:
+        """Prefer records with stronger evidence when consolidating duplicates."""
+        confidence = float(record.confidence or 0.0)
+        return (
+            confidence * 2.0
+            + record.helpful_count * 3.0
+            + record.retrieval_count * 0.1
+            - record.dismissed_count * 2.0
+            + min(len(record.content or "") / 1000.0, 1.0)
+        )
+
+    def consolidate(
+        self,
+        *,
+        dry_run: bool = True,
+        max_actions: int = 25,
+        min_age_days: int = 30,
+    ) -> Dict[str, Any]:
+        """Preview or apply conservative, reversible memory maintenance.
+
+        The operation never permanently deletes records. It quarantines only
+        expired records, stale unused temporary records, and lower-quality
+        exact/containment duplicates. Durable memories are not forgotten merely
+        because they are old or rarely retrieved.
+        """
+        max_actions = max(1, min(int(max_actions), 500))
+        min_age_days = max(1, int(min_age_days))
+        records = self._fetch_records(
+            "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active'"
+        )
+        now = datetime.now(timezone.utc)
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        def age_days(record: MemoryRecord) -> int | None:
+            if not record.created_at:
+                return None
+            try:
+                created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                return max(0, (now - created).days)
+            except Exception:
+                return None
+
+        def add_candidate(
+            record: MemoryRecord,
+            reason: str,
+            keeper_id: str | None = None,
+        ) -> None:
+            if record.memory_id in candidates:
+                return
+            candidates[record.memory_id] = {
+                "memory_id": record.memory_id,
+                "category": record.category,
+                "reason": reason,
+                "keeper_id": keeper_id,
+                "age_days": age_days(record),
+                "retrieval_count": record.retrieval_count,
+                "confidence": record.confidence,
+            }
+
+        for record in records:
+            if self._is_expired(record.expires_at):
+                add_candidate(record, "expired")
+                continue
+            age = age_days(record)
+            if (
+                record.durability == "temporary"
+                and age is not None
+                and age >= min_age_days
+                and record.retrieval_count == 0
+                and record.helpful_count == 0
+                and record.dismissed_count == 0
+                and float(record.confidence or 0.0) <= 0.6
+            ):
+                add_candidate(record, "stale_unused_temporary")
+
+        by_category: Dict[str, List[MemoryRecord]] = {}
+        for record in records:
+            by_category.setdefault(record.category, []).append(record)
+        for category_records in by_category.values():
+            for index, record in enumerate(category_records):
+                content = (record.content or "").strip().casefold()
+                if len(content) < 20:
+                    continue
+                for other in category_records[index + 1:]:
+                    other_content = (other.content or "").strip().casefold()
+                    if len(other_content) < 20:
+                        continue
+                    if content != other_content and content not in other_content and other_content not in content:
+                        continue
+                    if self._memory_quality_score(record) >= self._memory_quality_score(other):
+                        duplicate, keeper = other, record
+                    else:
+                        duplicate, keeper = record, other
+                    add_candidate(duplicate, "duplicate_containment", keeper.memory_id)
+
+        priority = {"expired": 0, "duplicate_containment": 1, "stale_unused_temporary": 2}
+        selected = sorted(
+            candidates.values(),
+            key=lambda item: (priority.get(item["reason"], 9), item["memory_id"]),
+        )[:max_actions]
+        quarantined = 0
+        if not dry_run:
+            for item in selected:
+                if self.quarantine_memory(item["memory_id"], item["reason"]):
+                    quarantined += 1
+        return {
+            "dry_run": bool(dry_run),
+            "candidate_count": len(selected),
+            "quarantined_count": quarantined,
+            "max_actions": max_actions,
+            "min_age_days": min_age_days,
+            "candidates": selected,
+        }
 
     # -- lifecycle ------------------------------------------------------------
 

@@ -95,6 +95,14 @@ class MemoryService:
             return _record_to_dict(self.store.remember(**args))
         if method == "update_memory":
             return _record_to_dict(self.store.update_memory(**args))
+        if method == "get_memories_by_ids":
+            return [
+                _record_to_dict(record)
+                for record in self.store.get_memories_by_ids(
+                    args.get("memory_ids", []),
+                    include_quarantined=bool(args.get("include_quarantined", False)),
+                )
+            ]
         if method == "save_candidate":
             return self.store.save_candidate(**args)
         if method == "list_candidates":
@@ -111,6 +119,8 @@ class MemoryService:
             return self.store.delete_memory(**args)
         if method == "cleanup_junk":
             return self.store.cleanup_junk()
+        if method == "consolidate":
+            return self.store.consolidate(**args)
         if method == "count":
             return self.store.count()
         if method == "list_recent":
@@ -138,6 +148,11 @@ class MemoryService:
         if method == "search_graph":
             return self.graph.search_graph(
                 args.get("term", ""),
+                limit=int(args.get("limit", 100)),
+            )
+        if method == "memory_ids_for_query":
+            return self.graph.memory_ids_for_query(
+                args.get("query", ""),
                 limit=int(args.get("limit", 100)),
             )
         if method == "query_graph":

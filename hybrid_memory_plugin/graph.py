@@ -52,6 +52,12 @@ _GRAPH_TECH_TERMS = frozenset({
     "duckdb", "kuzu", "stripe", "linux", "windows", "macos", "postgres",
     "postgresql", "redis", "sqlite", "aws", "gcp", "azure", "openai",
 })
+# Short extractor fragments that are never useful as graph entities. Keeping
+# this gate before graph writes prevents known leaks instead of only hiding them
+# later during quarantine maintenance.
+_GRAPH_CURATED_JUNK_ENTITIES = frozenset({
+    "location", "children and", "and", "the user", "a lot",
+})
 
 
 def _clean_graph_entity(value: str, max_length: int = 100) -> str:
@@ -67,11 +73,27 @@ def _clean_graph_entity(value: str, max_length: int = 100) -> str:
 
 def _valid_graph_entity(value: str) -> bool:
     cleaned = _clean_graph_entity(value)
-    if len(cleaned) < 3 or len(cleaned.split()) > 8:
+    words = cleaned.split()
+    if len(cleaned) < 3 or len(words) > 8:
         return False
     if cleaned.casefold() in _GRAPH_STOP_ENTITIES:
         return False
-    if cleaned.split()[0].casefold() in _GRAPH_STOP_ENTITIES:
+    if cleaned.casefold() in _GRAPH_CURATED_JUNK_ENTITIES:
+        return False
+    if words[0].casefold() in _GRAPH_STOP_ENTITIES:
+        return False
+    # Entity extraction should produce names or short noun phrases, not a
+    # sentence/paragraph accidentally captured by a broad pattern or LLM.
+    # Keep five-word goals such as "know more about the watcher", but reject
+    # longer payloads before they can create visible graph noise.
+    if len(words) >= 6 or len(cleaned) >= 80:
+        return False
+    if re.search(
+        r"\b(?:i|we|user|they)\s+(?:am|are|was|were|have|has|is|" \
+        r"expecting|waiting|trying|working|thinking)\b",
+        cleaned,
+        re.IGNORECASE,
+    ) and len(words) >= 4:
         return False
     return bool(re.search(r"[A-Za-z0-9]", cleaned))
 
@@ -851,6 +873,46 @@ class KuzuGraphStore:
     def _visible_attributes(raw: Any) -> bool:
         attrs = KuzuGraphStore._parse_attributes(raw)
         return not attrs or attrs.get("status") != "quarantined"
+
+    def memory_ids_for_query(self, query: str, limit: int = 100) -> List[str]:
+        """Return memory IDs linked to graph entities mentioned in *query*.
+
+        This is intentionally a bounded lexical bridge from normal memory
+        search into the graph. It does not replace vector/text retrieval; it
+        supplies graph-supported candidates and a stable relevance order.
+        """
+        stop_words = _GRAPH_STOP_ENTITIES | {
+            "about", "and", "are", "does", "from", "have", "into", "more",
+            "that", "the", "this", "what", "when", "where", "which", "with",
+        }
+        terms = []
+        seen_terms = set()
+        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", str(query or "").lower()):
+            if term in stop_words or term in seen_terms:
+                continue
+            seen_terms.add(term)
+            terms.append(term)
+            if len(terms) >= 8:
+                break
+        if not terms:
+            return []
+        scores: Dict[str, int] = {}
+        for term in terms:
+            for edge in self.search_graph(term, limit=max(10, min(limit, 100))):
+                attributes = edge.get("attributes") or {}
+                memory_ids = attributes.get("memory_ids", [])
+                if not isinstance(memory_ids, list):
+                    memory_ids = [memory_ids] if memory_ids else []
+                for memory_id in memory_ids:
+                    if memory_id:
+                        scores[str(memory_id)] = scores.get(str(memory_id), 0) + 2
+                for endpoint in (edge.get("source"), edge.get("target")):
+                    if str(endpoint).startswith("memory:"):
+                        memory_id = str(endpoint)[len("memory:"):]
+                        if memory_id:
+                            scores[memory_id] = scores.get(memory_id, 0) + 1
+        ordered = sorted(scores, key=lambda memory_id: (-scores[memory_id], memory_id))
+        return ordered[:max(1, min(int(limit), 500))]
 
     def query_graph(self, entity_id: str) -> List[Dict[str, Any]]:
         """Find visible edges touching an entity id (bidirectional).

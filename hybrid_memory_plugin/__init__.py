@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
 import traceback
 from pathlib import Path
@@ -354,9 +355,11 @@ class HybridMemoryProvider(MemoryProvider):
         self._prefetch_result: str = ""
         self._prefetch_done: bool = False
         self._prefetch_lock = threading.Lock()
-        # Sync state.
+        # Sync state: bounded queue + persistent worker.
+        self._sync_queue: "queue.Queue[Optional[tuple[str, str, str]]]" = queue.Queue(maxsize=3)
         self._sync_thread: Optional[threading.Thread] = None
         self._sync_lock = threading.Lock()
+        self._sync_worker_started = False
 
     @property
     def name(self) -> str:
@@ -810,7 +813,53 @@ class HybridMemoryProvider(MemoryProvider):
         if self._store is None:
             return
 
-        def _sync() -> None:
+        # Enqueue work for the persistent worker. If the queue is full,
+        # drop the oldest pending item to make room for the latest turn.
+        item = (user_content, assistant_content, session_id)
+        try:
+            self._sync_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._sync_queue.get_nowait()
+                self._sync_queue.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._sync_queue.put_nowait(item)
+            except queue.Full:
+                return  # extremely unlikely, just drop
+        self._ensure_sync_worker()
+
+    def _ensure_sync_worker(self) -> None:
+        """Start the persistent sync worker if it isn't running."""
+        with self._sync_lock:
+            if self._sync_worker_started and self._sync_thread and self._sync_thread.is_alive():
+                return
+            self._sync_worker_started = True
+            self._sync_thread = threading.Thread(
+                target=self._sync_worker_loop, daemon=True, name="hybrid-sync"
+            )
+            self._sync_thread.start()
+
+    def _sync_worker_loop(self) -> None:
+        """Process extraction/review items from the bounded queue."""
+        while True:
+            try:
+                item = self._sync_queue.get(timeout=10.0)
+            except queue.Empty:
+                # Idle for 10s; check if we should exit.
+                with self._sync_lock:
+                    if self._sync_queue.empty():
+                        self._sync_worker_started = False
+                        return
+                continue
+            if item is None:
+                # Sentinel to stop the worker.
+                self._sync_queue.task_done()
+                with self._sync_lock:
+                    self._sync_worker_started = False
+                return
+            user_content, assistant_content, session_id = item
             try:
                 facts = extract_from_turn(
                     user_content, assistant_content,
@@ -845,14 +894,8 @@ class HybridMemoryProvider(MemoryProvider):
                     )
             except Exception as e:
                 logger.warning("Sync turn proposal failed: %s", e)
-
-        with self._sync_lock:
-            if self._sync_thread and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=5.0)
-            if self._sync_thread and self._sync_thread.is_alive():
-                return
-            self._sync_thread = threading.Thread(target=_sync, daemon=True, name="hybrid-sync")
-            self._sync_thread.start()
+            finally:
+                self._sync_queue.task_done()
 
     # -- session end ---------------------------------------------------------
 
@@ -1234,6 +1277,11 @@ class HybridMemoryProvider(MemoryProvider):
     # -- shutdown ------------------------------------------------------------
 
     def shutdown(self) -> None:
+        # Signal the sync worker to stop and wait for it.
+        try:
+            self._sync_queue.put_nowait(None)
+        except queue.Full:
+            pass  # worker will exit on idle timeout
         for t in (self._prefetch_thread, self._sync_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)

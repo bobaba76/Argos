@@ -64,7 +64,7 @@ class MemoryService:
         model_name = str(
             config.get(
                 "local_embedding_model",
-                "sentence-transformers/bge-small-en-v1.5",
+                "BAAI/bge-small-en-v1.5",
             )
         )
         self.embedder = LocalEmbedder(model_name)

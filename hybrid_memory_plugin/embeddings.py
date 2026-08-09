@@ -1,6 +1,6 @@
 """Local sentence-transformers embedding wrapper with graceful fallback.
 
-Loads ``sentence-transformers/bge-small-en-v1.5`` lazily on first use.
+Loads ``BAAI/bge-small-en-v1.5`` lazily on first use.
 If the model or library is unavailable, ``embed()`` returns an empty list and
 the DuckDB store falls back to text search transparently.
 
@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "sentence-transformers/bge-small-en-v1.5"
+_DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
 # Process-level shared model cache: {model_name: (model, dim)}
 _SHARED_MODELS: Dict[str, Tuple[object, int]] = {}

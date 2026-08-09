@@ -70,7 +70,7 @@ def _load_model_name(home: Path) -> str:
                 return str(model)
         except Exception:
             pass
-    return "sentence-transformers/bge-small-en-v1.5"
+    return "BAAI/bge-small-en-v1.5"
 
 
 def _resolve_db_path(home: Path, override: str | None = None) -> Path:
@@ -179,7 +179,11 @@ def main() -> int:
         db_path.suffix + f".pre-reembed-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}.bak"
     )
     print(f"Backing up database to {backup_path}...")
+    # DuckDB holds a Windows file handle for the open connection, so close it
+    # before copying the database. Reopen it after the backup is complete.
+    conn.close()
     shutil.copy2(str(db_path), str(backup_path))
+    conn = duckdb.connect(str(db_path))
     print("Backup complete.")
     print()
 

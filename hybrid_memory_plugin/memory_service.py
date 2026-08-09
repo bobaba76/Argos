@@ -181,6 +181,8 @@ class MemoryService:
             return self.graph.remove_memory(**args)
         if method == "quarantine_junk_entities":
             return self.graph.quarantine_junk_entities()
+        if method == "clear_scope":
+            return list(self.graph.clear_scope())
         raise ValueError(f"Unsupported graph method: {method}")
 
     def dispatch(self, request: dict) -> Any:

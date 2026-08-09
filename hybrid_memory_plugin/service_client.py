@@ -324,5 +324,9 @@ class SharedGraphStore:
         """Alias for quarantine_junk_entities — matches KuzuGraphStore's method name."""
         return self.quarantine_junk_entities()
 
+    def clear_scope(self) -> tuple[int, int]:
+        result = self._rpc.call("graph", "clear_scope") or [0, 0]
+        return (int(result[0]), int(result[1]))
+
     def close(self) -> None:
         return None

@@ -1196,6 +1196,26 @@ class KuzuGraphStore:
             row = results.get_next()
             return int(row[0]) if row else 0
 
+    def clear_scope(self) -> tuple[int, int]:
+        """Delete all nodes and edges for the current user_scope.
+
+        Returns (remaining_nodes, remaining_edges) after deletion.
+        This is the first phase of a graph rebuild: clear, then re-index
+        from DuckDB.
+        """
+        with self._shared_conn_lock:
+            self.conn.execute(
+                "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) "
+                "WHERE r.user_scope = $scope DELETE r",
+                parameters={"scope": self.user_id},
+            )
+            self.conn.execute(
+                "MATCH (n:Entity) WHERE n.user_scope = $scope DELETE n",
+                parameters={"scope": self.user_id},
+            )
+        self._flush()
+        return (self.count_nodes(), self.count_edges())
+
     # -- maintenance ----------------------------------------------------------
 
     # Interrogative/stop words that are never valid entity ids.

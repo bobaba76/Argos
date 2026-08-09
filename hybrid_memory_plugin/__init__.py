@@ -70,7 +70,9 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "llm_fallback": "true",
         "auto_review": "true",
         "graph_aware_retrieval": "true",
-        "graph_retrieval_boost": "0.12",
+        "graph_retrieval_boost": "0.05",
+        "graph_inject_candidates": "false",
+        "graph_boost_min_similarity": "0.15",
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
@@ -333,7 +335,9 @@ class HybridMemoryProvider(MemoryProvider):
         self._llm_fallback: bool = True
         self._auto_review: bool = True
         self._graph_aware_retrieval: bool = True
-        self._graph_retrieval_boost: float = 0.12
+        self._graph_retrieval_boost: float = 0.05
+        self._graph_inject_candidates: bool = False
+        self._graph_boost_min_similarity: float = 0.15
         self._consolidation_enabled: bool = False
         self._consolidation_min_age_days: int = 30
         self._consolidation_max_actions: int = 25
@@ -410,7 +414,20 @@ class HybridMemoryProvider(MemoryProvider):
             {
                 "key": "graph_retrieval_boost",
                 "description": "Maximum graph-supported retrieval boost",
-                "default": "0.12",
+                "default": "0.05",
+                "required": False,
+            },
+            {
+                "key": "graph_inject_candidates",
+                "description": "Inject graph-only memories not found by semantic search",
+                "default": "false",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "graph_boost_min_similarity",
+                "description": "Minimum semantic similarity for a record to receive graph boost",
+                "default": "0.15",
                 "required": False,
             },
             {
@@ -484,10 +501,21 @@ class HybridMemoryProvider(MemoryProvider):
         )
         try:
             self._graph_retrieval_boost = max(
-                0.0, min(float(self._config.get("graph_retrieval_boost", 0.12)), 0.5)
+                0.0, min(float(self._config.get("graph_retrieval_boost", 0.05)), 0.5)
             )
         except (TypeError, ValueError):
-            self._graph_retrieval_boost = 0.12
+            self._graph_retrieval_boost = 0.05
+        graph_inject = self._config.get("graph_inject_candidates", "false")
+        self._graph_inject_candidates = (
+            graph_inject.lower() in ("true", "1", "yes")
+            if isinstance(graph_inject, str) else bool(graph_inject)
+        )
+        try:
+            self._graph_boost_min_similarity = max(
+                0.0, min(float(self._config.get("graph_boost_min_similarity", 0.15)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._graph_boost_min_similarity = 0.15
         consolidation_enabled = self._config.get("consolidation_enabled", "false")
         self._consolidation_enabled = (
             consolidation_enabled.lower() in ("true", "1", "yes")
@@ -621,16 +649,20 @@ class HybridMemoryProvider(MemoryProvider):
             )
             if graph_ids:
                 existing = {record.memory_id for record in results}
-                graph_records = self._store.get_memories_by_ids(graph_ids)
-                for record in graph_records:
-                    if record.memory_id not in existing:
-                        results.append(record)
+                if self._graph_inject_candidates:
+                    graph_records = self._store.get_memories_by_ids(graph_ids)
+                    for record in graph_records:
+                        if record.memory_id not in existing:
+                            results.append(record)
                 graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
+                graph_count = max(len(graph_ids), 1)
                 for record in results:
                     rank = graph_rank.get(record.memory_id)
                     if rank is None:
                         continue
-                    decay = 1.0 - (rank / max(len(graph_ids), 1))
+                    if record.similarity < self._graph_boost_min_similarity:
+                        continue
+                    decay = 1.0 - (rank / graph_count)
                     record.similarity += self._graph_retrieval_boost * max(0.0, decay)
                 results.sort(key=lambda record: record.similarity, reverse=True)
         except Exception as exc:

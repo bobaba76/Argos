@@ -1,0 +1,2193 @@
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index c822579fb97..cbb1f113470 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -1554,6 +1554,10 @@ def run_conversation(
+     _should_review_memory = _ctx.should_review_memory
+     _plugin_user_context = _ctx.plugin_user_context
+     _ext_prefetch_cache = _ctx.ext_prefetch_cache
++    _timestamp_hint = _ctx.timestamp_hint
++    _location_hint = _ctx.location_hint
++    _weather_hint = _ctx.weather_hint
++    _file_activity_hint = _ctx.file_activity_hint
+ 
+     # Commentary deduplication spans all provider continuations and tool calls
+     # within one user turn, but must not suppress the same phrase next turn.
+@@ -1877,6 +1881,10 @@ def run_conversation(
+                         api_msg.get("content", ""),
+                         _ext_prefetch_cache,
+                         _plugin_user_context,
++                        _timestamp_hint,
++                        _location_hint,
++                        _weather_hint,
++                        _file_activity_hint,
+                     )
+                     if _composed is not None:
+                         api_msg["content"] = _composed
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 7c36a923aab..cba86ba0e65 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -50,10 +50,110 @@ from agent.model_metadata import (
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _build_timestamp_hint() -> str:
++    """Render the per-turn local-time line, e.g. ``Current time: Friday 2026-07-31 19:55 SAST``.
++
++    Uses ``hermes_time.now()`` so the user's configured IANA timezone wins
++    (``HERMES_TIMEZONE`` env → ``config.yaml`` ``timezone`` → server-local).
++    Returns ``""`` on any failure so the injection path is unaffected — the
++    agent simply gets no time hint that turn. Kept to one short line (~10-15
++    tokens) for ambient awareness without per-turn overhead.
++    """
++    try:
++        from hermes_time import now as _hermes_now
++        _now = _hermes_now()
++        return "Current time: " + _now.strftime("%A %Y-%m-%d %H:%M %Z").strip()
++    except Exception:
++        return ""
++
++
++def _build_location_hint() -> str:
++    """Render the per-turn location line, e.g. ``Location: City-X``.
++
++    Resolves the location fresh each turn via ``hermes_location._resolve_location_name()``
++    (bypassing the module-level cache) so that a mid-session
++    ``hermes config set location "Riverton"`` is picked up on the very next
++    turn — even in a long-lived CLI session. The resolution is cheap: env
++    var check first, then ``read_raw_config()`` which is mtime/size-cached
++    (just a ``stat()`` per call, no YAML parse unless config.yaml changed).
++
++    Returns ``""`` when unset or on any failure — the injection path is
++    unaffected and the agent simply gets no location hint that turn. Kept to
++    one short line (~5-10 tokens) for ambient awareness. Free-form by design:
++    no geocoding, no coordinates, just a place name the model can reason about.
++    """
++    try:
++        from hermes_location import _resolve_location_name as _resolve
++        _loc = _resolve().strip()
++        return f"Location: {_loc}" if _loc else ""
++    except Exception:
++        return ""
++
++
++def _build_weather_hint() -> str:
++    """Render the per-turn weather line, e.g. ``Weather: 14°C, light rain``.
++
++    Uses ``hermes_weather.get_weather()`` which geocodes the configured
++    location and fetches current weather from Open-Meteo (free, no API key).
++    Cached for ~20 minutes so most turns are zero-network cache hits — a
++    cache miss is one HTTP call (~200-500ms), the same order as the memory
++    prefetch that already runs in the prologue.
++
++    Returns ``""`` when:
++      - Weather is disabled (``weather.enabled: false`` in config.yaml)
++      - No location is configured
++      - The network call fails or times out
++
++    The injection path is unaffected — the agent simply gets no weather line
++    that turn. Kept to one short line (~10 tokens) for ambient awareness.
++    """
++    try:
++        from hermes_weather import get_weather as _get_weather
++        _w = _get_weather().strip()
++        return f"Weather: {_w}" if _w else ""
++    except Exception:
++        return ""
++
++
++def _build_file_activity_hint() -> str:
++    """Render the per-turn file activity line, e.g. ``Last edited: ~/project/foo.py (4 min ago)``.
++
++    Uses ``hermes_file_activity.get_recent_files()`` which scans the
++    configured working directory (``terminal.cwd`` / ``TERMINAL_CWD``) for
++    recently modified files. Cached for ~5 minutes so most turns are
++    zero-I/O cache hits — a cache miss is a directory scan (~50-200ms),
++    the same order as the memory prefetch that already runs in the prologue.
++
++    Skips ``.git``, ``node_modules``, ``venv``, ``__pycache__``, etc. so the
++    hint reflects actual user work, not tool/cache churn.
++
++    Returns ``""`` when:
++      - File activity is disabled (``file_activity.enabled: false``)
++      - No working directory is configured
++      - No recent files found (nothing modified in the last 30 min)
++      - The scan fails (permissions, etc.)
++
++    The injection path is unaffected — the agent simply gets no file activity
++    line that turn. Kept to one short line (~15-20 tokens) for ambient
++    awareness. This is the "what was I just doing?" hint that bridges the gap
++    when the user messages from Telegram/Discord.
++    """
++    try:
++        from hermes_file_activity import get_recent_files as _get_recent
++        _r = _get_recent().strip()
++        return f"Last edited: {_r}" if _r else ""
++    except Exception:
++        return ""
++
++
+ def compose_user_api_content(
+     content: Any,
+     ext_prefetch_cache: str,
+     plugin_user_context: str,
++    timestamp_hint: str = "",
++    location_hint: str = "",
++    weather_hint: str = "",
++    file_activity_hint: str = "",
+ ) -> Optional[str]:
+     """Compose the API-bound content of the current turn's user message.
+ 
+@@ -68,12 +168,32 @@ def compose_user_api_content(
+     from the bytes on the wire — which is the whole prompt-cache invariant:
+     what turn N sends must be what turn N+1 replays.
+ 
++    ``timestamp_hint``, ``location_hint``, ``weather_hint`` and
++    ``file_activity_hint`` are short ambient lines ("Current time: ..." /
++    "Location: ..." / "Weather: ..." / "Last edited: ...") resolved once per
++    turn from ``hermes_time.now()`` / ``hermes_location._resolve_location_name()``
++    / ``hermes_weather.get_weather()`` / ``hermes_file_activity.get_recent_files()``
++    (the user's local timezone, configured location, current weather, and
++    recently modified files). They ride the same per-turn injection path as
++    memory context so the cached system prompt stays byte-stable, and they
++    land on the API copy only — each turn's user message carries its own
++    hints in its sidecar, so on replay the historical hints are preserved
++    and the latest user message always shows the current values.
++
+     Returns ``None`` when nothing is injected (multimodal/non-string content,
+     or no ephemeral context), meaning the message is sent as-is.
+     """
+     if not isinstance(content, str):
+         return None
+     injections = []
++    if timestamp_hint:
++        injections.append(timestamp_hint)
++    if location_hint:
++        injections.append(location_hint)
++    if weather_hint:
++        injections.append(weather_hint)
++    if file_activity_hint:
++        injections.append(file_activity_hint)
+     if ext_prefetch_cache:
+         fenced = build_memory_context_block(ext_prefetch_cache)
+         if fenced:
+@@ -423,6 +543,21 @@ class TurnContext:
+     plugin_user_context: str = ""
+     # External-memory prefetch result, reused across loop iterations.
+     ext_prefetch_cache: str = ""
++    # Per-turn "Current time: ..." line (user's local TZ). Empty when the
++    # clock could not be read. Rides the api_content injection path so the
++    # cached system prompt stays byte-stable while the agent stays time-aware.
++    timestamp_hint: str = ""
++    # Per-turn "Location: ..." line (user's configured location). Empty when
++    # no location is configured. Same injection path as timestamp_hint.
++    location_hint: str = ""
++    # Per-turn "Weather: ..." line (current weather at the configured
++    # location). Empty when disabled, no location, or the network lookup
++    # fails. Same injection path as timestamp_hint. Cached ~20 min.
++    weather_hint: str = ""
++    # Per-turn "Last edited: ..." line (recently modified files in the
++    # working directory). Empty when disabled, no recent files, or the scan
++    # fails. Same injection path as timestamp_hint. Cached ~5 min.
++    file_activity_hint: str = ""
+     # Turn-start preflight already proved an immediate retry ineffective.
+     preflight_compression_blocked: bool = False
+ 
+@@ -1266,6 +1401,19 @@ def build_turn_context(
+         except Exception:
+             pass
+ 
++    # Per-turn local-time + location hints. Resolved once here (not inside
++    # compose_user_api_content) so the prologue stamp and any live compose in
++    # the loop emit identical bytes — a per-call now()/get_location() could
++    # drift and break the api_content/wire byte-stability invariant. Both
++    # ride the same injection path as memory context so the cached system
++    # prompt is untouched; the system prompt already carries a date-only line
++    # for byte-stability-across-the-day, these add minute-precision time and
++    # a place name per turn.
++    timestamp_hint = _build_timestamp_hint()
++    location_hint = _build_location_hint()
++    weather_hint = _build_weather_hint()
++    file_activity_hint = _build_file_activity_hint()
++
+     # ── api_content sidecar: persist what you send ──
+     # The prefetch/plugin context above is injected into the API copy of this
+     # turn's user message, never into the stored content — so on the next
+@@ -1291,7 +1439,13 @@ def build_turn_context(
+     ):
+         _turn_user_msg = messages[current_turn_user_idx]
+         _api_content = compose_user_api_content(
+-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
++            _turn_user_msg.get("content", ""),
++            ext_prefetch_cache,
++            plugin_user_context,
++            timestamp_hint,
++            location_hint,
++            weather_hint,
++            file_activity_hint,
+         )
+         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
+             _turn_user_msg["api_content"] = _api_content
+@@ -1374,5 +1528,9 @@ def build_turn_context(
+         should_review_memory=should_review_memory,
+         plugin_user_context=plugin_user_context,
+         ext_prefetch_cache=ext_prefetch_cache,
++        timestamp_hint=timestamp_hint,
++        location_hint=location_hint,
++        weather_hint=weather_hint,
++        file_activity_hint=file_activity_hint,
+         preflight_compression_blocked=_preflight_compression_blocked,
+     )
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 77d93bea044..bfb4b7b7ebb 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -2745,8 +2745,53 @@ function forceKillProcessTree(pid) {
+   try {
+     execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
+   } catch {
+-    // Already gone, or no permission — best effort; the unlock wait below is
+-    // the real gate.
++    // The tracked PID may already be gone. On Windows, a venv python.exe is a
++    // launcher stub that spawns the real interpreter as a CHILD and then exits.
++    // By the time we kill on quit, the launcher (the PID we tracked) is already
++    // dead and taskkill /T finds nothing to tree-kill — leaving the real Python
++    // process orphaned, holding the DuckDB file lock forever (WAL never
++    // checkpoints). Find detached `hermes_cli.main serve` processes directly.
++    let processOutput = ''
++    try {
++      processOutput = execFileSync(
++        'wmic',
++        ['process', 'where', "name='python.exe'", 'get', 'ProcessId,CommandLine', '/format:csv'],
++        hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
++      )
++    } catch {
++      try {
++        processOutput = execFileSync(
++          'powershell.exe',
++          [
++            '-NoProfile',
++            '-NonInteractive',
++            '-Command',
++            "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | " +
++              "Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'hermes_cli\\.main\\s+serve' } | " +
++              'Select-Object -ExpandProperty ProcessId'
++          ],
++          hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
++        )
++      } catch {
++        processOutput = ''
++      }
++    }
++
++    for (const line of String(processOutput).split(/\r?\n/)) {
++      const trimmed = line.trim()
++      const parts = trimmed.split(',')
++      const orphanPid = /^\d+$/.test(trimmed)
++        ? parseInt(trimmed, 10)
++        : parseInt(parts[parts.length - 1], 10)
++      const isTargeted = /^\d+$/.test(trimmed) || (trimmed.includes('hermes_cli.main') && trimmed.includes('serve'))
++      if (Number.isInteger(orphanPid) && orphanPid > 0 && isTargeted) {
++        try {
++          execFileSync('taskkill', ['/PID', String(orphanPid), '/F'], hiddenWindowsChildOptions({ stdio: 'ignore' }))
++        } catch {
++          // Already gone — best effort.
++        }
++      }
++    }
+   }
+ }
+ 
+@@ -12597,3 +12642,16 @@ app.on('window-all-closed', () => {
+     app.quit()
+   }
+ })
++
++// Safety net: before-quit can be skipped entirely when heldQuitForActiveWork
++// returns early (user clicks "Keep Running"), and on Windows the venv launcher
++// PID we tracked may already be gone by the time we try to kill it (the
++// launcher spawns the real interpreter as a child and exits). will-quit fires
++// after all windows are closed and is the last chance for cleanup before the
++// process exits. Re-running stopBackendChild here is safe — it no-ops if the
++// child is already killed — and forceKillProcessTree's wmic fallback catches
++// orphaned `hermes serve` processes that the tracked PID can't reach.
++app.on('will-quit', () => {
++  stopBackendChild(backendConnectionState.getProcess())
++  stopAllPoolBackends()
++})
+diff --git a/gateway/run.py b/gateway/run.py
+index 52df713f7f4..91cb3e83342 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2266,6 +2266,12 @@ if _config_path.exists():
+         _tz_cfg = _cfg.get("timezone", "")
+         if _tz_cfg and isinstance(_tz_cfg, str):
+             os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
++        # Location: bridge config.yaml → HERMES_LOCATION env var (same pattern
++        # as timezone above) so the per-turn location hint resolves in the
++        # agent subprocess without re-reading config.yaml on every turn.
++        _loc_cfg = _cfg.get("location", "")
++        if _loc_cfg and isinstance(_loc_cfg, str):
++            os.environ["HERMES_LOCATION"] = _loc_cfg.strip()
+         # Security settings
+         _security_cfg = _cfg.get("security", {})
+         if isinstance(_security_cfg, dict):
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 8b5ef69c902..d0d952232ee 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1941,6 +1941,35 @@ DEFAULT_CONFIG = {
+     # Empty string means use server-local time.
+     "timezone": "",
+ 
++    # User's location (free-form city/place name, e.g.  "City-X", "Riverton, ZA").
++    # Empty string means no location hint is injected. Used for ambient context
++    # so the agent can reason about "your morning" / local relevance without
++    # asking. Set with: hermes config set location  "City-X"
++    "location": "",
++
++    # Weather ambient context. When enabled (default) and a location is set,
++    # a short weather line ("Weather: 14°C, light rain") is injected per turn
++    # alongside the time and location hints. Uses Open-Meteo (free, no API
++    # key). Cached for ~20 minutes so most turns are zero-network cache hits.
++    # Disable with: hermes config set weather.enabled false
++    "weather": {
++        "enabled": True,
++    },
++
++    # File activity ambient context. When enabled (default), scans the
++    # terminal working directory for recently modified files and injects
++    # a short hint like "Last edited: ~/project/foo.py (4 min ago)".
++    # Cached for ~5 minutes so most turns are zero-scan cache hits. Skips
++    # .git, node_modules, venv, __pycache__, etc. so the hint reflects actual
++    # user work, not tool/cache churn.
++    # Disable with: hermes config set file_activity.enabled false
++    "file_activity": {
++        "enabled": True,
++        "directories": [],       # Optional: override terminal.cwd with custom list
++        "max_files": 5,          # Max recent files to report
++        "max_age_minutes": 30,   # Only files modified within this window
++    },
++
+     # Slack platform settings (gateway mode)
+     "slack": {
+         "require_mention": True,       # Require @mention to respond in channels
+diff --git a/plugins/memory/__init__.py b/plugins/memory/__init__.py
+index 53eeb998a0e..1453fd17659 100644
+--- a/plugins/memory/__init__.py
++++ b/plugins/memory/__init__.py
+@@ -1,461 +1,505 @@
+-"""Memory provider plugin discovery.
+-
+-Scans two directories for memory provider plugins:
+-
+-1. Bundled providers: ``plugins/memory/<name>/`` (shipped with hermes-agent)
+-2. User-installed providers: ``$HERMES_HOME/plugins/<name>/``
+-
+-Each subdirectory must contain ``__init__.py`` with a class implementing
+-the MemoryProvider ABC.  On name collisions, bundled providers take
+-precedence.
+-
+-Only ONE provider can be active at a time, selected via
+-``memory.provider`` in config.yaml.
+-
+-Usage:
+-    from plugins.memory import discover_memory_providers, load_memory_provider
+-
+-    available = discover_memory_providers()   # [(name, desc, available), ...]
+-    provider = load_memory_provider("mnemosyne")  # MemoryProvider instance
+-"""
+-
+-from __future__ import annotations
+-
+-import importlib
+-import importlib.machinery
+-import importlib.util
+-import logging
+-import sys
+-from pathlib import Path
+-from typing import List, Optional, Tuple
+-from hermes_cli.config import cfg_get
+-
+-logger = logging.getLogger(__name__)
+-
+-_MEMORY_PLUGINS_DIR = Path(__file__).parent
+-
+-# Synthetic parent package for user-installed providers, so they don't
+-# collide with bundled providers in sys.modules.
+-_USER_NAMESPACE = "_hermes_user_memory"
+-
+-
+-def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
+-    """Register an empty package shell in sys.modules.
+-
+-    User-installed providers import as ``_hermes_user_memory.<name>``, a
+-    dotted name whose parents exist nowhere on disk.  Unless those parents
+-    are present in ``sys.modules``, any relative import inside the plugin
+-    (``from . import config``) fails with
+-    ``ModuleNotFoundError: No module named '_hermes_user_memory'`` — the
+-    same reason the loader already registers ``plugins`` and
+-    ``plugins.memory`` for bundled providers.
+-    """
+-    if name in sys.modules:
+-        return
+-    spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
+-    spec.submodule_search_locations = search_locations
+-    sys.modules[name] = importlib.util.module_from_spec(spec)
+-
+-
+-# ---------------------------------------------------------------------------
+-# Directory helpers
+-# ---------------------------------------------------------------------------
+-
+-def _get_user_plugins_dir() -> Optional[Path]:
+-    """Return ``$HERMES_HOME/plugins/`` or None if unavailable."""
+-    try:
+-        from hermes_constants import get_hermes_home
+-        d = get_hermes_home() / "plugins"
+-        return d if d.is_dir() else None
+-    except Exception:
+-        return None
+-
+-
+-def _is_memory_provider_dir(path: Path) -> bool:
+-    """Heuristic: does *path* look like a memory provider plugin?
+-
+-    Checks for ``register_memory_provider`` or ``MemoryProvider`` in the
+-    ``__init__.py`` source.  Cheap text scan — no import needed.
+-    """
+-    init_file = path / "__init__.py"
+-    if not init_file.exists():
+-        return False
+-    try:
+-        source = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
+-        return "register_memory_provider" in source or "MemoryProvider" in source
+-    except Exception:
+-        return False
+-
+-
+-def _iter_provider_dirs() -> List[Tuple[str, Path]]:
+-    """Yield ``(name, path)`` for all discovered provider directories.
+-
+-    Scans bundled first, then user-installed.  Bundled takes precedence
+-    on name collisions (first-seen wins via ``seen`` set).
+-    """
+-    seen: set = set()
+-    dirs: List[Tuple[str, Path]] = []
+-
+-    # 1. Bundled providers (plugins/memory/<name>/)
+-    if _MEMORY_PLUGINS_DIR.is_dir():
+-        for child in sorted(_MEMORY_PLUGINS_DIR.iterdir()):
+-            if not child.is_dir() or child.name.startswith(("_", ".")):
+-                continue
+-            if not (child / "__init__.py").exists():
+-                continue
+-            seen.add(child.name)
+-            dirs.append((child.name, child))
+-
+-    # 2. User-installed providers ($HERMES_HOME/plugins/<name>/)
+-    user_dir = _get_user_plugins_dir()
+-    if user_dir:
+-        for child in sorted(user_dir.iterdir()):
+-            if not child.is_dir() or child.name.startswith(("_", ".")):
+-                continue
+-            if child.name in seen:
+-                continue  # bundled takes precedence
+-            if not _is_memory_provider_dir(child):
+-                continue  # skip non-memory plugins
+-            dirs.append((child.name, child))
+-
+-    return dirs
+-
+-
+-def find_provider_dir(name: str) -> Optional[Path]:
+-    """Resolve a provider name to its directory.
+-
+-    Checks bundled first, then user-installed.
+-    """
+-    # Bundled
+-    bundled = _MEMORY_PLUGINS_DIR / name
+-    if bundled.is_dir() and (bundled / "__init__.py").exists():
+-        return bundled
+-    # User-installed
+-    user_dir = _get_user_plugins_dir()
+-    if user_dir:
+-        user = user_dir / name
+-        if user.is_dir() and _is_memory_provider_dir(user):
+-            return user
+-    return None
+-
+-
+-# ---------------------------------------------------------------------------
+-# Public API
+-# ---------------------------------------------------------------------------
+-
+-def list_memory_provider_names() -> List[str]:
+-    """Cheap name-only listing of discoverable memory providers.
+-
+-    Unlike :func:`discover_memory_providers`, this does NOT import provider
+-    modules or run availability checks — it's a directory scan only, safe to
+-    call at module-import time (e.g. when building the dashboard config
+-    schema).
+-    """
+-    return sorted({name for name, _ in _iter_provider_dirs()})
+-
+-
+-def discover_memory_providers() -> List[Tuple[str, str, bool]]:
+-    """Scan bundled and user-installed directories for available providers.
+-
+-    Returns list of (name, description, is_available) tuples.
+-    Bundled providers take precedence on name collisions.
+-    """
+-    results = []
+-
+-    for name, child in _iter_provider_dirs():
+-        # Read description from plugin.yaml if available
+-        desc = ""
+-        yaml_file = child / "plugin.yaml"
+-        if yaml_file.exists():
+-            try:
+-                import yaml
+-                with open(yaml_file, encoding="utf-8-sig") as f:
+-                    meta = yaml.safe_load(f) or {}
+-                desc = meta.get("description", "")
+-            except Exception:
+-                pass
+-
+-        # Quick availability check — try loading and calling is_available()
+-        available = True
+-        try:
+-            provider = _load_provider_from_dir(child)
+-            if provider:
+-                available = provider.is_available()
+-            else:
+-                available = False
+-        except Exception:
+-            available = False
+-
+-        results.append((name, desc, available))
+-
+-    return results
+-
+-
+-def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
+-    """Load and return a MemoryProvider instance by name.
+-
+-    Checks both bundled (``plugins/memory/<name>/``) and user-installed
+-    (``$HERMES_HOME/plugins/<name>/``) directories.  Bundled takes
+-    precedence on name collisions.
+-
+-    Returns None if the provider is not found or fails to load.
+-    """
+-    provider_dir = find_provider_dir(name)
+-    if not provider_dir:
+-        logger.debug("Memory provider '%s' not found in bundled or user plugins", name)
+-        return None
+-
+-    try:
+-        provider = _load_provider_from_dir(provider_dir)
+-        if provider:
+-            return provider
+-        logger.warning("Memory provider '%s' loaded but no provider instance found", name)
+-        return None
+-    except Exception as e:
+-        logger.warning("Failed to load memory provider '%s': %s", name, e)
+-        return None
+-
+-
+-def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
+-    """Import a provider module and extract the MemoryProvider instance.
+-
+-    The module must have either:
+-    - A register(ctx) function (plugin-style) — we simulate a ctx
+-    - A top-level class that extends MemoryProvider — we instantiate it
+-    """
+-    name = provider_dir.name
+-    # Use a separate namespace for user-installed plugins so they don't
+-    # collide with bundled providers in sys.modules.
+-    _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
+-    module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
+-    init_file = provider_dir / "__init__.py"
+-
+-    if not init_file.exists():
+-        return None
+-
+-    # Check if already loaded.  A synthetic package shell registered by
+-    # discover_plugin_cli_commands() for relative-import support has no
+-    # __file__; only reuse modules that were actually loaded from disk.
+-    cached = sys.modules.get(module_name)
+-    if cached is not None and getattr(cached, "__file__", None):
+-        mod = cached
+-    else:
+-        # Handle relative imports within the plugin
+-        # First ensure the parent packages are registered
+-        for parent in ("plugins", "plugins.memory"):
+-            if parent not in sys.modules:
+-                parent_path = Path(__file__).parent
+-                if parent == "plugins":
+-                    parent_path = parent_path.parent
+-                parent_init = parent_path / "__init__.py"
+-                if parent_init.exists():
+-                    spec = importlib.util.spec_from_file_location(
+-                        parent, str(parent_init),
+-                        submodule_search_locations=[str(parent_path)]
+-                    )
+-                    if spec:
+-                        parent_mod = importlib.util.module_from_spec(spec)
+-                        sys.modules[parent] = parent_mod
+-                        try:
+-                            spec.loader.exec_module(parent_mod)
+-                        except Exception:
+-                            pass
+-
+-        # User-installed plugins need their synthetic parent registered the
+-        # same way, or relative imports inside the plugin cannot resolve.
+-        if not _is_bundled:
+-            _register_synthetic_package(_USER_NAMESPACE, [])
+-
+-        # Now load the provider module
+-        spec = importlib.util.spec_from_file_location(
+-            module_name, str(init_file),
+-            submodule_search_locations=[str(provider_dir)]
+-        )
+-        if not spec:
+-            return None
+-
+-        mod = importlib.util.module_from_spec(spec)
+-        sys.modules[module_name] = mod
+-
+-        # Register submodules so relative imports work
+-        # e.g., "from .store import MemoryStore" in holographic plugin
+-        for sub_file in provider_dir.glob("*.py"):
+-            if sub_file.name == "__init__.py":
+-                continue
+-            sub_name = sub_file.stem
+-            full_sub_name = f"{module_name}.{sub_name}"
+-            if full_sub_name not in sys.modules:
+-                sub_spec = importlib.util.spec_from_file_location(
+-                    full_sub_name, str(sub_file)
+-                )
+-                if sub_spec:
+-                    sub_mod = importlib.util.module_from_spec(sub_spec)
+-                    sys.modules[full_sub_name] = sub_mod
+-                    try:
+-                        sub_spec.loader.exec_module(sub_mod)
+-                    except Exception as e:
+-                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
+-
+-        try:
+-            spec.loader.exec_module(mod)
+-        except Exception as e:
+-            logger.debug("Failed to exec_module %s: %s", module_name, e)
+-            sys.modules.pop(module_name, None)
+-            return None
+-
+-    # Try register(ctx) pattern first (how our plugins are written)
+-    if hasattr(mod, "register"):
+-        collector = _ProviderCollector()
+-        try:
+-            mod.register(collector)
+-            if collector.provider:
+-                return collector.provider
+-        except Exception as e:
+-            logger.debug("register() failed for %s: %s", name, e)
+-
+-    # Fallback: find a MemoryProvider subclass and instantiate it
+-    from agent.memory_provider import MemoryProvider
+-    for attr_name in dir(mod):
+-        attr = getattr(mod, attr_name, None)
+-        if (isinstance(attr, type) and issubclass(attr, MemoryProvider)
+-                and attr is not MemoryProvider):
+-            try:
+-                return attr()
+-            except Exception:
+-                pass
+-
+-    return None
+-
+-
+-class _ProviderCollector:
+-    """Fake plugin context that captures register_memory_provider calls."""
+-
+-    def __init__(self):
+-        self.provider = None
+-
+-    def register_memory_provider(self, provider):
+-        self.provider = provider
+-
+-    # No-op for other registration methods
+-    def register_tool(self, *args, **kwargs):
+-        pass
+-
+-    def register_hook(self, *args, **kwargs):
+-        pass
+-
+-    def register_cli_command(self, *args, **kwargs):
+-        pass  # CLI registration happens via discover_plugin_cli_commands()
+-
+-
+-def _get_active_memory_provider() -> Optional[str]:
+-    """Read the active memory provider name from config.yaml.
+-
+-    Returns the provider name (e.g. ``"honcho"``) or None if no
+-    external provider is configured.  Lightweight — only reads config,
+-    no plugin loading.
+-    """
+-    try:
+-        from hermes_cli.config import load_config
+-        config = load_config()
+-        return cfg_get(config, "memory", "provider") or None
+-    except Exception:
+-        return None
+-
+-
+-def discover_plugin_cli_commands() -> List[dict]:
+-    """Return CLI commands for the **active** memory plugin only.
+-
+-    Only one memory provider can be active at a time (set via
+-    ``memory.provider`` in config.yaml).  This function reads that
+-    value and only loads CLI registration for the matching plugin.
+-    If no provider is active, no commands are registered.
+-
+-    Looks for a ``register_cli(subparser)`` function in the active
+-    plugin's ``cli.py``.  Returns a list of at most one dict with
+-    keys: ``name``, ``help``, ``description``, ``setup_fn``,
+-    ``handler_fn``.
+-
+-    This is a lightweight scan — it only imports ``cli.py``, not the
+-    full plugin module.  Safe to call during argparse setup before
+-    any provider is loaded.
+-    """
+-    results: List[dict] = []
+-    if not _MEMORY_PLUGINS_DIR.is_dir():
+-        return results
+-
+-    active_provider = _get_active_memory_provider()
+-    if not active_provider:
+-        return results
+-
+-    # Only look at the active provider's directory
+-    plugin_dir = find_provider_dir(active_provider)
+-    if not plugin_dir:
+-        return results
+-
+-    cli_file = plugin_dir / "cli.py"
+-    if not cli_file.exists():
+-        return results
+-
+-    _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
+-    module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"{_USER_NAMESPACE}.{active_provider}.cli"
+-    try:
+-        # Import the CLI module (lightweight — no SDK needed)
+-        if module_name in sys.modules:
+-            cli_mod = sys.modules[module_name]
+-        else:
+-            if not _is_bundled:
+-                # cli.py imports as _hermes_user_memory.<name>.cli, usually
+-                # before the provider itself is loaded.  Register its parent
+-                # packages so relative imports inside cli.py
+-                # ("from . import config") resolve without executing the
+-                # plugin's __init__.py.  The package shell has no __file__,
+-                # so _load_provider_from_dir() will still load the real
+-                # module later instead of reusing the shell.
+-                _register_synthetic_package(_USER_NAMESPACE, [])
+-                _register_synthetic_package(
+-                    f"{_USER_NAMESPACE}.{active_provider}", [str(plugin_dir)]
+-                )
+-            spec = importlib.util.spec_from_file_location(
+-                module_name, str(cli_file)
+-            )
+-            if not spec or not spec.loader:
+-                return results
+-            cli_mod = importlib.util.module_from_spec(spec)
+-            sys.modules[module_name] = cli_mod
+-            spec.loader.exec_module(cli_mod)
+-
+-        register_cli = getattr(cli_mod, "register_cli", None)
+-        if not callable(register_cli):
+-            return results
+-
+-        # Read metadata from plugin.yaml if available
+-        help_text = f"Manage {active_provider} memory plugin"
+-        description = ""
+-        yaml_file = plugin_dir / "plugin.yaml"
+-        if yaml_file.exists():
+-            try:
+-                import yaml
+-                with open(yaml_file, encoding="utf-8-sig") as f:
+-                    meta = yaml.safe_load(f) or {}
+-                desc = meta.get("description", "")
+-                if desc:
+-                    help_text = desc
+-                    description = desc
+-            except Exception:
+-                pass
+-
+-        handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
+-                     getattr(cli_mod, "honcho_command", None)
+-
+-        results.append({
+-            "name": active_provider,
+-            "help": help_text,
+-            "description": description,
+-            "setup_fn": register_cli,
+-            "handler_fn": handler_fn,
+-            "plugin": active_provider,
+-        })
+-    except Exception as e:
+-        logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
+-
+-    return results
++"""Memory provider plugin discovery.
++
++Scans two directories for memory provider plugins:
++
++1. Bundled providers: ``plugins/memory/<name>/`` (shipped with hermes-agent)
++2. User-installed providers: ``$HERMES_HOME/plugins/<name>/``
++
++Each subdirectory must contain ``__init__.py`` with a class implementing
++the MemoryProvider ABC.  On name collisions, bundled providers take
++precedence.
++
++Only ONE provider can be active at a time, selected via
++``memory.provider`` in config.yaml.
++
++Usage:
++    from plugins.memory import discover_memory_providers, load_memory_provider
++
++    available = discover_memory_providers()   # [(name, desc, available), ...]
++    provider = load_memory_provider("mnemosyne")  # MemoryProvider instance
++"""
++
++from __future__ import annotations
++
++import importlib
++import importlib.machinery
++import importlib.util
++import logging
++import sys
++from pathlib import Path
++from typing import List, Optional, Tuple
++from hermes_cli.config import cfg_get
++
++logger = logging.getLogger(__name__)
++
++_MEMORY_PLUGINS_DIR = Path(__file__).parent
++
++# Synthetic parent package for user-installed providers, so they don't
++# collide with bundled providers in sys.modules.
++_USER_NAMESPACE = "_hermes_user_memory"
++
++
++def _register_synthetic_package(name: str, search_locations: List[str]) -> None:
++    """Register an empty package shell in sys.modules.
++
++    User-installed providers import as ``_hermes_user_memory.<name>``, a
++    dotted name whose parents exist nowhere on disk.  Unless those parents
++    are present in ``sys.modules``, any relative import inside the plugin
++    (``from . import config``) fails with
++    ``ModuleNotFoundError: No module named '_hermes_user_memory'`` — the
++    same reason the loader already registers ``plugins`` and
++    ``plugins.memory`` for bundled providers.
++    """
++    if name in sys.modules:
++        return
++    spec = importlib.machinery.ModuleSpec(name, None, is_package=True)
++    spec.submodule_search_locations = search_locations
++    sys.modules[name] = importlib.util.module_from_spec(spec)
++
++
++# ---------------------------------------------------------------------------
++# Directory helpers
++# ---------------------------------------------------------------------------
++
++def _get_user_plugins_dir() -> Optional[Path]:
++    """Return ``$HERMES_HOME/plugins/`` or None if unavailable."""
++    try:
++        from hermes_constants import get_hermes_home
++        d = get_hermes_home() / "plugins"
++        return d if d.is_dir() else None
++    except Exception:
++        return None
++
++
++def _is_memory_provider_dir(path: Path) -> bool:
++    """Heuristic: does *path* look like a memory provider plugin?
++
++    Checks for ``register_memory_provider`` or ``MemoryProvider`` in the
++    ``__init__.py`` source.  Cheap text scan — no import needed.
++    """
++    init_file = path / "__init__.py"
++    if not init_file.exists():
++        return False
++    try:
++        source = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
++        return "register_memory_provider" in source or "MemoryProvider" in source
++    except Exception:
++        return False
++
++
++def _iter_provider_dirs() -> List[Tuple[str, Path]]:
++    """Yield ``(name, path)`` for all discovered provider directories.
++
++    Scans bundled first, then user-installed.  Bundled takes precedence
++    on name collisions (first-seen wins via ``seen`` set).
++    """
++    seen: set = set()
++    dirs: List[Tuple[str, Path]] = []
++
++    # 1. Bundled providers (plugins/memory/<name>/)
++    if _MEMORY_PLUGINS_DIR.is_dir():
++        for child in sorted(_MEMORY_PLUGINS_DIR.iterdir()):
++            if not child.is_dir() or child.name.startswith(("_", ".")):
++                continue
++            if not (child / "__init__.py").exists():
++                continue
++            seen.add(child.name)
++            dirs.append((child.name, child))
++
++    # 2. User-installed providers ($HERMES_HOME/plugins/<name>/)
++    user_dir = _get_user_plugins_dir()
++    if user_dir:
++        for child in sorted(user_dir.iterdir()):
++            if not child.is_dir() or child.name.startswith(("_", ".")):
++                continue
++            if child.name in seen:
++                continue  # bundled takes precedence
++            if not _is_memory_provider_dir(child):
++                continue  # skip non-memory plugins
++            dirs.append((child.name, child))
++
++    return dirs
++
++
++def find_provider_dir(name: str) -> Optional[Path]:
++    """Resolve a provider name to its directory.
++
++    Checks bundled first, then user-installed.
++    """
++    # Bundled
++    bundled = _MEMORY_PLUGINS_DIR / name
++    if bundled.is_dir() and (bundled / "__init__.py").exists():
++        return bundled
++    # User-installed
++    user_dir = _get_user_plugins_dir()
++    if user_dir:
++        user = user_dir / name
++        if user.is_dir() and _is_memory_provider_dir(user):
++            return user
++    return None
++
++
++# ---------------------------------------------------------------------------
++# Public API
++# ---------------------------------------------------------------------------
++
++def list_memory_provider_names() -> List[str]:
++    """Cheap name-only listing of discoverable memory providers.
++
++    Unlike :func:`discover_memory_providers`, this does NOT import provider
++    modules or run availability checks — it's a directory scan only, safe to
++    call at module-import time (e.g. when building the dashboard config
++    schema).
++    """
++    return sorted({name for name, _ in _iter_provider_dirs()})
++
++
++def discover_memory_providers() -> List[Tuple[str, str, bool]]:
++    """Scan bundled and user-installed directories for available providers.
++
++    Returns list of (name, description, is_available) tuples.
++    Bundled providers take precedence on name collisions.
++    """
++    results = []
++
++    for name, child in _iter_provider_dirs():
++        # Read description from plugin.yaml if available
++        desc = ""
++        yaml_file = child / "plugin.yaml"
++        if yaml_file.exists():
++            try:
++                import yaml
++                with open(yaml_file, encoding="utf-8-sig") as f:
++                    meta = yaml.safe_load(f) or {}
++                desc = meta.get("description", "")
++            except Exception:
++                pass
++
++        # Quick availability check — try loading and calling is_available()
++        available = True
++        try:
++            provider = _load_provider_from_dir(child)
++            if provider:
++                available = provider.is_available()
++            else:
++                available = False
++        except Exception:
++            available = False
++
++        results.append((name, desc, available))
++
++    return results
++
++
++def load_memory_provider(name: str) -> Optional["MemoryProvider"]:
++    """Load and return a MemoryProvider instance by name.
++
++    Checks both bundled (``plugins/memory/<name>/``) and user-installed
++    (``$HERMES_HOME/plugins/<name>/``) directories.  Bundled takes
++    precedence on name collisions.
++
++    Returns None if the provider is not found or fails to load.
++    """
++    provider_dir = find_provider_dir(name)
++    if not provider_dir:
++        logger.debug("Memory provider '%s' not found in bundled or user plugins", name)
++        return None
++
++    try:
++        provider = _load_provider_from_dir(provider_dir)
++        if provider:
++            return provider
++        logger.warning("Memory provider '%s' loaded but no provider instance found", name)
++        return None
++    except Exception as e:
++        logger.warning("Failed to load memory provider '%s': %s", name, e)
++        return None
++
++
++def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
++    """Import a provider module and extract the MemoryProvider instance.
++
++    The module must have either:
++    - A register(ctx) function (plugin-style) — we simulate a ctx
++    - A top-level class that extends MemoryProvider — we instantiate it
++    """
++    name = provider_dir.name
++    # Use a separate namespace for user-installed plugins so they don't
++    # collide with bundled providers in sys.modules.
++    _is_bundled = _MEMORY_PLUGINS_DIR in provider_dir.parents or provider_dir.parent == _MEMORY_PLUGINS_DIR
++    module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
++    init_file = provider_dir / "__init__.py"
++
++    if not init_file.exists():
++        return None
++
++    # Check if already loaded.  A synthetic package shell registered by
++    # discover_plugin_cli_commands() for relative-import support has no
++    # __file__; only reuse modules that were actually loaded from disk.
++    cached = sys.modules.get(module_name)
++    if cached is not None and getattr(cached, "__file__", None):
++        mod = cached
++    else:
++        # Handle relative imports within the plugin
++        # First ensure the parent packages are registered
++        for parent in ("plugins", "plugins.memory"):
++            if parent not in sys.modules:
++                parent_path = Path(__file__).parent
++                if parent == "plugins":
++                    parent_path = parent_path.parent
++                parent_init = parent_path / "__init__.py"
++                if parent_init.exists():
++                    spec = importlib.util.spec_from_file_location(
++                        parent, str(parent_init),
++                        submodule_search_locations=[str(parent_path)]
++                    )
++                    if spec:
++                        parent_mod = importlib.util.module_from_spec(spec)
++                        sys.modules[parent] = parent_mod
++                        try:
++                            spec.loader.exec_module(parent_mod)
++                        except Exception:
++                            pass
++
++        # User-installed plugins need their synthetic parent registered the
++        # same way, or relative imports inside the plugin cannot resolve.
++        if not _is_bundled:
++            _register_synthetic_package(_USER_NAMESPACE, [])
++
++        # Now load the provider module
++        spec = importlib.util.spec_from_file_location(
++            module_name, str(init_file),
++            submodule_search_locations=[str(provider_dir)]
++        )
++        if not spec:
++            return None
++
++        mod = importlib.util.module_from_spec(spec)
++        sys.modules[module_name] = mod
++
++        # Register submodules so relative imports work
++        # e.g., "from .store import MemoryStore" in holographic plugin
++        for sub_file in provider_dir.glob("*.py"):
++            if sub_file.name == "__init__.py":
++                continue
++            sub_name = sub_file.stem
++            full_sub_name = f"{module_name}.{sub_name}"
++            if full_sub_name not in sys.modules:
++                sub_spec = importlib.util.spec_from_file_location(
++                    full_sub_name, str(sub_file)
++                )
++                if sub_spec:
++                    sub_mod = importlib.util.module_from_spec(sub_spec)
++                    sys.modules[full_sub_name] = sub_mod
++                    try:
++                        sub_spec.loader.exec_module(sub_mod)
++                    except Exception as e:
++                        logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
++
++        try:
++            spec.loader.exec_module(mod)
++        except Exception as e:
++            logger.debug("Failed to exec_module %s: %s", module_name, e)
++            sys.modules.pop(module_name, None)
++            return None
++
++    # Try register(ctx) pattern first (how our plugins are written)
++    if hasattr(mod, "register"):
++        # Pass the real PluginManager so the provider can register
++        # skills and slash commands alongside its memory provider.
++        try:
++            from hermes_cli.plugins import get_plugin_manager
++            _mgr = get_plugin_manager()
++        except Exception:
++            _mgr = None
++        collector = _ProviderCollector(plugin_name=name, manager=_mgr)
++        try:
++            mod.register(collector)
++            if collector.provider:
++                return collector.provider
++        except Exception as e:
++            logger.debug("register() failed for %s: %s", name, e)
++
++    # Fallback: find a MemoryProvider subclass and instantiate it
++    from agent.memory_provider import MemoryProvider
++    for attr_name in dir(mod):
++        attr = getattr(mod, attr_name, None)
++        if (isinstance(attr, type) and issubclass(attr, MemoryProvider)
++                and attr is not MemoryProvider):
++            try:
++                return attr()
++            except Exception:
++                pass
++
++    return None
++
++
++class _ProviderCollector:
++    """Fake plugin context that captures register_memory_provider calls.
++
++    Also delegates ``register_skill`` and ``register_command`` to the real
++    ``PluginManager`` so memory provider plugins can ship skills and slash
++    commands alongside their provider.  Other registration methods are
++    no-ops (memory providers are exclusive and don't register tools/hooks).
++    """
++
++    def __init__(self, plugin_name: str = "memory", manager=None):
++        self.provider = None
++        self._plugin_name = plugin_name
++        self._manager = manager
++
++    def register_memory_provider(self, provider):
++        self.provider = provider
++
++    def _delegate_ctx(self):
++        """Build a real PluginContext for skill/command registration."""
++        if self._manager is None:
++            return None
++        try:
++            from hermes_cli.plugins import PluginManifest, PluginContext
++            manifest = PluginManifest(name=self._plugin_name, kind="exclusive")
++            return PluginContext(manifest, self._manager)
++        except Exception:
++            return None
++
++    def register_skill(self, name, path, description=""):
++        """Register a skill via the real PluginManager (if available)."""
++        ctx = self._delegate_ctx()
++        if ctx is not None:
++            try:
++                ctx.register_skill(name, path, description)
++            except Exception as e:
++                logger.debug("register_skill failed for %s: %s", self._plugin_name, e)
++
++    def register_command(self, name, handler, description="", args_hint=""):
++        """Register a slash command via the real PluginManager (if available)."""
++        ctx = self._delegate_ctx()
++        if ctx is not None:
++            try:
++                ctx.register_command(name, handler, description, args_hint)
++            except Exception as e:
++                logger.debug("register_command failed for %s: %s", self._plugin_name, e)
++
++    # No-op for other registration methods
++    def register_tool(self, *args, **kwargs):
++        pass
++
++    def register_hook(self, *args, **kwargs):
++        pass
++
++    def register_cli_command(self, *args, **kwargs):
++        pass  # CLI registration happens via discover_plugin_cli_commands()
++
++
++def _get_active_memory_provider() -> Optional[str]:
++    """Read the active memory provider name from config.yaml.
++
++    Returns the provider name (e.g. ``"honcho"``) or None if no
++    external provider is configured.  Lightweight — only reads config,
++    no plugin loading.
++    """
++    try:
++        from hermes_cli.config import load_config
++        config = load_config()
++        return cfg_get(config, "memory", "provider") or None
++    except Exception:
++        return None
++
++
++def discover_plugin_cli_commands() -> List[dict]:
++    """Return CLI commands for the **active** memory plugin only.
++
++    Only one memory provider can be active at a time (set via
++    ``memory.provider`` in config.yaml).  This function reads that
++    value and only loads CLI registration for the matching plugin.
++    If no provider is active, no commands are registered.
++
++    Looks for a ``register_cli(subparser)`` function in the active
++    plugin's ``cli.py``.  Returns a list of at most one dict with
++    keys: ``name``, ``help``, ``description``, ``setup_fn``,
++    ``handler_fn``.
++
++    This is a lightweight scan — it only imports ``cli.py``, not the
++    full plugin module.  Safe to call during argparse setup before
++    any provider is loaded.
++    """
++    results: List[dict] = []
++    if not _MEMORY_PLUGINS_DIR.is_dir():
++        return results
++
++    active_provider = _get_active_memory_provider()
++    if not active_provider:
++        return results
++
++    # Only look at the active provider's directory
++    plugin_dir = find_provider_dir(active_provider)
++    if not plugin_dir:
++        return results
++
++    cli_file = plugin_dir / "cli.py"
++    if not cli_file.exists():
++        return results
++
++    _is_bundled = _MEMORY_PLUGINS_DIR in plugin_dir.parents or plugin_dir.parent == _MEMORY_PLUGINS_DIR
++    module_name = f"plugins.memory.{active_provider}.cli" if _is_bundled else f"{_USER_NAMESPACE}.{active_provider}.cli"
++    try:
++        # Import the CLI module (lightweight — no SDK needed)
++        if module_name in sys.modules:
++            cli_mod = sys.modules[module_name]
++        else:
++            if not _is_bundled:
++                # cli.py imports as _hermes_user_memory.<name>.cli, usually
++                # before the provider itself is loaded.  Register its parent
++                # packages so relative imports inside cli.py
++                # ("from . import config") resolve without executing the
++                # plugin's __init__.py.  The package shell has no __file__,
++                # so _load_provider_from_dir() will still load the real
++                # module later instead of reusing the shell.
++                _register_synthetic_package(_USER_NAMESPACE, [])
++                _register_synthetic_package(
++                    f"{_USER_NAMESPACE}.{active_provider}", [str(plugin_dir)]
++                )
++            spec = importlib.util.spec_from_file_location(
++                module_name, str(cli_file)
++            )
++            if not spec or not spec.loader:
++                return results
++            cli_mod = importlib.util.module_from_spec(spec)
++            sys.modules[module_name] = cli_mod
++            spec.loader.exec_module(cli_mod)
++
++        register_cli = getattr(cli_mod, "register_cli", None)
++        if not callable(register_cli):
++            return results
++
++        # Read metadata from plugin.yaml if available
++        help_text = f"Manage {active_provider} memory plugin"
++        description = ""
++        yaml_file = plugin_dir / "plugin.yaml"
++        if yaml_file.exists():
++            try:
++                import yaml
++                with open(yaml_file, encoding="utf-8-sig") as f:
++                    meta = yaml.safe_load(f) or {}
++                desc = meta.get("description", "")
++                if desc:
++                    help_text = desc
++                    description = desc
++            except Exception:
++                pass
++
++        handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
++                     getattr(cli_mod, "honcho_command", None)
++
++        results.append({
++            "name": active_provider,
++            "help": help_text,
++            "description": description,
++            "setup_fn": register_cli,
++            "handler_fn": handler_fn,
++            "plugin": active_provider,
++        })
++    except Exception as e:
++        logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
++
++    return results
+diff --git a/skills/autonomous-ai-agents/hermes-agent/references/configuration.md b/skills/autonomous-ai-agents/hermes-agent/references/configuration.md
+index e92443a56f5..f53eaf668ba 100644
+--- a/skills/autonomous-ai-agents/hermes-agent/references/configuration.md
++++ b/skills/autonomous-ai-agents/hermes-agent/references/configuration.md
+@@ -20,9 +20,35 @@ Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configurat
+ | `delegation` | `model`, `provider`, `max_concurrent_children`, `max_iterations` (50), `max_spawn_depth` |
+ | `checkpoints` | `enabled`, `max_snapshots` (50) |
+ | `curator` | `enabled`, `consolidate` (false, opt-in aux-model consolidation), `interval_hours`, `stale_after_days` |
++| (top-level) | `timezone` (IANA name, e.g. `Region/X`), `location` (free-form city/place, e.g. `City-X`) |
++| `weather` | `enabled` (true) — when true and a location is set, a short weather line is injected per turn |
++| `file_activity` | `enabled` (true), `directories` ([]), `max_files` (5), `max_age_minutes` (30) — when true, a "Last edited: ..." line with recently modified files from the working directory is injected per turn |
+ 
+ `hermes config check` reports sections missing from an older config.
+ 
++### Timezone, Location, Weather & File Activity (self-settable)
++
++`timezone`, `location`, `weather`, and `file_activity` are injected as
++ambient context on every turn (a `Current time: ...` line, a `Location: ...`
++line, a `Weather: ...` line, and a `Last edited: ...` line on the API copy of
++the user message — never in the cached system prompt). The agent sees them
++without the user having to repeat where/when they are or what they were doing.
++Weather uses Open-Meteo (free, no API key) and is cached for ~20 minutes. File
++activity scans the working directory for recently modified files (skipping
++`.git`, `node_modules`, `venv`, `__pycache__`, etc.) and is cached for ~5
++minutes.
++
++**You can set these yourself** when the user tells you where they are or you
++infer a timezone mismatch — run `hermes config set location "Riverton"` or
++`hermes config set timezone  "Region/X"`. The location and weather
++take effect on the very next turn (re-resolved each turn); timezone may need
++a `/reset` in a long-lived CLI session (cached at first use). Don't ask the
++user to run the command — just run it and confirm.
++
++Disable weather with `hermes config set weather.enabled false` (e.g. if the
++user is on a metered connection or doesn't want the network call). Disable
++file activity with `hermes config set file_activity.enabled false`.
++
+ ### Toolsets
+ 
+ Enable/disable via `hermes tools` (interactive) or `hermes tools enable/disable NAME`.
+diff --git a/tests/agent/test_api_content_sidecar.py b/tests/agent/test_api_content_sidecar.py
+index ce7f3cb9be3..bb9fb20f596 100644
+--- a/tests/agent/test_api_content_sidecar.py
++++ b/tests/agent/test_api_content_sidecar.py
+@@ -49,6 +49,110 @@ class TestComposeUserApiContent:
+         assert out == "hello" + "\n\n" + fenced + "\n\n" + "PLUGIN-CTX"
+ 
+ 
++    def test_timestamp_hint_rides_injection_path_first(self):
++        """The per-turn local-time hint reuses the same api_content injection
++        path as memory context (so the cached system prompt stays byte-stable)
++        and lands BEFORE the memory block. A timestamp alone is enough to
++        produce a sidecar — the agent sees the current time every turn even
++        with no recalled memory."""
++        out = compose_user_api_content("hello", "", "", "Current time: Friday 2026-07-31 19:55 SAST")
++        assert out == "hello\n\nCurrent time: Friday 2026-07-31 19:55 SAST"
++
++    def test_timestamp_hint_precedes_memory_block(self):
++        out = compose_user_api_content(
++            "hello", "likes tea", "", "Current time: Friday 2026-07-31 19:55 SAST"
++        )
++        fenced = build_memory_context_block("likes tea")
++        assert out == (
++            "hello\n\nCurrent time: Friday 2026-07-31 19:55 SAST\n\n" + fenced
++        )
++
++
++    def test_location_hint_rides_injection_path(self):
++        """The per-turn location hint reuses the same api_content injection
++        path. A location alone is enough to produce a sidecar — the agent
++        sees the configured place every turn even with no recalled memory."""
++        out = compose_user_api_content("hello", "", "", "", "Location: City-X")
++        assert out == "hello\n\nLocation: City-X"
++
++    def test_location_hint_follows_timestamp_hint(self):
++        """Both ambient hints land together, timestamp first then location,
++        before the memory block."""
++        out = compose_user_api_content(
++            "hello", "", "", "Current time: Friday 2026-07-31 19:55 SAST",
++            "Location: City-X",
++        )
++        assert out == (
++            "hello\n\nCurrent time: Friday 2026-07-31 19:55 SAST"
++            "\n\nLocation: City-X"
++        )
++
++    def test_location_and_timestamp_precede_memory_and_plugin(self):
++        out = compose_user_api_content(
++            "hello", "likes tea", "PLUGIN-CTX",
++            "Current time: Friday 2026-07-31 19:55 SAST",
++            "Location: City-X",
++        )
++        fenced = build_memory_context_block("likes tea")
++        assert out == (
++            "hello\n\nCurrent time: Friday 2026-07-31 19:55 SAST"
++            "\n\nLocation: City-X"
++            "\n\n" + fenced +
++            "\n\nPLUGIN-CTX"
++        )
++
++
++    def test_weather_hint_rides_injection_path(self):
++        """The per-turn weather hint reuses the same api_content injection
++        path. Weather alone is enough to produce a sidecar."""
++        out = compose_user_api_content("hello", "", "", "", "", "Weather: 14°C, light rain")
++        assert out == "hello\n\nWeather: 14°C, light rain"
++
++    def test_weather_follows_location_before_memory(self):
++        """All three ambient hints land together: time → location → weather,
++        before the memory block and plugin context."""
++        out = compose_user_api_content(
++            "hello", "likes tea", "PLUGIN-CTX",
++            "Current time: Friday 2026-07-31 19:55 SAST",
++            "Location: City-X",
++            "Weather: 14°C, light rain",
++        )
++        fenced = build_memory_context_block("likes tea")
++        assert out == (
++            "hello\n\nCurrent time: Friday 2026-07-31 19:55 SAST"
++            "\n\nLocation: City-X"
++            "\n\nWeather: 14°C, light rain"
++            "\n\n" + fenced +
++            "\n\nPLUGIN-CTX"
++        )
++
++
++    def test_file_activity_hint_rides_injection_path(self):
++        """The per-turn file activity hint reuses the same api_content
++        injection path. File activity alone is enough to produce a sidecar."""
++        out = compose_user_api_content("hello", "", "", "", "", "",
++            "Last edited: ~/project/foo.py (4 min ago)")
++        assert out == "hello\n\nLast edited: ~/project/foo.py (4 min ago)"
++
++    def test_all_four_hints_precede_memory_and_plugin(self):
++        """All four ambient hints land together: time → location → weather →
++        file activity, before the memory block and plugin context."""
++        out = compose_user_api_content(
++            "hello", "likes tea", "PLUGIN-CTX",
++            "Current time: Friday 2026-07-31 19:55 SAST",
++            "Location: City-X",
++            "Weather: 14°C, light rain",
++            "Last edited: ~/project/foo.py (4 min ago)",
++        )
++        fenced = build_memory_context_block("likes tea")
++        assert out == (
++            "hello\n\nCurrent time: Friday 2026-07-31 19:55 SAST"
++            "\n\nLocation: City-X"
++            "\n\nWeather: 14°C, light rain"
++            "\n\nLast edited: ~/project/foo.py (4 min ago)"
++            "\n\n" + fenced +
++            "\n\nPLUGIN-CTX"
++        )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -245,6 +349,18 @@ def _stub_runtime_main():
+         yield
+ 
+ 
++@pytest.fixture(autouse=True)
++def _stub_timestamp_hint():
++    """Pin the per-turn ambient hints to empty — these tests assert exact
++    api_content bytes for plugin/memory injection, not timestamp/location/
++    weather/file-activity behavior."""
++    with patch("agent.turn_context._build_timestamp_hint", return_value=""), \
++         patch("agent.turn_context._build_location_hint", return_value=""), \
++         patch("agent.turn_context._build_weather_hint", return_value=""), \
++         patch("agent.turn_context._build_file_activity_hint", return_value=""):
++        yield
++
++
+ class TestPrologueStamping:
+     def test_stamps_api_content_from_plugin_context(self):
+         agent = _FakeAgent()
+diff --git a/tests/agent/test_gateway_turn_sidecar.py b/tests/agent/test_gateway_turn_sidecar.py
+index c9233959319..61eeaed2283 100644
+--- a/tests/agent/test_gateway_turn_sidecar.py
++++ b/tests/agent/test_gateway_turn_sidecar.py
+@@ -121,6 +121,18 @@ def _stub_runtime_main():
+         yield
+ 
+ 
++@pytest.fixture(autouse=True)
++def _stub_timestamp_hint():
++    """These tests assert exact api_content bytes for gateway-note delivery,
++    not ambient hint injection. Pin all per-turn hints to empty so the
++    assertions stay focused and deterministic."""
++    with patch("agent.turn_context._build_timestamp_hint", return_value=""), \
++         patch("agent.turn_context._build_location_hint", return_value=""), \
++         patch("agent.turn_context._build_weather_hint", return_value=""), \
++         patch("agent.turn_context._build_file_activity_hint", return_value=""):
++        yield
++
++
+ RESET_NOTE = (
+     "[System note: The user's previous session expired due to inactivity. "
+     "This is a fresh conversation with no prior context.]"
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+index 71f79422551..20eadd6bce5 100644
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -176,6 +176,19 @@ def _stub_runtime_main():
+         yield
+ 
+ 
++@pytest.fixture(autouse=True)
++def _stub_timestamp_hint():
++    """These tests assert exact message-list structure (user message appended,
++    compression-child replacement), not ambient hint injection. Pin all
++    per-turn hints to empty so the api_content sidecar stays absent and the
++    assertions remain focused and deterministic."""
++    with patch("agent.turn_context._build_timestamp_hint", return_value=""), \
++         patch("agent.turn_context._build_location_hint", return_value=""), \
++         patch("agent.turn_context._build_weather_hint", return_value=""), \
++         patch("agent.turn_context._build_file_activity_hint", return_value=""):
++        yield
++
++
+ def _build(agent, **overrides):
+     kwargs = dict(
+         agent=agent,
+diff --git a/tests/test_timezone.py b/tests/test_timezone.py
+index b2c736d0d41..8d1242b7f44 100644
+--- a/tests/test_timezone.py
++++ b/tests/test_timezone.py
+@@ -68,6 +68,57 @@ class TestHermesTimeNow:
+ 
+ 
+ 
++class TestBuildTimestampHint:
++    """The per-turn ``Current time: ...`` line injected via the memory-context
++    api_content path. Must use the user's configured timezone and never crash."""
++
++    def setup_method(self):
++        _reset_hermes_time_cache()
++
++    def teardown_method(self):
++        _reset_hermes_time_cache()
++        os.environ.pop("HERMES_TIMEZONE", None)
++
++    def test_uses_configured_timezone(self):
++        from agent.turn_context import _build_timestamp_hint
++        from zoneinfo import ZoneInfo
++
++        os.environ["HERMES_TIMEZONE"] =  "Region/X"
++        line = _build_timestamp_hint()
++        assert line.startswith("Current time: ")
++        # Format: "Current time: <Weekday> <YYYY-MM-DD> <HH:MM> <TZ>"
++        body = line[len("Current time: "):]
++        parts = body.split(" ")
++        assert len(parts) >= 4
++        weekday, date, clock = parts[0], parts[1], parts[2]
++        assert weekday in {
++            "Monday", "Tuesday", "Wednesday", "Thursday",
++            "Friday", "Saturday", "Sunday",
++        }
++        # Date is ISO YYYY-MM-DD
++        y, m, d = date.split("-")
++        assert len(y) == 4 and len(m) == 2 and len(d) == 2
++        # Clock is HH:MM
++        assert ":" in clock and len(clock.split(":")) == 2
++        # City-Z is UTC+2 — the resolved tzinfo must reflect it.
++        assert hermes_time.get_timezone() == ZoneInfo( "Region/X")
++
++    def test_returns_string_even_without_configured_tz(self):
++        from agent.turn_context import _build_timestamp_hint
++        # No HERMES_TIMEZONE, no config.yaml timezone → server-local fallback.
++        line = _build_timestamp_hint()
++        assert isinstance(line, str)
++        assert line.startswith("Current time: ")
++
++    def test_never_crashes_on_bad_timezone(self):
++        from agent.turn_context import _build_timestamp_hint
++        os.environ["HERMES_TIMEZONE"] = "Not/A/Real/Zone"
++        # hermes_time falls back safely; the hint must still render.
++        line = _build_timestamp_hint()
++        assert isinstance(line, str)
++        assert line.startswith("Current time: ")
++
++
+ 
+ 
+ class TestGetTimezone:
+diff --git a/tools/browser_cdp_tool.py b/tools/browser_cdp_tool.py
+index eccd8f8fc1c..5271450528d 100644
+--- a/tools/browser_cdp_tool.py
++++ b/tools/browser_cdp_tool.py
+@@ -539,44 +539,31 @@ def browser_cdp(
+ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
+     "name": "browser_cdp",
+     "description": (
+-        "Send a raw Chrome DevTools Protocol (CDP) command. Escape hatch for "
+-        "browser operations not covered by browser_navigate, browser_click, "
+-        "browser_console, etc.\n\n"
+-        "**Requires a reachable CDP endpoint.** Available when the user has "
+-        "run '/browser connect' to attach to a running Chrome, Brave, Chromium, "
+-        "or Edge browser, or when 'browser.cdp_url' is set in config.yaml. "
+-        "Not currently wired up for cloud backends (Browserbase, Browser Use, "
+-        "Firecrawl) — those expose CDP per session but live-session routing is "
+-        "a follow-up. Camofox is REST-only and will never support CDP. If the "
+-        "tool is in your toolset at all, a CDP endpoint is already reachable.\n\n"
+-        f"**CDP method reference:** {CDP_DOCS_URL} — use web_extract on a "
+-        "method's URL (e.g. '/tot/Page/#method-handleJavaScriptDialog') "
+-        "to look up parameters and return shape.\n\n"
++        "Send a raw Chrome DevTools Protocol (CDP) command — escape hatch for "
++        "browser operations not covered by browser_navigate/click/console/etc. "
++        "If this tool is in your toolset, a CDP endpoint is already reachable "
++        "('/browser connect' or browser.cdp_url in config).\n\n"
++        f"Method reference: {CDP_DOCS_URL} — use web_extract on a method's URL "
++        "to look up parameters.\n\n"
+         "**Common patterns:**\n"
+         "- List tabs: method='Target.getTargets', params={}\n"
+-        "- Handle a native JS dialog: method='Page.handleJavaScriptDialog', "
++        "- Handle JS dialog: method='Page.handleJavaScriptDialog', "
+         "params={'accept': true, 'promptText': ''}, target_id=<tabId>\n"
+-        "- Get all cookies: method='Network.getAllCookies', params={}\n"
+-        "- Eval in a specific tab: method='Runtime.evaluate', "
++        "- Get cookies: method='Network.getAllCookies', params={}\n"
++        "- Eval in tab: method='Runtime.evaluate', "
+         "params={'expression': '...', 'returnByValue': true}, "
+         "target_id=<tabId>\n"
+-        "- Set viewport for a tab: method='Emulation.setDeviceMetricsOverride', "
++        "- Set viewport: method='Emulation.setDeviceMetricsOverride', "
+         "params={'width': 1280, 'height': 720, 'deviceScaleFactor': 1, "
+         "'mobile': false}, target_id=<tabId>\n\n"
+-        "**Usage rules:**\n"
+-        "- Browser-level methods (Target.*, Browser.*, Storage.*): omit "
+-        "target_id and frame_id.\n"
+-        "- Page-level methods (Page.*, Runtime.*, DOM.*, Emulation.*, "
+-        "Network.* scoped to a tab): pass target_id from Target.getTargets.\n"
+-        "- **Cross-origin iframe scope** (Runtime.evaluate inside an OOPIF, "
+-        "Page.* targeting a frame target, etc.): pass frame_id from the "
+-        "browser_snapshot frame_tree output. This routes through the CDP "
+-        "supervisor's live connection — the only reliable way on "
+-        "Browserbase where stateless CDP calls hit signed-URL expiry.\n"
+-        "- Each stateless call (without frame_id) is independent — sessions "
+-        "and event subscriptions do not persist between calls. For stateful "
+-        "workflows, prefer the dedicated browser tools or use frame_id "
+-        "routing."
++        "**Routing:** browser-level methods (Target.*, Browser.*, Storage.*): "
++        "omit target_id/frame_id. Page-level methods (Page.*, Runtime.*, DOM.*, "
++        "Emulation.*, Network.*): pass target_id from Target.getTargets. "
++        "Cross-origin iframe (OOPIF): pass frame_id from browser_snapshot "
++        "frame_tree — routes through the CDP supervisor's live connection "
++        "(required on Browserbase where stateless calls hit signed-URL expiry). "
++        "Stateless calls (no frame_id) are independent — sessions/events don't "
++        "persist. For stateful workflows, prefer dedicated browser tools."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/browser_dialog_tool.py b/tools/browser_dialog_tool.py
+index e37337b9bba..59ddba60805 100644
+--- a/tools/browser_dialog_tool.py
++++ b/tools/browser_dialog_tool.py
+@@ -28,22 +28,13 @@ logger = logging.getLogger(__name__)
+ BROWSER_DIALOG_SCHEMA: Dict[str, Any] = {
+     "name": "browser_dialog",
+     "description": (
+-        "Respond to a native JavaScript dialog (alert / confirm / prompt / "
+-        "beforeunload) that is currently blocking the page.\n\n"
+-        "**Workflow:** call ``browser_snapshot`` first — if a dialog is open, "
+-        "it appears in the ``pending_dialogs`` field with ``id``, ``type``, "
+-        "and ``message``. Then call this tool with ``action='accept'`` or "
+-        "``action='dismiss'``.\n\n"
+-        "**Prompt dialogs:** pass ``prompt_text`` to supply the response "
+-        "string. Ignored for alert/confirm/beforeunload.\n\n"
+-        "**Multiple dialogs:** if more than one dialog is queued (rare — "
+-        "happens when a second dialog fires while the first is still open), "
+-        "pass ``dialog_id`` from the snapshot to disambiguate.\n\n"
+-        "**Availability:** only present when a CDP-capable backend is "
+-        "attached — Browserbase sessions, local Chromium-family browser via "
+-        "``/browser connect``, or ``browser.cdp_url`` in config.yaml. "
+-        "Not available on Camofox (REST-only) or the default Playwright "
+-        "local browser (CDP port is hidden)."
++        "Respond to a native JS dialog (alert/confirm/prompt/beforeunload) "
++        "blocking the page. Call browser_snapshot first — if a dialog is open, "
++        "it appears in pending_dialogs with id, type, and message. Then call "
++        "with action='accept' or 'dismiss'. For prompt() dialogs, pass "
++        "prompt_text. If multiple dialogs are queued (rare), pass dialog_id "
++        "from the snapshot to disambiguate. Only available with a CDP-capable "
++        "backend (Browserbase, '/browser connect', or browser.cdp_url in config)."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/browser_tool.py b/tools/browser_tool.py
+index 337c00477bc..46aa513213d 100644
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -1981,7 +1981,7 @@ atexit.register(_stop_browser_cleanup_thread)
+ BROWSER_TOOL_SCHEMAS = [
+     {
+         "name": "browser_navigate",
+-        "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
++        "description": "Navigate to a URL. Must be called before other browser tools. For plain-text endpoints (.md, .txt, .json, .yaml, .csv, .xml, raw.githubusercontent.com, API endpoints) prefer web_extract or curl via terminal — the browser stack is overkill. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact snapshot with ref IDs — no need to call browser_snapshot after navigating.",
+         "parameters": {
+             "type": "object",
+             "properties": {
+@@ -1995,7 +1995,7 @@ BROWSER_TOOL_SCHEMAS = [
+     },
+     {
+         "name": "browser_snapshot",
+-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 15000 chars are truncated or LLM-summarized; when that happens the complete snapshot is saved to a file and the output includes its path so you can page through the rest with read_file. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
++        "description": "Text snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (@e1, @e2) for browser_click/browser_type. full=false (default): interactive elements only. full=true: complete content. Snapshots over 15000 chars are truncated/summarized; the full snapshot is saved to a file (path included in output) — page through with read_file. Requires browser_navigate first. Use to refresh after interactions change the page, or with full=true for complete content.",
+         "parameters": {
+             "type": "object",
+             "properties": {
+@@ -2089,7 +2089,7 @@ BROWSER_TOOL_SCHEMAS = [
+     },
+     {
+         "name": "browser_vision",
+-        "description": "Take a screenshot of the current page so you can inspect it visually. Use this when you need to understand what the page looks like - especially for CAPTCHAs, visual verification challenges, complex layouts, or cases where the text snapshot misses important visual information. When your active model has native vision, the screenshot is attached to your context directly and you inspect it on the next turn; otherwise Hermes falls back to an auxiliary vision model and returns a text analysis. Includes a screenshot_path that you can share with the user by including MEDIA:<screenshot_path> in your response. Requires browser_navigate to be called first.",
++        "description": "Screenshot the current page for visual inspection — CAPTCHAs, visual challenges, complex layouts, or when the text snapshot misses visual info. On vision-capable models the screenshot is attached directly; otherwise an auxiliary vision model returns text analysis. Includes screenshot_path — share with the user via MEDIA:<screenshot_path>. Requires browser_navigate first.",
+         "parameters": {
+             "type": "object",
+             "properties": {
+@@ -2108,7 +2108,7 @@ BROWSER_TOOL_SCHEMAS = [
+     },
+     {
+         "name": "browser_console",
+-        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically.",
++        "description": "Get browser console output and JS errors (console.log/warn/error/info + uncaught exceptions). Use to detect silent JS errors, failed API calls, warnings. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use for DOM inspection, reading page state, or extracting data. Requires browser_navigate first.",
+         "parameters": {
+             "type": "object",
+             "properties": {
+diff --git a/tools/clarify_tool.py b/tools/clarify_tool.py
+index 98bc9e4b42f..c323e5ac8b3 100644
+--- a/tools/clarify_tool.py
++++ b/tools/clarify_tool.py
+@@ -188,28 +188,19 @@ def check_clarify_requirements() -> bool:
+ CLARIFY_SCHEMA = {
+     "name": "clarify",
+     "description": (
+-        "Ask the user a question when you need clarification, feedback, or a "
+-        "decision before proceeding. Supports three modes:\n\n"
+-        "1. **Single-select multiple choice** — provide up to 4 choices. The user picks one "
+-        "or types their own answer via a 5th 'Other' option.\n"
+-        "2. **Multi-select multiple choice** — set multi_select=true. The user can select "
+-        "multiple options via checkboxes. user_response will be a list of selected choices.\n"
+-        "3. **Open-ended** — omit choices entirely. The user types a free-form "
+-        "response.\n\n"
+-        "CRITICAL: when you are offering options, put each option ONLY in the "
+-        "`choices` array — NEVER enumerate the options inside the `question` "
+-        "text. The UI renders `choices` as selectable rows; options written "
+-        "into the question string render as dead prose the user can't pick. "
+-        "Right: question='Which deployment target?', choices=['staging', "
+-        "'prod']. Wrong: question='Which target? 1) staging 2) prod', choices=[].\n\n"
+-        "Use this tool when:\n"
+-        "- The task is ambiguous and you need the user to choose an approach\n"
+-        "- You want post-task feedback ('How did that work out?')\n"
+-        "- You want to offer to save a skill or update memory\n"
+-        "- A decision has meaningful trade-offs the user should weigh in on\n\n"
+-        "Do NOT use this tool for simple yes/no confirmation of dangerous "
+-        "commands (the terminal tool handles that). Prefer making a reasonable "
+-        "default choice yourself when the decision is low-stakes."
++        "Ask the user a question when you need clarification, feedback, or a decision "
++        "before proceeding. Three modes:\n"
++        "1. Single-select: up to 4 choices, user picks one (or types via 'Other').\n"
++        "2. Multi-select: multi_select=true, user selects multiple via checkboxes.\n"
++        "3. Open-ended: omit choices, user types free-form.\n\n"
++        "CRITICAL: put options ONLY in the `choices` array — NEVER enumerate them in "
++        "the `question` text. The UI renders `choices` as selectable rows; options in "
++        "the question string are dead prose. Right: question='Which target?', "
++        "choices=['staging','prod']. Wrong: question='Which? 1) staging 2) prod', choices=[].\n\n"
++        "Use when: task is ambiguous, you want post-task feedback, offering to save a "
++        "skill/memory, or a decision has meaningful trade-offs. Do NOT use for yes/no "
++        "confirmation of dangerous commands (terminal handles that). Prefer a reasonable "
++        "default when the decision is low-stakes."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/code_execution_tool.py b/tools/code_execution_tool.py
+index 6bead21f18a..4377634247a 100644
+--- a/tools/code_execution_tool.py
++++ b/tools/code_execution_tool.py
+@@ -2017,22 +2017,23 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
+         )
+ 
+     description = (
+-        "Run a Python script that calls Hermes tools programmatically. "
+-        "Use when you need 3+ tool calls with logic between them: "
+-        "filtering/reducing large outputs before they enter context, "
+-        "conditional branching, or loops (N pages/files, retry on failure). "
+-        "Use normal tool calls for single calls, results you must reason "
+-        "over in full, or anything needing user interaction.\n\n"
++        "Run a Python script that calls Hermes tools programmatically. Use when you "
++        "need 3+ tool calls with processing between them, need to filter/reduce large "
++        "outputs before they enter your context, need conditional branching, or need "
++        "to loop (fetch N pages, process N files, retry on failure).\n\n"
++        "Use normal tool calls instead for: single calls with no processing, tasks "
++        "needing complex reasoning on full results, or interactive user input.\n\n"
+         f"Available via `from hermes_tools import ...`:\n\n"
+         f"{tool_lines}\n\n"
+-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+-        "terminal() is foreground-only (no background or pty).\n\n"
++        "Limits: 5-min timeout, 50KB stdout cap, max 50 tool calls. terminal() is "
++        f"foreground-only.\n\n"
+         f"{cwd_note}\n\n"
+-        "Print your final result to stdout; stdlib (json, re, csv, datetime, ...) "
+-        "is available for processing.\n\n"
+-        "Built-in helpers (no import): json_parse(text) — tolerant json.loads for "
+-        "terminal() output; shell_quote(s) — shlex.quote for dynamic shell args; "
+-        "retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures."
++        "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
++        "datetime, collections) for processing.\n\n"
++        "Built into hermes_tools (no import):\n"
++        "  json_parse(text) — json.loads(strict=False); for terminal output with control chars\n"
++        "  shell_quote(s) — shlex.quote(); for interpolating dynamic strings into shell commands\n"
++        "  retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures"
+     )
+ 
+     return {
+diff --git a/tools/delegate_tool.py b/tools/delegate_tool.py
+index 25b8c81d070..23bb30d51ef 100644
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -4073,39 +4073,44 @@ def _build_top_level_description() -> str:
+     here, check it is not already stated in a parameter description.
+     """
+     return (
+-        "Spawn subagents in isolated contexts; each gets its own conversation, "
+-        "terminal session, and toolset, and only its final summary returns to "
+-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
+-        "(limits and nesting rules are in the parameter descriptions).\n\n"
+-        "Runs in the background: dispatch returns immediately with live "
+-        "transcript paths, and the completed result (one consolidated message "
+-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
+-        "poll; continue other work.\n\n"
+-        "USE FOR: reasoning-heavy subtasks, work that would flood your context "
+-        "with intermediate data, or independent parallel workstreams.\n"
+-        "DO NOT USE FOR (use these instead):\n"
+-        "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
+-        "- A single tool call -> call the tool directly\n"
+-        "- Tasks needing user interaction -> subagents cannot ask questions\n"
+-        "- Durable work that must survive this session -> cronjob or "
+-        "terminal(background=True, notify_on_complete=True); /stop, /new, or "
+-        "process exit discards running subagents.\n\n"
+-        "RULES:\n"
+-        "- Children know nothing of this conversation: pass everything needed "
+-        "via 'context', including any required output language, tone, or "
+-        "style (e.g. \"respond in Chinese\").\n"
+-        "- Child summaries are SELF-REPORTS, not verified facts: a child "
+-        "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
+-        "For external side effects (uploads, remote writes, publishing), "
+-        "require a verifiable handle (URL, ID, absolute path) and verify it "
+-        "yourself — fetch the URL, stat the file, read back the content — "
+-        "before telling the user the operation succeeded.\n"
+-        "- Leaf children (the default) cannot call delegate_task, clarify, "
+-        "memory, send_message, or cronjob; orchestrators regain only "
+-        "delegate_task.\n"
+-        "- Children inherit the parent model and fallback chain unless pinned "
+-        "globally via delegation.provider / delegation.model in config.yaml. "
+-        "Results are returned as an array, one entry per task."
++        "Spawn one or more subagents in isolated contexts. Each gets its own "
++        "conversation, terminal, and toolset. Only the final summary is returned "
++        "-- intermediate tool results never enter your context.\n\n"
++        "TWO MODES (one of 'goal' or 'tasks' required):\n"
++        "1. Single: provide 'goal' (+ optional context and role).\n"
++        "2. Batch (parallel): provide a 'tasks' array; its concurrency and nesting "
++        "limits are controlled by delegation settings in config.yaml.\n\n"
++        "BOTH MODES RUN IN BACKGROUND. Returns immediately — keep working; the "
++        "result re-enters the conversation when done. Batch returns one handle, "
++        "runs N subagents concurrently, delivers one consolidated result after "
++        "ALL finish. Do NOT wait or poll.\n\n"
++        "LIVE TRANSCRIPTS: dispatch response includes 'live_transcripts' — "
++        "append-only log files per task (cache/delegation/live/<id>/). Read or "
++        "`tail -f` to see what a subagent is doing without waiting for the summary.\n\n"
++        "WHEN TO USE: reasoning-heavy subtasks (debugging, code review, research), "
++        "tasks that would flood your context, parallel independent workstreams.\n"
++        "WHEN NOT TO: mechanical multi-step work -> execute_code; single tool call "
++        "-> call directly; user interaction needed -> subagents can't use clarify; "
++        "durable work that must outlive the turn -> cronjob(action='create') or "
++        "terminal(background=True, notify_on_complete=True). Background delegations "
++        "are NOT durable: /new or process exit discards unfinished subagents; /stop "
++        "cancels all running subagents.\n\n"
++        "IMPORTANT:\n"
++        "- Subagents have NO memory of your conversation. Pass all relevant info "
++        "(file paths, errors, constraints) via 'context'.\n"
++        "- If non-English output is needed, say so in 'context' (e.g. \"respond in "
++        "Chinese\"). Otherwise subagents default to English.\n"
++        "- Subagent summaries are SELF-REPORTS, not verified facts. For operations "
++        "with external side-effects, require a verifiable handle (URL, ID, path, "
++        "HTTP status) and verify it yourself before telling the user it succeeded.\n"
++        "- Leaf subagents (default) CANNOT call: delegate_task, clarify, memory, "
++        "send_message. Orchestrator subagents retain delegate_task but still "
++        "cannot use clarify/memory/send_message; their depth is bounded by the "
++        "configured max_spawn_depth and can be disabled in config.yaml.\n"
++        "- Subagent model is NOT selectable per call: children inherit the parent "
++        "model unless pinned via delegation.provider/delegation.model in config.yaml.\n"
++        "- Each subagent gets its own terminal session. Results are always an array, "
++        "one entry per task."
+     )
+ 
+ 
+diff --git a/tools/memory_tool.py b/tools/memory_tool.py
+index d77aa9e285c..e56fef1b9cb 100644
+--- a/tools/memory_tool.py
++++ b/tools/memory_tool.py
+@@ -1162,24 +1162,19 @@ MEMORY_SCHEMA = {
+     "description": (
+         "Save durable facts to persistent memory that survive across sessions. Memory is "
+         "injected into every future turn, so keep entries compact and high-signal.\n\n"
+-        "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
+-        "{action, content?, old_text?}). The batch applies atomically and the char limit is "
+-        "checked only on the FINAL result — so a single call can remove/replace stale entries "
+-        "to free room AND add new ones, even when an add alone would overflow. The response "
+-        "reports current/limit chars and confirms completion; one batch call finishes the "
+-        "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
+-        "single lone change.\n\n"
++        "HOW: make ALL changes in ONE call via an 'operations' array (each item: "
++        "{action, content?, old_text?}). Batch applies atomically; char limit checked only "
++        "on the FINAL result — so one call can remove/replace stale entries to free room AND "
++        "add new ones. Use bare action/content/old_text fields only for a single lone change.\n\n"
+         "WHEN: save proactively when the user states a preference, correction, or personal "
+-        "detail, or you learn a stable fact about their environment, conventions, or workflow. "
+-        "Priority: user preferences & corrections > environment facts > procedures. The best "
+-        "memory stops the user repeating themselves.\n\n"
+-        "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
+-        "removes or shortens enough stale entries and adds the new one together.\n\n"
++        "detail, or you learn a stable fact about their environment/workflow. Priority: "
++        "user preferences & corrections > environment facts > procedures.\n\n"
++        "IF FULL: reissue as ONE batch that removes/shortens stale entries and adds the new one together.\n\n"
+         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
+         "notes (environment, conventions, tool quirks, lessons).\n\n"
+         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
+-        "completed-work logs, temporary TODO state (use session_search for those). Reusable "
+-        "procedures belong in a skill, not memory."
++        "completed-work logs, temporary TODO state (use session_search). Reusable procedures "
++        "belong in a skill, not memory."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/session_search_tool.py b/tools/session_search_tool.py
+index 1c15aca5bf4..429bbc953a0 100644
+--- a/tools/session_search_tool.py
++++ b/tools/session_search_tool.py
+@@ -982,78 +982,34 @@ def check_session_search_requirements() -> bool:
+ SESSION_SEARCH_SCHEMA = {
+     "name": "session_search",
+     "description": (
+-        "Search past sessions stored in the local session DB, or scroll inside one. "
+-        "FTS5-backed retrieval over the SQLite message store. No LLM calls — every "
+-        "shape returns actual messages from the DB.\n\n"
+-        "SOURCE-FIRST LIMIT\n\n"
+-        "  This tool searches Hermes conversation history only. It is not evidence "
+-        "about the current contents of external sources. If the user provided a "
+-        "direct source such as a URL, phone number/contact, app/thread, file path, "
+-        "account, website, or live system, inspect that original source before or "
+-        "instead of session_search when accessible. Use session_search as secondary "
+-        "context for what was previously said, not as primary proof of what the "
+-        "source currently contains. If the original source is inaccessible, say so "
+-        "and why before falling back to session history. Do not conclude 'not found' "
+-        "or 'no prior correspondence' from session_search alone when a direct source "
+-        "was provided.\n\n"
+-        "FOUR CALLING SHAPES\n\n"
+-        "  1) DISCOVERY — pass `query`:\n"
+-        "     session_search(query=\"auth refactor\", limit=3)\n"
+-        "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
+-        "Each result carries:\n"
+-        "       - session_id, title, when, source\n"
+-        "       - snippet: FTS5-highlighted match excerpt\n"
+-        "       - bookend_start: first 3 user+assistant messages of the session "
+-        "(the goal / kickoff)\n"
+-        "       - messages: ±5 messages around the FTS5 match, with the anchor message "
+-        "flagged (the hit in context)\n"
+-        "       - bookend_end: last 3 user+assistant messages of the session "
+-        "(the resolution / decisions)\n"
+-        "       - match_message_id, messages_before, messages_after\n"
+-        "     Bookends + window together let you reconstruct goal → match → resolution "
+-        "without paying for the whole transcript.\n\n"
+-        "  2) SCROLL — pass `session_id` + `around_message_id`:\n"
+-        "     session_search(session_id=\"...\", around_message_id=12345, window=10)\n"
+-        "     Returns a window of ±`window` messages centered on the anchor. No FTS5, "
+-        "no bookends — just the slice. Use after a discovery call when you need more "
+-        "context than the ±5 default window.\n"
+-        "       - To scroll FORWARD: pass messages[-1].id back as around_message_id.\n"
+-        "       - To scroll BACKWARD: pass messages[0].id back as around_message_id.\n"
+-        "       - The boundary message appears in both windows — orientation marker.\n"
+-        "       - When messages_before or messages_after is < window, you're at the "
+-        "start or end of the session.\n\n"
+-        "  3) READ — pass `session_id` only (no around_message_id):\n"
+-        "     session_search(session_id=\"...\", profile=\"work\")\n"
+-        "     Dumps the whole session by id (first 20 + last 10 messages when "
+-        "large). This is how you resolve an `@session:<profile>/<id>` link the "
+-        "user dropped into the chat: split the value on `/` into profile + id "
+-        "and call session_search(session_id=id, profile=profile).\n\n"
+-        "  4) BROWSE — no args:\n"
+-        "     session_search()\n"
+-        "     Returns recent sessions chronologically: titles, previews, timestamps. "
+-        "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
+-        "LINKING THE USER TO A SESSION\n\n"
+-        "  When you refer the user to a session, write its `link` value inline in "
+-        "your reply — every result carries one, e.g. "
+-        "`@session:default/20260722_204335_d62c16`. Copy it verbatim; do not "
+-        "reformat it as a markdown link or wrap it in backticks. Hermes renders "
+-        "it as a link showing the session's title, so the link IS the title: "
+-        "use it as a noun mid-sentence (\"that's @session:default/... — want me "
+-        "to pick it up?\"), never alone on its own line, and never alongside the "
+-        "title, id, or date spelled out — that shows the user the same session "
+-        "twice.\n\n"
+-        "FTS5 SYNTAX\n\n"
+-        "  AND is the default — multi-word queries require all terms. Use OR explicitly "
+-        "for broader recall (`alpha OR beta OR gamma`), quoted phrases for exact match "
+-        "(`\"docker networking\"`), boolean (`python NOT java`), or prefix wildcards "
+-        "(`deploy*`).\n\n"
+-        "WHEN TO USE\n\n"
+-        "  Reach for this on questions about Hermes conversation history itself, such "
+-        "as \"what did we do about X\", \"where did we leave Y\", or \"find the "
+-        "session where Z\". If the user provided a direct source identifier, inspect "
+-        "that source first when accessible; session_search can then supply historical "
+-        "context. The session DB carries what was said when; external tools show "
+-        "current source/world state."
++        "Search past sessions in the local session DB, or scroll inside one. "
++        "FTS5-backed retrieval over SQLite. No LLM calls — returns actual messages.\n\n"
++        "SOURCE-FIRST: searches Hermes history only, not external sources. If the user "
++        "provided a direct source (URL, contact, file path, app/thread, live system), "
++        "inspect that source first when accessible. Use session_search as secondary "
++        "context, not primary proof. Don't conclude 'not found' from session_search "
++        "alone when a direct source was provided.\n\n"
++        "FOUR CALLING SHAPES:\n"
++        "1) DISCOVERY — pass `query`: FTS5 search, dedupes by session lineage, returns "
++        "top N sessions. Each result: session_id, title, when, source, snippet (FTS5 "
++        "highlight), bookend_start (first 3 msgs = goal), messages (±5 around match, "
++        "anchor flagged), bookend_end (last 3 msgs = resolution), match_message_id. "
++        "Bookends + window reconstruct goal → match → resolution without the full transcript.\n"
++        "2) SCROLL — pass `session_id` + `around_message_id`: returns ±`window` messages "
++        "centered on anchor. Scroll forward: pass messages[-1].id; backward: pass "
++        "messages[0].id. Boundary message appears in both windows. When messages_before/"
++        "after < window, you're at the start/end.\n"
++        "3) READ — pass `session_id` only: dumps whole session (first 20 + last 10 when "
++        "large). Use to resolve @session:<profile>/<id> links: split on '/' into profile + id.\n"
++        "4) BROWSE — no args: recent sessions chronologically (titles, previews, timestamps).\n\n"
++        "LINKING: write the result's `link` value inline (e.g. "
++        "`@session:default/20260722_204335_d62c16`). Copy verbatim — don't reformat as "
++        "markdown or wrap in backticks. Hermes renders it as a link showing the title. "
++        "Use as a noun mid-sentence, never alone on its own line or alongside the title/id/date.\n\n"
++        "FTS5: AND is default. Use OR for broader recall, quoted phrases for exact match, "
++        "boolean (python NOT java), prefix wildcards (deploy*).\n\n"
++        "Use for questions about Hermes history (\"what did we do about X\", \"find the "
++        "session where Z\"). For direct source identifiers, inspect the source first."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/skill_manager_tool.py b/tools/skill_manager_tool.py
+index 0d80722025e..765625573f5 100644
+--- a/tools/skill_manager_tool.py
++++ b/tools/skill_manager_tool.py
+@@ -1670,38 +1670,27 @@ def skill_manage(
+ SKILL_MANAGE_SCHEMA = {
+     "name": "skill_manage",
+     "description": (
+-        "Manage skills (create, update, delete). Skills are your procedural "
+-        "memory — reusable approaches for recurring task types. "
+-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+-        "Actions: create (full SKILL.md + optional category), "
+-        "patch (old_string/new_string — preferred for fixes), "
+-        "edit (full SKILL.md rewrite — major overhauls only), "
+-        "delete, write_file, remove_file.\n\n"
+-        "On delete, pass `absorbed_into=<umbrella>` when you're merging this "
+-        "skill's content into another one, or `absorbed_into=\"\"` when you're "
+-        "pruning it with no forwarding target. This lets the curator tell "
+-        "consolidation from pruning without guessing, so downstream consumers "
+-        "(cron jobs that reference the old skill name, etc.) get updated "
+-        "correctly. The target you name in `absorbed_into` must already "
+-        "exist — create/patch the umbrella first, then delete.\n\n"
+-        "Create when: complex task succeeded (5+ calls), errors overcome, "
+-        "user-corrected approach worked, non-trivial workflow discovered, "
+-        "or user asks you to remember a procedure.\n"
+-        "Update when: instructions stale/wrong, OS-specific failures, "
+-        "missing steps or pitfalls found during use. "
+-        "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"
+-        "After difficult/iterative tasks, offer to save as a skill. "
+-        "Skip for simple one-offs. Confirm with user before creating/deleting.\n\n"
+-        "Good skills: trigger conditions, numbered steps with exact commands, "
+-        "pitfalls section, verification steps. Use skill_view() to see format examples.\n\n"
+-        "Description: long descriptions are truncated to the first 57 chars "
+-        "plus '...' in the system prompt skill index; longer text is visible "
+-        "via skills_list/skill_view. Keep the trigger self-contained in that "
+-        "first 57-char window: 'Use when <trigger>. <one-line behavior>.'\n\n"
+-        "Pinned skills are protected from deletion only — skill_manage(action='delete') "
+-        "will refuse with a message pointing the user to `hermes curator unpin <name>`. "
+-        "Patches and edits go through on pinned skills so you can still improve them as "
+-        "pitfalls come up; pin only guards against irrecoverable loss."
++        "Manage skills (create, update, delete). Skills are procedural memory — "
++        f"reusable approaches for recurring task types. New skills go to "
++        f"{display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
++        "Actions: create (full SKILL.md + optional category), patch (old_string/"
++        "new_string — preferred for fixes), edit (full rewrite — major overhauls "
++        "only), delete, write_file, remove_file.\n\n"
++        "On delete, pass `absorbed_into=<umbrella>` when merging into another skill, "
++        "or `absorbed_into=\"\"` when pruning with no forwarding target. The target "
++        "must already exist — create/patch the umbrella first, then delete.\n\n"
++        "Create when: complex task succeeded (5+ calls), errors overcome, user-corrected "
++        "approach worked, non-trivial workflow discovered, or user asks to remember a "
++        "procedure. Update when: instructions stale/wrong, OS-specific failures, missing "
++        "steps/pitfalls found. If you used a skill and hit issues not covered, patch it immediately.\n\n"
++        "After difficult/iterative tasks, offer to save as a skill. Skip for simple one-offs. "
++        "Confirm with user before creating/deleting.\n\n"
++        "Good skills: trigger conditions, numbered steps with exact commands, pitfalls section, "
++        "verification steps. Use skill_view() for format examples.\n\n"
++        "Description: truncated to first 57 chars + '...' in the system prompt skill index; "
++        "keep the trigger self-contained there: 'Use when <trigger>. <one-line behavior>.'\n\n"
++        "Pinned skills are protected from deletion only — patches/edits go through. "
++        "Pin guards against irrecoverable loss, not improvement."
+     ),
+     "parameters": {
+         "type": "object",
+diff --git a/tools/terminal_tool.py b/tools/terminal_tool.py
+index f9dd09114fc..01611fe8d47 100644
+--- a/tools/terminal_tool.py
++++ b/tools/terminal_tool.py
+@@ -1083,6 +1083,11 @@ Foreground (default): returns INSTANTLY when the command finishes, even with a h
+ Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
+ Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
+ PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
++Do NOT use cat/head/tail (read_file), grep/rg/find (search_files), ls (search_files target='files'), sed/awk (patch), or echo/heredoc (write_file) — dedicated tools exist for all file operations. Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell. Activate virtualenvs/export setup vars once per session; don't re-source unless the shell state was reset.
++
++Foreground (default): returns INSTANTLY when done, even with high timeout. Set timeout=300 for long builds — you'll still get results in seconds if it's fast.
++Background: set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY. Two legitimate uses: (1) long-lived processes that never exit (servers/daemons) — silent is correct; (2) bounded long tasks (tests/builds/deploys) — MUST set notify_on_complete=true. Don't use nohup/disown/setsid/trailing '&' in foreground; use background=true so Hermes tracks lifecycle.
++After starting a server, verify readiness with a health check, then run tests in a separate call. Use process(action='poll') for progress, process(action='wait') to block until done. Use 'workdir' for per-command cwd. Set pty=true for interactive CLI tools (Codex, Claude Code, REPL). Don't use vim/nano without pty=true — they hang. Pipe git output to cat if it might page.
+ """
+ 
+ # Global state for environment lifecycle management
+@@ -3564,7 +3569,7 @@ TERMINAL_SCHEMA = {
+             },
+             "background": {
+                 "type": "boolean",
+-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
++                "description": "Run in background. Almost always pair with notify_on_complete=true — without it, the process runs silently. Legitimate uses: (1) long-lived processes that never exit (servers/daemons); (2) bounded long tasks (tests/builds/deploys) — MUST set notify_on_complete=true. For short commands, prefer foreground.",
+                 "default": False
+             },
+             "timeout": {
+@@ -3583,13 +3588,13 @@ TERMINAL_SCHEMA = {
+             },
+             "notify_on_complete": {
+                 "type": "boolean",
+-                "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
++                "description": "When true (and background=true), notified exactly once when the process finishes. Right choice for almost every long-running task (tests, builds, deploys, batch jobs). Keep working; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns.",
+                 "default": False
+             },
+             "watch_patterns": {
+                 "type": "array",
+                 "items": {"type": "string"},
+-                "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s; repeated over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
++                "description": "Strings to watch for in background output. Rate limit: 1 notification per 15s per process; after 3 consecutive windows with dropped matches, auto-disabled and promoted to notify_on_complete. USE ONLY for rare one-shot signals on long-lived processes that never exit (e.g. ['Application startup complete']). DO NOT use for end-of-run markers (use notify_on_complete) or error patterns in loops (they fire every iteration). MUTUALLY EXCLUSIVE with notify_on_complete."
+             }
+         },
+         "required": ["command"]

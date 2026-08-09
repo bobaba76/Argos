@@ -1,0 +1,83 @@
+{
+  "bundle_version": 1,
+  "upstream": {
+    "version": "0.20.0",
+    "base_commit": "6bdeb2df24d2d1d47cc08862a6bbc3171105746b"
+  },
+  "core_patch": "patches/hermes-v0.20.0-custom.patch",
+  "core_copies": [
+    {
+      "source": "ambient_context/hermes_time.py",
+      "target": "hermes_time.py"
+    },
+    {
+      "source": "ambient_context/hermes_location.py",
+      "target": "hermes_location.py"
+    },
+    {
+      "source": "ambient_context/hermes_weather.py",
+      "target": "hermes_weather.py"
+    },
+    {
+      "source": "ambient_context/hermes_file_activity.py",
+      "target": "hermes_file_activity.py"
+    },
+    {
+      "source": "ambient_context/tests/test_location.py",
+      "target": "tests/test_location.py"
+    },
+    {
+      "source": "ambient_context/tests/test_weather.py",
+      "target": "tests/test_weather.py"
+    },
+    {
+      "source": "ambient_context/tests/test_file_activity.py",
+      "target": "tests/test_file_activity.py"
+    }
+  ],
+  "plugin": {
+    "source": "hybrid_memory_plugin",
+    "target": "plugins/hybrid_memory",
+    "dependencies": [
+      "duckdb",
+      "kuzu",
+      "sentence-transformers"
+    ],
+    "excluded_names": [
+      "*.duckdb",
+      "*.wal",
+      "*_kuzu",
+      "__pycache__",
+      ".pytest_cache"
+    ]
+  },
+  "config": {
+    "yaml": {
+      "memory": {
+        "memory_enabled": true,
+        "user_profile_enabled": true,
+        "provider": "hybrid_memory"
+      }
+    },
+    "hybrid_memory_json_defaults": {
+      "database_filename": "hybrid_memory.duckdb",
+      "graph_dirname": "hybrid_memory_kuzu",
+      "storage_mode": "shared_service",
+      "max_injected_items": "8",
+      "local_embedding_model": "BAAI/bge-small-en-v1.5",
+      "auto_extract": "true",
+      "llm_fallback": "true",
+      "auto_review": "true"
+    }
+  },
+  "tests": {
+    "plugin": "plugins/hybrid_memory/tests",
+    "core": [
+      "tests/agent/test_memory_provider.py",
+      "tests/providers/test_plugin_discovery.py",
+      "tests/agent/test_memory_user_id.py",
+      "tests/agent/test_memory_session_switch.py",
+      "tests/run_agent/test_memory_provider_init.py"
+    ]
+  }
+}

@@ -89,6 +89,7 @@ class MemoryService:
                     limit=int(args.get("limit", 5)),
                     exclude_categories=args.get("exclude_categories"),
                     category_filter=args.get("category_filter"),
+                    project_id=args.get("project_id"),
                 )
             ]
         if method == "remember":

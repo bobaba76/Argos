@@ -122,6 +122,10 @@ SEARCH_SCHEMA = {
                                "One of: personal_fact, preference, insight, event, "
                                "relationship, goal, context_note.",
             },
+            "project_id": {
+                "type": "string",
+                "description": "Restrict results to this project's memories plus global memories (optional).",
+            },
         },
         "required": ["query"],
     },
@@ -343,6 +347,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._consolidation_max_actions: int = 25
         self._auto_extract_paused: bool = False
         self._initialized: bool = False
+        self._current_project_id: str = ""
         # Prefetch state.
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query: str = ""
@@ -457,6 +462,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._agent_context = kwargs.get("agent_context", "primary")
         self._user_id = kwargs.get("user_id") or "default_user"
+        self._current_project_id = str(kwargs.get("project_id") or "").strip()
 
         self._config = _load_config(self._hermes_home)
         home = Path(self._hermes_home) if self._hermes_home else Path(os.path.expanduser("~/.hermes"))
@@ -631,15 +637,22 @@ class HybridMemoryProvider(MemoryProvider):
         query: str,
         limit: int,
         category_filter: str | None = None,
+        project_id: str | None = None,
     ) -> List[Any]:
-        """Run hybrid search and apply a bounded graph-supported boost."""
+        """Run hybrid search and apply a bounded graph-supported boost.
+
+        When *project_id* is provided, memories from other projects are
+        excluded. When None, the provider's current project scope is used.
+        """
         if self._store is None:
             return []
+        effective_project = project_id if project_id is not None else self._current_project_id
         candidate_limit = min(50, max(limit, limit * 4))
         results = self._store.search(
             query,
             limit=candidate_limit,
             category_filter=category_filter,
+            project_id=effective_project or None,
         )
         if not self._graph or not self._graph_aware_retrieval:
             return results[:limit]
@@ -899,6 +912,9 @@ class HybridMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **kwargs,
     ) -> None:
+        project_id = str(kwargs.get("project_id") or "").strip()
+        if project_id != self._current_project_id:
+            self._current_project_id = project_id
         if reset:
             with self._prefetch_lock:
                 self._prefetch_query = ""
@@ -1004,8 +1020,10 @@ class HybridMemoryProvider(MemoryProvider):
             category = args.get("category")
             if category and category not in VALID_CATEGORIES:
                 return tool_error(f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
+            project_id = args.get("project_id")
             results = self._search_memories(
-                query, limit=top_k, category_filter=category
+                query, limit=top_k, category_filter=category,
+                project_id=project_id,
             )
             return json.dumps({
                 "query": query,

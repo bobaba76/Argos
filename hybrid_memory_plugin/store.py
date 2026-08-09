@@ -361,26 +361,35 @@ class DuckDBMemoryStore:
     def _text_search_raw(
         self, query: str, limit: int, excluded: set[str],
         category_filter: str | None = None,
+        project_id: str | None = None,
     ) -> List[MemoryRecord]:
         """ILIKE text search. Returns filtered records ranked by token overlap.
 
         Does NOT record retrieval — the caller is responsible for that.
         Sets ``similarity`` to a text-match score (fraction of query tokens
         that matched the content) so downstream fusion has a comparable signal.
+        When *project_id* is provided, memories from other projects are
+        excluded; global memories (project_id IS NULL) remain visible.
         """
         words = [t for t in query.split() if len(t) > 2][:4]
         if not words:
             return []
         tokens = [f"%{t}%" for t in words]
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
+        project_clause = ""
+        params: list = [self.user_id]
+        if project_id:
+            project_clause = " AND (project_id IS NULL OR project_id = ?)"
+            params.append(project_id)
         sql = (
             "SELECT * FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
             "AND (json_extract_string(payload, '$.user_scope') IS NULL "
-            "OR json_extract_string(payload, '$.user_scope') = ?) AND ("
+            "OR json_extract_string(payload, '$.user_scope') = ?) "
+            f"{project_clause} AND ("
             f"{conditions}) LIMIT 200"
         )
-        results = self._fetch_records(sql, [self.user_id, *tokens])
+        results = self._fetch_records(sql, [*params, *tokens])
         out: List[MemoryRecord] = []
         for r in results:
             if excluded and r.category.lower() in excluded:
@@ -401,23 +410,33 @@ class DuckDBMemoryStore:
     def _vector_search_raw(
         self, emb: List[float], limit: int, excluded: set[str],
         category_filter: str | None = None,
+        project_id: str | None = None,
     ) -> List[MemoryRecord]:
         """Vector similarity search. Returns filtered records ranked by cosine.
 
         Does NOT record retrieval — the caller is responsible for that.
         Raises on vector search errors so the caller can fall back.
+        When *project_id* is provided, memories from other projects are
+        excluded; global memories (project_id IS NULL) remain visible.
         """
-        sql = """
-            SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim
-            FROM memory_records
-            WHERE COALESCE(status, 'active') = 'active'
-              AND embedding IS NOT NULL
-              AND (json_extract_string(payload, '$.user_scope') IS NULL
-                   OR json_extract_string(payload, '$.user_scope') = ?)
-            ORDER BY sim DESC
-            LIMIT ?
-        """
-        results = self._fetch_records(sql, [emb, self.user_id, limit * 4], sim_col="sim")
+        project_clause = ""
+        params: list = [emb, self.user_id]
+        if project_id:
+            project_clause = " AND (project_id IS NULL OR project_id = ?)"
+            params.append(project_id)
+        params.append(limit * 4)
+        sql = (
+            "SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim "
+            "FROM memory_records "
+            "WHERE COALESCE(status, 'active') = 'active' "
+            "  AND embedding IS NOT NULL "
+            "  AND (json_extract_string(payload, '$.user_scope') IS NULL "
+            "       OR json_extract_string(payload, '$.user_scope') = ?) "
+            f"{project_clause} "
+            "ORDER BY sim DESC "
+            "LIMIT ?"
+        )
+        results = self._fetch_records(sql, params, sim_col="sim")
         out: List[MemoryRecord] = []
         for r in results:
             if excluded and r.category.lower() in excluded:
@@ -560,6 +579,7 @@ class DuckDBMemoryStore:
         limit: int = 5,
         exclude_categories: List[str] | None = None,
         category_filter: str | None = None,
+        project_id: str | None = None,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with feedback and recency.
 
@@ -568,6 +588,9 @@ class DuckDBMemoryStore:
         embeddings are unavailable, falls back to text-only search.  In
         both cases, the final ranking is adjusted by feedback signals
         (helpful/dismissed), confidence, and recency.
+
+        When *project_id* is provided, memories from other projects are
+        excluded; global memories (project_id IS NULL) remain visible.
         """
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
@@ -577,13 +600,13 @@ class DuckDBMemoryStore:
         # Gather candidate results from both paths.
         vector_results: List[MemoryRecord] = []
         text_results: List[MemoryRecord] = self._text_search_raw(
-            query, limit, excluded, category_filter
+            query, limit, excluded, category_filter, project_id=project_id
         )
 
         if emb:
             try:
                 vector_results = self._vector_search_raw(
-                    emb, limit, excluded, category_filter
+                    emb, limit, excluded, category_filter, project_id=project_id
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):

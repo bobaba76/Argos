@@ -862,7 +862,12 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: memory_id")
             content = args.get("content")
             tags = args.get("tags")
-            rec = self._store.update_memory(memory_id, content=content, tags=tags)
+            # memory_id must be passed as a keyword: SharedMemoryStore.update_memory
+            # is keyword-only (def update_memory(self, **kwargs)) over the shared
+            # service path. Passing it positionally raises TypeError on the live
+            # memory_update tool path (the direct DuckDBMemoryStore path accepted
+            # positional args, so store-level tests missed this).
+            rec = self._store.update_memory(memory_id=memory_id, content=content, tags=tags)
             if rec is None:
                 return tool_error(f"Memory not found: {memory_id}")
             if getattr(self, "_graph", None):

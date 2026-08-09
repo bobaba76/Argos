@@ -113,6 +113,7 @@ class MemoryRecord:
             "payload": self.payload,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "expires_at": self.expires_at,
             "similarity": round(self.similarity, 4),
             "status": self.status,
             "source": self.source,
@@ -374,10 +375,12 @@ class DuckDBMemoryStore:
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
         sql = (
             "SELECT * FROM memory_records "
-            "WHERE COALESCE(status, 'active') = 'active' AND ("
+            "WHERE COALESCE(status, 'active') = 'active' "
+            "AND (json_extract_string(payload, '$.user_scope') IS NULL "
+            "OR json_extract_string(payload, '$.user_scope') = ?) AND ("
             f"{conditions}) LIMIT 200"
         )
-        results = self._fetch_records(sql, tokens)
+        results = self._fetch_records(sql, [self.user_id, *tokens])
         out: List[MemoryRecord] = []
         for r in results:
             if excluded and r.category.lower() in excluded:
@@ -409,10 +412,12 @@ class DuckDBMemoryStore:
             FROM memory_records
             WHERE COALESCE(status, 'active') = 'active'
               AND embedding IS NOT NULL
+              AND (json_extract_string(payload, '$.user_scope') IS NULL
+                   OR json_extract_string(payload, '$.user_scope') = ?)
             ORDER BY sim DESC
             LIMIT ?
         """
-        results = self._fetch_records(sql, [emb, limit * 4], sim_col="sim")
+        results = self._fetch_records(sql, [emb, self.user_id, limit * 4], sim_col="sim")
         out: List[MemoryRecord] = []
         for r in results:
             if excluded and r.category.lower() in excluded:
@@ -538,8 +543,11 @@ class DuckDBMemoryStore:
         placeholders = ", ".join("?" for _ in ids)
         status_clause = "" if include_quarantined else " AND COALESCE(status, 'active') = 'active'"
         records = self._fetch_records(
-            f"SELECT * FROM memory_records WHERE memory_id IN ({placeholders}){status_clause}",
-            ids,
+            f"SELECT * FROM memory_records WHERE memory_id IN ({placeholders})"
+            " AND (json_extract_string(payload, '$.user_scope') IS NULL"
+            " OR json_extract_string(payload, '$.user_scope') = ?)"
+            f"{status_clause}",
+            [*ids, self.user_id],
         )
         by_id = {record.memory_id: record for record in records}
         return [by_id[memory_id] for memory_id in ids if memory_id in by_id
@@ -617,15 +625,22 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             # Layer 1: exact match.
             result = self.connection.execute(
-                "SELECT COUNT(*) FROM memory_records WHERE content = ? AND category = ?",
-                [content, category],
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE content = ? AND category = ?
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                [content, category, self.user_id],
             ).fetchone()
             if result and result[0] > 0:
                 return True
             # Layer 2: substring containment (case-insensitive).
             result = self.connection.execute(
-                "SELECT content FROM memory_records WHERE category = ? LIMIT 500",
-                [category],
+                """SELECT content FROM memory_records
+                   WHERE category = ?
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                          OR json_extract_string(payload, '$.user_scope') = ?)
+                   LIMIT 500""",
+                [category, self.user_id],
             ).fetchall()
             content_lower = content.lower().strip()
             for (existing,) in result:
@@ -644,9 +659,11 @@ class DuckDBMemoryStore:
                         result = self.connection.execute(
                             """SELECT memory_id FROM memory_records
                                WHERE category = ? AND embedding IS NOT NULL
+                                 AND (json_extract_string(payload, '$.user_scope') IS NULL
+                                      OR json_extract_string(payload, '$.user_scope') = ?)
                                  AND list_cosine_similarity(embedding, ?::DOUBLE[]) > ?
                                LIMIT 1""",
-                            [category, emb, self._DEDUP_SIMILARITY_THRESHOLD],
+                            [category, self.user_id, emb, self._DEDUP_SIMILARITY_THRESHOLD],
                         ).fetchone()
                         if result:
                             return True
@@ -893,7 +910,9 @@ class DuckDBMemoryStore:
         now = self._now()
         memory = None
         final_status = decision
-        if decision == "approved":
+        if decision in {"approved", "reviewed_approved"}:
+            selected_durability = durability or candidate["durability"]
+            selected_scope = scope or candidate["scope"]
             memory = self.remember(
                 category=candidate["category"],
                 content=candidate["content"],
@@ -901,8 +920,8 @@ class DuckDBMemoryStore:
                 payload=candidate["payload"],
                 source=candidate["source"],
                 confidence=candidate["confidence"],
-                durability=candidate["durability"],
-                scope=candidate["scope"],
+                durability=selected_durability,
+                scope=selected_scope,
                 project_id=candidate["project_id"],
             )
             if memory is None:
@@ -931,7 +950,11 @@ class DuckDBMemoryStore:
         with self._lock:
             assert self.connection is not None
             check = self.connection.execute(
-                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE memory_id = ?
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
                 return False
@@ -949,7 +972,11 @@ class DuckDBMemoryStore:
         with self._lock:
             assert self.connection is not None
             check = self.connection.execute(
-                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE memory_id = ?
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
                 return False
@@ -971,7 +998,11 @@ class DuckDBMemoryStore:
         with self._lock:
             assert self.connection is not None
             exists = self.connection.execute(
-                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE memory_id = ?
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                [memory_id, self.user_id],
             ).fetchone()
             if not exists or exists[0] == 0:
                 return False
@@ -1000,7 +1031,11 @@ class DuckDBMemoryStore:
     ) -> MemoryRecord | None:
         """Update an existing memory by ID. Returns updated record or None."""
         existing = self._fetch_records(
-            "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
+            """SELECT * FROM memory_records
+               WHERE memory_id = ?
+                 AND (json_extract_string(payload, '$.user_scope') IS NULL
+                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+            [memory_id, self.user_id],
         )
         if not existing:
             return None
@@ -1049,7 +1084,11 @@ class DuckDBMemoryStore:
             # Check existence first — DuckDB's execute() return value for
             # DELETE is not a reliable indicator of whether rows were deleted.
             check = self.connection.execute(
-                "SELECT COUNT(*) FROM memory_records WHERE memory_id = ?", [memory_id]
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE memory_id = ?
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
                 return False
@@ -1061,13 +1100,24 @@ class DuckDBMemoryStore:
     # -- listing --------------------------------------------------------------
 
     def list_recent(self, limit: int = 10) -> List[MemoryRecord]:
-        sql = "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active' ORDER BY created_at DESC LIMIT ?"
-        results = self._fetch_records(sql, [limit])
+        sql = (
+            "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active' "
+            "AND (json_extract_string(payload, '$.user_scope') IS NULL "
+            "OR json_extract_string(payload, '$.user_scope') = ?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        results = self._fetch_records(sql, [self.user_id, limit])
         return [r for r in results if self._matches_scope(r.payload) and not self._is_expired(r.expires_at)]
 
     def list_by_category(self, category: str, limit: int = 50) -> List[MemoryRecord]:
-        sql = "SELECT * FROM memory_records WHERE category = ? AND COALESCE(status, 'active') = 'active' ORDER BY created_at DESC LIMIT ?"
-        results = self._fetch_records(sql, [category, limit])
+        sql = (
+            "SELECT * FROM memory_records WHERE category = ? "
+            "AND COALESCE(status, 'active') = 'active' "
+            "AND (json_extract_string(payload, '$.user_scope') IS NULL "
+            "OR json_extract_string(payload, '$.user_scope') = ?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        results = self._fetch_records(sql, [category, self.user_id, limit])
         return [r for r in results if self._matches_scope(r.payload) and not self._is_expired(r.expires_at)]
 
     def list_memories(
@@ -1096,8 +1146,13 @@ class DuckDBMemoryStore:
             List of MemoryRecords with category='insight', sorted
             newest-first by created_at.
         """
-        conditions = ["category = 'insight'", "COALESCE(status, 'active') = 'active'"]
-        params: list = []
+        conditions = [
+            "category = 'insight'",
+            "COALESCE(status, 'active') = 'active'",
+            "(json_extract_string(payload, '$.user_scope') IS NULL OR "
+            "json_extract_string(payload, '$.user_scope') = ?)",
+        ]
+        params: list = [self.user_id]
         if since:
             conditions.append("created_at >= ?")
             params.append(since)
@@ -1126,9 +1181,11 @@ class DuckDBMemoryStore:
             sql_simple = (
                 "SELECT * FROM memory_records WHERE category = 'insight' "
                 "AND COALESCE(status, 'active') = 'active' "
+                "AND (json_extract_string(payload, '$.user_scope') IS NULL "
+                "OR json_extract_string(payload, '$.user_scope') = ?) "
                 "ORDER BY created_at DESC LIMIT ?"
             )
-            results = self._fetch_records(sql_simple, [limit])
+            results = self._fetch_records(sql_simple, [self.user_id, limit])
             if tags:
                 tag_set = {t.lower() for t in tags}
                 results = [r for r in results if tag_set & {t.lower() for t in (r.tags or [])}]
@@ -1139,12 +1196,17 @@ class DuckDBMemoryStore:
     def count(self) -> int:
         with self._lock:
             assert self.connection is not None
-            result = self.connection.execute("SELECT COUNT(*) FROM memory_records").fetchone()
+            result = self.connection.execute(
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE json_extract_string(payload, '$.user_scope') IS NULL
+                      OR json_extract_string(payload, '$.user_scope') = ?""",
+                [self.user_id],
+            ).fetchone()
             return result[0] if result else 0
 
     # -- junk cleanup ---------------------------------------------------------
 
-    def cleanup_junk(self) -> int:
+    def cleanup_junk(self, return_ids: bool = False) -> int | Dict[str, Any]:
         """Quarantine low-quality memories without deleting their records.
 
         This method name remains for lifecycle compatibility, but cleanup is now
@@ -1157,7 +1219,11 @@ class DuckDBMemoryStore:
             from extractor import hard_quality_flags, quality_flags_for_fact
 
         all_records = self._fetch_records(
-            "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active'"
+            """SELECT * FROM memory_records
+               WHERE COALESCE(status, 'active') = 'active'
+                 AND (json_extract_string(payload, '$.user_scope') IS NULL
+                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+            [self.user_id],
         )
         to_quarantine: Dict[str, str] = {}
         seen_content: Dict[tuple[str, str], str] = {}
@@ -1190,12 +1256,16 @@ class DuckDBMemoryStore:
                 seen_content[key] = rec.memory_id
 
         quarantined = 0
+        quarantined_ids: List[str] = []
         for memory_id, reason in to_quarantine.items():
             if self.quarantine_memory(memory_id, reason):
                 quarantined += 1
+                quarantined_ids.append(memory_id)
 
         if quarantined:
             logger.info("Quarantined %d questionable memories", quarantined)
+        if return_ids:
+            return {"count": quarantined, "memory_ids": quarantined_ids}
         return quarantined
 
     # -- consolidation / forgetting -----------------------------------------
@@ -1229,7 +1299,11 @@ class DuckDBMemoryStore:
         max_actions = max(1, min(int(max_actions), 500))
         min_age_days = max(1, int(min_age_days))
         records = self._fetch_records(
-            "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active'"
+            """SELECT * FROM memory_records
+               WHERE COALESCE(status, 'active') = 'active'
+                 AND (json_extract_string(payload, '$.user_scope') IS NULL
+                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+            [self.user_id],
         )
         now = datetime.now(timezone.utc)
         candidates: Dict[str, Dict[str, Any]] = {}
@@ -1302,14 +1376,17 @@ class DuckDBMemoryStore:
             key=lambda item: (priority.get(item["reason"], 9), item["memory_id"]),
         )[:max_actions]
         quarantined = 0
+        quarantined_ids: List[str] = []
         if not dry_run:
             for item in selected:
                 if self.quarantine_memory(item["memory_id"], item["reason"]):
                     quarantined += 1
+                    quarantined_ids.append(item["memory_id"])
         return {
             "dry_run": bool(dry_run),
             "candidate_count": len(selected),
             "quarantined_count": quarantined,
+            "quarantined_ids": quarantined_ids,
             "max_actions": max_actions,
             "min_age_days": min_age_days,
             "candidates": selected,

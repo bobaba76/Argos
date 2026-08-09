@@ -118,7 +118,7 @@ class MemoryService:
         if method == "delete_memory":
             return self.store.delete_memory(**args)
         if method == "cleanup_junk":
-            return self.store.cleanup_junk()
+            return self.store.cleanup_junk(**args)
         if method == "consolidate":
             return self.store.consolidate(**args)
         if method == "count":

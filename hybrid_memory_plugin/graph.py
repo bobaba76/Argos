@@ -604,6 +604,21 @@ class KuzuGraphStore:
     def set_user_scope(self, user_id: str | None) -> None:
         self.user_id = (user_id or "default_user").strip()
 
+    def _internal_id(self, node_id: str) -> str:
+        """Scope graph IDs for non-default users while preserving legacy IDs."""
+        node_id = str(node_id or "")
+        if self.user_id == "default_user":
+            return node_id
+        prefix = f"{self.user_id}::"
+        return node_id if node_id.startswith(prefix) else prefix + node_id
+
+    def _external_id(self, node_id: str) -> str:
+        node_id = str(node_id or "")
+        if self.user_id == "default_user":
+            return node_id
+        prefix = f"{self.user_id}::"
+        return node_id[len(prefix):] if node_id.startswith(prefix) else node_id
+
     def _flush(self) -> None:
         """Re-open the connection to force Kuzu to flush the WAL."""
         import kuzu
@@ -631,6 +646,7 @@ class KuzuGraphStore:
     ) -> None:
         incoming = dict(attributes or {})
         scope = user_scope or self.user_id
+        node_id = self._internal_id(node_id)
         with self._shared_conn_lock:
             existing_result = self.conn.execute(
                 "MATCH (n:Entity {id: $id}) RETURN n.attributes",
@@ -662,6 +678,8 @@ class KuzuGraphStore:
         """Create or update an edge while preserving multi-memory evidence."""
         incoming = dict(attributes or {})
         scope = user_scope or self.user_id
+        source_id = self._internal_id(source_id)
+        target_id = self._internal_id(target_id)
         with self._shared_conn_lock:
             existing_result = self.conn.execute(
                 """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
@@ -797,7 +815,7 @@ class KuzuGraphStore:
         if not memory_id:
             return False
         memory_id = str(memory_id)
-        memory_node = f"memory:{memory_id}"
+        memory_node = self._internal_id(f"memory:{memory_id}")
         changed = False
         with self._shared_conn_lock:
             result = self.conn.execute(
@@ -931,16 +949,17 @@ class KuzuGraphStore:
                b.entity_type AS target_type, a.attributes AS source_attrs,
                b.attributes AS target_attrs, r.attributes AS relation_attrs
         """
+        internal_id = self._internal_id(entity_id)
         with self._shared_conn_lock:
-            results = self.conn.execute(query, parameters={"id": entity_id})
+            results = self.conn.execute(query, parameters={"id": internal_id})
         edges: List[Dict[str, Any]] = []
         while results.has_next():
             row = results.get_next()
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
             edges.append({
-                "source": row[0], "source_type": row[1],
-                "relation": row[2], "target": row[3],
+                "source": self._external_id(row[0]), "source_type": row[1],
+                "relation": row[2], "target": self._external_id(row[3]),
                 "target_type": row[4],
                 "attributes": self._parse_attributes(row[7]),
             })
@@ -967,7 +986,8 @@ class KuzuGraphStore:
         # supports toLower() in Cypher.
         query = """
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        WHERE toLower(a.id) CONTAINS $term OR toLower(b.id) CONTAINS $term
+        WHERE (a.user_scope = $scope OR b.user_scope = $scope)
+          AND (toLower(a.id) CONTAINS $term OR toLower(b.id) CONTAINS $term)
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
@@ -975,15 +995,18 @@ class KuzuGraphStore:
         LIMIT $limit
         """
         with self._shared_conn_lock:
-            results = self.conn.execute(query, parameters={"term": term_lower, "limit": limit * 3})
+            results = self.conn.execute(
+                query,
+                parameters={"term": term_lower, "scope": self.user_id, "limit": limit * 3},
+            )
         edges: List[Dict[str, Any]] = []
         while results.has_next():
             row = results.get_next()
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
             edges.append({
-                "source": row[0], "source_type": row[1],
-                "relation": row[2], "target": row[3],
+                "source": self._external_id(row[0]), "source_type": row[1],
+                "relation": row[2], "target": self._external_id(row[3]),
                 "target_type": row[4],
                 "attributes": self._parse_attributes(row[7]),
             })
@@ -1000,6 +1023,7 @@ class KuzuGraphStore:
         """
         if not node_ids:
             return []
+        node_ids = [self._internal_id(node_id) for node_id in node_ids]
         # Kuzu doesn't support parameterized IN-lists reliably across
         # versions, so we build the list literal safely.
         safe_ids = [str(n).replace("'", "\\'") for n in node_ids]
@@ -1021,39 +1045,42 @@ class KuzuGraphStore:
                 continue
             source, target = str(row[0]), str(row[3])
             edges.append({
-                "source": source,
+                "source": self._external_id(source),
                 "source_type": row[1],
                 "relation": row[2],
-                "target": target,
+                "target": self._external_id(target),
                 "target_type": row[4],
                 "attributes": self._parse_attributes(row[7]),
             })
         return edges
 
     def _query_node(self, entity_id: str) -> Dict[str, Any] | None:
-        """Fetch a single node by exact or fuzzy id match."""
+        """Fetch a single node by exact or fuzzy id match within the scope."""
+        internal_id = self._internal_id(entity_id)
         with self._shared_conn_lock:
             # Try exact match first.
             result = self.conn.execute(
-                "MATCH (n:Entity {id: $id}) RETURN n.id, n.entity_type, n.attributes",
-                parameters={"id": entity_id},
+                "MATCH (n:Entity {id: $id}) WHERE n.user_scope = $scope "
+                "RETURN n.id, n.entity_type, n.attributes",
+                parameters={"id": internal_id, "scope": self.user_id},
             )
             if result.has_next():
                 row = result.get_next()
                 attrs = self._parse_attributes(row[2])
                 if self._visible_attributes(attrs):
-                    return {"id": str(row[0]), "entity_type": row[1], "attributes": attrs}
+                    return {"id": self._external_id(row[0]), "entity_type": row[1], "attributes": attrs}
             # Fuzzy match on substring.
             result = self.conn.execute(
-                "MATCH (n:Entity) WHERE toLower(n.id) CONTAINS $term "
+                "MATCH (n:Entity) WHERE n.user_scope = $scope "
+                "AND toLower(n.id) CONTAINS $term "
                 "RETURN n.id, n.entity_type, n.attributes LIMIT 1",
-                parameters={"term": entity_id.lower()},
+                parameters={"scope": self.user_id, "term": entity_id.lower()},
             )
             if result.has_next():
                 row = result.get_next()
                 attrs = self._parse_attributes(row[2])
                 if self._visible_attributes(attrs):
-                    return {"id": str(row[0]), "entity_type": row[1], "attributes": attrs}
+                    return {"id": self._external_id(row[0]), "entity_type": row[1], "attributes": attrs}
         return None
 
     def traverse_graph(
@@ -1128,13 +1155,15 @@ class KuzuGraphStore:
 
     def list_nodes(self, node_type: str | None = None, limit: int = 100) -> List[Dict[str, Any]]:
         if node_type:
-            query = "MATCH (n:Entity) WHERE n.entity_type = $type RETURN n.id, n.entity_type, n.attributes LIMIT $limit"
-            with self._shared_conn_lock:
-                results = self.conn.execute(query, parameters={"type": node_type, "limit": limit})
+            query = "MATCH (n:Entity) WHERE n.user_scope = $scope AND n.entity_type = $type " \
+                    "RETURN n.id, n.entity_type, n.attributes LIMIT $limit"
+            params = {"scope": self.user_id, "type": node_type, "limit": limit}
         else:
-            query = "MATCH (n:Entity) RETURN n.id, n.entity_type, n.attributes LIMIT $limit"
-            with self._shared_conn_lock:
-                results = self.conn.execute(query, parameters={"limit": limit})
+            query = "MATCH (n:Entity) WHERE n.user_scope = $scope " \
+                    "RETURN n.id, n.entity_type, n.attributes LIMIT $limit"
+            params = {"scope": self.user_id, "limit": limit}
+        with self._shared_conn_lock:
+            results = self.conn.execute(query, parameters=params)
         nodes: List[Dict[str, Any]] = []
         while results.has_next():
             row = results.get_next()
@@ -1145,18 +1174,25 @@ class KuzuGraphStore:
                 pass
             if not self._visible_attributes(attrs):
                 continue
-            nodes.append({"id": row[0], "entity_type": row[1], "attributes": attrs})
+            nodes.append({"id": self._external_id(row[0]), "entity_type": row[1], "attributes": attrs})
         return nodes
 
     def count_nodes(self) -> int:
         with self._shared_conn_lock:
-            results = self.conn.execute("MATCH (n:Entity) RETURN COUNT(*)")
+            results = self.conn.execute(
+                "MATCH (n:Entity) WHERE n.user_scope = $scope RETURN COUNT(*)",
+                parameters={"scope": self.user_id},
+            )
             row = results.get_next()
             return int(row[0]) if row else 0
 
     def count_edges(self) -> int:
         with self._shared_conn_lock:
-            results = self.conn.execute("MATCH ()-[r:RelatesTo]->() RETURN COUNT(*)")
+            results = self.conn.execute(
+                "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) "
+                "WHERE r.user_scope = $scope RETURN COUNT(*)",
+                parameters={"scope": self.user_id},
+            )
             row = results.get_next()
             return int(row[0]) if row else 0
 
@@ -1182,10 +1218,11 @@ class KuzuGraphStore:
 
     def _quarantine_node(self, node_id: str, reason: str) -> bool:
         now = datetime.now(timezone.utc).isoformat()
+        node_id = self._internal_id(node_id)
         with self._shared_conn_lock:
             result = self.conn.execute(
-                "MATCH (n:Entity {id: $id}) RETURN n.attributes",
-                parameters={"id": node_id},
+                "MATCH (n:Entity {id: $id}) WHERE n.user_scope = $scope RETURN n.attributes",
+                parameters={"id": node_id, "scope": self.user_id},
             )
             if not result.has_next():
                 return False
@@ -1200,19 +1237,22 @@ class KuzuGraphStore:
                 "quarantined_at": now,
             })
             self.conn.execute(
-                "MATCH (n:Entity {id: $id}) SET n.attributes = $attrs",
-                parameters={"id": node_id, "attrs": json.dumps(attrs)},
+                "MATCH (n:Entity {id: $id}) WHERE n.user_scope = $scope "
+                "SET n.attributes = $attrs",
+                parameters={"id": node_id, "scope": self.user_id, "attrs": json.dumps(attrs)},
             )
         return True
 
     def _quarantine_edge(self, source: str, target: str, relation: str, reason: str) -> bool:
         now = datetime.now(timezone.utc).isoformat()
+        source = self._internal_id(source)
+        target = self._internal_id(target)
         with self._shared_conn_lock:
             result = self.conn.execute(
                 """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
-                   WHERE r.relation_type = $relation
+                   WHERE r.relation_type = $relation AND r.user_scope = $scope
                    RETURN r.attributes""",
-                parameters={"source": source, "target": target, "relation": relation},
+                parameters={"source": source, "target": target, "relation": relation, "scope": self.user_id},
             )
             if not result.has_next():
                 return False
@@ -1228,11 +1268,12 @@ class KuzuGraphStore:
             })
             self.conn.execute(
                 """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
-                   WHERE r.relation_type = $relation
+                   WHERE r.relation_type = $relation AND r.user_scope = $scope
                    SET r.attributes = $attrs""",
                 parameters={
                     "source": source, "target": target,
-                    "relation": relation, "attrs": json.dumps(attrs),
+                    "relation": relation, "scope": self.user_id,
+                    "attrs": json.dumps(attrs),
                 },
             )
         return True
@@ -1241,14 +1282,18 @@ class KuzuGraphStore:
         """Hide obviously malformed nodes/edges without deleting graph data."""
         with self._shared_conn_lock:
             node_results = self.conn.execute(
-                "MATCH (n:Entity) RETURN n.id AS id, n.attributes AS attributes"
+                "MATCH (n:Entity) WHERE n.user_scope = $scope "
+                "RETURN n.id AS id, n.attributes AS attributes",
+                parameters={"scope": self.user_id},
             )
             nodes = []
             while node_results.has_next():
                 nodes.append(node_results.get_next())
             edge_results = self.conn.execute(
                 """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-                   RETURN a.id, r.relation_type, b.id, r.attributes"""
+                   WHERE r.user_scope = $scope
+                   RETURN a.id, r.relation_type, b.id, r.attributes""",
+                parameters={"scope": self.user_id},
             )
             edges = []
             while edge_results.has_next():
@@ -1258,7 +1303,7 @@ class KuzuGraphStore:
         for node_id, raw_attrs in nodes:
             if not self._visible_attributes(raw_attrs):
                 continue
-            node_id = str(node_id)
+            node_id = self._external_id(str(node_id))
             first_word = node_id.split()[0].lower() if node_id.split() else ""
             word_count = len(node_id.split())
             # Whole-sentence / paragraph payloads are not valid entity names.

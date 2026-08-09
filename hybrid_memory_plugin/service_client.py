@@ -228,8 +228,9 @@ class SharedMemoryStore:
     def delete_memory(self, **kwargs: Any) -> bool:
         return bool(self._rpc.call("store", "delete_memory", **kwargs))
 
-    def cleanup_junk(self) -> int:
-        return int(self._rpc.call("store", "cleanup_junk") or 0)
+    def cleanup_junk(self, return_ids: bool = False) -> int | dict:
+        value = self._rpc.call("store", "cleanup_junk", return_ids=return_ids) or 0
+        return value if return_ids else int(value)
 
     def consolidate(self, **kwargs: Any) -> dict:
         return self._rpc.call("store", "consolidate", **kwargs) or {}

@@ -658,6 +658,7 @@ class HybridMemoryProvider(MemoryProvider):
 
         def _run() -> None:
             sections = []
+            body = ""
             try:
                 confirmation_candidates = store.list_candidates(
                     status="pending_user_confirmation", limit=1
@@ -717,7 +718,7 @@ class HybridMemoryProvider(MemoryProvider):
             review = review_candidate_with_llm(candidate)
             decision = review.get("decision", "pending_user_confirmation")
             decision_map = {
-                "approve": "reviewed_approved",
+                "approve": "approved",
                 "reject": "rejected",
                 "quarantine": "quarantined",
                 "pending_user_confirmation": "pending_user_confirmation",
@@ -822,9 +823,15 @@ class HybridMemoryProvider(MemoryProvider):
         # Quarantine questionable memories at session end; never delete silently.
         if self._store:
             try:
-                quarantined = self._store.cleanup_junk()
+                cleanup_result = self._store.cleanup_junk(return_ids=True)
+                quarantined = int(cleanup_result.get("count", 0)) if isinstance(cleanup_result, dict) else int(cleanup_result)
                 if quarantined:
                     logger.info("Quarantined %d questionable memories at session end", quarantined)
+                    for memory_id in cleanup_result.get("memory_ids", []) if isinstance(cleanup_result, dict) else []:
+                        try:
+                            self._graph.remove_memory(memory_id)
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.debug("Memory quarantine failed: %s", e)
             if self._consolidation_enabled:
@@ -839,6 +846,13 @@ class HybridMemoryProvider(MemoryProvider):
                             "Consolidation quarantined %d memories",
                             report["quarantined_count"],
                         )
+                        for memory_id in report.get("quarantined_ids", []):
+                            if not self._graph:
+                                break
+                            try:
+                                self._graph.remove_memory(memory_id)
+                            except Exception:
+                                pass
                 except Exception as e:
                     logger.debug("Consolidation failed: %s", e)
 
@@ -1077,6 +1091,16 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: memory_id")
             if not self._store.restore_memory(memory_id):
                 return tool_error(f"Memory not found: {memory_id}")
+            if self._graph:
+                restored = self._store.get_memories_by_ids([memory_id])
+                if restored:
+                    self._index_memory_graph(
+                        restored[0].memory_id,
+                        restored[0].category,
+                        restored[0].content,
+                        restored[0].tags,
+                        restored[0].created_at,
+                    )
             return json.dumps({"status": "restored", "memory_id": memory_id})
 
         elif tool_name == "memory_feedback":
@@ -1090,6 +1114,11 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error(str(exc))
             if not recorded:
                 return tool_error(f"Memory not found: {memory_id}")
+            if feedback == "incorrect" and self._graph:
+                try:
+                    self._graph.remove_memory(memory_id)
+                except Exception as exc:
+                    logger.debug("Graph cleanup failed for incorrect memory %s: %s", memory_id, exc)
             return json.dumps({"status": "recorded", "memory_id": memory_id, "feedback": feedback})
 
         elif tool_name == "memory_maintenance":
@@ -1109,6 +1138,12 @@ class HybridMemoryProvider(MemoryProvider):
                 max_actions=max_actions,
                 min_age_days=min_age_days,
             )
+            if not dry_run and self._graph:
+                for memory_id in report.get("quarantined_ids", []):
+                    try:
+                        self._graph.remove_memory(memory_id)
+                    except Exception as exc:
+                        logger.debug("Graph cleanup failed for %s: %s", memory_id, exc)
             return json.dumps(report)
 
         elif tool_name == "memory_graph_search":

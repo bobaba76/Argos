@@ -200,9 +200,8 @@ def extract_graph_relations(
             add("user", "person", f"has_{relation}", name, "person")
 
     my_relation = re.compile(
-        r"\b(?:my|the\s+user'?s?)\s+([a-z][a-z_-]*)\s+is\s+"
-        r"([A-Za-z][A-Za-z0-9'_-]*(?:\s+[A-Za-z][A-Za-z0-9'_-]*)?)",
-        re.IGNORECASE,
+        r"\b(?i:(?:my|the\s+user'?s?))\s+([a-z][a-z_-]*)\s+is\s+"
+        r"([A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*)?)",
     )
     for match in my_relation.finditer(text):
         relation, name = match.group(1).lower(), match.group(2)
@@ -211,12 +210,15 @@ def extract_graph_relations(
 
     # Bare role-name pattern: "Role is Entity-A", "Contact is Entity-B"
     # (common in generated memories that drop the "my" prefix).
+    # The name group MUST start with a capital letter to prevent matching
+    # "boss is expecting", "doctor is happy", "ex is a director" etc. —
+    # those are verbs/adjectives, not names. The role word is case-insensitive
+    # (matches both "Wife" and "wife") but the name is NOT.
     bare_role = re.compile(
-        r"\b(wife|husband|partner|boyfriend|girlfriend|ex|boss|advisor|"
+        r"\b(?i:(wife|husband|partner|boyfriend|girlfriend|ex|boss|advisor|"
         r"doctor|doc|teacher|mentor|friend|colleague|manager|supervisor|"
-        r"sibling|brother|sister|parent|mother|father|son|daughter|child)"
-        r"\s+is\s+([A-Za-z][A-Za-z0-9'_-]*(?:\s+[A-Za-z][A-Za-z0-9'_-]*)?)",
-        re.IGNORECASE,
+        r"sibling|brother|sister|parent|mother|father|son|daughter|child))"
+        r"\s+is\s+([A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*)?)",
     )
     for match in bare_role.finditer(text):
         role, name = match.group(1).lower(), match.group(2)
@@ -699,13 +701,27 @@ class KuzuGraphStore:
                 existing = self._parse_attributes(existing_result.get_next()[0])
             merged = dict(existing)
             merged.update(incoming)
+            # Never downgrade a person node to concept. If the node already
+            # exists as "person" (from an explicit relationship pattern),
+            # a later merge from a relation-free memory must not overwrite
+            # it to "concept". "person" is a stronger type than "concept".
+            type_result = self.conn.execute(
+                "MATCH (n:Entity {id: $id}) RETURN n.entity_type",
+                parameters={"id": node_id},
+            )
+            existing_type = None
+            if type_result.has_next():
+                existing_type = type_result.get_next()[0]
+            effective_type = node_type
+            if existing_type == "person" and node_type != "person":
+                effective_type = "person"
             query = """
             MERGE (n:Entity {id: $id})
             ON MATCH SET n.entity_type = $type, n.attributes = $attrs, n.user_scope = $scope
             ON CREATE SET n.entity_type = $type, n.attributes = $attrs, n.user_scope = $scope
             """
             self.conn.execute(query, parameters={
-                "id": node_id, "type": node_type,
+                "id": node_id, "type": effective_type,
                 "attrs": json.dumps(merged), "scope": scope,
             })
 

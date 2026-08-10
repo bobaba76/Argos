@@ -1290,19 +1290,26 @@ class DuckDBMemoryStore:
 
         with self._lock:
             assert self.connection is not None
-            # 1. Create the new version
+            # 1. Create the new version, carrying feedback counters forward
+            #    from the superseded record so importance evidence survives
+            #    edits. A memory with 10 helpful votes keeps them after a
+            #    content fix. retrieval_count also carries forward because the
+            #    new version represents the same fact the user has been
+            #    retrieving.
             self.connection.execute(
                 """INSERT INTO memory_records
                    (memory_id, category, content, tags, payload, created_at, updated_at,
                     expires_at, embedding, status, source, confidence, durability, scope,
                     project_id, retrieval_count, helpful_count, dismissed_count,
                     valid_from, valid_to, superseded_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                 [new_id, rec.category, new_content, new_tags,
                  json.dumps(new_payload), now, now,
                  rec.expires_at, new_emb if new_emb else None,
                  rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
-                 rec.project_id, now],
+                 rec.project_id,
+                 rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
+                 now],
             )
             # 2. Supersede the old version
             self.connection.execute(
@@ -1456,6 +1463,25 @@ class DuckDBMemoryStore:
                 [self.user_id],
             ).fetchall()
         return [{"alias": r[0], "canonical_entity": r[1]} for r in rows]
+
+    def aliases_for_canonical(self, canonical_entity: str) -> List[str]:
+        """Return all aliases that map to a canonical entity name.
+
+        This is the reverse of resolve_aliases: given "Sam", returns
+        ["my role", "the role"] — so a search for  "Entity-A"can also
+        search for memories that mention "my role" without naming Entity-A.
+        """
+        canonical = canonical_entity.strip().lower()
+        if not canonical:
+            return []
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT alias FROM entity_aliases
+                   WHERE canonical_entity = ? AND user_scope = ?""",
+                [canonical, self.user_id],
+            ).fetchall()
+        return [r[0] for r in rows if r[0]]
 
     # -- listing --------------------------------------------------------------
 

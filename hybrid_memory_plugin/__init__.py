@@ -978,6 +978,35 @@ class HybridMemoryProvider(MemoryProvider):
                         effective_query[:50], alias_expansions,
                     )
 
+            # Canonical→alias expansion: when the query mentions a canonical
+            # entity name, also search for its aliases in the graph.
+            # Example: "tell me about Entity-A" → also search for "my role"
+            # so memories that say "my role" without naming Entity-A are found.
+            alias_terms: list[str] = []
+            if hasattr(self._store, "aliases_for_canonical"):
+                for canonical in alias_expansions:
+                    try:
+                        aliases = self._store.aliases_for_canonical(canonical)
+                        alias_terms.extend(aliases)
+                    except Exception:
+                        pass
+                # Also check if the query itself contains a canonical name
+                # that has aliases (even if no alias→canonical match fired)
+                if not alias_terms:
+                    for alias_map in (self._store.list_aliases() if hasattr(self._store, "list_aliases") else []):
+                        canonical = alias_map.get("canonical_entity", "")
+                        if canonical and canonical.lower() in effective_query.lower():
+                            try:
+                                aliases = self._store.aliases_for_canonical(canonical)
+                                alias_terms.extend(aliases)
+                            except Exception:
+                                pass
+                if alias_terms:
+                    logger.debug(
+                        "Canonical→alias expansion: '%s' → %s",
+                        effective_query[:50], alias_terms,
+                    )
+
             graph_ids = self._graph.memory_ids_for_query(
                 effective_query, limit=max(10, candidate_limit)
             )
@@ -988,6 +1017,19 @@ class HybridMemoryProvider(MemoryProvider):
                         canonical, limit=max(10, candidate_limit)
                     )
                     # Merge, preserving order (dedup)
+                    seen = set(graph_ids)
+                    for eid in extra_ids:
+                        if eid not in seen:
+                            graph_ids.append(eid)
+                            seen.add(eid)
+                except Exception:
+                    pass
+            # Also query the graph for each alias term (canonical→alias)
+            for alias_term in alias_terms:
+                try:
+                    extra_ids = self._graph.memory_ids_for_query(
+                        alias_term, limit=max(10, candidate_limit)
+                    )
                     seen = set(graph_ids)
                     for eid in extra_ids:
                         if eid not in seen:

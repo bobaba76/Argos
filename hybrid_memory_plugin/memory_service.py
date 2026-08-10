@@ -165,6 +165,23 @@ class MemoryService:
                     limit=int(args.get("limit", 50)),
                 )
             ]
+        if method == "add_alias":
+            self.store.add_alias(
+                alias=args.get("alias", ""),
+                canonical_entity=args.get("canonical_entity", ""),
+            )
+            return True
+        if method == "remove_alias":
+            return self.store.remove_alias(
+                alias=args.get("alias", ""),
+                canonical_entity=args.get("canonical_entity"),
+            )
+        if method == "resolve_aliases":
+            return self.store.resolve_aliases(args.get("text", ""))
+        if method == "list_aliases":
+            return self.store.list_aliases()
+        if method == "aliases_for_canonical":
+            return self.store.aliases_for_canonical(args.get("canonical_entity", ""))
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str) -> Any:

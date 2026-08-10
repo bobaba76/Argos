@@ -42,7 +42,7 @@ _GRAPH_STOP_ENTITIES = frozenset({
 })
 _GRAPH_RELATIONSHIP_WORDS = frozenset({
     "wife", "husband", "partner", "boyfriend", "girlfriend", "ex",
-    "boss", "advisor", "doctor", "teacher", "mentor", "friend",
+    "boss", "advisor", "doctor", "doc", "teacher", "mentor", "friend",
     "colleague", "manager", "supervisor", "sibling", "brother", "sister",
     "parent", "mother", "father", "son", "daughter", "child",
 })
@@ -80,7 +80,12 @@ def _valid_graph_entity(value: str) -> bool:
         return False
     if cleaned.casefold() in _GRAPH_CURATED_JUNK_ENTITIES:
         return False
+    # Allow role mentions like "my role", "my doctor", "the boss" through
+    # even though their first word is a stopword. These are valid graph
+    # entities that alias to canonical person names.
     if words[0].casefold() in _GRAPH_STOP_ENTITIES:
+        if len(words) >= 2 and words[1].casefold() in _GRAPH_RELATIONSHIP_WORDS:
+            return True
         return False
     # Entity extraction should produce names or short noun phrases, not a
     # sentence/paragraph accidentally captured by a broad pattern or LLM.
@@ -204,6 +209,19 @@ def extract_graph_relations(
         if relation in _GRAPH_RELATIONSHIP_WORDS:
             add("user", "person", f"has_{relation}", name, "person")
 
+    # Bare role-name pattern: "Role is Entity-A", "Contact is Entity-B"
+    # (common in generated memories that drop the "my" prefix).
+    bare_role = re.compile(
+        r"\b(wife|husband|partner|boyfriend|girlfriend|ex|boss|advisor|"
+        r"doctor|doc|teacher|mentor|friend|colleague|manager|supervisor|"
+        r"sibling|brother|sister|parent|mother|father|son|daughter|child)"
+        r"\s+is\s+([A-Za-z][A-Za-z0-9'_-]*(?:\s+[A-Za-z][A-Za-z0-9'_-]*)?)",
+        re.IGNORECASE,
+    )
+    for match in bare_role.finditer(text):
+        role, name = match.group(1).lower(), match.group(2)
+        add("user", "person", f"has_{role}", name, "person")
+
     direct_relationship = re.compile(
         r"\b(?:i\s+am\s+|i\s+)?(married|dating|seeing|friends?)"
         r"\s+(?:to|with)\s+([A-Za-z][A-Za-z0-9'_-]*(?:\s+[A-Za-z][A-Za-z0-9'_-]*)?)",
@@ -211,6 +229,20 @@ def extract_graph_relations(
     )
     for match in direct_relationship.finditer(text):
         add("user", "person", _slug_relation(f"{match.group(1)}_with"), match.group(2), "person")
+
+    # Role mentions without names: "my role", "my doc", "my advisor".
+    # These create graph nodes that can be aliased to canonical names.
+    # Without this, "my role" never enters the graph and searching for it
+    # via the graph yields nothing — the alias system has no anchor.
+    role_mention = re.finditer(
+        r"\b(?:my|the\s+user'?s?)\s+([a-z][a-z_-]*)\b",
+        text,
+        re.IGNORECASE,
+    )
+    for match in role_mention:
+        role = match.group(1).lower()
+        if role in _GRAPH_RELATIONSHIP_WORDS:
+            add("user", "person", f"has_{role}", f"my {role}", "person", "role_mention")
 
     # Work and location.
     work = re.search(
@@ -359,12 +391,22 @@ def extract_graph_relations(
         "relationship": "related_to",
     }.get(category, "related_to")
     explicit_targets = {item["target"].casefold() for item in relations}
+    # Track which entities were already typed as "person" by explicit
+    # relationship patterns, so proper-noun mentions of the same name
+    # inherit the person type instead of defaulting to "concept".
+    person_targets = {
+        item["target"].casefold()
+        for item in relations
+        if item.get("target_type") == "person"
+    }
     for entity in proper_nouns:
         if entity.casefold() in _GRAPH_STOP_ENTITIES or entity.casefold() == "user":
             continue
         if entity.casefold() in explicit_targets:
             continue
-        add("user", "person", proper_relation, entity, "concept", "proper_noun")
+        # Inherit person type if this name was already seen in a relationship
+        entity_type = "person" if entity.casefold() in person_targets else "concept"
+        add("user", "person", proper_relation, entity, entity_type, "proper_noun")
 
     return relations
 

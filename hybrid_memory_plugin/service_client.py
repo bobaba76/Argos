@@ -268,6 +268,32 @@ class SharedMemoryStore:
     def close(self) -> None:
         return None
 
+    # -- entity aliases -------------------------------------------------------
+
+    def add_alias(self, alias: str, canonical_entity: str) -> None:
+        self._rpc.call(
+            "store", "add_alias",
+            alias=alias, canonical_entity=canonical_entity,
+        )
+
+    def remove_alias(self, alias: str, canonical_entity: str | None = None) -> bool:
+        return bool(self._rpc.call(
+            "store", "remove_alias",
+            alias=alias, canonical_entity=canonical_entity,
+        ) or False)
+
+    def resolve_aliases(self, text: str) -> List[str]:
+        return self._rpc.call("store", "resolve_aliases", text=text) or []
+
+    def list_aliases(self) -> List[Dict[str, str]]:
+        return self._rpc.call("store", "list_aliases") or []
+
+    def aliases_for_canonical(self, canonical_entity: str) -> List[str]:
+        return self._rpc.call(
+            "store", "aliases_for_canonical",
+            canonical_entity=canonical_entity,
+        ) or []
+
 
 class SharedGraphStore:
     """Kùzu graph client backed by the shared service."""

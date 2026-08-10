@@ -55,6 +55,7 @@ class MemoryRecord:
         "status", "source", "confidence", "durability", "scope", "project_id",
         "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
         "quarantine_reason", "quarantined_at",
+        "valid_from", "valid_to", "superseded_by",
     )
 
     def __init__(
@@ -82,6 +83,9 @@ class MemoryRecord:
         dismissed_count: int = 0,
         quarantine_reason: str | None = None,
         quarantined_at: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        superseded_by: str | None = None,
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -109,6 +113,13 @@ class MemoryRecord:
         self.dismissed_count = int(dismissed_count or 0)
         self.quarantine_reason = quarantine_reason
         self.quarantined_at = quarantined_at
+        # Temporal validity: valid_from/valid_to define when this version
+        # was/is current. superseded_by points to the newer version that
+        # replaced it (NULL = current). Retrieval defaults to current state
+        # (valid_to IS NULL); history is queryable via as_of parameter.
+        self.valid_from = valid_from
+        self.valid_to = valid_to
+        self.superseded_by = superseded_by
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -134,6 +145,9 @@ class MemoryRecord:
             "dismissed_count": self.dismissed_count,
             "quarantine_reason": self.quarantine_reason,
             "quarantined_at": self.quarantined_at,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
+            "superseded_by": self.superseded_by,
         }
 
 
@@ -200,7 +214,10 @@ class DuckDBMemoryStore:
                     helpful_count      INTEGER DEFAULT 0,
                     dismissed_count    INTEGER DEFAULT 0,
                     quarantine_reason  VARCHAR,
-                    quarantined_at     VARCHAR
+                    quarantined_at     VARCHAR,
+                    valid_from         VARCHAR,
+                    valid_to           VARCHAR,
+                    superseded_by      VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -240,6 +257,9 @@ class DuckDBMemoryStore:
                 "dismissed_count": "INTEGER DEFAULT 0",
                 "quarantine_reason": "VARCHAR",
                 "quarantined_at": "VARCHAR",
+                "valid_from": "VARCHAR",
+                "valid_to": "VARCHAR",
+                "superseded_by": "VARCHAR",
             }
             candidate_columns = {
                 "evidence_text": "VARCHAR",
@@ -287,6 +307,18 @@ class DuckDBMemoryStore:
                 """)
             except Exception as exc:
                 logger.warning("Memory metadata backfill failed: %s", exc)
+
+            # Retroactive temporal-validity migration: every existing memory
+            # gets valid_from = created_at. valid_to stays NULL (current).
+            # This runs once on databases that predate the versioning feature.
+            try:
+                self.connection.execute("""
+                    UPDATE memory_records
+                    SET valid_from = COALESCE(valid_from, created_at)
+                    WHERE valid_from IS NULL
+                """)
+            except Exception as exc:
+                logger.warning("Temporal validity backfill failed: %s", exc)
 
     # -- helpers --------------------------------------------------------------
 
@@ -337,6 +369,9 @@ class DuckDBMemoryStore:
             dismissed_count=row.get("dismissed_count", 0),
             quarantine_reason=row.get("quarantine_reason"),
             quarantined_at=row.get("quarantined_at"),
+            valid_from=row.get("valid_from"),
+            valid_to=row.get("valid_to"),
+            superseded_by=row.get("superseded_by"),
         )
 
     def _fetch_records(
@@ -371,6 +406,7 @@ class DuckDBMemoryStore:
         self, query: str, limit: int, excluded: set[str],
         category_filter: str | None = None,
         project_id: str | None = None,
+        as_of: str | None = None,
     ) -> List[MemoryRecord]:
         """ILIKE text search. Returns filtered records ranked by token overlap.
 
@@ -390,15 +426,28 @@ class DuckDBMemoryStore:
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
+        # Temporal filter: default to current (valid_to IS NULL),
+        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of))
+        if as_of:
+            temporal_clause = (
+                "AND valid_from <= ? "
+                "AND (valid_to IS NULL OR valid_to > ?) "
+            )
+            temporal_params = [as_of, as_of]
+        else:
+            temporal_clause = "AND valid_to IS NULL "
+            temporal_params = []
+
         sql = (
             "SELECT * FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
+            f"{temporal_clause} "
             "AND (json_extract_string(payload, '$.user_scope') IS NULL "
             "OR json_extract_string(payload, '$.user_scope') = ?) "
             f"{project_clause} AND ("
             f"{conditions}) LIMIT 200"
         )
-        results = self._fetch_records(sql, [*params, *tokens])
+        results = self._fetch_records(sql, [*temporal_params, *params, *tokens])
         out: List[MemoryRecord] = []
         for r in results:
             if excluded and r.category.lower() in excluded:
@@ -420,6 +469,7 @@ class DuckDBMemoryStore:
         self, emb: List[float], limit: int, excluded: set[str],
         category_filter: str | None = None,
         project_id: str | None = None,
+        as_of: str | None = None,
     ) -> List[MemoryRecord]:
         """Vector similarity search. Returns filtered records ranked by cosine.
 
@@ -429,7 +479,18 @@ class DuckDBMemoryStore:
         excluded; global memories (project_id IS NULL) remain visible.
         """
         project_clause = ""
-        params: list = [emb, self.user_id]
+        params: list = [emb]
+        # Temporal filter: default to current (valid_to IS NULL),
+        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of))
+        if as_of:
+            temporal_clause = (
+                "AND valid_from <= ? "
+                "AND (valid_to IS NULL OR valid_to > ?) "
+            )
+            params.extend([as_of, as_of])
+        else:
+            temporal_clause = "AND valid_to IS NULL "
+        params.append(self.user_id)
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -438,6 +499,7 @@ class DuckDBMemoryStore:
             "SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim "
             "FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
+            f"  {temporal_clause} "
             "  AND embedding IS NOT NULL "
             "  AND (json_extract_string(payload, '$.user_scope') IS NULL "
             "       OR json_extract_string(payload, '$.user_scope') = ?) "
@@ -618,7 +680,8 @@ class DuckDBMemoryStore:
                         """UPDATE memory_records
                            SET retrieval_count = COALESCE(retrieval_count, 0) + 1,
                                last_retrieved_at = ?
-                           WHERE memory_id = ? AND COALESCE(status, 'active') = 'active'""",
+                           WHERE memory_id = ? AND COALESCE(status, 'active') = 'active'
+                           AND valid_to IS NULL""",
                         [now, memory_id],
                     )
             for record in records:
@@ -639,7 +702,7 @@ class DuckDBMemoryStore:
         if not ids:
             return []
         placeholders = ", ".join("?" for _ in ids)
-        status_clause = "" if include_quarantined else " AND COALESCE(status, 'active') = 'active'"
+        status_clause = "" if include_quarantined else " AND COALESCE(status, 'active') = 'active' AND valid_to IS NULL"
         records = self._fetch_records(
             f"SELECT * FROM memory_records WHERE memory_id IN ({placeholders})"
             " AND (json_extract_string(payload, '$.user_scope') IS NULL"
@@ -659,6 +722,7 @@ class DuckDBMemoryStore:
         exclude_categories: List[str] | None = None,
         category_filter: str | None = None,
         project_id: str | None = None,
+        as_of: str | None = None,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with optional cross-encoder
         re-ranking, feedback, and recency.
@@ -687,13 +751,15 @@ class DuckDBMemoryStore:
         # Gather candidate results from both paths.
         vector_results: List[MemoryRecord] = []
         text_results: List[MemoryRecord] = self._text_search_raw(
-            query, pool_size, excluded, category_filter, project_id=project_id
+            query, pool_size, excluded, category_filter,
+            project_id=project_id, as_of=as_of,
         )
 
         if emb:
             try:
                 vector_results = self._vector_search_raw(
-                    emb, pool_size, excluded, category_filter, project_id=project_id
+                    emb, pool_size, excluded, category_filter,
+                    project_id=project_id, as_of=as_of,
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):
@@ -867,8 +933,9 @@ class DuckDBMemoryStore:
             INSERT INTO memory_records
                 (memory_id, category, content, tags, payload, created_at, updated_at,
                  expires_at, embedding, status, source, confidence, durability, scope,
-                 project_id, retrieval_count, helpful_count, dismissed_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
+                 project_id, retrieval_count, helpful_count, dismissed_count,
+                 valid_from)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
         """
         with self._lock:
             assert self.connection is not None
@@ -878,6 +945,7 @@ class DuckDBMemoryStore:
                 record_payload.get("expires_at"),
                 emb if emb else None,
                 status, source, confidence, durability, scope, project_id,
+                now,  # valid_from = creation time
             ])
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
@@ -1168,7 +1236,17 @@ class DuckDBMemoryStore:
         tags: List[str] | None = None,
         payload_updates: Dict[str, Any] | None = None,
     ) -> MemoryRecord | None:
-        """Update an existing memory by ID. Returns updated record or None."""
+        """Update an existing memory by creating a new version.
+
+        Instead of overwriting the old record, this:
+        1. Creates a new memory record with a new ID (the new version)
+        2. Sets the old record's valid_to = now and superseded_by = new_id
+        3. Returns the new version
+
+        The old record is preserved for history queries (as_of parameter).
+        If no content/tags/payload changes are provided, returns the existing
+        record unchanged.
+        """
         existing = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE memory_id = ?
@@ -1185,37 +1263,94 @@ class DuckDBMemoryStore:
         new_payload = dict(rec.payload)
         if payload_updates:
             new_payload.update(payload_updates)
+
+        # If nothing actually changed, return the existing record
+        if (content is None and tags is None and not payload_updates):
+            return rec
+
+        # Re-embed if content changed
         new_emb: List[float] = []
         if content is not None and self.embedder and hasattr(self.embedder, "embed"):
             new_emb = self.embedder.embed(new_content)
+        elif rec.embedding:
+            new_emb = rec.embedding
+
+        # Generate new version ID
+        new_id = f"mem-{uuid.uuid4().hex}"
 
         with self._lock:
             assert self.connection is not None
-            if content is not None and new_emb:
-                self.connection.execute(
-                    """UPDATE memory_records
-                       SET content = ?, tags = ?, payload = ?, updated_at = ?, embedding = ?
-                       WHERE memory_id = ?""",
-                    [new_content, new_tags, json.dumps(new_payload), now, new_emb, memory_id],
-                )
-            elif content is not None:
-                self.connection.execute(
-                    """UPDATE memory_records
-                       SET content = ?, tags = ?, payload = ?, updated_at = ?
-                       WHERE memory_id = ?""",
-                    [new_content, new_tags, json.dumps(new_payload), now, memory_id],
-                )
-            else:
-                self.connection.execute(
-                    """UPDATE memory_records
-                       SET tags = ?, payload = ?, updated_at = ?
-                       WHERE memory_id = ?""",
-                    [new_tags, json.dumps(new_payload), now, memory_id],
-                )
+            # 1. Create the new version
+            self.connection.execute(
+                """INSERT INTO memory_records
+                   (memory_id, category, content, tags, payload, created_at, updated_at,
+                    expires_at, embedding, status, source, confidence, durability, scope,
+                    project_id, retrieval_count, helpful_count, dismissed_count,
+                    valid_from, valid_to, superseded_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, NULL, NULL)""",
+                [new_id, rec.category, new_content, new_tags,
+                 json.dumps(new_payload), now, now,
+                 rec.expires_at, new_emb if new_emb else None,
+                 rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
+                 rec.project_id, now],
+            )
+            # 2. Supersede the old version
+            self.connection.execute(
+                """UPDATE memory_records
+                   SET valid_to = ?, superseded_by = ?, updated_at = ?
+                   WHERE memory_id = ?""",
+                [now, new_id, now, memory_id],
+            )
         fetched = self._fetch_records(
-            "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
+            "SELECT * FROM memory_records WHERE memory_id = ?", [new_id]
         )
         return fetched[0] if fetched else None
+
+    def get_memory_history(self, memory_id: str) -> List[MemoryRecord]:
+        """Return the full version chain for a memory.
+
+        Given any version's ID, walks the superseded_by chain to find
+        all versions: the original, all intermediate versions, and the
+        current version. Returns them in chronological order (oldest first).
+        """
+        # Walk forward from the given ID to find all successors
+        chain: List[MemoryRecord] = []
+        current = self._fetch_records(
+            "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
+        )
+        if not current:
+            return []
+        chain.append(current[0])
+
+        # Follow superseded_by forward
+        node = current[0]
+        while node.superseded_by:
+            nxt = self._fetch_records(
+                "SELECT * FROM memory_records WHERE memory_id = ?",
+                [node.superseded_by],
+            )
+            if not nxt or nxt[0].memory_id == node.memory_id:
+                break
+            chain.append(nxt[0])
+            node = nxt[0]
+
+        # Now walk backward to find predecessors (records that were
+        # superseded by the oldest version in our chain)
+        oldest = chain[0]
+        predecessors: List[MemoryRecord] = []
+        prev_search = self._fetch_records(
+            "SELECT * FROM memory_records WHERE superseded_by = ?",
+            [oldest.memory_id],
+        )
+        while prev_search:
+            predecessors.append(prev_search[0])
+            prev_search = self._fetch_records(
+                "SELECT * FROM memory_records WHERE superseded_by = ?",
+                [prev_search[0].memory_id],
+            )
+        # Prepend predecessors (oldest first)
+        predecessors.reverse()
+        return predecessors + chain
 
     def delete_memory(self, memory_id: str) -> bool:
         with self._lock:
@@ -1241,6 +1376,7 @@ class DuckDBMemoryStore:
     def list_recent(self, limit: int = 10) -> List[MemoryRecord]:
         sql = (
             "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active' "
+            "AND valid_to IS NULL "
             "AND (json_extract_string(payload, '$.user_scope') IS NULL "
             "OR json_extract_string(payload, '$.user_scope') = ?) "
             "ORDER BY created_at DESC LIMIT ?"
@@ -1252,6 +1388,7 @@ class DuckDBMemoryStore:
         sql = (
             "SELECT * FROM memory_records WHERE category = ? "
             "AND COALESCE(status, 'active') = 'active' "
+            "AND valid_to IS NULL "
             "AND (json_extract_string(payload, '$.user_scope') IS NULL "
             "OR json_extract_string(payload, '$.user_scope') = ?) "
             "ORDER BY created_at DESC LIMIT ?"
@@ -1288,6 +1425,7 @@ class DuckDBMemoryStore:
         conditions = [
             "category = 'insight'",
             "COALESCE(status, 'active') = 'active'",
+            "valid_to IS NULL",
             "(json_extract_string(payload, '$.user_scope') IS NULL OR "
             "json_extract_string(payload, '$.user_scope') = ?)",
         ]
@@ -1320,6 +1458,7 @@ class DuckDBMemoryStore:
             sql_simple = (
                 "SELECT * FROM memory_records WHERE category = 'insight' "
                 "AND COALESCE(status, 'active') = 'active' "
+                "AND valid_to IS NULL "
                 "AND (json_extract_string(payload, '$.user_scope') IS NULL "
                 "OR json_extract_string(payload, '$.user_scope') = ?) "
                 "ORDER BY created_at DESC LIMIT ?"
@@ -1333,12 +1472,14 @@ class DuckDBMemoryStore:
             return results
 
     def count(self) -> int:
+        """Count current (non-superseded) memories for this user."""
         with self._lock:
             assert self.connection is not None
             result = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
-                   WHERE json_extract_string(payload, '$.user_scope') IS NULL
-                      OR json_extract_string(payload, '$.user_scope') = ?""",
+                   WHERE valid_to IS NULL
+                     AND (json_extract_string(payload, '$.user_scope') IS NULL
+                      OR json_extract_string(payload, '$.user_scope') = ?)""",
                 [self.user_id],
             ).fetchone()
             return result[0] if result else 0
@@ -1360,6 +1501,7 @@ class DuckDBMemoryStore:
         all_records = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE COALESCE(status, 'active') = 'active'
+                 AND valid_to IS NULL
                  AND (json_extract_string(payload, '$.user_scope') IS NULL
                       OR json_extract_string(payload, '$.user_scope') = ?)""",
             [self.user_id],
@@ -1440,6 +1582,7 @@ class DuckDBMemoryStore:
         records = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE COALESCE(status, 'active') = 'active'
+                 AND valid_to IS NULL
                  AND (json_extract_string(payload, '$.user_scope') IS NULL
                       OR json_extract_string(payload, '$.user_scope') = ?)""",
             [self.user_id],

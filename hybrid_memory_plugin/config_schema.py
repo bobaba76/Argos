@@ -164,6 +164,23 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Retrieval",
         ),
         ProviderField(
+            key="query_expansion_enabled",
+            label="Query expansion",
+            kind=KIND_BOOL,
+            default="true",
+            description="Expand weak queries into sub-queries via LLM for better recall.",
+            info="Only fires when the top search result is below a similarity floor (weak results). Uses the host's auxiliary LLM client. Cached for 1 hour. Fail-soft: returns original results if the LLM call fails. Adds ~1-3s latency only on weak queries.",
+            group="Retrieval",
+        ),
+        ProviderField(
+            key="query_expansion_similarity_floor",
+            label="Expansion similarity floor",
+            kind=KIND_TEXT,
+            default="0.3",
+            description="Trigger expansion when top hit similarity is below this (0.0-1.0).",
+            group="Retrieval",
+        ),
+        ProviderField(
             key="storage_mode",
             label="Storage mode",
             kind=KIND_SELECT,

@@ -41,6 +41,7 @@ from .extractor import extract_from_turn
 from .routing import resolve_storage_names
 from .service_client import SharedGraphStore, SharedMemoryStore
 from .reviewer import review_candidate_with_llm
+from .query_expander import QueryExpander
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "context_aware_retrieval": "true",
         "context_window_size": "3",
         "context_max_chars": "500",
+        "query_expansion_enabled": "true",
+        "query_expansion_similarity_floor": "0.3",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -368,6 +371,10 @@ class HybridMemoryProvider(MemoryProvider):
         self._context_max_chars: int = 500  # cap total context length
         self._recent_user_messages: list[str] = []
         self._context_lock = threading.Lock()
+        # Query expansion (lazy/conditional, cached, fail-soft)
+        self._query_expansion_enabled: bool = True
+        self._query_expansion_similarity_floor: float = 0.3
+        self._query_expander: Optional[QueryExpander] = None
         # Prefetch state.
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query: str = ""
@@ -594,6 +601,22 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._context_max_chars = 500
+        # Query expansion config
+        qe_enabled = self._config.get("query_expansion_enabled", "true")
+        self._query_expansion_enabled = (
+            qe_enabled.lower() in ("true", "1", "yes")
+            if isinstance(qe_enabled, str) else bool(qe_enabled)
+        )
+        try:
+            self._query_expansion_similarity_floor = float(
+                self._config.get("query_expansion_similarity_floor", "0.3")
+            )
+        except (TypeError, ValueError):
+            self._query_expansion_similarity_floor = 0.3
+        if self._query_expansion_enabled:
+            self._query_expander = QueryExpander(
+                similarity_floor=self._query_expansion_similarity_floor,
+            )
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
         env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
         self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
@@ -771,6 +794,77 @@ class HybridMemoryProvider(MemoryProvider):
             while len(self._recent_user_messages) > self._context_window_size:
                 self._recent_user_messages.pop(0)
 
+    def _expand_and_merge(
+        self,
+        query: str,
+        project_id: str | None,
+        category_filter: str | None,
+        candidate_limit: int,
+        original_results: List[Any],
+    ) -> List[Any]:
+        """Expand a weak query into sub-queries and merge results via RRF.
+
+        Fail-soft: if expansion produces no sub-queries or all sub-query
+        searches fail, return the original results unchanged.
+        """
+        if not self._query_expander or not self._store:
+            return original_results
+
+        try:
+            sub_queries = self._query_expander.expand(query)
+        except Exception as exc:
+            logger.debug("Query expansion failed: %s", exc)
+            return original_results
+
+        if not sub_queries:
+            return original_results
+
+        logger.debug("Query expansion: '%s' → %d sub-queries", query[:50], len(sub_queries))
+
+        # Search each sub-query and merge via Reciprocal Rank Fusion
+        # with the original results.
+        all_results: dict[str, Any] = {}
+        for r in original_results:
+            all_results[r.memory_id] = r
+
+        # RRF: original results get rank-based scores
+        rrf_k = 60  # standard RRF constant
+        rrf_scores: dict[str, float] = {}
+        for rank, r in enumerate(original_results):
+            rrf_scores[r.memory_id] = 1.0 / (rrf_k + rank + 1)
+
+        # Search each sub-query
+        for sq in sub_queries:
+            try:
+                sq_results = self._store.search(
+                    sq,
+                    limit=candidate_limit,
+                    category_filter=category_filter,
+                    project_id=project_id or None,
+                )
+            except Exception as exc:
+                logger.debug("Sub-query search failed for '%s': %s", sq[:30], exc)
+                continue
+
+            for rank, r in enumerate(sq_results):
+                if r.memory_id not in all_results:
+                    all_results[r.memory_id] = r
+                rrf_scores[r.memory_id] = rrf_scores.get(r.memory_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+
+        # Sort by RRF score
+        merged = sorted(
+            all_results.values(),
+            key=lambda r: rrf_scores.get(r.memory_id, 0.0),
+            reverse=True,
+        )
+
+        # Update similarity to RRF score (normalized to 0-1)
+        max_score = max(rrf_scores.values()) if rrf_scores else 1.0
+        for r in merged:
+            r.similarity = rrf_scores.get(r.memory_id, 0.0) / max_score if max_score > 0 else 0.0
+
+        return merged
+
     def _search_memories(
         self,
         query: str,
@@ -796,6 +890,33 @@ class HybridMemoryProvider(MemoryProvider):
             category_filter=category_filter,
             project_id=effective_project or None,
         )
+
+        # Query expansion: if the top hit is below the similarity floor,
+        # ask the LLM to rewrite the query into sub-queries and re-search.
+        # This is lazy (only fires on weak results), cached, and fail-soft
+        # (returns original results on any LLM failure).
+        if (
+            self._query_expander
+            and self._query_expander.enabled
+            and results
+            and self._query_expander.should_expand(query, results[0].similarity)
+        ):
+            results = self._expand_and_merge(
+                query, effective_project, category_filter,
+                candidate_limit, results,
+            )
+        elif (
+            self._query_expander
+            and self._query_expander.enabled
+            and not results
+            and self._query_expander.should_expand(query, 0.0)
+        ):
+            # No results at all — try expansion with floor=0
+            results = self._expand_and_merge(
+                query, effective_project, category_filter,
+                candidate_limit, results,
+            )
+
         if not self._graph or not self._graph_aware_retrieval:
             return results[:limit]
         try:

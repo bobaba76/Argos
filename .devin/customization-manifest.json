@@ -80,7 +80,9 @@
       "reranker_top_n": "10",
       "context_aware_retrieval": "true",
       "context_window_size": "3",
-      "context_max_chars": "500"
+      "context_max_chars": "500",
+      "query_expansion_enabled": "true",
+      "query_expansion_similarity_floor": "0.3"
     }
   },
   "tests": {

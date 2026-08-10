@@ -820,14 +820,26 @@ class HybridMemoryProvider(MemoryProvider):
             self._sync_queue.put_nowait(item)
         except queue.Full:
             try:
-                self._sync_queue.get_nowait()
+                dropped = self._sync_queue.get_nowait()
                 self._sync_queue.task_done()
+                dropped_preview = (dropped[0] or "")[:80]
+                logger.warning(
+                    "Sync queue full; dropping oldest pending turn to make room "
+                    "(preview: %r). Extraction/review is bounded to prevent "
+                    "unbounded backlog under sustained load.",
+                    dropped_preview,
+                )
             except queue.Empty:
                 pass
             try:
                 self._sync_queue.put_nowait(item)
             except queue.Full:
-                return  # extremely unlikely, just drop
+                logger.warning(
+                    "Sync queue still full after drop; skipping extraction for "
+                    "this turn (preview: %r).",
+                    (user_content or "")[:80],
+                )
+                return
         self._ensure_sync_worker()
 
     def _ensure_sync_worker(self) -> None:

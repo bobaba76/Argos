@@ -70,6 +70,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "local_embedding_model": _DEFAULT_MODEL,
         "auto_extract": "true",
         "llm_fallback": "true",
+        "extraction_shadow_diff": "false",
         "auto_review": "true",
         "graph_aware_retrieval": "true",
         "graph_retrieval_boost": "0.05",
@@ -350,6 +351,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._max_injected: int = _DEFAULT_MAX_INJECTED
         self._auto_extract: bool = True
         self._llm_fallback: bool = True
+        self._extraction_shadow_diff: bool = False
         self._auto_review: bool = True
         self._graph_aware_retrieval: bool = True
         self._graph_retrieval_boost: float = 0.05
@@ -530,6 +532,11 @@ class HybridMemoryProvider(MemoryProvider):
         llm_fb = self._config.get("llm_fallback", "true")
         self._llm_fallback = (
             llm_fb.lower() in ("true", "1", "yes") if isinstance(llm_fb, str) else bool(llm_fb)
+        )
+        shadow_diff = self._config.get("extraction_shadow_diff", "false")
+        self._extraction_shadow_diff = (
+            shadow_diff.lower() in ("true", "1", "yes")
+            if isinstance(shadow_diff, str) else bool(shadow_diff)
         )
         auto_review = self._config.get("auto_review", "true")
         self._auto_review = (
@@ -1206,6 +1213,7 @@ class HybridMemoryProvider(MemoryProvider):
                     use_llm_fallback=self._llm_fallback,
                     llm_model=self._llm_model,
                     llm_provider=self._llm_provider,
+                    shadow_diff=self._extraction_shadow_diff,
                 )
                 proposed = 0
                 for fact in facts:

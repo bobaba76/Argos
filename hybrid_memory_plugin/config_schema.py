@@ -62,6 +62,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="extraction_shadow_diff",
+            label="Extraction shadow-diff",
+            kind=KIND_BOOL,
+            default="false",
+            description="Run LLM extraction in parallel with regex and log the diff (validation mode).",
+            info="When enabled, always runs LLM extraction alongside regex and logs what each found that the other missed. Does NOT change the actual proposals created — purely attributetic for evaluating LLM-first extraction. Adds latency + token cost on every turn. Check logs for SHADOW_DIFF entries.",
+            inline=True,
+            group="Extraction",
+        ),
+        ProviderField(
             key="auto_review",
             label="Automatic proposal review",
             kind=KIND_BOOL,

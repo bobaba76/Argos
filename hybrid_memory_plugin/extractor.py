@@ -731,6 +731,7 @@ def extract_from_turn(
     use_llm_fallback: bool = True,
     llm_model: str = "",
     llm_provider: str = "",
+    shadow_diff: bool = False,
 ) -> List[Dict[str, Any]]:
     """Extract candidate facts from a completed turn.
 
@@ -741,9 +742,24 @@ def extract_from_turn(
 
     Only extracts from the USER's content — the assistant's content is
     the agent's own output and not a source of durable user facts.
+
+    When *shadow_diff* is True, always runs LLM extraction in parallel
+    and logs the diff (what LLM found that regex didn't, and vice versa).
+    The actual proposals are NOT changed — this is a validation mode for
+    evaluating whether LLM-first extraction would improve recall. The diff
+    is logged at INFO level with structured fields for offline analysis.
     """
     # Stage 1: regex patterns.
     facts = _extract_facts_regex(user_content)
+
+    # Shadow-diff mode: always run LLM extraction and compare.
+    # Does NOT change the returned facts — purely attributetic.
+    if shadow_diff and use_llm_fallback and len(user_content.strip()) >= _LLM_MIN_CONTENT_LENGTH:
+        try:
+            llm_facts_shadow = _extract_facts_llm(user_content, model=llm_model, provider=llm_provider)
+            _log_shadow_diff(user_content, facts, llm_facts_shadow)
+        except Exception as exc:
+            logger.debug("Shadow-diff LLM extraction failed: %s", exc)
 
     # Stage 2: LLM fallback if regex didn't find enough.
     # The LLM is expensive (latency + tokens), so we only call it when
@@ -777,3 +793,58 @@ def extract_from_turn(
         normalized.append(fact)
 
     return normalized
+
+
+def _log_shadow_diff(
+    user_content: str,
+    regex_facts: List[Dict[str, Any]],
+    llm_facts: List[Dict[str, Any]],
+) -> None:
+    """Log the diff between regex and LLM extraction for offline analysis.
+
+    Logs structured fields:
+    - regex_count: number of regex-extracted facts
+    - llm_count: number of LLM-extracted facts
+    - llm_only: facts the LLM found that regex missed (potential recall gain)
+    - regex_only: facts regex found that the LLM missed (potential precision gain)
+    - content_preview: first 80 chars of the user message
+    """
+    regex_contents = {f.get("content", "").lower() for f in regex_facts}
+    llm_contents = {f.get("content", "").lower() for f in llm_facts}
+
+    llm_only = [f for f in llm_facts if f.get("content", "").lower() not in regex_contents]
+    regex_only = [f for f in regex_facts if f.get("content", "").lower() not in llm_contents]
+
+    # Use near-duplicate matching for more accurate diff
+    llm_only_real: List[Dict[str, Any]] = []
+    for lf in llm_facts:
+        lf_lower = lf.get("content", "").lower()
+        if not any(_text_overlap(lf_lower, rc) for rc in regex_contents):
+            llm_only_real.append(lf)
+
+    regex_only_real: List[Dict[str, Any]] = []
+    for rf in regex_facts:
+        rf_lower = rf.get("content", "").lower()
+        if not any(_text_overlap(rf_lower, lc) for lc in llm_contents):
+            regex_only_real.append(rf)
+
+    logger.info(
+        "SHADOW_DIFF regex=%d llm=%d llm_only=%d regex_only=%d preview=%.80s",
+        len(regex_facts),
+        len(llm_facts),
+        len(llm_only_real),
+        len(regex_only_real),
+        user_content.replace("\n", " ")[:80],
+    )
+    for fact in llm_only_real:
+        logger.info(
+            "SHADOW_DIFF_LLM_ONLY content=%.120s category=%s",
+            fact.get("content", "")[:120],
+            fact.get("category", "?"),
+        )
+    for fact in regex_only_real:
+        logger.info(
+            "SHADOW_DIFF_REGEX_ONLY content=%.120s category=%s",
+            fact.get("content", "")[:120],
+            fact.get("category", "?"),
+        )

@@ -1056,8 +1056,11 @@ class HybridMemoryProvider(MemoryProvider):
             FEEDBACK_SCHEMA,
             MAINTENANCE_SCHEMA,
         ]
-        if self._graph:
-            schemas.extend([GRAPH_SEARCH_SCHEMA, GRAPH_QUERY_SCHEMA])
+        # Always include graph tool schemas so they are registered in the
+        # MemoryManager routing table at add_provider() time — before
+        # initialize() connects the Kùzu graph store. If the graph is not
+        # available at call time, handle_tool_call returns a clear error.
+        schemas.extend([GRAPH_SEARCH_SCHEMA, GRAPH_QUERY_SCHEMA])
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:

@@ -68,9 +68,33 @@ class MemoryService:
             )
         )
         self.embedder = LocalEmbedder(model_name)
-        self.store = DuckDBMemoryStore(
-            home / db_name, user_id="default_user", embedder=self.embedder
+        # Reranker (lazy — loads on first rerank call)
+        reranker_enabled = str(config.get("reranker_enabled", "true")).lower() in (
+            "true", "1", "yes"
         )
+        reranker = None
+        if reranker_enabled:
+            try:
+                if __package__:
+                    from .embeddings import CrossEncoderReranker
+                else:
+                    from embeddings import CrossEncoderReranker
+                reranker_model = str(
+                    config.get("reranker_model", "BAAI/bge-reranker-base")
+                )
+                reranker = CrossEncoderReranker(reranker_model)
+            except Exception as exc:
+                logger.warning("Reranker unavailable in shared service: %s", exc)
+        self.store = DuckDBMemoryStore(
+            home / db_name, user_id="default_user", embedder=self.embedder,
+            reranker=reranker,
+        )
+        try:
+            self.store._reranker_top_n = max(
+                5, min(int(config.get("reranker_top_n", 20)), 100)
+            )
+        except (TypeError, ValueError):
+            self.store._reranker_top_n = 20
         try:
             self.graph = KuzuGraphStore(home / graph_name, user_id="default_user")
         except Exception as exc:

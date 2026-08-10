@@ -77,6 +77,9 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
+        "reranker_enabled": "false",
+        "reranker_model": "BAAI/bge-reranker-base",
+        "reranker_top_n": "10",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -346,6 +349,10 @@ class HybridMemoryProvider(MemoryProvider):
         self._consolidation_enabled: bool = False
         self._consolidation_min_age_days: int = 30
         self._consolidation_max_actions: int = 25
+        self._reranker_enabled: bool = False
+        self._reranker_model: str = "BAAI/bge-reranker-base"
+        self._reranker_top_n: int = 10
+        self._reranker = None
         self._auto_extract_paused: bool = False
         self._initialized: bool = False
         self._current_project_id: str = ""
@@ -542,6 +549,21 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._consolidation_max_actions = 25
+        # Reranker config
+        reranker_enabled = self._config.get("reranker_enabled", "true")
+        self._reranker_enabled = (
+            reranker_enabled.lower() in ("true", "1", "yes")
+            if isinstance(reranker_enabled, str) else bool(reranker_enabled)
+        )
+        self._reranker_model = str(
+            self._config.get("reranker_model", "BAAI/bge-reranker-base")
+        )
+        try:
+            self._reranker_top_n = max(
+                5, min(int(self._config.get("reranker_top_n", 20)), 100)
+            )
+        except (TypeError, ValueError):
+            self._reranker_top_n = 20
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
         env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
         self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
@@ -551,9 +573,19 @@ class HybridMemoryProvider(MemoryProvider):
         # Embedder (lazy — model loads on first embed call).
         self._embedder = LocalEmbedder(model_name)
 
+        # Reranker (lazy — model loads on first rerank call).
+        if self._reranker_enabled:
+            try:
+                from .embeddings import CrossEncoderReranker
+            except ImportError:
+                from embeddings import CrossEncoderReranker
+            self._reranker = CrossEncoderReranker(self._reranker_model)
+
         if use_shared_service:
             # One local service owns the canonical DuckDB/Kùzu files. The
             # provider process never opens those files directly in this mode.
+            # The reranker runs inside the service process (passed via RPC
+            # config), not here.
             self._store = SharedMemoryStore(
                 home, user_id=self._user_id, embedder=self._embedder
             )
@@ -565,8 +597,10 @@ class HybridMemoryProvider(MemoryProvider):
         else:
             db_path = home / db_filename
             self._store = DuckDBMemoryStore(
-                db_path, user_id=self._user_id, embedder=self._embedder
+                db_path, user_id=self._user_id, embedder=self._embedder,
+                reranker=self._reranker,
             )
+            self._store._reranker_top_n = self._reranker_top_n
             try:
                 graph_path = home / graph_dirname
                 self._graph = KuzuGraphStore(graph_path, user_id=self._user_id)

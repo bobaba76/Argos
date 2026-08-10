@@ -138,11 +138,13 @@ class DuckDBMemoryStore:
         db_path: str | Path,
         user_id: str = "default_user",
         embedder=None,
+        reranker=None,
     ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.user_id = (user_id or "default_user").strip()
         self.embedder = embedder
+        self.reranker = reranker
         self._lock = threading.Lock()
         self.connection: Optional[duckdb.DuckDBPyConnection] = None
         self._connect()
@@ -505,23 +507,93 @@ class DuckDBMemoryStore:
         except Exception:
             return 0.0
 
+    # Importance scoring weights — configurable via the store's attributes.
+    # These are applied as additive adjustments to similarity (0-1 scale).
+    _IMPORTANCE_HELPFUL_WEIGHT = 0.05       # per helpful vote
+    _IMPORTANCE_DISMISSED_WEIGHT = -0.10    # per dismissed vote (before decay)
+    _IMPORTANCE_CONFIDENCE_WEIGHT = 0.08    # * (confidence - 0.5)
+    _IMPORTANCE_RETRIEVAL_WEIGHT = 0.02     # per retrieval (capped at 20)
+    _IMPORTANCE_RETRIEVAL_CAP = 20
+    _IMPORTANCE_AGE_DECAY_PER_DAY = 0.0005  # slow age penalty
+    _IMPORTANCE_AGE_DECAY_CAP_DAYS = 730    # cap at 2 years
+    _IMPORTANCE_DORMANCY_DECAY_PER_DAY = 0.001  # decay for not being retrieved
+    _IMPORTANCE_DORMANCY_CAP_DAYS = 365     # cap at 1 year
+    # Dismissal forgiveness: dismissals age out over this many days so a
+    # single bad dismiss (frustration click, misattribution) doesn't
+    # permanently sink a memory. The effective dismissed penalty is:
+    #   -0.10 * dismissed_count * max(0, 1 - days_since / FORGIVENESS_DAYS)
+    _IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS = 180  # 6 months
+
+    @classmethod
+    def _importance_adjustment(cls, r: MemoryRecord) -> float:
+        """Compute the importance-based similarity adjustment for a record.
+
+        This is a transparent, additive scoring formula that combines:
+          - Feedback signals (helpful/dismissed votes, with dismissal forgiveness)
+          - Extraction confidence
+          - Retrieval frequency (capped — popular memories get a boost)
+          - Recency boost (exponential decay from creation date)
+          - Age penalty (slow linear decay — old memories slowly fade)
+          - Dormancy penalty (memories not retrieved recently slowly fade)
+
+        Dismissal forgiveness: dismissals age out over
+        _IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS so a single bad dismiss
+        (frustration click, misattribution) doesn't permanently sink a
+        memory. Uses updated_at as a proxy for when the dismissal happened.
+        """
+        adj = 0.0
+        # Feedback: helpful votes are permanent positive signal
+        adj += cls._IMPORTANCE_HELPFUL_WEIGHT * r.helpful_count
+        # Dismissed votes decay over time (forgiveness factor)
+        if r.dismissed_count > 0:
+            dismissal_factor = 1.0  # full penalty if no timestamp available
+            if r.updated_at:
+                try:
+                    updated = datetime.fromisoformat(r.updated_at.replace("Z", "+00:00"))
+                    days_since = max(0, (datetime.now(timezone.utc) - updated).days)
+                    dismissal_factor = max(
+                        0.0,
+                        1.0 - days_since / cls._IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS,
+                    )
+                except Exception:
+                    pass
+            adj += cls._IMPORTANCE_DISMISSED_WEIGHT * r.dismissed_count * dismissal_factor
+        # Confidence: reward high-confidence extractions
+        if r.confidence is not None:
+            adj += cls._IMPORTANCE_CONFIDENCE_WEIGHT * (r.confidence - 0.5)
+        # Retrieval frequency: frequently-retrieved memories are important
+        # (capped to prevent rich-get-richer spiral)
+        adj += cls._IMPORTANCE_RETRIEVAL_WEIGHT * min(r.retrieval_count, cls._IMPORTANCE_RETRIEVAL_CAP)
+        # Recency boost (from creation date)
+        adj += cls._recency_boost(r.created_at)
+        # Age penalty: slow linear decay
+        if r.created_at:
+            try:
+                created = datetime.fromisoformat(r.created_at.replace("Z", "+00:00"))
+                age_days = max(0, (datetime.now(timezone.utc) - created).days)
+                adj -= cls._IMPORTANCE_AGE_DECAY_PER_DAY * min(age_days, cls._IMPORTANCE_AGE_DECAY_CAP_DAYS)
+            except Exception:
+                pass
+        # Dormancy penalty: memories not retrieved recently slowly fade
+        if r.last_retrieved_at:
+            try:
+                last_ret = datetime.fromisoformat(r.last_retrieved_at.replace("Z", "+00:00"))
+                dormant_days = max(0, (datetime.now(timezone.utc) - last_ret).days)
+                adj -= cls._IMPORTANCE_DORMANCY_DECAY_PER_DAY * min(dormant_days, cls._IMPORTANCE_DORMANCY_CAP_DAYS)
+            except Exception:
+                pass
+        return adj
+
     @classmethod
     def _apply_feedback_and_recency(cls, records: List[MemoryRecord]) -> None:
-        """Adjust ``similarity`` in-place using feedback, confidence, and recency.
+        """Adjust ``similarity`` in-place using importance scoring.
 
-        Adjustments are additive on a 0-1 scale:
-          - helpful_count:  +0.03 per vote (boosts memories the user found useful)
-          - dismissed_count: -0.05 per vote (penalises dismissed memories)
-          - confidence:     +0.05 * (confidence - 0.5) (rewards high-confidence)
-          - recency:        0 to +0.10 based on age (recent memories get a boost)
+        Combines feedback signals (helpful/dismissed), extraction confidence,
+        retrieval frequency, recency boost, age decay, and dormancy penalty
+        into a single additive adjustment on a 0-1 scale.
         """
         for r in records:
-            adj = 0.0
-            adj += 0.03 * r.helpful_count
-            adj -= 0.05 * r.dismissed_count
-            if r.confidence is not None:
-                adj += 0.05 * (r.confidence - 0.5)
-            adj += cls._recency_boost(r.created_at)
+            adj = cls._importance_adjustment(r)
             r.similarity = max(0.0, r.similarity + adj)
         records.sort(key=lambda r: r.similarity, reverse=True)
 
@@ -581,12 +653,15 @@ class DuckDBMemoryStore:
         category_filter: str | None = None,
         project_id: str | None = None,
     ) -> List[MemoryRecord]:
-        """Hybrid search: RRF-fused vector + text, with feedback and recency.
+        """Hybrid search: RRF-fused vector + text, with optional cross-encoder
+        re-ranking, feedback, and recency.
 
         When embeddings are available, runs vector and text search in
         parallel and fuses results via Reciprocal Rank Fusion.  When
-        embeddings are unavailable, falls back to text-only search.  In
-        both cases, the final ranking is adjusted by feedback signals
+        embeddings are unavailable, falls back to text-only search.  If
+        a cross-encoder reranker is available, the top candidates are
+        re-scored with full bidirectional attention before final ranking.
+        In all cases, the final ranking is adjusted by feedback signals
         (helpful/dismissed), confidence, and recency.
 
         When *project_id* is provided, memories from other projects are
@@ -597,16 +672,21 @@ class DuckDBMemoryStore:
         if self.embedder and hasattr(self.embedder, "embed"):
             emb = self.embedder.embed(query, is_query=True)
 
+        # Retrieve more candidates than requested so the reranker has a
+        # larger pool to work with. If no reranker, just use limit.
+        reranker_top_n = getattr(self, "_reranker_top_n", 20)
+        pool_size = max(limit, reranker_top_n) if self.reranker else limit
+
         # Gather candidate results from both paths.
         vector_results: List[MemoryRecord] = []
         text_results: List[MemoryRecord] = self._text_search_raw(
-            query, limit, excluded, category_filter, project_id=project_id
+            query, pool_size, excluded, category_filter, project_id=project_id
         )
 
         if emb:
             try:
                 vector_results = self._vector_search_raw(
-                    emb, limit, excluded, category_filter, project_id=project_id
+                    emb, pool_size, excluded, category_filter, project_id=project_id
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):
@@ -622,6 +702,30 @@ class DuckDBMemoryStore:
             fused = text_results
         else:
             return []
+
+        # Cross-encoder re-ranking: re-score the top N candidates with
+        # full bidirectional attention. The cross-encoder score is blended
+        # with the existing RRF similarity (not replacing it) so we keep
+        # the bi-encoder's signal while adding the cross-encoder's nuance.
+        # Blend: 20% cross-encoder + 80% original similarity, after
+        # normalizing the cross-encoder scores to 0-1. This is intentionally
+        # conservative — the cross-encoder acts as a gentle tie-breaker
+        # rather than overriding the bi-encoder's ranking.
+        if self.reranker and len(fused) > 1:
+            rerank_pool = fused[:reranker_top_n]
+            documents = [r.content for r in rerank_pool]
+            scores = self.reranker.score(query, documents)
+            if scores and len(scores) == len(rerank_pool):
+                min_s, max_s = min(scores), max(scores)
+                range_s = max_s - min_s
+                for i, record in enumerate(rerank_pool):
+                    if range_s > 0:
+                        ce_norm = (scores[i] - min_s) / range_s
+                    else:
+                        ce_norm = 0.5
+                    record.similarity = 0.8 * record.similarity + 0.2 * ce_norm
+                rerank_pool.sort(key=lambda r: r.similarity, reverse=True)
+                fused = rerank_pool + fused[reranker_top_n:]
 
         # Apply feedback weighting and recency boost, then truncate.
         self._apply_feedback_and_recency(fused)

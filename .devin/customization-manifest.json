@@ -74,7 +74,10 @@
       "graph_boost_min_similarity": "0.15",
       "consolidation_enabled": "false",
       "consolidation_min_age_days": "30",
-      "consolidation_max_actions": "25"
+      "consolidation_max_actions": "25",
+      "reranker_enabled": "false",
+      "reranker_model": "BAAI/bge-reranker-base",
+      "reranker_top_n": "10"
     }
   },
   "tests": {

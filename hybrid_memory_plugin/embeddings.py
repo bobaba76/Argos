@@ -178,3 +178,93 @@ class LocalEmbedder:
         except Exception as e:
             logger.debug("Batch embedding failed: %s", e)
             return [[] for _ in texts]
+
+
+# ---------------------------------------------------------------------------
+# Cross-encoder reranker
+# ---------------------------------------------------------------------------
+
+_DEFAULT_RERANKER = "BAAI/bge-reranker-base"
+
+# Process-level shared reranker cache: {model_name: model}
+_SHARED_RERANKERS: Dict[str, object] = {}
+_SHARED_RERANKER_LOCK = threading.Lock()
+
+
+class CrossEncoderReranker:
+    """Cross-encoder reranker for second-stage relevance scoring.
+
+    Unlike bi-encoders (LocalEmbedder), a cross-encoder reads the query
+    and document *together* with full bidirectional attention, producing
+    a relevance score that captures subtle semantic matches the bi-encoder
+    misses. This is the standard trick for improving top-k ranking quality
+    in RAG pipelines.
+
+    Lazy-loaded and process-shared (same pattern as LocalEmbedder).
+    Falls back gracefully — if the model is unavailable, ``rerank()``
+    returns the input unchanged.
+    """
+
+    def __init__(self, model_name: str = _DEFAULT_RERANKER) -> None:
+        self._model_name = model_name
+        self._loaded = False
+        self._load_failed = False
+        self._lock = threading.Lock()
+
+    @property
+    def is_available(self) -> bool:
+        shared = _SHARED_RERANKERS.get(self._model_name)
+        if shared is not None:
+            return True
+        return self._loaded and _SHARED_RERANKERS.get(self._model_name) is not None
+
+    def _ensure_loaded(self) -> None:
+        """Lazy-load the reranker model on first call. Thread-safe."""
+        if self._loaded or self._load_failed:
+            return
+        with self._lock:
+            if self._loaded or self._load_failed:
+                return
+            with _SHARED_RERANKER_LOCK:
+                shared = _SHARED_RERANKERS.get(self._model_name)
+                if shared is not None:
+                    self._loaded = True
+                    logger.debug("Reranker reused from cache: %s", self._model_name)
+                    return
+            try:
+                from sentence_transformers import CrossEncoder
+
+                logger.info("Loading reranker model: %s", self._model_name)
+                model = CrossEncoder(self._model_name, max_length=512)
+                with _SHARED_RERANKER_LOCK:
+                    _SHARED_RERANKERS[self._model_name] = model
+                self._loaded = True
+                logger.info("Reranker loaded: %s", self._model_name)
+            except Exception as e:
+                self._load_failed = True
+                logger.warning(
+                    "Reranker model '%s' unavailable — falling back to bi-encoder ranking. "
+                    "Reason: %s",
+                    self._model_name, e,
+                )
+
+    def score(self, query: str, documents: List[str]) -> List[float]:
+        """Score (query, document) pairs. Returns one float per document.
+
+        Higher score = more relevant. If the reranker is unavailable,
+        returns empty list (caller should fall back to existing ranking).
+        """
+        if not query or not documents:
+            return []
+        self._ensure_loaded()
+        with _SHARED_RERANKER_LOCK:
+            model = _SHARED_RERANKERS.get(self._model_name)
+        if model is None:
+            return []
+        try:
+            pairs = [(query, doc) for doc in documents]
+            scores = model.predict(pairs)
+            return [float(s) for s in scores]
+        except Exception as e:
+            logger.debug("Reranker scoring failed: %s", e)
+            return []

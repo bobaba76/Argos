@@ -49,7 +49,7 @@ def _parse_json_response(response: Any) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def review_candidate_with_llm(candidate: Dict[str, Any]) -> Dict[str, Any]:
+def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", provider: str = "") -> Dict[str, Any]:
     """Review a candidate; never auto-approve sensitive or contextless data."""
     payload = candidate.get("payload") or {}
     flags = quality_flags_for_fact(candidate)
@@ -131,6 +131,8 @@ Use reject for obvious non-memory text. Use quarantine for malformed or suspicio
             temperature=0.0,
             max_tokens=500,
             timeout=15.0,
+            model=model or None,
+            provider=provider or None,
         )
         parsed = _parse_json_response(response)
     except Exception as exc:

@@ -90,11 +90,15 @@ class QueryExpander:
         max_subqueries: int = _MAX_SUBQUERIES,
         cache_ttl: int = _CACHE_TTL,
         timeout: float = _LLM_TIMEOUT,
+        model: str = "",
+        provider: str = "",
     ) -> None:
         self._similarity_floor = similarity_floor
         self._max_subqueries = max_subqueries
         self._cache_ttl = cache_ttl
         self._timeout = timeout
+        self._model = model
+        self._provider = provider
         # Cache: {query_hash: (timestamp, sub_queries)}
         self._cache: Dict[str, Tuple[float, List[str]]] = {}
         self._cache_lock = threading.Lock()
@@ -213,6 +217,8 @@ class QueryExpander:
                 temperature=0.0,
                 max_tokens=200,
                 timeout=self._timeout,
+                model=self._model or None,
+                provider=self._provider or None,
             )
         except Exception as exc:
             logger.debug("Query expansion LLM call failed: %s", exc)

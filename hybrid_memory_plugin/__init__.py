@@ -86,6 +86,8 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "context_max_chars": "500",
         "query_expansion_enabled": "true",
         "query_expansion_similarity_floor": "0.3",
+        "llm_model": "",
+        "llm_provider": "",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -375,6 +377,10 @@ class HybridMemoryProvider(MemoryProvider):
         self._query_expansion_enabled: bool = True
         self._query_expansion_similarity_floor: float = 0.3
         self._query_expander: Optional[QueryExpander] = None
+        # LLM model/provider for auxiliary tasks (extraction, review, expansion)
+        # Empty string = use the auxiliary client's default model
+        self._llm_model: str = ""
+        self._llm_provider: str = ""
         # Prefetch state.
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query: str = ""
@@ -613,9 +619,14 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._query_expansion_similarity_floor = 0.3
+        # LLM model/provider config (empty = use auxiliary client default)
+        self._llm_model = str(self._config.get("llm_model", "")).strip()
+        self._llm_provider = str(self._config.get("llm_provider", "")).strip()
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,
+                model=self._llm_model,
+                provider=self._llm_provider,
             )
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
         env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
@@ -1037,7 +1048,9 @@ class HybridMemoryProvider(MemoryProvider):
     def _review_candidate(self, candidate: Dict[str, Any]) -> None:
         """Run the conservative automatic reviewer for one new proposal."""
         try:
-            review = review_candidate_with_llm(candidate)
+            review = review_candidate_with_llm(
+                candidate, model=self._llm_model, provider=self._llm_provider,
+            )
             decision = review.get("decision", "pending_user_confirmation")
             decision_map = {
                 "approve": "approved",
@@ -1150,6 +1163,8 @@ class HybridMemoryProvider(MemoryProvider):
                 facts = extract_from_turn(
                     user_content, assistant_content,
                     use_llm_fallback=self._llm_fallback,
+                    llm_model=self._llm_model,
+                    llm_provider=self._llm_provider,
                 )
                 proposed = 0
                 for fact in facts:

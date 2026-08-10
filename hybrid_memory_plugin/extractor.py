@@ -564,7 +564,7 @@ Output: []
 """
 
 
-def _extract_facts_llm(user_content: str) -> List[Dict[str, Any]]:
+def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = "") -> List[Dict[str, Any]]:
     """Stage 2: Extract facts using the host's LLM via call_llm.
 
     Returns a list of fact dicts, or empty list on any failure.
@@ -594,6 +594,8 @@ def _extract_facts_llm(user_content: str) -> List[Dict[str, Any]]:
             temperature=0.0,
             max_tokens=800,
             timeout=_LLM_TIMEOUT,
+            model=model or None,
+            provider=provider or None,
         )
     except Exception as e:
         logger.debug("LLM extraction call failed: %s", e)
@@ -727,6 +729,8 @@ def extract_from_turn(
     assistant_content: str,
     *,
     use_llm_fallback: bool = True,
+    llm_model: str = "",
+    llm_provider: str = "",
 ) -> List[Dict[str, Any]]:
     """Extract candidate facts from a completed turn.
 
@@ -745,7 +749,7 @@ def extract_from_turn(
     # The LLM is expensive (latency + tokens), so we only call it when
     # regex extraction looks insufficient for the message length.
     if use_llm_fallback and _should_try_llm_fallback(user_content, len(facts)):
-        llm_facts = _extract_facts_llm(user_content)
+        llm_facts = _extract_facts_llm(user_content, model=llm_model, provider=llm_provider)
         if llm_facts:
             # Dedup LLM facts against regex facts by content similarity.
             existing_contents = [f["content"].lower() for f in facts]

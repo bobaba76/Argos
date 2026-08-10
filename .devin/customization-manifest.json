@@ -82,7 +82,9 @@
       "context_window_size": "3",
       "context_max_chars": "500",
       "query_expansion_enabled": "true",
-      "query_expansion_similarity_floor": "0.3"
+      "query_expansion_similarity_floor": "0.3",
+      "llm_model": "",
+      "llm_provider": ""
     }
   },
   "tests": {

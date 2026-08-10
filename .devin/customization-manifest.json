@@ -84,7 +84,8 @@
       "query_expansion_enabled": "true",
       "query_expansion_similarity_floor": "0.3",
       "llm_model": "",
-      "llm_provider": ""
+      "llm_provider": "",
+      "entity_aliases": ""
     }
   },
   "tests": {

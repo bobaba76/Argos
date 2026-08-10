@@ -190,6 +190,15 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="LLM",
         ),
         ProviderField(
+            key="entity_aliases",
+            label="Entity aliases",
+            kind=KIND_TEXT,
+            default="",
+            description="JSON mapping of aliases to canonical entity names for retrieval.",
+            info='Example: {"my role": "Sam", "the role": "Sam", "the property": "the-property"}. When a search query contains an alias, the system also searches for the canonical entity in the graph. This fixes "tell me about my role" failing to find Entity-A memories.',
+            group="Retrieval",
+        ),
+        ProviderField(
             key="llm_provider",
             label="LLM provider",
             kind=KIND_TEXT,

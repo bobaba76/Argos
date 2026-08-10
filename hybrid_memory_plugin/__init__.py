@@ -88,6 +88,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "query_expansion_similarity_floor": "0.3",
         "llm_model": "",
         "llm_provider": "",
+        "entity_aliases": "",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -634,6 +635,19 @@ class HybridMemoryProvider(MemoryProvider):
             "1", "true", "yes", "on"
         }
 
+        # Entity aliases: load from config (JSON mapping) into the store.
+        aliases_json = str(self._config.get("entity_aliases", "")).strip()
+        if aliases_json and self._store:
+            try:
+                alias_map = json.loads(aliases_json)
+                if isinstance(alias_map, dict):
+                    for alias, canonical in alias_map.items():
+                        if isinstance(canonical, str):
+                            self._store.add_alias(alias, canonical)
+                    logger.info("Loaded %d entity aliases from config", len(alias_map))
+            except (json.JSONDecodeError, Exception) as exc:
+                logger.warning("Failed to parse entity_aliases config: %s", exc)
+
         # Embedder (lazy — model loads on first embed call).
         self._embedder = LocalEmbedder(model_name)
 
@@ -944,9 +958,36 @@ class HybridMemoryProvider(MemoryProvider):
         if not self._graph or not self._graph_aware_retrieval:
             return results[:limit]
         try:
+            # Entity alias resolution: expand the query with canonical
+            # entity names for any aliases found in the query text.
+            # Example: "tell me about my role" → also search for "Sam"
+            alias_expansions: list[str] = []
+            if hasattr(self._store, "resolve_aliases"):
+                canonicals = self._store.resolve_aliases(effective_query)
+                if canonicals:
+                    alias_expansions = canonicals
+                    logger.debug(
+                        "Alias expansion: '%s' → %s",
+                        effective_query[:50], alias_expansions,
+                    )
+
             graph_ids = self._graph.memory_ids_for_query(
                 effective_query, limit=max(10, candidate_limit)
             )
+            # Also query the graph for each canonical entity from aliases
+            for canonical in alias_expansions:
+                try:
+                    extra_ids = self._graph.memory_ids_for_query(
+                        canonical, limit=max(10, candidate_limit)
+                    )
+                    # Merge, preserving order (dedup)
+                    seen = set(graph_ids)
+                    for eid in extra_ids:
+                        if eid not in seen:
+                            graph_ids.append(eid)
+                            seen.add(eid)
+                except Exception:
+                    pass
             if graph_ids:
                 existing = {record.memory_id for record in results}
                 if self._graph_inject_candidates:

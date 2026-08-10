@@ -242,6 +242,13 @@ class DuckDBMemoryStore:
                     review_confidence  DOUBLE,
                     review_model       VARCHAR
                 );
+                CREATE TABLE IF NOT EXISTS entity_aliases (
+                    alias              VARCHAR,
+                    canonical_entity   VARCHAR,
+                    user_scope         VARCHAR DEFAULT 'default_user',
+                    created_at         VARCHAR,
+                    PRIMARY KEY (alias, canonical_entity, user_scope)
+                );
             """)
             # Additive migration for databases created by earlier versions.
             columns = {
@@ -1370,6 +1377,82 @@ class DuckDBMemoryStore:
                 "DELETE FROM memory_records WHERE memory_id = ?", [memory_id]
             )
             return True
+
+    # -- entity aliases -------------------------------------------------------
+
+    def add_alias(self, alias: str, canonical_entity: str) -> None:
+        """Map an alias to a canonical entity name.
+
+        Example: add_alias("my role", "Sam") means that searching for
+        "my role" will also match graph entities for "Sam".
+        """
+        alias = alias.strip().lower()
+        canonical = canonical_entity.strip()
+        if not alias or not canonical:
+            return
+        now = self._now()
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute(
+                """INSERT OR REPLACE INTO entity_aliases
+                   (alias, canonical_entity, user_scope, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                [alias, canonical.lower(), self.user_id, now],
+            )
+
+    def remove_alias(self, alias: str, canonical_entity: str | None = None) -> bool:
+        """Remove an alias mapping. If canonical_entity is None, removes all
+        mappings for that alias."""
+        alias = alias.strip().lower()
+        with self._lock:
+            assert self.connection is not None
+            if canonical_entity:
+                canonical = canonical_entity.strip().lower()
+                result = self.connection.execute(
+                    """DELETE FROM entity_aliases
+                       WHERE alias = ? AND canonical_entity = ? AND user_scope = ?""",
+                    [alias, canonical, self.user_id],
+                )
+            else:
+                result = self.connection.execute(
+                    """DELETE FROM entity_aliases
+                       WHERE alias = ? AND user_scope = ?""",
+                    [alias, self.user_id],
+                )
+            return True
+
+    def resolve_aliases(self, text: str) -> List[str]:
+        """Given a text query, return canonical entity names for any aliases
+        found in the text.
+
+        Example: resolve_aliases("tell me about my role") → ["Sam"]
+        """
+        if not text:
+            return []
+        text_lower = text.lower()
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT alias, canonical_entity FROM entity_aliases
+                   WHERE user_scope = ?""",
+                [self.user_id],
+            ).fetchall()
+        canonicals: set[str] = set()
+        for alias, canonical in rows:
+            if alias and alias in text_lower:
+                canonicals.add(canonical)
+        return sorted(canonicals)
+
+    def list_aliases(self) -> List[Dict[str, str]]:
+        """List all alias mappings for this user."""
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT alias, canonical_entity FROM entity_aliases
+                   WHERE user_scope = ? ORDER BY canonical_entity, alias""",
+                [self.user_id],
+            ).fetchall()
+        return [{"alias": r[0], "canonical_entity": r[1]} for r in rows]
 
     # -- listing --------------------------------------------------------------
 

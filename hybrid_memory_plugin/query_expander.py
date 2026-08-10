@@ -30,7 +30,8 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # LLM call timeout in seconds. Short because this is in the search path.
-_LLM_TIMEOUT = 10.0
+# 5s is the max we can add to a search before it feels broken to the user.
+_LLM_TIMEOUT = 5.0
 
 # Cache TTL in seconds (1 hour). Prevents re-calling the LLM for the same query.
 _CACHE_TTL = 3600

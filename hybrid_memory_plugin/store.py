@@ -51,6 +51,7 @@ class MemoryRecord:
     __slots__ = (
         "memory_id", "category", "content", "tags", "payload",
         "created_at", "updated_at", "expires_at", "embedding", "similarity",
+        "raw_similarity",
         "status", "source", "confidence", "durability", "scope", "project_id",
         "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
         "quarantine_reason", "quarantined_at",
@@ -68,6 +69,7 @@ class MemoryRecord:
         expires_at: str | None = None,
         embedding: List[float] | None = None,
         similarity: float = 0.0,
+        raw_similarity: float | None = None,
         status: str = "active",
         source: str = "explicit",
         confidence: float | None = None,
@@ -91,6 +93,10 @@ class MemoryRecord:
         self.expires_at = expires_at
         self.embedding = embedding
         self.similarity = similarity
+        # raw_similarity preserves the pre-importance-adjustment score for
+        # gates that need pure retrieval strength (e.g. query expansion).
+        # Defaults to similarity if not explicitly set.
+        self.raw_similarity = raw_similarity if raw_similarity is not None else similarity
         self.status = status or "active"
         self.source = source or "explicit"
         self.confidence = confidence
@@ -115,6 +121,7 @@ class MemoryRecord:
             "updated_at": self.updated_at,
             "expires_at": self.expires_at,
             "similarity": round(self.similarity, 4),
+            "raw_similarity": round(self.raw_similarity, 4),
             "status": self.status,
             "source": self.source,
             "confidence": self.confidence,
@@ -726,6 +733,11 @@ class DuckDBMemoryStore:
                     record.similarity = 0.8 * record.similarity + 0.2 * ce_norm
                 rerank_pool.sort(key=lambda r: r.similarity, reverse=True)
                 fused = rerank_pool + fused[reranker_top_n:]
+
+        # Preserve raw similarity (pre-importance) for gates that need
+        # pure retrieval strength (e.g. query expansion trigger).
+        for r in fused:
+            r.raw_similarity = r.similarity
 
         # Apply feedback weighting and recency boost, then truncate.
         self._apply_feedback_and_recency(fused)

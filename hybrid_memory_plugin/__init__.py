@@ -891,15 +891,28 @@ class HybridMemoryProvider(MemoryProvider):
             project_id=effective_project or None,
         )
 
-        # Query expansion: if the top hit is below the similarity floor,
-        # ask the LLM to rewrite the query into sub-queries and re-search.
+        # Query expansion: if the top hit's RAW similarity (pre-importance)
+        # is below the similarity floor, ask the LLM to rewrite the query
+        # into sub-queries and re-search.
         # This is lazy (only fires on weak results), cached, and fail-soft
         # (returns original results on any LLM failure).
+        #
+        # IMPORTANT: we gate on raw_similarity, NOT the final similarity.
+        # The final similarity includes importance boosts (recency, retrieval
+        # frequency) that contaminate the retrieval-strength signal. A memory
+        # can score 1.5 on the adjusted scale but only 0.2 on raw retrieval
+        # strength — that's the signal the gate needs.
+        top_raw_sim = getattr(results[0], "raw_similarity", None) if results else 0.0
+        if top_raw_sim is None:
+            # Fallback for stub records without raw_similarity: use the
+            # final similarity. This is the contaminated score but it's
+            # the best we have for non-MemoryRecord results.
+            top_raw_sim = results[0].similarity if results else 0.0
         if (
             self._query_expander
             and self._query_expander.enabled
             and results
-            and self._query_expander.should_expand(query, results[0].similarity)
+            and self._query_expander.should_expand(query, top_raw_sim)
         ):
             results = self._expand_and_merge(
                 query, effective_project, category_filter,

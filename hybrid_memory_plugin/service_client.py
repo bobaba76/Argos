@@ -51,6 +51,7 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
         updated_at=value.get("updated_at"),
         expires_at=value.get("expires_at"),
         similarity=float(value.get("similarity", 0.0) or 0.0),
+        raw_similarity=float(value.get("raw_similarity", 0.0) or 0.0),
         status=value.get("status", "active"),
         source=value.get("source", "explicit"),
         confidence=value.get("confidence"),
@@ -63,6 +64,9 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
         dismissed_count=value.get("dismissed_count", 0),
         quarantine_reason=value.get("quarantine_reason"),
         quarantined_at=value.get("quarantined_at"),
+        valid_from=value.get("valid_from"),
+        valid_to=value.get("valid_to"),
+        superseded_by=value.get("superseded_by"),
     )
 
 
@@ -178,12 +182,14 @@ class SharedMemoryStore:
         exclude_categories: List[str] | None = None,
         category_filter: str | None = None,
         project_id: str | None = None,
+        as_of: str | None = None,
     ) -> List[MemoryRecord]:
         values = self._rpc.call(
             "store", "search", query=query, limit=limit,
             exclude_categories=exclude_categories,
             category_filter=category_filter,
             project_id=project_id,
+            as_of=as_of,
         )
         return [_record_from_dict(value) for value in (values or [])]
 

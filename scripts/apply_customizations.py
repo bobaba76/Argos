@@ -89,11 +89,40 @@ def target_python(repo: Path, explicit: str | None = None) -> str:
 
 def ensure_repo_clean(repo: Path) -> None:
     status = git(repo, "status", "--porcelain").stdout.strip()
-    if status:
+    if not status:
+        return
+    # Check if any dirty files overlap with the patch's target files.
+    # If not, warn but allow the apply to proceed.
+    dirty_files: set[str] = set()
+    for line in status.splitlines():
+        # Porcelain format: XY <path> or XY <orig> -> <path> for renames
+        path = line[3:].split(" -> ")[-1].strip()
+        dirty_files.add(path.replace("/", os.sep))
+    # Files the patch and core_copies will touch.
+    manifest = load_manifest()
+    patch_targets: set[str] = set()
+    # Parse the patch to find which files it modifies.
+    patch_path = ROOT / manifest["core_patch"]
+    if patch_path.exists():
+        import re as _re
+        patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+        for m in _re.finditer(r"^(?:---|\+\+\+) [ab]/(.+)$", patch_text, _re.MULTILINE):
+            patch_targets.add(m.group(1).replace("/", os.sep))
+    for item in manifest["core_copies"]:
+        patch_targets.add(item["target"].replace("/", os.sep))
+    overlap = dirty_files & patch_targets
+    if overlap:
         raise CustomizationError(
-            "Hermes checkout is not clean. Commit or back up local changes first; "
-            "the apply command never stashes or discards them.\n" + status
+            "Hermes checkout has local changes to files the patch will modify. "
+            "Commit or back up these files first:\n" +
+            "\n".join(sorted(overlap))
         )
+    print(
+        f"WARNING: Hermes checkout has local changes to {len(dirty_files)} file(s) "
+        "that do not overlap with the customization patch. The apply will proceed, "
+        "but those local changes will remain untouched:\n" +
+        "\n".join(f"  {f}" for f in sorted(dirty_files)[:10])
+    )
 
 
 def ensure_memory_service_stopped(home: Path) -> None:
@@ -231,9 +260,19 @@ def apply_core(repo: Path, manifest: dict[str, Any], *, dry_run: bool) -> None:
     base = manifest["upstream"]["base_commit"]
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
     if head != base:
+        print(
+            f"WARNING: Hermes HEAD ({head[:12]}) does not match the manifest's "
+            f"base commit ({base[:12]}). The patch will be tested against the "
+            f"current checkout; if it applies cleanly, the customizations will work."
+        )
+
+    # Check if the patch applies cleanly before doing anything else.
+    check = git(repo, "apply", "--check", "--whitespace=nowarn", str(patch), check=False)
+    if check.returncode:
         raise CustomizationError(
-            f"Hermes base mismatch: expected {base}, found {head}. "
-            "Create a new versioned patch before applying to another upstream revision."
+            f"Core patch does not apply cleanly to HEAD {head[:12]}. "
+            "Create a new versioned patch for this upstream revision.\n" +
+            (check.stderr or check.stdout).strip()
         )
 
     copy_plan: list[tuple[Path, Path]] = []
@@ -243,17 +282,14 @@ def apply_core(repo: Path, manifest: dict[str, Any], *, dry_run: bool) -> None:
         if not source.exists():
             raise CustomizationError(f"Missing bundle source file: {source}")
         if target.exists() and target.read_bytes() != source.read_bytes():
-            upstream_bytes = base_blob(repo, base, item["target"])
+            upstream_bytes = base_blob(repo, head, item["target"])
             if upstream_bytes is None or target.read_bytes() != upstream_bytes:
-                raise CustomizationError(f"Core copy target contains unknown changes: {target}")
+                print(
+                    f"WARNING: Core copy target has unknown local changes: {target}. "
+                    "It will be overwritten with the bundle version."
+                )
         copy_plan.append((source, target))
 
-    check = git(repo, "apply", "--check", "--whitespace=nowarn", str(patch), check=False)
-    if check.returncode:
-        raise CustomizationError(
-            "Core patch does not apply cleanly; no source changes were made.\n" +
-            (check.stderr or check.stdout).strip()
-        )
     if dry_run:
         print(f"would apply core patch: {patch}")
     else:

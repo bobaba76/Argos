@@ -77,7 +77,10 @@
       "consolidation_max_actions": "25",
       "reranker_enabled": "false",
       "reranker_model": "BAAI/bge-reranker-base",
-      "reranker_top_n": "10"
+      "reranker_top_n": "10",
+      "context_aware_retrieval": "true",
+      "context_window_size": "3",
+      "context_max_chars": "500"
     }
   },
   "tests": {

@@ -80,6 +80,9 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "reranker_enabled": "false",
         "reranker_model": "BAAI/bge-reranker-base",
         "reranker_top_n": "10",
+        "context_aware_retrieval": "true",
+        "context_window_size": "3",
+        "context_max_chars": "500",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -356,6 +359,15 @@ class HybridMemoryProvider(MemoryProvider):
         self._auto_extract_paused: bool = False
         self._initialized: bool = False
         self._current_project_id: str = ""
+        # Context-aware retrieval: rolling window of recent messages.
+        # Used to enrich queries that contain pronouns/references with
+        # conversation context so the embedder can resolve "that", "he",
+        # "the thing" etc.
+        self._context_aware_retrieval: bool = True
+        self._context_window_size: int = 3  # last N user messages
+        self._context_max_chars: int = 500  # cap total context length
+        self._recent_user_messages: list[str] = []
+        self._context_lock = threading.Lock()
         # Prefetch state.
         self._prefetch_thread: Optional[threading.Thread] = None
         self._prefetch_query: str = ""
@@ -564,6 +576,24 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._reranker_top_n = 20
+        # Context-aware retrieval config
+        ctx_aware = self._config.get("context_aware_retrieval", "true")
+        self._context_aware_retrieval = (
+            ctx_aware.lower() in ("true", "1", "yes")
+            if isinstance(ctx_aware, str) else bool(ctx_aware)
+        )
+        try:
+            self._context_window_size = max(
+                1, min(int(self._config.get("context_window_size", 3)), 10)
+            )
+        except (TypeError, ValueError):
+            self._context_window_size = 3
+        try:
+            self._context_max_chars = max(
+                100, min(int(self._config.get("context_max_chars", 500)), 2000)
+            )
+        except (TypeError, ValueError):
+            self._context_max_chars = 500
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
         env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
         self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
@@ -669,6 +699,78 @@ class HybridMemoryProvider(MemoryProvider):
 
     # -- retrieval ------------------------------------------------------------
 
+    # -- context-aware retrieval ---------------------------------------------
+
+    # Patterns that indicate a query depends on conversation context to
+    # resolve references. If the query matches any of these AND we have
+    # recent messages, we prepend the context to the query before search.
+    _REFERENTIAL_PATTERNS = [
+        r"\bthat\b", r"\bthis\b", r"\bit\b", r"\bthe thing\b",
+        r"\bwhat about\b", r"\btell me more\b", r"\bhe\b", r"\bshe\b",
+        r"\bhim\b", r"\bher\b", r"\bthem\b", r"\bthey\b",
+        r"\bthe one\b", r"\bthe last\b", r"\bthe other\b",
+        r"\bremember (when|that|the)\b",
+    ]
+
+    @classmethod
+    def _is_referential_query(cls, query: str) -> bool:
+        """Check if a query contains pronouns/references that need context."""
+        import re
+        query_lower = query.lower().strip()
+        # Short queries with referential language are the strongest signal.
+        # Long queries usually have enough keywords on their own.
+        if len(query_lower) > 300:
+            return False
+        for pattern in cls._REFERENTIAL_PATTERNS:
+            if re.search(pattern, query_lower):
+                return True
+        return False
+
+    def _enrich_query_with_context(self, query: str) -> str:
+        """Prepend recent conversation context to a referential query.
+
+        This resolves pronouns like "that", "he", "the thing" by giving
+        the embedder the surrounding conversation as context. The context
+        is prepended (not appended) so the embedder sees it first.
+
+        Returns the original query unchanged if:
+        - context-aware retrieval is disabled
+        - the query doesn't contain referential language
+        - there are no recent messages
+        """
+        if not self._context_aware_retrieval:
+            return query
+        if not self._is_referential_query(query):
+            return query
+        with self._context_lock:
+            recent = list(self._recent_user_messages)
+        if not recent:
+            return query
+        # Build context string from recent messages, capped to max_chars.
+        # We use the last N user messages (most recent last).
+        context_parts: list[str] = []
+        total_chars = 0
+        for msg in reversed(recent):  # most recent first
+            if total_chars + len(msg) > self._context_max_chars:
+                break
+            context_parts.insert(0, msg)
+            total_chars += len(msg)
+        if not context_parts:
+            return query
+        context = " ".join(context_parts)
+        # Prepend context, then the query. The embedder will see both.
+        return f"{context} {query}"
+
+    def _record_user_message(self, message: str) -> None:
+        """Add a user message to the rolling context window."""
+        if not message or not message.strip():
+            return
+        with self._context_lock:
+            self._recent_user_messages.append(message.strip())
+            # Keep only the last N messages.
+            while len(self._recent_user_messages) > self._context_window_size:
+                self._recent_user_messages.pop(0)
+
     def _search_memories(
         self,
         query: str,
@@ -683,10 +785,13 @@ class HybridMemoryProvider(MemoryProvider):
         """
         if self._store is None:
             return []
+        # Enrich the query with conversation context if it contains
+        # pronouns/references that need resolution.
+        effective_query = self._enrich_query_with_context(query)
         effective_project = project_id if project_id is not None else self._current_project_id
         candidate_limit = min(50, max(limit, limit * 4))
         results = self._store.search(
-            query,
+            effective_query,
             limit=candidate_limit,
             category_filter=category_filter,
             project_id=effective_project or None,
@@ -695,7 +800,7 @@ class HybridMemoryProvider(MemoryProvider):
             return results[:limit]
         try:
             graph_ids = self._graph.memory_ids_for_query(
-                query, limit=max(10, candidate_limit)
+                effective_query, limit=max(10, candidate_limit)
             )
             if graph_ids:
                 existing = {record.memory_id for record in results}
@@ -722,6 +827,7 @@ class HybridMemoryProvider(MemoryProvider):
     # -- prefetch (auto-inject context before each turn) ---------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        self._record_user_message(message)
         self._start_prefetch(message)
 
     def _start_prefetch(self, query: str) -> None:

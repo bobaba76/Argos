@@ -1464,10 +1464,14 @@ class HybridMemoryProvider(MemoryProvider):
             if rec is None:
                 return tool_error(f"Memory not found: {memory_id}")
             if getattr(self, "_graph", None):
+                # update_memory creates a new version: rec.memory_id is the
+                # NEW ID, but the graph was indexed against the OLD memory_id.
+                # Remove the old ID from the graph (it's now superseded and
+                # resolves to 0 records), then index the new version.
                 try:
-                    self._graph.remove_memory(rec.memory_id)
+                    self._graph.remove_memory(memory_id)
                 except Exception as exc:
-                    logger.debug("Graph evidence cleanup failed for %s: %s", rec.memory_id, exc)
+                    logger.debug("Graph evidence cleanup failed for %s: %s", memory_id, exc)
                 self._index_memory_graph(
                     rec.memory_id,
                     rec.category,

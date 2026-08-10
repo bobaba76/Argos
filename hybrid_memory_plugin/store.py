@@ -835,20 +835,22 @@ class DuckDBMemoryStore:
         """
         with self._lock:
             assert self.connection is not None
-            # Layer 1: exact match.
+            # Layer 1: exact match (only against current versions).
             result = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE content = ? AND category = ?
+                     AND valid_to IS NULL
                      AND (json_extract_string(payload, '$.user_scope') IS NULL
                           OR json_extract_string(payload, '$.user_scope') = ?)""",
                 [content, category, self.user_id],
             ).fetchone()
             if result and result[0] > 0:
                 return True
-            # Layer 2: substring containment (case-insensitive).
+            # Layer 2: substring containment (case-insensitive, current only).
             result = self.connection.execute(
                 """SELECT content FROM memory_records
                    WHERE category = ?
+                     AND valid_to IS NULL
                      AND (json_extract_string(payload, '$.user_scope') IS NULL
                           OR json_extract_string(payload, '$.user_scope') = ?)
                    LIMIT 500""",
@@ -871,6 +873,7 @@ class DuckDBMemoryStore:
                         result = self.connection.execute(
                             """SELECT memory_id FROM memory_records
                                WHERE category = ? AND embedding IS NOT NULL
+                                 AND valid_to IS NULL
                                  AND (json_extract_string(payload, '$.user_scope') IS NULL
                                       OR json_extract_string(payload, '$.user_scope') = ?)
                                  AND list_cosine_similarity(embedding, ?::DOUBLE[]) > ?

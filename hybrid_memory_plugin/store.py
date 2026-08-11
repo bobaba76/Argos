@@ -794,6 +794,7 @@ class DuckDBMemoryStore:
         category_filter: str | None = None,
         project_id: str | None = None,
         as_of: str | None = None,
+        suppress_retrieval: bool = False,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with optional cross-encoder
         re-ranking, feedback, and recency.
@@ -808,6 +809,12 @@ class DuckDBMemoryStore:
 
         When *project_id* is provided, memories from other projects are
         excluded; global memories (project_id IS NULL) remain visible.
+
+        When *suppress_retrieval* is True, _record_retrieval is skipped —
+        eval/attributetic runs won't inflate retrieval_count on the memories
+        they search. This prevents eval self-pollution where repeated eval
+        runs pump the retrieval_count of eval-relevant memories to the cap,
+        flattening the retrieval signal as a discriminator.
         """
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
@@ -879,7 +886,8 @@ class DuckDBMemoryStore:
         # Apply feedback weighting and recency boost, then truncate.
         self._apply_feedback_and_recency(fused)
         final = fused[:limit]
-        self._record_retrieval(final)
+        if not suppress_retrieval:
+            self._record_retrieval(final)
         return final
 
     # -- write operations -----------------------------------------------------

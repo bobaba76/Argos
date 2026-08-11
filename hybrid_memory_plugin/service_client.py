@@ -183,6 +183,7 @@ class SharedMemoryStore:
         category_filter: str | None = None,
         project_id: str | None = None,
         as_of: str | None = None,
+        suppress_retrieval: bool = False,
     ) -> List[MemoryRecord]:
         values = self._rpc.call(
             "store", "search", query=query, limit=limit,
@@ -190,6 +191,7 @@ class SharedMemoryStore:
             category_filter=category_filter,
             project_id=project_id,
             as_of=as_of,
+            suppress_retrieval=suppress_retrieval,
         )
         return [_record_from_dict(value) for value in (values or [])]
 

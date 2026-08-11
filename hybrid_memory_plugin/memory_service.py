@@ -115,6 +115,7 @@ class MemoryService:
                     category_filter=args.get("category_filter"),
                     project_id=args.get("project_id"),
                     as_of=args.get("as_of"),
+                    suppress_retrieval=bool(args.get("suppress_retrieval", False)),
                 )
             ]
         if method == "remember":

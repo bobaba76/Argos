@@ -72,6 +72,7 @@
       "graph_retrieval_boost": "0.05",
       "graph_inject_candidates": "false",
       "graph_boost_min_similarity": "0.15",
+      "alias_expansion_boost": "0.7",
       "consolidation_enabled": "false",
       "consolidation_min_age_days": "30",
       "consolidation_max_actions": "25",

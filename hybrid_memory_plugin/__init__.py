@@ -80,6 +80,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "graph_retrieval_boost": "0.05",
         "graph_inject_candidates": "false",
         "graph_boost_min_similarity": "0.15",
+        "alias_expansion_boost": "0.7",
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
@@ -361,6 +362,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._graph_retrieval_boost: float = 0.05
         self._graph_inject_candidates: bool = False
         self._graph_boost_min_similarity: float = 0.15
+        self._alias_expansion_boost: float = 0.7
         self._consolidation_enabled: bool = False
         self._consolidation_min_age_days: int = 30
         self._consolidation_max_actions: int = 25
@@ -478,6 +480,12 @@ class HybridMemoryProvider(MemoryProvider):
                 "required": False,
             },
             {
+                "key": "alias_expansion_boost",
+                "description": "Minimum similarity floor for alias-expanded candidates (identity mappings like 'my role'→'Sam'). Alias expansion is definitive, not fuzzy — the candidate IS about the query entity, so its similarity is floored to this value when the raw embedding similarity is lower.",
+                "default": "0.7",
+                "required": False,
+            },
+            {
                 "key": "consolidation_enabled",
                 "description": "Allow automatic reversible memory maintenance at session end",
                 "default": "false",
@@ -569,6 +577,12 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._graph_boost_min_similarity = 0.15
+        try:
+            self._alias_expansion_boost = max(
+                0.0, min(float(self._config.get("alias_expansion_boost", 0.7)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._alias_expansion_boost = 0.7
         consolidation_enabled = self._config.get("consolidation_enabled", "false")
         self._consolidation_enabled = (
             consolidation_enabled.lower() in ("true", "1", "yes")
@@ -1028,7 +1042,12 @@ class HybridMemoryProvider(MemoryProvider):
                             seen.add(eid)
                 except Exception:
                     pass
-            # Also query the graph for each alias term (canonical→alias)
+            # Also query the graph for each alias term (canonical→alias).
+            # Track which IDs came from alias expansion specifically — these
+            # are the only graph-only candidates eligible for injection, so
+            # we don't re-introduce the noise regression that made
+            # graph_inject_candidates=false necessary in the first place.
+            alias_expanded_ids: list[str] = []
             for alias_term in alias_terms:
                 try:
                     extra_ids = self._graph.memory_ids_for_query(
@@ -1039,18 +1058,76 @@ class HybridMemoryProvider(MemoryProvider):
                         if eid not in seen:
                             graph_ids.append(eid)
                             seen.add(eid)
+                            alias_expanded_ids.append(eid)
                 except Exception:
                     pass
             if graph_ids:
                 existing = {record.memory_id for record in results}
+                # Graph-only candidate injection. Two guards prevent noise:
+                # 1. graph_inject_candidates must be true (the global gate),
+                #    OR the candidate came from alias expansion specifically
+                #    (the Ticket 1 path:  "Entity-A"→ "my role" → graph IDs).
+                # 2. The candidate's semantic similarity to the query must
+                #    clear graph_boost_min_similarity — a precision guard
+                #    that stops unrelated graph neighbors from being injected.
+                #    Records from get_memories_by_ids have no similarity
+                #    computed, so we compute it here via the store's embedder.
+                injectable_ids = set(alias_expanded_ids) if alias_expanded_ids else set()
                 if self._graph_inject_candidates:
-                    graph_records = self._store.get_memories_by_ids(graph_ids)
+                    injectable_ids.update(graph_ids)
+                if injectable_ids:
+                    # Compute query embedding once for similarity scoring.
+                    query_emb: List[float] = []
+                    embedder = getattr(self._store, "embedder", None)
+                    if embedder and hasattr(embedder, "embed"):
+                        try:
+                            query_emb = embedder.embed(effective_query, is_query=True)
+                        except Exception:
+                            query_emb = []
+                    graph_records = self._store.get_memories_by_ids(
+                        list(injectable_ids)
+                    )
                     for record in graph_records:
-                        if record.memory_id not in existing:
+                        if record.memory_id in existing:
+                            continue
+                        # Compute cosine similarity if we have embeddings;
+                        # otherwise fall back to the record's existing
+                        # similarity (set by get_memories_by_ids or a
+                        # prior search path).
+                        sim = 0.0
+                        if query_emb and getattr(record, "embedding", None):
+                            try:
+                                import math
+                                dot = sum(a * b for a, b in zip(query_emb, record.embedding))
+                                norm_q = math.sqrt(sum(a * a for a in query_emb))
+                                norm_r = math.sqrt(sum(b * b for b in record.embedding))
+                                if norm_q > 0 and norm_r > 0:
+                                    sim = dot / (norm_q * norm_r)
+                            except Exception:
+                                sim = 0.0
+                        elif hasattr(record, "similarity"):
+                            sim = record.similarity
+                        record.similarity = sim
+                        record.raw_similarity = sim
+                        if sim >= self._graph_boost_min_similarity:
                             results.append(record)
                 graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
                 graph_count = max(len(graph_ids), 1)
+                alias_id_set = set(alias_expanded_ids)
                 for record in results:
+                    # Alias-expanded candidates: alias expansion is a
+                    # definitive identity mapping (e.g. "my role" =
+                    # "Sam"), not a fuzzy graph neighbor.  The raw
+                    # embedding similarity is low only because the memory
+                    # text doesn't contain the query word — but semantically
+                    # it IS about the query entity.  Floor the similarity
+                    # so high-similarity candidates are unaffected and low-
+                    # similarity ones are lifted above the cutoff.
+                    if record.memory_id in alias_id_set:
+                        record.similarity = max(
+                            record.similarity, self._alias_expansion_boost
+                        )
+                        continue
                     rank = graph_rank.get(record.memory_id)
                     if rank is None:
                         continue
@@ -1377,6 +1454,11 @@ class HybridMemoryProvider(MemoryProvider):
         Uses regex-first, LLM-supplemented extraction. The LLM path only
         fires when regex finds few relations and content is substantial,
         so short memories don't pay the token cost.
+
+        Also extracts role→canonical-name aliases at index time: when a
+        memory contains "my role is Sam" or "Role is Entity-A", writes
+        add_alias("my role", "Sam") so that searching for "Entity-A"
+        also finds memories that say "my role" without naming Entity-A.
         """
         graph = getattr(self, "_graph", None)
         if not graph or not memory_id or not content:
@@ -1394,6 +1476,59 @@ class HybridMemoryProvider(MemoryProvider):
             # Graph indexing is an enrichment path; a graph failure must not
             # make a successful memory write fail.
             logger.debug("Graph indexing failed for memory %s: %s", memory_id, exc)
+
+        # Index-time alias expansion: extract role→canonical-name mappings
+        # from the same content and write aliases so both directions work:
+        #   alias→canonical (query "my role" → matches Entity-A) [already works]
+        #   canonical→alias (query  "Entity-A"→ matches "my role") [NEW]
+        self._extract_role_aliases(content, tags or [])
+
+    def _extract_role_aliases(
+        self, content: str, tags: List[str] | None = None
+    ) -> None:
+        """Extract role→canonical-person aliases from memory content.
+
+        When a memory contains a pattern like "my role is Sam" or
+        "Role is Entity-A", writes add_alias("my role", "Sam") so that:
+        - searching "my role" resolves to Entity-A (alias→canonical)
+        - searching  "Entity-A"also finds memories mentioning "my role"
+          (canonical→alias, via aliases_for_canonical at query time)
+
+        Guards against over-minting:
+        - Only fires on has_<role> relations with a person target
+        - The canonical name must start with a capital letter (a real name,
+          not a verb/adjective — same guard as the bare_role pattern)
+        - Idempotent: INSERT OR REPLACE in add_alias
+        """
+        store = getattr(self, "_store", None)
+        if not store or not content:
+            return
+        try:
+            from graph import extract_graph_relations, _GRAPH_RELATIONSHIP_WORDS
+            relations = extract_graph_relations(content, "context_note", tags)
+            for rel in relations:
+                relation = rel.get("relation", "")
+                if not relation.startswith("has_"):
+                    continue
+                if rel.get("target_type") != "person":
+                    continue
+                role = relation[4:]  # e.g. "role", "contact", "doc"
+                canonical = rel.get("target", "")
+                # Guard: canonical must be a real name (capital letter)
+                if not canonical or not canonical[0].isupper():
+                    continue
+                # Skip if the "name" is actually a role word capitalized
+                # (e.g. "Role" — not a person name)
+                if canonical.lower() in _GRAPH_RELATIONSHIP_WORDS:
+                    continue
+                alias = f"my {role}"
+                store.add_alias(alias, canonical)
+                logger.debug(
+                    "Index-time alias: %r -> %r (from: %s)",
+                    alias, canonical, content[:60],
+                )
+        except Exception as exc:
+            logger.debug("Role-alias extraction failed: %s", exc)
 
     def _try_graph_relationship(self, content: str) -> None:
         """Attempt to extract a relationship from content text and add to graph.

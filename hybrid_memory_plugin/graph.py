@@ -701,6 +701,14 @@ class KuzuGraphStore:
                 existing = self._parse_attributes(existing_result.get_next()[0])
             merged = dict(existing)
             merged.update(incoming)
+            # If new evidence is being provided (incoming has memory_id or
+            # memory_ids), clear any prior quarantine — a quarantined node
+            # that receives fresh evidence is no longer junk.
+            if (incoming.get("memory_id") or incoming.get("memory_ids")) and \
+                    merged.get("status") == "quarantined":
+                merged.pop("status", None)
+                merged.pop("quarantine_reason", None)
+                merged.pop("quarantined_at", None)
             # Never downgrade a person node to concept. If the node already
             # exists as "person" (from an explicit relationship pattern),
             # a later merge from a relation-free memory must not overwrite
@@ -798,9 +806,21 @@ class KuzuGraphStore:
         target_type: str,
         attributes: Dict[str, Any] | None = None,
     ) -> None:
-        """Convenience: upsert both nodes then the edge."""
-        self.upsert_node(source, source_type)
-        self.upsert_node(target, target_type)
+        """Convenience: upsert both nodes then the edge.
+
+        Passes memory_id/memory_ids from the edge attributes to the node
+        upserts so that re-indexing a memory clears any prior quarantine
+        on the entity nodes (the quarantine-clear guard in upsert_node
+        requires incoming memory evidence to fire).
+        """
+        node_attrs: Dict[str, Any] = {}
+        if attributes:
+            if "memory_id" in attributes:
+                node_attrs["memory_id"] = attributes["memory_id"]
+            if "memory_ids" in attributes:
+                node_attrs["memory_ids"] = attributes["memory_ids"]
+        self.upsert_node(source, source_type, node_attrs)
+        self.upsert_node(target, target_type, node_attrs)
         self.upsert_edge(source, target, relation, attributes)
 
     def index_memory(
@@ -1361,7 +1381,8 @@ class KuzuGraphStore:
         with self._shared_conn_lock:
             node_results = self.conn.execute(
                 "MATCH (n:Entity) WHERE n.user_scope = $scope "
-                "RETURN n.id AS id, n.attributes AS attributes",
+                "RETURN n.id AS id, n.attributes AS attributes, "
+                "n.entity_type AS entity_type",
                 parameters={"scope": self.user_id},
             )
             nodes = []
@@ -1378,8 +1399,17 @@ class KuzuGraphStore:
                 edges.append(edge_results.get_next())
 
         changed = 0
-        for node_id, raw_attrs in nodes:
+        for node_id, raw_attrs, entity_type in nodes:
             if not self._visible_attributes(raw_attrs):
+                continue
+            # Skip nodes that have active memory evidence — they were indexed
+            # from a real memory and validated by the extraction pipeline.
+            # The junk heuristics (prefix matching, length) would re-quarantine
+            # legitimate role-mention entities like "my role" (first word "my"
+            # is in _JUNK_ENTITY_PREFIXES) on every startup sweep, undoing the
+            # quarantine-clear that add_relationship performs at index time.
+            attrs = self._parse_attributes(raw_attrs)
+            if attrs.get("memory_id") or attrs.get("memory_ids"):
                 continue
             node_id = self._external_id(str(node_id))
             first_word = node_id.split()[0].lower() if node_id.split() else ""

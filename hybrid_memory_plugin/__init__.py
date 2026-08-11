@@ -46,7 +46,11 @@ from .query_expander import QueryExpander
 logger = logging.getLogger(__name__)
 
 _PREFETCH_WAIT_SECS = 3.0
-_DEFAULT_MAX_INJECTED = 8
+_DEFAULT_MAX_INJECTED = 20
+# Per-memory content cap in the auto-injection block. Without this, a few
+# long memories (3000+ chars) can blow the token budget at N=20. 200 chars
+# preserves the key fact while keeping the injection block compact.
+_INJECT_CONTENT_CHAR_CAP = 200
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _AUTO_EXTRACT_PAUSE_MARKER = "hybrid_memory.auto_extract.paused"
 
@@ -1096,6 +1100,8 @@ class HybridMemoryProvider(MemoryProvider):
                     for r in results:
                         cat = r.category
                         content = r.content
+                        if len(content) > _INJECT_CONTENT_CHAR_CAP:
+                            content = content[:_INJECT_CONTENT_CHAR_CAP].rsplit(" ", 1)[0] + "..."
                         sim = f" (score: {r.similarity:.2f})" if r.similarity > 0 else ""
                         lines.append(f"- [{cat}] {content}{sim}")
                     sections.append("## Recalled Memories\n" + "\n".join(lines))

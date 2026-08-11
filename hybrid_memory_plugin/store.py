@@ -528,7 +528,10 @@ class DuckDBMemoryStore:
 
     # -- ranking: RRF + feedback + recency -----------------------------------
 
-    _RRF_K = 60  # Standard Reciprocal Rank Fusion constant.
+    _RRF_K = 20  # Lowered from 60 to sharpen relevance discrimination.
+    # With k=60, rank 1 → 0.0164 and rank 10 → 0.0143 (spread ~0.002).
+    # With k=20, rank 1 → 0.0476 and rank 10 → 0.0323 (spread ~0.015).
+    # The wider spread lets relevance survive the importance adjustment.
 
     @classmethod
     def _rrf_fuse(
@@ -660,17 +663,78 @@ class DuckDBMemoryStore:
                 pass
         return adj
 
+    # Clamp the importance adjustment so it can't erase a relevance gap.
+    # With k=20 RRF, the relevance spread between rank 1 and rank 10 is
+    # ~0.015. An unclamped adjustment of +0.50 (from retrieval_count alone)
+    # swamps that entirely. We split the adjustment into:
+    #   - base signals (recency, age, dormancy) that are similar for nearby
+    #     memories and don't discriminate — these get a tight clamp
+    #   - feedback signals (helpful, dismissed, confidence, retrieval) that
+    #     DO discriminate between equally-relevant memories — these get a
+    #     wider clamp so a helpful vote still breaks ties
+    _IMPORTANCE_BASE_CLAMP = 0.03   # recency/age/dormancy: tight clamp
+    _IMPORTANCE_FEEDBACK_CLAMP = 0.08  # helpful/dismissed/confidence/retrieval
+
+    @classmethod
+    def _importance_adjustment_split(cls, r: MemoryRecord) -> tuple[float, float]:
+        """Compute importance adjustment split into (base, feedback) components.
+
+        base: recency + age + dormancy (similar for nearby memories)
+        feedback: helpful + dismissed + confidence + retrieval (discriminates)
+        """
+        base = cls._recency_boost(r.created_at)
+        # Age penalty
+        if r.created_at:
+            try:
+                created = datetime.fromisoformat(r.created_at.replace("Z", "+00:00"))
+                age_days = max(0, (datetime.now(timezone.utc) - created).days)
+                base -= cls._IMPORTANCE_AGE_DECAY_PER_DAY * min(age_days, cls._IMPORTANCE_AGE_DECAY_CAP_DAYS)
+            except Exception:
+                pass
+        # Dormancy penalty
+        if r.last_retrieved_at:
+            try:
+                last_ret = datetime.fromisoformat(r.last_retrieved_at.replace("Z", "+00:00"))
+                dormant_days = max(0, (datetime.now(timezone.utc) - last_ret).days)
+                base -= cls._IMPORTANCE_DORMANCY_DECAY_PER_DAY * min(dormant_days, cls._IMPORTANCE_DORMANCY_CAP_DAYS)
+            except Exception:
+                pass
+
+        feedback = cls._IMPORTANCE_HELPFUL_WEIGHT * r.helpful_count
+        if r.dismissed_count > 0:
+            dismissal_factor = 1.0
+            if r.updated_at:
+                try:
+                    updated = datetime.fromisoformat(r.updated_at.replace("Z", "+00:00"))
+                    days_since = max(0, (datetime.now(timezone.utc) - updated).days)
+                    dismissal_factor = max(0.0, 1.0 - days_since / cls._IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS)
+                except Exception:
+                    pass
+            feedback += cls._IMPORTANCE_DISMISSED_WEIGHT * r.dismissed_count * dismissal_factor
+        if r.confidence is not None:
+            feedback += cls._IMPORTANCE_CONFIDENCE_WEIGHT * (r.confidence - 0.5)
+        feedback += cls._IMPORTANCE_RETRIEVAL_WEIGHT * min(r.retrieval_count, cls._IMPORTANCE_RETRIEVAL_CAP)
+
+        return base, feedback
+
     @classmethod
     def _apply_feedback_and_recency(cls, records: List[MemoryRecord]) -> None:
         """Adjust ``similarity`` in-place using importance scoring.
 
-        Combines feedback signals (helpful/dismissed), extraction confidence,
-        retrieval frequency, recency boost, age decay, and dormancy penalty
-        into a single additive adjustment on a 0-1 scale.
+        The adjustment is split into base signals (recency/age/dormancy)
+        and feedback signals (helpful/dismissed/confidence/retrieval).
+        Each is clamped separately so:
+        - base signals can't swamp relevance (tight ±0.03 clamp)
+        - feedback signals can still break ties between equally-relevant
+          memories (wider ±0.08 clamp)
+        Without this split-clamp, a +0.40 retrieval boost (identical for
+        all memories in the eval corpus) would swamp the ~0.015 RRF gap.
         """
         for r in records:
-            adj = cls._importance_adjustment(r)
-            r.similarity = max(0.0, r.similarity + adj)
+            base, feedback = cls._importance_adjustment_split(r)
+            base = max(-cls._IMPORTANCE_BASE_CLAMP, min(cls._IMPORTANCE_BASE_CLAMP, base))
+            feedback = max(-cls._IMPORTANCE_FEEDBACK_CLAMP, min(cls._IMPORTANCE_FEEDBACK_CLAMP, feedback))
+            r.similarity = max(0.0, r.similarity + base + feedback)
         records.sort(key=lambda r: r.similarity, reverse=True)
 
     def _record_retrieval(self, records: List[MemoryRecord]) -> None:

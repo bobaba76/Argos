@@ -860,7 +860,7 @@ class HybridMemoryProvider(MemoryProvider):
             all_results[r.memory_id] = r
 
         # RRF: original results get rank-based scores
-        rrf_k = 60  # standard RRF constant
+        rrf_k = 20  # lowered from 60 to sharpen relevance discrimination
         rrf_scores: dict[str, float] = {}
         for rank, r in enumerate(original_results):
             rrf_scores[r.memory_id] = 1.0 / (rrf_k + rank + 1)

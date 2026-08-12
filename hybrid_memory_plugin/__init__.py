@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
-from .embeddings import LocalEmbedder
+from .embeddings import LocalEmbedder, _resolve_embedding_model_path
 from .store import DuckDBMemoryStore, VALID_CATEGORIES
 from .graph import KuzuGraphStore
 from .confirmation import build_confirmation_block
@@ -398,6 +398,7 @@ class HybridMemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         # Sync state: bounded queue + persistent worker.
         self._sync_queue: "queue.Queue[Optional[tuple[str, str, str]]]" = queue.Queue(maxsize=3)
+        self._sync_dropped_turns = 0
         self._sync_thread: Optional[threading.Thread] = None
         self._sync_lock = threading.Lock()
         self._sync_worker_started = False
@@ -674,7 +675,11 @@ class HybridMemoryProvider(MemoryProvider):
                 logger.warning("Failed to parse entity_aliases config: %s", exc)
 
         # Embedder (lazy — model loads on first embed call).
-        self._embedder = LocalEmbedder(model_name)
+        resolved_model = _resolve_embedding_model_path(model_name, home)
+        self._embedder = LocalEmbedder(resolved_model)
+        self._evidence_retention = str(
+            config.get("evidence_retention", "full")
+        ).lower()
 
         # Reranker (lazy — model loads on first rerank call).
         if self._reranker_enabled:
@@ -1252,6 +1257,7 @@ class HybridMemoryProvider(MemoryProvider):
             }
             final_status = decision_map.get(decision, "pending_user_confirmation")
             result = self._store.review_candidate(
+                evidence_retention=self._evidence_retention,
                 candidate_id=candidate["candidate_id"],
                 decision=final_status,
                 reason=review.get("reason", ""),
@@ -1298,6 +1304,7 @@ class HybridMemoryProvider(MemoryProvider):
         try:
             self._sync_queue.put_nowait(item)
         except queue.Full:
+            self._sync_dropped_turns += 1
             try:
                 dropped = self._sync_queue.get_nowait()
                 self._sync_queue.task_done()
@@ -1718,6 +1725,7 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: candidate_id or decision")
             try:
                 result = self._store.review_candidate(
+                    evidence_retention=self._evidence_retention,
                     candidate_id=candidate_id,
                     decision=decision,
                     reason=args.get("reason", ""),

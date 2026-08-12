@@ -16,6 +16,7 @@ import signal
 import socketserver
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,8 @@ class MemoryService:
             logger.warning("Kùzu unavailable in shared memory service: %s", exc)
             self.graph = None
         self.lock = threading.RLock()
+        self._lock_wait_total_s = 0.0
+        self._lock_wait_count = 0
         self.server = None
 
     def _call_store(self, method: str, args: dict, user_id: str) -> Any:
@@ -153,6 +156,8 @@ class MemoryService:
         if method == "record_retrieval":
             self.store.record_retrieval(args.get("memory_ids", []))
             return True
+        if method == "get_evidence":
+            return self.store.get_evidence(args.get("memory_id", ""))
         if method == "list_recent":
             return [
                 _record_to_dict(record)
@@ -233,7 +238,17 @@ class MemoryService:
 
     def dispatch(self, request: dict) -> Any:
         if request.get("method") == "health":
-            return {"status": "ok", "pid": os.getpid()}
+            return {
+                "status": "ok",
+                "pid": os.getpid(),
+                "lock_wait_total_s": round(self._lock_wait_total_s, 4),
+                "lock_wait_count": self._lock_wait_count,
+            }
+        if request.get("method") == "stats":
+            return {
+                "lock_wait_total_s": round(self._lock_wait_total_s, 4),
+                "lock_wait_count": self._lock_wait_count,
+            }
         if request.get("method") == "shutdown":
             if self.server is not None:
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -245,7 +260,10 @@ class MemoryService:
         user_id = str(request.get("user_id") or "default_user")
         if component not in {"store", "graph"} or not isinstance(method, str):
             raise ValueError("Invalid service request")
+        t0 = time.monotonic()
         with self.lock:
+            self._lock_wait_total_s += time.monotonic() - t0
+            self._lock_wait_count += 1
             if component == "store":
                 return self._call_store(method, args, user_id)
             return self._call_graph(method, args, user_id)

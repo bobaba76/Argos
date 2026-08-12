@@ -215,6 +215,16 @@ class SharedMemoryStore:
         """Explicitly credit retrieval for the final injected memory list."""
         self._rpc.call("store", "record_retrieval", memory_ids=list(memory_ids or []))
 
+    def get_evidence(self, memory_id: str) -> dict | None:
+        """Return the provenance record for a memory, or None."""
+        return self._rpc.call("store", "get_evidence", memory_id=memory_id)
+
+    def set_retriever(self, retriever: Any) -> None:
+        """Retrieval engines are only swappable on the direct store."""
+        raise NotImplementedError(
+            "set_retriever is only supported on DuckDBMemoryStore"
+        )
+
     def update_memory(self, **kwargs: Any) -> MemoryRecord | None:
         return _record_from_dict(self._rpc.call("store", "update_memory", **kwargs))
 

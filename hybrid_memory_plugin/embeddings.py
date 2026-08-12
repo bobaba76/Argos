@@ -19,7 +19,9 @@ search time.  Callers embedding stored content (the default) pass no flag.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,27 @@ def _query_instruction_for(model_name: str) -> str:
     return ""
 
 
+def _resolve_embedding_model_path(
+    model_name: str, hermes_home: Optional[Path] = None
+) -> str:
+    """Resolve a configured model name to a fully local path when possible.
+
+    Priority: explicit existing path > ``<hermes_home>/models/<name>`` > hub
+    name.  Local-first avoids the network HEAD-check sentence-transformers
+    performs when loading by hub name — which fails behind firewalls and
+    previously degraded to silent text-only search on fresh installs.
+    """
+    name = (model_name or "").strip() or _DEFAULT_MODEL
+    p = Path(name)
+    if p.is_dir():
+        return str(p)
+    if hermes_home is not None:
+        candidate = Path(hermes_home) / "models" / Path(name).name
+        if candidate.is_dir():
+            return str(candidate)
+    return name
+
+
 class LocalEmbedder:
     """Thin wrapper around sentence-transformers with lazy init + fallback.
 
@@ -75,6 +98,11 @@ class LocalEmbedder:
         if shared is not None:
             return True
         return self._loaded and _SHARED_MODELS.get(self._model_name) is not None
+
+    @property
+    def load_failed(self) -> bool:
+        """True after a failed load attempt (degraded, not just pending)."""
+        return self._load_failed
 
     @property
     def dimension(self) -> Optional[int]:
@@ -107,8 +135,13 @@ class LocalEmbedder:
             try:
                 from sentence_transformers import SentenceTransformer
 
-                logger.info("Loading embedding model: %s", self._model_name)
-                model = SentenceTransformer(self._model_name)
+                resolved = _resolve_embedding_model_path(self._model_name)
+                use_local_only = Path(resolved).is_dir()
+                logger.info(
+                    "Loading embedding model: %s (local_files_only=%s)",
+                    resolved, use_local_only,
+                )
+                model = SentenceTransformer(resolved, local_files_only=use_local_only)
                 # Probe dimension with a dummy encode.
                 test = model.encode(["dimension probe"], normalize_embeddings=True)
                 dim = len(test[0])
@@ -120,7 +153,7 @@ class LocalEmbedder:
                 logger.info("Embedding model loaded (dim=%d)", self._dim)
             except Exception as e:
                 self._load_failed = True
-                logger.warning(
+                logger.error(
                     "Embedding model '%s' unavailable — falling back to text search. "
                     "Reason: %s",
                     self._model_name, e,

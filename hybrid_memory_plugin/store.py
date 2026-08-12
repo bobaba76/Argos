@@ -15,7 +15,13 @@ Categories (general-purpose — any topic):
 """
 from __future__ import annotations
 
+import hashlib
 import json
+
+try:
+    from .retriever import DuckDBRetriever
+except ImportError:  # store.py imported as a top-level module (tests)
+    from retriever import DuckDBRetriever
 import logging
 import math
 import threading
@@ -250,6 +256,22 @@ class DuckDBMemoryStore:
                     created_at         VARCHAR,
                     PRIMARY KEY (alias, canonical_entity, user_scope)
                 );
+            """)
+
+            # Evidence/provenance: links an active memory back to the exact
+            # user statement that produced it (Wave 2).
+            self.connection.execute("""
+                CREATE TABLE IF NOT EXISTS memory_evidence (
+                    memory_id          VARCHAR PRIMARY KEY,
+                    user_scope         VARCHAR,
+                    source_session_id  VARCHAR,
+                    source_timestamp   VARCHAR,
+                    evidence_role      VARCHAR,
+                    evidence_text      VARCHAR,
+                    extraction_method  VARCHAR,
+                    reviewer_decision  VARCHAR,
+                    created_at         VARCHAR
+                )
             """)
             # Additive migration for databases created by earlier versions.
             columns = {
@@ -841,6 +863,28 @@ class DuckDBMemoryStore:
     def search(
         self,
         query: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> List[MemoryRecord]:
+        """Run retrieval through the configured retriever.
+        The default ``DuckDBRetriever`` wraps the existing scan-based hybrid
+        search (vector + ILIKE + RRF fusion).  Alternative engines (ANN,
+        BM25, graph-candidate) can be plugged in via ``set_retriever``
+        without touching the provider.  Behavior is identical to the
+        pre-seam implementation.
+        """
+        retriever = getattr(self, "_retriever", None)
+        if retriever is None:
+            retriever = self._retriever = DuckDBRetriever(self)
+        return retriever.search(query, *args, **kwargs)
+
+    def set_retriever(self, retriever: Any) -> None:
+        """Swap the retrieval engine (advanced; must match the protocol)."""
+        self._retriever = retriever
+
+    def _hybrid_search(
+        self,
+        query: str,
         limit: int = 5,
         exclude_categories: List[str] | None = None,
         category_filter: str | None = None,
@@ -1232,6 +1276,7 @@ class DuckDBMemoryStore:
         review_model: str = "",
         durability: str | None = None,
         scope: str | None = None,
+        evidence_retention: str = "full",
     ) -> dict | None:
         """Approve, reject, quarantine, or classify a pending proposal."""
         decision = decision.strip().lower()
@@ -1279,10 +1324,75 @@ class DuckDBMemoryStore:
                     review_model or "", durability, scope, candidate_id,
                 ],
             )
+
+            # Wave 2: carry candidate evidence into memory_evidence so every
+            # approved memory keeps provenance ("why does Hermes believe
+            # this, and from exactly which user statement?").
+            # Retention modes: full | hash | none.
+            if memory is not None and evidence_retention != "none":
+                evidence_text = candidate.get("evidence_text") or ""
+                if evidence_retention == "hash" and evidence_text:
+                    evidence_text = hashlib.sha256(
+                        evidence_text.encode("utf-8")
+                    ).hexdigest()
+                payload = candidate.get("payload") or {}
+                self.connection.execute(
+                    """INSERT INTO memory_evidence
+                       (memory_id, user_scope, source_session_id, source_timestamp,
+                        evidence_role, evidence_text, extraction_method,
+                        reviewer_decision, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (memory_id) DO NOTHING""",
+                    [
+                        memory.memory_id,
+                        (
+                            payload.get("user_scope")
+                            if isinstance(payload, dict) else None
+                        ) or self.user_id,
+                        (
+                            payload.get("source_session_id")
+                            if isinstance(payload, dict) else None
+                        ) or candidate.get("session_id") or "",
+                        candidate.get("source_timestamp") or now,
+                        candidate.get("evidence_role") or "",
+                        evidence_text,
+                        (
+                            payload.get("extraction_method", "")
+                            if isinstance(payload, dict) else ""
+                        ),
+                        final_status,
+                        now,
+                    ],
+                )
         return {
             "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
             "memory": memory.to_dict() if memory else None,
         }
+
+    def get_evidence(self, memory_id: str) -> dict | None:
+        """Return the provenance record for a memory, or None."""
+        with self._lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                """SELECT memory_id, source_session_id, source_timestamp,
+                          evidence_role, evidence_text, extraction_method,
+                          reviewer_decision, created_at
+                   FROM memory_evidence
+                   WHERE memory_id = ? AND (user_scope IS NULL OR user_scope = ?)""",
+                [memory_id, self.user_id],
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "memory_id": row[0],
+                "source_session_id": row[1],
+                "source_timestamp": row[2],
+                "evidence_role": row[3],
+                "evidence_text": row[4],
+                "extraction_method": row[5],
+                "reviewer_decision": row[6],
+                "created_at": row[7],
+            }
 
     def quarantine_memory(self, memory_id: str, reason: str) -> bool:
         """Hide a memory from retrieval without deleting its record."""
@@ -1504,6 +1614,12 @@ class DuckDBMemoryStore:
                 return False
             self.connection.execute(
                 "DELETE FROM memory_records WHERE memory_id = ?"
+                " AND (user_scope IS NULL OR user_scope = ?)",
+                [memory_id, self.user_id],
+            )
+            # Wave 2: provenance rows die with their memory.
+            self.connection.execute(
+                "DELETE FROM memory_evidence WHERE memory_id = ?"
                 " AND (user_scope IS NULL OR user_scope = ?)",
                 [memory_id, self.user_id],
             )

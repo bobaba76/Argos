@@ -158,6 +158,10 @@ class MemoryService:
             return True
         if method == "get_evidence":
             return self.store.get_evidence(args.get("memory_id", ""))
+        if method == "backfill_evidence":
+            return self.store.backfill_evidence(
+                retention=str(args.get("retention", "full")),
+            )
         if method == "list_recent":
             return [
                 _record_to_dict(record)

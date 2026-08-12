@@ -1394,6 +1394,60 @@ class DuckDBMemoryStore:
                 "created_at": row[7],
             }
 
+    def backfill_evidence(self, retention: str = "full") -> int:
+        """Copy evidence from approved candidates into memory_evidence.
+
+        One-time migration for memories approved before Wave 2 (which carries
+        evidence only for NEW approvals).  Matches candidates to their memory
+        by content equality + same-era source timestamp; skips candidates that
+        already have an evidence row.  Retention: full | hash | none.
+        Returns the number of evidence rows written.
+        """
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT c.candidate_id, c.evidence_text, c.evidence_role,
+                          c.source_timestamp, c.session_id, c.created_at,
+                          c.payload, m.memory_id
+                   FROM memory_candidates c
+                   JOIN memory_records m ON m.content = c.content
+                   WHERE c.status = 'approved'
+                     AND c.evidence_text IS NOT NULL AND c.evidence_text != ''
+                     AND m.status = 'active'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_evidence e
+                         WHERE e.memory_id = m.memory_id
+                     )"""
+            ).fetchall()
+            written = 0
+            for (cand_id, evidence_text, evidence_role, source_ts,
+                 session_id, created_at, payload, memory_id) in rows:
+                text = evidence_text or ""
+                if retention == "hash" and text:
+                    text = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                payload_dict = payload if isinstance(payload, dict) else {}
+                self.connection.execute(
+                    """INSERT INTO memory_evidence
+                       (memory_id, user_scope, source_session_id, source_timestamp,
+                        evidence_role, evidence_text, extraction_method,
+                        reviewer_decision, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (memory_id) DO NOTHING""",
+                    [
+                        memory_id,
+                        payload_dict.get("user_scope") or self.user_id,
+                        payload_dict.get("source_session_id") or session_id or "",
+                        source_ts or created_at,
+                        evidence_role or "",
+                        text,
+                        payload_dict.get("extraction_method", ""),
+                        "backfilled",
+                        self._now(),
+                    ],
+                )
+                written += 1
+            return written
+
     def quarantine_memory(self, memory_id: str, reason: str) -> bool:
         """Hide a memory from retrieval without deleting its record."""
         now = self._now()
@@ -1475,6 +1529,7 @@ class DuckDBMemoryStore:
         content: str | None = None,
         tags: List[str] | None = None,
         payload_updates: Dict[str, Any] | None = None,
+        expires_at: str | None = None,
     ) -> MemoryRecord | None:
         """Update an existing memory by creating a new version.
 
@@ -1482,6 +1537,9 @@ class DuckDBMemoryStore:
         1. Creates a new memory record with a new ID (the new version)
         2. Sets the old record's valid_to = now and superseded_by = new_id
         3. Returns the new version
+
+        *expires_at* sets a new expiry on the version (ISO string); when None,
+        the existing expiry is carried forward unchanged.
 
         The old record is preserved for history queries (as_of parameter).
         If no content/tags/payload changes are provided, returns the existing
@@ -1504,7 +1562,8 @@ class DuckDBMemoryStore:
             new_payload.update(payload_updates)
 
         # If nothing actually changed, return the existing record
-        if (content is None and tags is None and not payload_updates):
+        if (content is None and tags is None and not payload_updates
+                and expires_at is None):
             return rec
 
         # Re-embed if content changed
@@ -1534,7 +1593,8 @@ class DuckDBMemoryStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                 [new_id, rec.category, new_content, new_tags,
                  json.dumps(new_payload), now, now,
-                 rec.expires_at, new_emb if new_emb else None,
+                 expires_at if expires_at is not None else rec.expires_at,
+                 new_emb if new_emb else None,
                  rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
                  rec.project_id,
                  rec.payload.get("user_scope"),

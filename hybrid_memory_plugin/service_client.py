@@ -219,6 +219,12 @@ class SharedMemoryStore:
         """Return the provenance record for a memory, or None."""
         return self._rpc.call("store", "get_evidence", memory_id=memory_id)
 
+    def backfill_evidence(self, retention: str = "full") -> int:
+        """Backfill memory_evidence from approved candidates (pre-Wave-2 memories)."""
+        return int(
+            self._rpc.call("store", "backfill_evidence", retention=retention) or 0
+        )
+
     def set_retriever(self, retriever: Any) -> None:
         """Retrieval engines are only swappable on the direct store."""
         raise NotImplementedError(

@@ -25,7 +25,9 @@ except ImportError:  # store.py imported as a top-level module (tests)
 import logging
 import math
 import threading
+import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -176,6 +178,16 @@ class DuckDBMemoryStore:
         self.connection: Optional[duckdb.DuckDBPyConnection] = None
         self._connect()
         self._init_db()
+        # Scale-trigger metrics (measured gate for ANN/BM25 per the roadmap):
+        # rolling p95 latency window + record count, warn when thresholds cross.
+        self._scale_warn_latency_ms = 300.0
+        self._scale_warn_records = 5000
+        self._scale_window = 50
+        self._scale_latencies: Deque[float] = deque(maxlen=self._scale_window)
+        self._scale_queries = 0
+        self._scale_warnings_fired = 0
+        self._scale_last_count_check = 0
+        self._scale_record_count: Optional[int] = None
 
     # -- connection management ------------------------------------------------
 
@@ -270,7 +282,8 @@ class DuckDBMemoryStore:
                     evidence_text      VARCHAR,
                     extraction_method  VARCHAR,
                     reviewer_decision  VARCHAR,
-                    created_at         VARCHAR
+                    created_at         VARCHAR,
+                    candidate_id       VARCHAR
                 )
             """)
             # Additive migration for databases created by earlier versions.
@@ -314,6 +327,27 @@ class DuckDBMemoryStore:
                     )
                 except Exception as exc:
                     logger.warning("Candidate schema migration for %s failed: %s", name, exc)
+
+            try:
+                self.connection.execute(
+                    "ALTER TABLE memory_evidence ADD COLUMN IF NOT EXISTS candidate_id VARCHAR"
+                )
+            except Exception as exc:
+                logger.warning("Evidence schema migration (candidate_id) failed: %s", exc)
+
+            try:
+                # One-time: link pre-existing evidence rows (written before the
+                # column existed) back to their source candidate.
+                self.connection.execute("""
+                    UPDATE memory_evidence e
+                    SET candidate_id = c.candidate_id
+                    FROM memory_candidates c
+                    WHERE e.candidate_id IS NULL
+                      AND e.source_session_id = c.session_id
+                      AND e.source_timestamp = c.source_timestamp
+                """)
+            except Exception as exc:
+                logger.warning("Evidence candidate_id backfill failed: %s", exc)
 
             try:
                 self.connection.execute("""
@@ -873,10 +907,75 @@ class DuckDBMemoryStore:
         without touching the provider.  Behavior is identical to the
         pre-seam implementation.
         """
-        retriever = getattr(self, "_retriever", None)
-        if retriever is None:
-            retriever = self._retriever = DuckDBRetriever(self)
-        return retriever.search(query, *args, **kwargs)
+        _t0 = time.perf_counter()
+        try:
+            retriever = getattr(self, "_retriever", None)
+            if retriever is None:
+                retriever = self._retriever = DuckDBRetriever(self)
+            return retriever.search(query, *args, **kwargs)
+        finally:
+            self._record_scale_metric(time.perf_counter() - _t0)
+
+    def _record_scale_metric(self, elapsed_s: float) -> None:
+        """Track query latency and corpus size; warn when thresholds cross.
+
+        The measured trigger for expensive-engine gating (ANN/BM25, fact
+        families): a rolling p95 latency window and the active record count.
+        Warnings fire once per crossing and are actionable — they name the
+        threshold that was exceeded, not a vague "slow".
+        """
+        try:
+            self._scale_latencies.append(elapsed_s * 1000.0)
+            self._scale_queries += 1
+            # Sample the record count every 25 queries (COUNT(*) on every
+            # query would add overhead we're trying to measure).
+            if self._scale_queries - self._scale_last_count_check >= 25:
+                self._scale_last_count_check = self._scale_queries
+                try:
+                    self._scale_record_count = int(self.count())
+                except Exception:
+                    pass
+            n = len(self._scale_latencies)
+            if n < 5:
+                return  # too few samples to be meaningful
+            avg_ms = sum(self._scale_latencies) / n
+            p95_ms = sorted(self._scale_latencies)[int(n * 0.95) - 1]
+            over_latency = p95_ms > self._scale_warn_latency_ms
+            over_count = (self._scale_record_count or 0) > self._scale_warn_records
+            if over_latency or over_count:
+                self._scale_warnings_fired += 1
+                logger.warning(
+                    "HYBRID_MEMORY_SCALE: p95=%.0fms avg=%.0fms (warn>%.0fms) "
+                    "records=%s (warn>%s) — if this persists, enable ANN/BM25 "
+                    "indexing or fact-family consolidation per the scaling "
+                    "roadmap (trigger: %s)",
+                    p95_ms, avg_ms, self._scale_warn_latency_ms,
+                    self._scale_record_count, self._scale_warn_records,
+                    "latency" if over_latency else "corpus-size",
+                )
+        except Exception:
+            pass  # metrics must never break retrieval
+
+    def set_scale_thresholds(self, warn_latency_ms: float, warn_records: int) -> None:
+        """Configure the scale-trigger thresholds (from the provider config)."""
+        self._scale_warn_latency_ms = float(warn_latency_ms)
+        self._scale_warn_records = int(warn_records)
+
+    def get_scale_metrics(self) -> Dict[str, Any]:
+        """Return current scale-trigger state (for dashboards/handoffs)."""
+        n = len(self._scale_latencies)
+        p95 = sorted(self._scale_latencies)[int(n * 0.95) - 1] if n >= 5 else 0.0
+        return {
+            "queries_measured": self._scale_queries,
+            "window": n,
+            "avg_latency_ms": round(sum(self._scale_latencies) / n, 1) if n else 0.0,
+            "p95_latency_ms": round(p95, 1),
+            "max_latency_ms": round(max(self._scale_latencies), 1) if n else 0.0,
+            "record_count": self._scale_record_count,
+            "warnings_fired": self._scale_warnings_fired,
+            "warn_latency_ms": self._scale_warn_latency_ms,
+            "warn_records": self._scale_warn_records,
+        }
 
     def set_retriever(self, retriever: Any) -> None:
         """Swap the retrieval engine (advanced; must match the protocol)."""
@@ -1402,7 +1501,14 @@ class DuckDBMemoryStore:
         by content equality + same-era source timestamp; skips candidates that
         already have an evidence row.  Retention: full | hash | none.
         Returns the number of evidence rows written.
+
+        Pass 2 (fallback): candidates whose original memory was deleted (the
+        fact lives on in a semantically-identical replacement) are attached to
+        the best-matching active memory when raw similarity is strong.
         """
+        # Pass 2 runs OUTSIDE the lock: self.search() acquires the same
+        # non-reentrant lock, so calling it inside `with self._lock` deadlocks.
+        orphan_rows = None
         with self._lock:
             assert self.connection is not None
             rows = self.connection.execute(
@@ -1422,31 +1528,108 @@ class DuckDBMemoryStore:
             written = 0
             for (cand_id, evidence_text, evidence_role, source_ts,
                  session_id, created_at, payload, memory_id) in rows:
-                text = evidence_text or ""
-                if retention == "hash" and text:
-                    text = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                payload_dict = payload if isinstance(payload, dict) else {}
-                self.connection.execute(
-                    """INSERT INTO memory_evidence
-                       (memory_id, user_scope, source_session_id, source_timestamp,
-                        evidence_role, evidence_text, extraction_method,
-                        reviewer_decision, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT (memory_id) DO NOTHING""",
-                    [
-                        memory_id,
-                        payload_dict.get("user_scope") or self.user_id,
-                        payload_dict.get("source_session_id") or session_id or "",
-                        source_ts or created_at,
-                        evidence_role or "",
-                        text,
-                        payload_dict.get("extraction_method", ""),
-                        "backfilled",
-                        self._now(),
-                    ],
+                written += self._write_evidence_row(
+                    memory_id, cand_id, evidence_text, evidence_role,
+                    source_ts, session_id, created_at, payload, retention,
                 )
-                written += 1
-            return written
+
+            # Pass 2: semantic fallback for candidates whose original memory
+            # was deleted — attach to the strongest surviving match.
+            orphan_rows = self.connection.execute(
+                """SELECT candidate_id, content, evidence_text, evidence_role,
+                          source_timestamp, session_id, created_at, payload
+                   FROM memory_candidates
+                   WHERE status = 'approved'
+                     AND evidence_text IS NOT NULL AND evidence_text != ''
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_records m
+                         WHERE m.content = memory_candidates.content
+                           AND m.status = 'active'
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM memory_evidence e
+                         WHERE e.candidate_id = memory_candidates.candidate_id
+                     )"""
+            ).fetchall()
+
+        for (cand_id, content, evidence_text, evidence_role, source_ts,
+             session_id, created_at, payload) in (orphan_rows or []):
+            try:
+                best = self.search(
+                    content or "", limit=3, suppress_retrieval=True,
+                )
+            except Exception:
+                best = []
+            if not best:
+                continue
+            top = best[0]
+            raw = getattr(top, "raw_similarity", None)
+            if raw is None:
+                raw = top.similarity if hasattr(top, "similarity") else 0.0
+            if raw < 0.5:
+                continue  # not confident enough — leave orphaned
+            with self._lock:
+                inserted = self._write_evidence_row(
+                    top.memory_id, cand_id, evidence_text, evidence_role,
+                    source_ts, session_id, created_at, payload, retention,
+                )
+                if inserted:
+                    written += 1
+                else:
+                    # Row exists (conflict) — link it if written pre-candidate_id.
+                    try:
+                        cur = self.connection.cursor()
+                        cur.execute(
+                            "UPDATE memory_evidence SET candidate_id = ? "
+                            "WHERE memory_id = ? AND candidate_id IS NULL",
+                            [cand_id, top.memory_id],
+                        )
+                        cur.close()
+                    except Exception:
+                        pass
+        return written
+
+    def _write_evidence_row(
+        self, memory_id, cand_id, evidence_text, evidence_role, source_ts,
+        session_id, created_at, payload, retention: str,
+    ) -> int:
+        """Insert one evidence row (shared by exact + fallback passes)."""
+        text = evidence_text or ""
+        if retention == "hash" and text:
+            text = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        payload_dict = payload if isinstance(payload, dict) else {}
+        # DuckDB reports rowcount=-1 for INSERT ... ON CONFLICT, so we
+        # pre-check existence: the NOT EXISTS guards in backfill_evidence
+        # already dedupe; this makes the return value truthful.
+        existing = self.connection.execute(
+            "SELECT 1 FROM memory_evidence WHERE memory_id = ?",
+            [memory_id],
+        ).fetchone()
+        if existing:
+            return 0
+        cur = self.connection.cursor()
+        cur.execute(
+            """INSERT INTO memory_evidence
+               (memory_id, user_scope, source_session_id, source_timestamp,
+                evidence_role, evidence_text, extraction_method,
+                reviewer_decision, created_at, candidate_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (memory_id) DO NOTHING""",
+            [
+                memory_id,
+                payload_dict.get("user_scope") or self.user_id,
+                payload_dict.get("source_session_id") or session_id or "",
+                source_ts or created_at,
+                evidence_role or "",
+                text,
+                payload_dict.get("extraction_method", ""),
+                "backfilled",
+                self._now(),
+                cand_id,
+            ],
+        )
+        cur.close()
+        return 1  # pre-checked: no existing row, so the insert succeeded
 
     def quarantine_memory(self, memory_id: str, reason: str) -> bool:
         """Hide a memory from retrieval without deleting its record."""

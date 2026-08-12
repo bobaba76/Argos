@@ -661,6 +661,25 @@ class HybridMemoryProvider(MemoryProvider):
             "1", "true", "yes", "on"
         }
 
+        # ---- Scale trigger instrumentation -------------------------------
+        # The triage rule: build cheap/irreversible seams now, gate expensive
+        # engines (ANN/BM25, fact families) behind MEASURED triggers. The
+        # store owns the latency window and record-count sampling; the
+        # provider exposes them via get_scale_metrics().
+        self._scale_warn_latency_ms = float(
+            self._config.get("scale_warn_latency_ms", 300.0)
+        )
+        self._scale_warn_records = int(
+            self._config.get("scale_warn_records", 5000)
+        )
+        if self._store is not None:
+            try:
+                self._store.set_scale_thresholds(
+                    self._scale_warn_latency_ms, self._scale_warn_records
+                )
+            except Exception:
+                pass
+
         # Entity aliases: load from config (JSON mapping) into the store.
         aliases_json = str(self._config.get("entity_aliases", "")).strip()
         if aliases_json and self._store:
@@ -935,6 +954,19 @@ class HybridMemoryProvider(MemoryProvider):
                 self._store.record_retrieval([r.memory_id for r in records])
         except Exception as exc:
             logger.debug("Could not record injected retrieval: %s", exc)
+
+    def get_scale_metrics(self) -> Dict[str, Any]:
+        """Return current scale-trigger state (delegates to the store).
+
+        The store owns the latency window and record-count sampling — it is
+        the layer that actually executes search (both in-process and via the
+        shared service), so its numbers are the ones the scaling roadmap's
+        measured triggers gate on.
+        """
+        try:
+            return dict(self._store.get_scale_metrics())
+        except Exception:
+            return {"error": "scale metrics unavailable"}
 
     def _search_memories(
         self,

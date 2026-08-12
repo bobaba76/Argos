@@ -160,8 +160,16 @@ class MemoryService:
             return self.store.get_evidence(args.get("memory_id", ""))
         if method == "backfill_evidence":
             return self.store.backfill_evidence(
-                retention=str(args.get("retention", "full")),
+                retention=args.get("retention", "full")
             )
+        if method == "get_scale_metrics":
+            return self.store.get_scale_metrics()
+        if method == "set_scale_thresholds":
+            self.store.set_scale_thresholds(
+                args.get("warn_latency_ms", 300.0),
+                args.get("warn_records", 5000),
+            )
+            return True
         if method == "list_recent":
             return [
                 _record_to_dict(record)

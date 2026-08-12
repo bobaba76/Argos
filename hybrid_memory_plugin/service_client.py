@@ -225,6 +225,19 @@ class SharedMemoryStore:
             self._rpc.call("store", "backfill_evidence", retention=retention) or 0
         )
 
+    def get_scale_metrics(self) -> dict:
+        """Return scale-trigger metrics (query latency, record count)."""
+        return self._rpc.call("store", "get_scale_metrics") or {}
+
+    def set_scale_thresholds(self, warn_latency_ms: float, warn_records: int) -> bool:
+        """Configure scale-trigger thresholds on the shared store."""
+        return bool(
+            self._rpc.call(
+                "store", "set_scale_thresholds",
+                warn_latency_ms=warn_latency_ms, warn_records=warn_records,
+            )
+        )
+
     def set_retriever(self, retriever: Any) -> None:
         """Retrieval engines are only swappable on the direct store."""
         raise NotImplementedError(

@@ -676,7 +676,7 @@ class HybridMemoryProvider(MemoryProvider):
 
         # Embedder (lazy — model loads on first embed call).
         resolved_model = _resolve_embedding_model_path(model_name, home)
-        self._embedder = LocalEmbedder(resolved_model)
+        self._embedder = LocalEmbedder(resolved_model, hermes_home=home)
         self._evidence_retention = str(
             config.get("evidence_retention", "full")
         ).lower()
@@ -687,7 +687,9 @@ class HybridMemoryProvider(MemoryProvider):
                 from .embeddings import CrossEncoderReranker
             except ImportError:
                 from embeddings import CrossEncoderReranker
-            self._reranker = CrossEncoderReranker(self._reranker_model)
+            self._reranker = CrossEncoderReranker(
+                self._reranker_model, hermes_home=home
+            )
 
         if use_shared_service:
             # One local service owns the canonical DuckDB/Kùzu files. The

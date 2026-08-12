@@ -83,8 +83,10 @@ class LocalEmbedder:
     ~130MB model every time Hermes creates a new agent/session.
     """
 
-    def __init__(self, model_name: str = _DEFAULT_MODEL) -> None:
+    def __init__(self, model_name: str = _DEFAULT_MODEL,
+                 hermes_home: Optional[Path] = None) -> None:
         self._model_name = model_name
+        self._hermes_home = hermes_home
         self._loaded = False
         self._load_failed = False
         self._lock = threading.Lock()
@@ -135,7 +137,9 @@ class LocalEmbedder:
             try:
                 from sentence_transformers import SentenceTransformer
 
-                resolved = _resolve_embedding_model_path(self._model_name)
+                resolved = _resolve_embedding_model_path(
+                    self._model_name, self._hermes_home
+                )
                 use_local_only = Path(resolved).is_dir()
                 logger.info(
                     "Loading embedding model: %s (local_files_only=%s)",
@@ -238,8 +242,10 @@ class CrossEncoderReranker:
     returns the input unchanged.
     """
 
-    def __init__(self, model_name: str = _DEFAULT_RERANKER) -> None:
+    def __init__(self, model_name: str = _DEFAULT_RERANKER,
+                 hermes_home: Optional[Path] = None) -> None:
         self._model_name = model_name
+        self._hermes_home = hermes_home
         self._loaded = False
         self._load_failed = False
         self._lock = threading.Lock()
@@ -268,7 +274,14 @@ class CrossEncoderReranker:
                 from sentence_transformers import CrossEncoder
 
                 logger.info("Loading reranker model: %s", self._model_name)
-                model = CrossEncoder(self._model_name, max_length=512)
+                resolved = _resolve_embedding_model_path(
+                    self._model_name, self._hermes_home
+                )
+                use_local_only = Path(resolved).is_dir()
+                model = CrossEncoder(
+                    resolved, max_length=512,
+                    local_files_only=use_local_only,
+                )
                 with _SHARED_RERANKER_LOCK:
                     _SHARED_RERANKERS[self._model_name] = model
                 self._loaded = True

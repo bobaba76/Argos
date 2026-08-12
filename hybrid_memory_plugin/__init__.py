@@ -891,6 +891,7 @@ class HybridMemoryProvider(MemoryProvider):
                     limit=candidate_limit,
                     category_filter=category_filter,
                     project_id=project_id or None,
+                    suppress_retrieval=True,
                 )
             except Exception as exc:
                 logger.debug("Sub-query search failed for '%s': %s", sq[:30], exc)
@@ -914,6 +915,19 @@ class HybridMemoryProvider(MemoryProvider):
             r.similarity = rrf_scores.get(r.memory_id, 0.0) / max_score if max_score > 0 else 0.0
 
         return merged
+
+    def _record_injected(self, records: List[Any]) -> None:
+        """Record retrieval only for the final injected list (not pool filler).
+
+        The store's search(suppress_retrieval=True) skips retrieval accounting
+        for candidate-pool searches; the provider re-records here so only the
+        memories actually injected into the conversation gain popularity credit.
+        """
+        try:
+            if records and self._store is not None and hasattr(self._store, "record_retrieval"):
+                self._store.record_retrieval([r.memory_id for r in records])
+        except Exception as exc:
+            logger.debug("Could not record injected retrieval: %s", exc)
 
     def _search_memories(
         self,
@@ -939,6 +953,7 @@ class HybridMemoryProvider(MemoryProvider):
             limit=candidate_limit,
             category_filter=category_filter,
             project_id=effective_project or None,
+            suppress_retrieval=True,
         )
 
         # Query expansion: if the top hit's RAW similarity (pre-importance)
@@ -981,7 +996,9 @@ class HybridMemoryProvider(MemoryProvider):
             )
 
         if not self._graph or not self._graph_aware_retrieval:
-            return results[:limit]
+            final_results = results[:limit]
+            self._record_injected(final_results)
+            return final_results
         try:
             # Entity alias resolution: expand the query with canonical
             # entity names for any aliases found in the query text.
@@ -1138,7 +1155,9 @@ class HybridMemoryProvider(MemoryProvider):
                 results.sort(key=lambda record: record.similarity, reverse=True)
         except Exception as exc:
             logger.debug("Graph-aware retrieval failed: %s", exc)
-        return results[:limit]
+        final_results = results[:limit]
+        self._record_injected(final_results)
+        return final_results
 
     # -- prefetch (auto-inject context before each turn) ---------------------
 

@@ -211,6 +211,10 @@ class SharedMemoryStore:
     def remember(self, **kwargs: Any) -> MemoryRecord | None:
         return _record_from_dict(self._rpc.call("store", "remember", **kwargs))
 
+    def record_retrieval(self, memory_ids: List[str]) -> None:
+        """Explicitly credit retrieval for the final injected memory list."""
+        self._rpc.call("store", "record_retrieval", memory_ids=list(memory_ids or []))
+
     def update_memory(self, **kwargs: Any) -> MemoryRecord | None:
         return _record_from_dict(self._rpc.call("store", "update_memory", **kwargs))
 

@@ -150,6 +150,9 @@ class MemoryService:
             return self.store.consolidate(**args)
         if method == "count":
             return self.store.count()
+        if method == "record_retrieval":
+            self.store.record_retrieval(args.get("memory_ids", []))
+            return True
         if method == "list_recent":
             return [
                 _record_to_dict(record)

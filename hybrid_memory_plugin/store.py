@@ -209,6 +209,7 @@ class DuckDBMemoryStore:
                     durability         VARCHAR DEFAULT 'durable',
                     scope              VARCHAR DEFAULT 'profile',
                     project_id         VARCHAR,
+                    user_scope         VARCHAR,
                     retrieval_count    INTEGER DEFAULT 0,
                     last_retrieved_at  VARCHAR,
                     helpful_count      INTEGER DEFAULT 0,
@@ -258,6 +259,7 @@ class DuckDBMemoryStore:
                 "durability": "VARCHAR DEFAULT 'durable'",
                 "scope": "VARCHAR DEFAULT 'profile'",
                 "project_id": "VARCHAR",
+                "user_scope": "VARCHAR",
                 "retrieval_count": "INTEGER DEFAULT 0",
                 "last_retrieved_at": "VARCHAR",
                 "helpful_count": "INTEGER DEFAULT 0",
@@ -269,6 +271,7 @@ class DuckDBMemoryStore:
                 "superseded_by": "VARCHAR",
             }
             candidate_columns = {
+                "user_scope": "VARCHAR",
                 "evidence_text": "VARCHAR",
                 "evidence_role": "VARCHAR DEFAULT 'user_turn'",
                 "source_timestamp": "VARCHAR",
@@ -326,6 +329,34 @@ class DuckDBMemoryStore:
                 """)
             except Exception as exc:
                 logger.warning("Temporal validity backfill failed: %s", exc)
+
+            # user_scope column backfill (NULL stays NULL = legacy global scope).
+            try:
+                self.connection.execute("""
+                    UPDATE memory_records
+                    SET user_scope = json_extract_string(payload, '$.user_scope')
+                    WHERE user_scope IS NULL
+                      AND json_extract_string(payload, '$.user_scope') IS NOT NULL
+                """)
+            except Exception as exc:
+                logger.warning("user_scope backfill failed: %s", exc)
+            try:
+                self.connection.execute("""
+                    UPDATE memory_candidates
+                    SET user_scope = json_extract_string(payload, '$.user_scope')
+                    WHERE user_scope IS NULL
+                      AND json_extract_string(payload, '$.user_scope') IS NOT NULL
+                """)
+            except Exception as exc:
+                logger.warning("candidate user_scope backfill failed: %s", exc)
+            # Composite index: scope → status → validity.
+            try:
+                self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memory_scope_status_valid
+                    ON memory_records (user_scope, status, valid_to)
+                """)
+            except Exception as exc:
+                logger.warning("user_scope index creation failed: %s", exc)
 
     # -- helpers --------------------------------------------------------------
 
@@ -429,7 +460,7 @@ class DuckDBMemoryStore:
         tokens = [f"%{t}%" for t in words]
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
         project_clause = ""
-        params: list = [self.user_id]
+        params: list = [self.user_id, self._now()]
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -449,8 +480,8 @@ class DuckDBMemoryStore:
             "SELECT * FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
             f"{temporal_clause} "
-            "AND (json_extract_string(payload, '$.user_scope') IS NULL "
-            "OR json_extract_string(payload, '$.user_scope') = ?) "
+            "AND (user_scope IS NULL OR user_scope = ?) "
+            "AND (expires_at IS NULL OR expires_at > ?) "
             f"{project_clause} AND ("
             f"{conditions}) LIMIT 200"
         )
@@ -498,6 +529,7 @@ class DuckDBMemoryStore:
         else:
             temporal_clause = "AND valid_to IS NULL "
         params.append(self.user_id)
+        params.append(self._now())
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -508,8 +540,8 @@ class DuckDBMemoryStore:
             "WHERE COALESCE(status, 'active') = 'active' "
             f"  {temporal_clause} "
             "  AND embedding IS NOT NULL "
-            "  AND (json_extract_string(payload, '$.user_scope') IS NULL "
-            "       OR json_extract_string(payload, '$.user_scope') = ?) "
+            "  AND (user_scope IS NULL OR user_scope = ?) "
+            "  AND (expires_at IS NULL OR expires_at > ?) "
             f"{project_clause} "
             "ORDER BY sim DESC "
             "LIMIT ?"
@@ -762,6 +794,27 @@ class DuckDBMemoryStore:
             # A read-only fallback connection must still be able to search.
             logger.debug("Could not record memory retrieval: %s", exc)
 
+    def record_retrieval(self, memory_ids: List[str]) -> None:
+        """Explicitly credit retrieval for the final injected memory list.
+
+        The provider truncates a suppress_retrieval search to the memories it
+        actually injects, then re-records them here — so pool filler and
+        internal sub-queries never gain popularity credit.
+        """
+        if not memory_ids:
+            return
+        ids = [str(memory_id) for memory_id in memory_ids if str(memory_id).strip()]
+        if not ids:
+            return
+        placeholders = ", ".join("?" for _ in ids)
+        records = self._fetch_records(
+            f"SELECT * FROM memory_records WHERE memory_id IN ({placeholders})"
+            " AND (user_scope IS NULL OR user_scope = ?)"
+            " AND COALESCE(status, 'active') = 'active' AND valid_to IS NULL",
+            [*ids, self.user_id],
+        )
+        self._record_retrieval(records)
+
     def get_memories_by_ids(
         self,
         memory_ids: List[str],
@@ -776,8 +829,7 @@ class DuckDBMemoryStore:
         status_clause = "" if include_quarantined else " AND COALESCE(status, 'active') = 'active' AND valid_to IS NULL"
         records = self._fetch_records(
             f"SELECT * FROM memory_records WHERE memory_id IN ({placeholders})"
-            " AND (json_extract_string(payload, '$.user_scope') IS NULL"
-            " OR json_extract_string(payload, '$.user_scope') = ?)"
+            " AND (user_scope IS NULL OR user_scope = ?)"
             f"{status_clause}",
             [*ids, self.user_id],
         )
@@ -910,10 +962,9 @@ class DuckDBMemoryStore:
             # Layer 1: exact match (only against current versions).
             result = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
-                   WHERE content = ? AND category = ?
-                     AND valid_to IS NULL
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                  WHERE content = ? AND category = ?
+                    AND valid_to IS NULL
+                    AND (user_scope IS NULL OR user_scope = ?)""",
                 [content, category, self.user_id],
             ).fetchone()
             if result and result[0] > 0:
@@ -921,11 +972,10 @@ class DuckDBMemoryStore:
             # Layer 2: substring containment (case-insensitive, current only).
             result = self.connection.execute(
                 """SELECT content FROM memory_records
-                   WHERE category = ?
-                     AND valid_to IS NULL
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                          OR json_extract_string(payload, '$.user_scope') = ?)
-                   LIMIT 500""",
+                  WHERE category = ?
+                    AND valid_to IS NULL
+                    AND (user_scope IS NULL OR user_scope = ?)
+                  LIMIT 500""",
                 [category, self.user_id],
             ).fetchall()
             content_lower = content.lower().strip()
@@ -944,11 +994,10 @@ class DuckDBMemoryStore:
                     try:
                         result = self.connection.execute(
                             """SELECT memory_id FROM memory_records
-                               WHERE category = ? AND embedding IS NOT NULL
-                                 AND valid_to IS NULL
-                                 AND (json_extract_string(payload, '$.user_scope') IS NULL
-                                      OR json_extract_string(payload, '$.user_scope') = ?)
-                                 AND list_cosine_similarity(embedding, ?::DOUBLE[]) > ?
+                              WHERE category = ? AND embedding IS NOT NULL
+                                AND valid_to IS NULL
+                                AND (user_scope IS NULL OR user_scope = ?)
+                                AND list_cosine_similarity(embedding, ?::DOUBLE[]) > ?
                                LIMIT 1""",
                             [category, self.user_id, emb, self._DEDUP_SIMILARITY_THRESHOLD],
                         ).fetchone()
@@ -1015,9 +1064,9 @@ class DuckDBMemoryStore:
             INSERT INTO memory_records
                 (memory_id, category, content, tags, payload, created_at, updated_at,
                  expires_at, embedding, status, source, confidence, durability, scope,
-                 project_id, retrieval_count, helpful_count, dismissed_count,
+                 project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
                  valid_from)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
         """
         with self._lock:
             assert self.connection is not None
@@ -1027,6 +1076,7 @@ class DuckDBMemoryStore:
                 record_payload.get("expires_at"),
                 emb if emb else None,
                 status, source, confidence, durability, scope, project_id,
+                record_payload.get("user_scope"),
                 now,  # valid_from = creation time
             ])
         fetched = self._fetch_records(
@@ -1107,8 +1157,9 @@ class DuckDBMemoryStore:
                 existing = self.connection.execute(
                     """SELECT candidate_id FROM memory_candidates
                        WHERE category = ? AND content = ? AND status = 'pending'
+                         AND (user_scope IS NULL OR user_scope = ?)
                        LIMIT 1""",
-                    [category, content.strip()],
+                    [category, content.strip(), self.user_id],
                 ).fetchone()
             if existing:
                 return None
@@ -1128,16 +1179,17 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             self.connection.execute(
                 """INSERT INTO memory_candidates
-                   (candidate_id, category, content, tags, payload, source,
-                    confidence, durability, scope, project_id, session_id,
-                    status, created_at, updated_at, evidence_text, evidence_role,
-                    source_timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+                  (candidate_id, category, content, tags, payload, source,
+                   confidence, durability, scope, project_id, session_id,
+                   user_scope, status, created_at, updated_at, evidence_text,
+                   evidence_role, source_timestamp)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
                 [
                     candidate_id, category, content.strip(), tags or [],
                     json.dumps(candidate_payload), source, normalized_confidence,
                     durability or "durable", scope or "profile", project_id,
-                    session_id or "", now, now, evidence_text,
+                    session_id or "", candidate_payload.get("user_scope"),
+                    now, now, evidence_text,
                     evidence_role or "user_turn", source_timestamp,
                 ],
             )
@@ -1151,8 +1203,7 @@ class DuckDBMemoryStore:
         limit: int = 100,
     ) -> List[dict]:
         conditions = [
-            "(json_extract_string(payload, '$.user_scope') IS NULL OR "
-            "json_extract_string(payload, '$.user_scope') = ?)"
+            "(user_scope IS NULL OR user_scope = ?)"
         ]
         params: list[Any] = [self.user_id]
         if candidate_id:
@@ -1241,8 +1292,7 @@ class DuckDBMemoryStore:
             check = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE memory_id = ?
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
@@ -1263,8 +1313,7 @@ class DuckDBMemoryStore:
             check = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE memory_id = ?
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
@@ -1289,8 +1338,7 @@ class DuckDBMemoryStore:
             exists = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE memory_id = ?
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not exists or exists[0] == 0:
@@ -1332,8 +1380,7 @@ class DuckDBMemoryStore:
         existing = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE memory_id = ?
-                 AND (json_extract_string(payload, '$.user_scope') IS NULL
-                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+                 AND (user_scope IS NULL OR user_scope = ?)""",
             [memory_id, self.user_id],
         )
         if not existing:
@@ -1372,14 +1419,15 @@ class DuckDBMemoryStore:
                 """INSERT INTO memory_records
                    (memory_id, category, content, tags, payload, created_at, updated_at,
                     expires_at, embedding, status, source, confidence, durability, scope,
-                    project_id, retrieval_count, helpful_count, dismissed_count,
+                    project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
                     valid_from, valid_to, superseded_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                 [new_id, rec.category, new_content, new_tags,
                  json.dumps(new_payload), now, now,
                  rec.expires_at, new_emb if new_emb else None,
                  rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
                  rec.project_id,
+                 rec.payload.get("user_scope"),
                  rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
                  now],
             )
@@ -1449,14 +1497,15 @@ class DuckDBMemoryStore:
             check = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE memory_id = ?
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                          OR json_extract_string(payload, '$.user_scope') = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
                 return False
             self.connection.execute(
-                "DELETE FROM memory_records WHERE memory_id = ?", [memory_id]
+                "DELETE FROM memory_records WHERE memory_id = ?"
+                " AND (user_scope IS NULL OR user_scope = ?)",
+                [memory_id, self.user_id],
             )
             return True
 
@@ -1561,11 +1610,11 @@ class DuckDBMemoryStore:
         sql = (
             "SELECT * FROM memory_records WHERE COALESCE(status, 'active') = 'active' "
             "AND valid_to IS NULL "
-            "AND (json_extract_string(payload, '$.user_scope') IS NULL "
-            "OR json_extract_string(payload, '$.user_scope') = ?) "
+            "AND (user_scope IS NULL OR user_scope = ?) "
+            "AND (expires_at IS NULL OR expires_at > ?) "
             "ORDER BY created_at DESC LIMIT ?"
         )
-        results = self._fetch_records(sql, [self.user_id, limit])
+        results = self._fetch_records(sql, [self.user_id, self._now(), limit])
         return [r for r in results if self._matches_scope(r.payload) and not self._is_expired(r.expires_at)]
 
     def list_by_category(self, category: str, limit: int = 50) -> List[MemoryRecord]:
@@ -1573,11 +1622,11 @@ class DuckDBMemoryStore:
             "SELECT * FROM memory_records WHERE category = ? "
             "AND COALESCE(status, 'active') = 'active' "
             "AND valid_to IS NULL "
-            "AND (json_extract_string(payload, '$.user_scope') IS NULL "
-            "OR json_extract_string(payload, '$.user_scope') = ?) "
+            "AND (user_scope IS NULL OR user_scope = ?) "
+            "AND (expires_at IS NULL OR expires_at > ?) "
             "ORDER BY created_at DESC LIMIT ?"
         )
-        results = self._fetch_records(sql, [category, self.user_id, limit])
+        results = self._fetch_records(sql, [category, self.user_id, self._now(), limit])
         return [r for r in results if self._matches_scope(r.payload) and not self._is_expired(r.expires_at)]
 
     def list_memories(
@@ -1610,8 +1659,7 @@ class DuckDBMemoryStore:
             "category = 'insight'",
             "COALESCE(status, 'active') = 'active'",
             "valid_to IS NULL",
-            "(json_extract_string(payload, '$.user_scope') IS NULL OR "
-            "json_extract_string(payload, '$.user_scope') = ?)",
+            "(user_scope IS NULL OR user_scope = ?)",
         ]
         params: list = [self.user_id]
         if since:
@@ -1643,8 +1691,7 @@ class DuckDBMemoryStore:
                 "SELECT * FROM memory_records WHERE category = 'insight' "
                 "AND COALESCE(status, 'active') = 'active' "
                 "AND valid_to IS NULL "
-                "AND (json_extract_string(payload, '$.user_scope') IS NULL "
-                "OR json_extract_string(payload, '$.user_scope') = ?) "
+                "AND (user_scope IS NULL OR user_scope = ?) "
                 "ORDER BY created_at DESC LIMIT ?"
             )
             results = self._fetch_records(sql_simple, [self.user_id, limit])
@@ -1662,8 +1709,7 @@ class DuckDBMemoryStore:
             result = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE valid_to IS NULL
-                     AND (json_extract_string(payload, '$.user_scope') IS NULL
-                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)""",
                 [self.user_id],
             ).fetchone()
             return result[0] if result else 0
@@ -1686,8 +1732,7 @@ class DuckDBMemoryStore:
             """SELECT * FROM memory_records
                WHERE COALESCE(status, 'active') = 'active'
                  AND valid_to IS NULL
-                 AND (json_extract_string(payload, '$.user_scope') IS NULL
-                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+                 AND (user_scope IS NULL OR user_scope = ?)""",
             [self.user_id],
         )
         to_quarantine: Dict[str, str] = {}
@@ -1767,8 +1812,7 @@ class DuckDBMemoryStore:
             """SELECT * FROM memory_records
                WHERE COALESCE(status, 'active') = 'active'
                  AND valid_to IS NULL
-                 AND (json_extract_string(payload, '$.user_scope') IS NULL
-                      OR json_extract_string(payload, '$.user_scope') = ?)""",
+                 AND (user_scope IS NULL OR user_scope = ?)""",
             [self.user_id],
         )
         now = datetime.now(timezone.utc)

@@ -77,7 +77,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "extraction_shadow_diff": "false",
         "auto_review": "true",
         "graph_aware_retrieval": "true",
-        "graph_retrieval_boost": "0.05",
+        "graph_retrieval_boost": "0.0",
         "graph_inject_candidates": "false",
         "graph_boost_min_similarity": "0.15",
         "alias_expansion_boost": "0.7",
@@ -697,7 +697,7 @@ class HybridMemoryProvider(MemoryProvider):
         resolved_model = _resolve_embedding_model_path(model_name, home)
         self._embedder = LocalEmbedder(resolved_model, hermes_home=home)
         self._evidence_retention = str(
-            config.get("evidence_retention", "full")
+            self._config.get("evidence_retention", "full")
         ).lower()
 
         # Reranker (lazy — model loads on first rerank call).

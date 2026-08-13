@@ -50,8 +50,19 @@ _LLM_TIMEOUT = 15.0
 # user fact.  These appear when the regex accidentally matches text the
 # assistant said (e.g. "I'll search authoritative sources").
 _AGENT_SPEAK_PATTERNS = re.compile(
-    r'(?:i\'ll\s+search|i\'ll\s+look|i\'ll\s+check|let me|authoritative\s+sources'
-    r'|i\'ll\s+find|i\'ll\s+research|searching\s+for|looking\s+up)',
+    r"(?:i'll\s+search|i'll\s+look|i'll\s+check|let me|authoritative\s+sources"
+    r"|i'll\s+find|i'll\s+research|searching\s+for|looking\s+up"
+    # Implementation-status reports: when a work summary/handoff is pasted
+    # into the chat, the LLM extraction stage reads it as "user facts" and
+    # mints the agent's self-report as memories (e.g. "Completed
+    # implementation of evolution chains feature", "Memory provider now
+    # includes 13 tools", "Chain-unfold configuration ships off by
+    # default"). These are agent/dev-log narration, not user facts.
+    r"|completed\s+implementation\s+of|now\s+includes\s+\d+\s+tools"
+    r"|ships\s+off\s+by\s+default|deployment\s+reference\s+specifies"
+    r"|handoff\s+doc\s+is\s+located|implementation\s+of\s+evolution"
+    r"|work\s+items?\s+(?:from\s+the\s+handoff|complete)"
+    r"|service\s+\(pids?\s+\d+)",
     re.IGNORECASE,
 )
 

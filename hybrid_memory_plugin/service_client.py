@@ -219,6 +219,32 @@ class SharedMemoryStore:
         """Return the provenance record for a memory, or None."""
         return self._rpc.call("store", "get_evidence", memory_id=memory_id)
 
+    def get_evidence_batch(self, memory_ids: List[str]) -> dict:
+        """Return provenance rows for a batch of memory IDs (one round trip)."""
+        return self._rpc.call(
+            "store", "get_evidence_batch", memory_ids=list(memory_ids or [])
+        ) or {}
+
+    def get_memory_history(
+        self, memory_id: str, *, max_versions: int | None = None,
+    ) -> List[MemoryRecord]:
+        """Return the full version chain for a memory (oldest first).
+
+        Keyword-only signature matching the facade convention. *max_versions*
+        truncates to the most recent N versions (head always retained).
+        """
+        values = self._rpc.call(
+            "store", "get_memory_history",
+            memory_id=memory_id, max_versions=max_versions,
+        ) or []
+        return [_record_from_dict(value) for value in values]
+
+    def get_chain_membership(self, memory_ids: List[str]) -> dict:
+        """Batched chain-membership annotation for search-result IDs."""
+        return self._rpc.call(
+            "store", "get_chain_membership", memory_ids=list(memory_ids or [])
+        ) or {}
+
     def backfill_evidence(self, retention: str = "full") -> int:
         """Backfill memory_evidence from approved candidates (pre-Wave-2 memories)."""
         return int(
@@ -259,6 +285,15 @@ class SharedMemoryStore:
             value["memory"] = _record_from_dict(value["memory"]).to_dict()
         return value
 
+    def find_supersede_candidates(
+        self, candidate_id: str, limit: int = 3,
+    ) -> List[dict]:
+        """Surface current memories similar to a candidate (supersede options)."""
+        return self._rpc.call(
+            "store", "find_supersede_candidates",
+            candidate_id=candidate_id, limit=limit,
+        ) or []
+
     def quarantine_memory(self, **kwargs: Any) -> bool:
         return bool(self._rpc.call("store", "quarantine_memory", **kwargs))
 
@@ -268,8 +303,13 @@ class SharedMemoryStore:
     def record_feedback(self, **kwargs: Any) -> bool:
         return bool(self._rpc.call("store", "record_feedback", **kwargs))
 
-    def delete_memory(self, **kwargs: Any) -> bool:
-        return bool(self._rpc.call("store", "delete_memory", **kwargs))
+    def delete_memory(self, **kwargs: Any) -> bool | dict:
+        """Chain-aware delete. Returns False if not found, else a result dict
+        with an 'action' key (deleted | quarantined | promoted)."""
+        value = self._rpc.call("store", "delete_memory", **kwargs)
+        if value is False or value is None:
+            return False
+        return value
 
     def cleanup_junk(self, return_ids: bool = False) -> int | dict:
         value = self._rpc.call("store", "cleanup_junk", return_ids=return_ids) or 0

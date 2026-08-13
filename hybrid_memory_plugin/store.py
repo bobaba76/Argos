@@ -1376,8 +1376,16 @@ class DuckDBMemoryStore:
         durability: str | None = None,
         scope: str | None = None,
         evidence_retention: str = "full",
+        supersedes_memory_id: str | None = None,
     ) -> dict | None:
-        """Approve, reject, quarantine, or classify a pending proposal."""
+        """Approve, reject, quarantine, or classify a pending proposal.
+
+        When *supersedes_memory_id* is set and the decision is an approval,
+        the newly created memory is chained behind the named current memory
+        (the old record is superseded: valid_to set, superseded_by pointed
+        at the new version). This is the confirm-first way chains grow —
+        never automatic, always a reviewer decision.
+        """
         decision = decision.strip().lower()
         allowed = {
             "approved", "rejected", "quarantined", "reviewed_approved",
@@ -1394,6 +1402,7 @@ class DuckDBMemoryStore:
         now = self._now()
         memory = None
         final_status = decision
+        superseded_ok = False
         if decision in {"approved", "reviewed_approved"}:
             selected_durability = durability or candidate["durability"]
             selected_scope = scope or candidate["scope"]
@@ -1410,6 +1419,29 @@ class DuckDBMemoryStore:
             )
             if memory is None:
                 final_status = "deduplicated"
+            elif supersedes_memory_id:
+                # Chain the new memory behind the named current record.
+                # Same supersession semantics as update_memory, but the new
+                # version's content comes from the candidate, not the old
+                # record. Scope-checked: cannot supersede another user's
+                # memory.
+                with self._lock:
+                    assert self.connection is not None
+                    check = self.connection.execute(
+                        """SELECT 1 FROM memory_records
+                           WHERE memory_id = ?
+                             AND (user_scope IS NULL OR user_scope = ?)
+                             AND valid_to IS NULL""",
+                        [supersedes_memory_id, self.user_id],
+                    ).fetchone()
+                    if check:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, superseded_by = ?, updated_at = ?
+                               WHERE memory_id = ?""",
+                            [now, memory.memory_id, now, supersedes_memory_id],
+                        )
+                        superseded_ok = True
         with self._lock:
             assert self.connection is not None
             self.connection.execute(
@@ -1463,10 +1495,53 @@ class DuckDBMemoryStore:
                         now,
                     ],
                 )
-        return {
+        result = {
             "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
             "memory": memory.to_dict() if memory else None,
         }
+        if supersedes_memory_id:
+            result["supersedes_memory_id"] = supersedes_memory_id
+            result["superseded"] = superseded_ok
+        return result
+
+    def find_supersede_candidates(
+        self, candidate_id: str, limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """Surface current memories similar to a candidate's content.
+
+        Used by the reviewer path to offer an approve-with-supersede option
+        when a candidate is a replacement/contradiction of an existing
+        current fact (e.g. residence, employer, tools). Returns current
+        (valid_to IS NULL) memories ranked by raw similarity, each with its
+        chain length so the reviewer can see what would be chained behind.
+        Confirm-first: this only SURFACES options; it never writes.
+        """
+        candidates = self.list_candidates(candidate_id=candidate_id, limit=1)
+        if not candidates:
+            return []
+        content = candidates[0].get("content") or ""
+        if not content:
+            return []
+        # suppress_retrieval: internal search must not inflate counters.
+        hits = self.search(
+            content, limit=limit, suppress_retrieval=True,
+        )
+        out: List[Dict[str, Any]] = []
+        for hit in hits:
+            if hit.valid_to is not None:
+                continue  # only current records are supersede targets
+            raw = getattr(hit, "raw_similarity", None)
+            if raw is None:
+                raw = hit.similarity
+            out.append({
+                "memory_id": hit.memory_id,
+                "content": hit.content,
+                "category": hit.category,
+                "raw_similarity": round(float(raw), 4),
+                "valid_from": hit.valid_from,
+                "valid_to": hit.valid_to,
+            })
+        return out
 
     def get_evidence(self, memory_id: str) -> dict | None:
         """Return the provenance record for a memory, or None."""
@@ -1796,53 +1871,200 @@ class DuckDBMemoryStore:
         )
         return fetched[0] if fetched else None
 
-    def get_memory_history(self, memory_id: str) -> List[MemoryRecord]:
+    def get_memory_history(
+        self, memory_id: str, max_versions: int | None = None,
+    ) -> List[MemoryRecord]:
         """Return the full version chain for a memory.
 
         Given any version's ID, walks the superseded_by chain to find
         all versions: the original, all intermediate versions, and the
         current version. Returns them in chronological order (oldest first).
+
+        *max_versions* truncates the result to the most recent N versions
+        (keeping the current/head version) when set.
+
+        Cycle guard: a visited-set defends both directions against corrupt
+        A→B→A cycles (logs loudly and stops the walk). Scope isolation:
+        every hop enforces user_scope so a cross-scope hop cannot leak
+        another user's chain.
         """
         # Walk forward from the given ID to find all successors
         chain: List[MemoryRecord] = []
         current = self._fetch_records(
-            "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
+            """SELECT * FROM memory_records WHERE memory_id = ?
+              AND (user_scope IS NULL OR user_scope = ?)""",
+            [memory_id, self.user_id],
         )
         if not current:
             return []
         chain.append(current[0])
 
-        # Follow superseded_by forward
+        # Follow superseded_by forward (visited-set cycle guard + scope)
+        visited: set[str] = {current[0].memory_id}
         node = current[0]
         while node.superseded_by:
+            nxt_id = node.superseded_by
+            if nxt_id in visited:
+                logger.warning(
+                    "Cycle detected in memory chain at %s → %s; stopping "
+                    "forward walk (corrupt superseded_by edge).",
+                    node.memory_id, nxt_id,
+                )
+                break
             nxt = self._fetch_records(
-                "SELECT * FROM memory_records WHERE memory_id = ?",
-                [node.superseded_by],
+                """SELECT * FROM memory_records WHERE memory_id = ?
+                  AND (user_scope IS NULL OR user_scope = ?)""",
+                [nxt_id, self.user_id],
             )
             if not nxt or nxt[0].memory_id == node.memory_id:
                 break
+            visited.add(nxt[0].memory_id)
             chain.append(nxt[0])
             node = nxt[0]
 
         # Now walk backward to find predecessors (records that were
-        # superseded by the oldest version in our chain)
+        # superseded by the oldest version in our chain). Scope-isolated
+        # and cycle-guarded like the forward walk.
         oldest = chain[0]
         predecessors: List[MemoryRecord] = []
+        prev_visited: set[str] = {oldest.memory_id}
         prev_search = self._fetch_records(
-            "SELECT * FROM memory_records WHERE superseded_by = ?",
-            [oldest.memory_id],
+            """SELECT * FROM memory_records WHERE superseded_by = ?
+              AND (user_scope IS NULL OR user_scope = ?)""",
+            [oldest.memory_id, self.user_id],
         )
         while prev_search:
-            predecessors.append(prev_search[0])
+            prev = prev_search[0]
+            if prev.memory_id in prev_visited:
+                logger.warning(
+                    "Cycle detected in memory chain (backward) at %s; "
+                    "stopping backward walk (corrupt superseded_by edge).",
+                    prev.memory_id,
+                )
+                break
+            prev_visited.add(prev.memory_id)
+            predecessors.append(prev)
             prev_search = self._fetch_records(
-                "SELECT * FROM memory_records WHERE superseded_by = ?",
-                [prev_search[0].memory_id],
+                """SELECT * FROM memory_records WHERE superseded_by = ?
+                  AND (user_scope IS NULL OR user_scope = ?)""",
+                [prev.memory_id, self.user_id],
             )
         # Prepend predecessors (oldest first)
         predecessors.reverse()
-        return predecessors + chain
+        full = predecessors + chain
+        if max_versions is not None and max_versions > 0 and len(full) > max_versions:
+            # Keep the most recent N versions (head/current always retained).
+            return full[-max_versions:]
+        return full
 
-    def delete_memory(self, memory_id: str) -> bool:
+    def get_evidence_batch(
+        self, memory_ids: List[str],
+    ) -> Dict[str, dict]:
+        """Return provenance rows for a batch of memory IDs in one query.
+
+        Maps memory_id → evidence dict (same shape as get_evidence).
+        Retention-aware: hash-mode rows already store a digest and none-mode
+        rows store nothing, so callers never receive raw text for those.
+        IDs with no evidence row are simply absent from the result.
+        """
+        if not memory_ids:
+            return {}
+        with self._lock:
+            assert self.connection is not None
+            placeholders = ", ".join(["?"] * len(memory_ids))
+            result = self.connection.execute(
+                f"""SELECT memory_id, source_session_id, source_timestamp,
+                           evidence_role, evidence_text, extraction_method,
+                           reviewer_decision, created_at
+                    FROM memory_evidence
+                    WHERE memory_id IN ({placeholders})
+                      AND (user_scope IS NULL OR user_scope = ?)""",
+                [*memory_ids, self.user_id],
+            )
+            out: Dict[str, dict] = {}
+            for row in result.fetchall():
+                out[row[0]] = {
+                    "memory_id": row[0],
+                    "source_session_id": row[1],
+                    "source_timestamp": row[2],
+                    "evidence_role": row[3],
+                    "evidence_text": row[4],
+                    "extraction_method": row[5],
+                    "reviewer_decision": row[6],
+                    "created_at": row[7],
+                }
+            return out
+
+    def get_chain_membership(self, memory_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Batched chain-membership annotation for search results.
+
+        Given a list of memory IDs (e.g. top-k search hits), returns a map
+        memory_id → {"versions": N, "has_history": bool} where N is the
+        total chain length for the chain that ID belongs to. A single
+        batched query finds every chain that any hit participates in, then
+        each chain is walked to count its versions. This is the trigger
+        annotation that lets the agent know a fact has a history without
+        unfolding it automatically.
+        """
+        if not memory_ids:
+            return {}
+        with self._lock:
+            assert self.connection is not None
+            placeholders = ", ".join(["?"] * len(memory_ids))
+            # Find every record that either IS a hit or is superseded BY a
+            # hit (i.e. a hit is the head of a chain) — plus every record
+            # whose superseded_by points at a hit (hit is a predecessor).
+            rows = self.connection.execute(
+                f"""SELECT memory_id, superseded_by FROM memory_records
+                    WHERE memory_id IN ({placeholders})
+                       OR superseded_by IN ({placeholders})""",
+                [*memory_ids, *memory_ids],
+            ).fetchall()
+        if not rows:
+            return {mid: {"versions": 1, "has_history": False} for mid in memory_ids}
+        # Build a quick lookup of superseded_by edges (scope-agnostic here;
+        # the per-chain walk via get_memory_history enforces scope).
+        supersede_map: Dict[str, str | None] = {
+            row[0]: row[1] for row in rows
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        for mid in memory_ids:
+            if mid in out:
+                continue
+            if mid not in supersede_map:
+                out[mid] = {"versions": 1, "has_history": False}
+                continue
+            # Walk the full chain for this hit to count versions. Reuse
+            # get_memory_history (scope-isolated, cycle-guarded). Cache by
+            # chain so two hits in the same chain share one walk.
+            chain = self.get_memory_history(mid)
+            n = len(chain)
+            has = n > 1
+            entry = {"versions": n, "has_history": has}
+            # Annotate every other hit that belongs to this same chain.
+            for rec in chain:
+                if rec.memory_id in memory_ids:
+                    out[rec.memory_id] = entry
+            if mid not in out:
+                out[mid] = entry
+        # Any hit not yet annotated has no chain row at all.
+        for mid in memory_ids:
+            out.setdefault(mid, {"versions": 1, "has_history": False})
+        return out
+
+    def delete_memory(self, memory_id: str) -> bool | dict:
+        """Delete a memory, chain-aware.
+
+        - Head (current) deletion: promotes the predecessor to current
+          (valid_to=NULL, superseded_by=NULL) — reversible supersession.
+          Returns {"action": "promoted", "promoted_memory_id": ...}.
+        - Non-head (historical) deletion: converts to quarantine instead of
+          a hard delete, because deleting a middle version severs the causal
+          arc. Returns {"action": "quarantined"}.
+        - Single-version (no chain): hard delete.
+          Returns {"action": "deleted"}.
+        Returns False if the memory is not found.
+        """
         with self._lock:
             assert self.connection is not None
             # Check existence first — DuckDB's execute() return value for
@@ -1855,18 +2077,68 @@ class DuckDBMemoryStore:
             ).fetchone()
             if not check or check[0] == 0:
                 return False
+            # Chain position: is this the head (valid_to IS NULL)?
+            row = self.connection.execute(
+                """SELECT valid_to FROM memory_records
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)""",
+                [memory_id, self.user_id],
+            ).fetchone()
+            is_head = row is not None and row[0] is None
+            now = self._now()
+            if is_head:
+                # Promote the predecessor (the record superseded BY this
+                # head) to current. If there is no predecessor, hard-delete.
+                pred = self.connection.execute(
+                    """SELECT memory_id FROM memory_records
+                       WHERE superseded_by = ?
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [memory_id, self.user_id],
+                ).fetchone()
+                if pred:
+                    self.connection.execute(
+                        """UPDATE memory_records
+                           SET valid_to = NULL, superseded_by = NULL, updated_at = ?
+                           WHERE memory_id = ?""",
+                        [now, pred[0]],
+                    )
+                    self.connection.execute(
+                        "DELETE FROM memory_records WHERE memory_id = ?"
+                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        [memory_id, self.user_id],
+                    )
+                    self.connection.execute(
+                        "DELETE FROM memory_evidence WHERE memory_id = ?"
+                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        [memory_id, self.user_id],
+                    )
+                    return {
+                        "deleted": True, "action": "promoted",
+                        "promoted_memory_id": pred[0],
+                    }
+            # Non-head: quarantine instead of severing the causal arc.
+            if not is_head:
+                self.connection.execute(
+                    """UPDATE memory_records
+                       SET status = 'quarantined',
+                           quarantine_reason = 'deleted from chain (reversible)',
+                           quarantined_at = ?, updated_at = ?
+                       WHERE memory_id = ?""",
+                    [now, now, memory_id],
+                )
+                return {"deleted": True, "action": "quarantined"}
+            # Head with no predecessor: hard delete.
             self.connection.execute(
                 "DELETE FROM memory_records WHERE memory_id = ?"
                 " AND (user_scope IS NULL OR user_scope = ?)",
                 [memory_id, self.user_id],
             )
-            # Wave 2: provenance rows die with their memory.
             self.connection.execute(
                 "DELETE FROM memory_evidence WHERE memory_id = ?"
                 " AND (user_scope IS NULL OR user_scope = ?)",
                 [memory_id, self.user_id],
             )
-            return True
+            return {"deleted": True, "action": "deleted"}
 
     # -- entity aliases -------------------------------------------------------
 

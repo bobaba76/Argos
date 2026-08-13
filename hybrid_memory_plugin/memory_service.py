@@ -139,6 +139,11 @@ class MemoryService:
             return self.store.list_candidates(**args)
         if method == "review_candidate":
             return self.store.review_candidate(**args)
+        if method == "find_supersede_candidates":
+            return self.store.find_supersede_candidates(
+                candidate_id=args.get("candidate_id", ""),
+                limit=int(args.get("limit", 3)),
+            )
         if method == "quarantine_memory":
             return self.store.quarantine_memory(**args)
         if method == "restore_memory":
@@ -158,6 +163,18 @@ class MemoryService:
             return True
         if method == "get_evidence":
             return self.store.get_evidence(args.get("memory_id", ""))
+        if method == "get_evidence_batch":
+            return self.store.get_evidence_batch(args.get("memory_ids", []) or [])
+        if method == "get_memory_history":
+            return [
+                _record_to_dict(record)
+                for record in self.store.get_memory_history(
+                    args.get("memory_id", ""),
+                    max_versions=args.get("max_versions"),
+                )
+            ]
+        if method == "get_chain_membership":
+            return self.store.get_chain_membership(args.get("memory_ids", []) or [])
         if method == "backfill_evidence":
             return self.store.backfill_evidence(
                 retention=args.get("retention", "full")

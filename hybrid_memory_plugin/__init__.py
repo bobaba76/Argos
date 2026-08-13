@@ -21,6 +21,7 @@ Categories:
 """
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -278,7 +279,10 @@ CANDIDATE_REVIEW_SCHEMA = {
     "name": "memory_candidate_review",
     "description": (
         "Review a pending memory proposal. Approve only facts that are correct, "
-        "durable, about the user, and scoped appropriately."
+        "durable, about the user, and scoped appropriately. When a candidate "
+        "replaces or contradicts an existing current fact (e.g. a new employer, "
+        "address, or changed opinion), pass supersedes_memory_id to chain the "
+        "new memory behind the old one — preserving the change history."
     ),
     "parameters": {
         "type": "object",
@@ -289,6 +293,10 @@ CANDIDATE_REVIEW_SCHEMA = {
                 "description": "approved, rejected, or quarantined.",
             },
             "reason": {"type": "string", "description": "Short review explanation (optional)."},
+            "supersedes_memory_id": {
+                "type": "string",
+                "description": "Existing current memory_id this candidate replaces (optional). Chains the new memory behind the old one, preserving history. Use when the candidate is a replacement/contradiction of an existing fact.",
+            },
         },
         "required": ["candidate_id", "decision"],
     },
@@ -339,6 +347,29 @@ MAINTENANCE_SCHEMA = {
     },
 }
 
+CHAIN_SCHEMA = {
+    "name": "memory_chain",
+    "description": (
+        "Show how a memory evolved over time — the version chain behind a "
+        "fact (e.g. why an opinion, job, tool, or preference changed). Pass "
+        "a memory_id from a memory_search result whose chain annotation said "
+        "it has history. Modes: arc (one line per version, default), versions "
+        "(full records), diff (what changed at each step)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "Any memory_id from the chain (head, middle, or tail)."},
+            "mode": {
+                "type": "string",
+                "description": "arc (compact, default), versions (full), or diff (per-step deltas).",
+            },
+            "max_versions": {"type": "integer", "description": "Most recent versions to return (default 5, max 10)."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -377,6 +408,17 @@ class HybridMemoryProvider(MemoryProvider):
         self._reranker_top_n: int = 10
         self._reranker = None
         self._auto_extract_paused: bool = False
+        # Chain-unfold (Hy-Memory headline feature): auto-inject a compact
+        # version arc when the query signals change-intent AND a top result
+        # has a chain. Ships OFF for the first wave — measure, then flip to
+        # "auto". Accounting is separate from retrieval counters (see
+        # _chain_unfolded_stats).
+        self._chain_unfold: str = "off"  # "off" | "auto" | "always"
+        self._chain_max_versions: int = 3
+        self._chain_max_inject: int = 150  # soft token cap per chain
+        self._chain_unfolded_stats: Dict[str, int] = {
+            "count": 0, "tokens_injected": 0,
+        }
         self._initialized: bool = False
         self._current_project_id: str = ""
         # Context-aware retrieval: rolling window of recent messages.
@@ -735,6 +777,24 @@ class HybridMemoryProvider(MemoryProvider):
         self._evidence_retention = str(
             self._config.get("evidence_retention", "full")
         ).lower()
+        # Chain-unfold config (ships off; flip to "auto" after eval).
+        self._chain_unfold = str(
+            self._config.get("chain_unfold", "off")
+        ).lower()
+        if self._chain_unfold not in {"off", "auto", "always"}:
+            self._chain_unfold = "off"
+        try:
+            self._chain_max_versions = max(
+                1, min(int(self._config.get("chain_max_versions", 3)), 10)
+            )
+        except (TypeError, ValueError):
+            self._chain_max_versions = 3
+        try:
+            self._chain_max_inject = max(
+                1, int(self._config.get("chain_max_inject", 150))
+            )
+        except (TypeError, ValueError):
+            self._chain_max_inject = 150
 
         # Reranker (lazy — model loads on first rerank call).
         if self._reranker_enabled:
@@ -990,6 +1050,91 @@ class HybridMemoryProvider(MemoryProvider):
                 self._store.record_retrieval([r.memory_id for r in records])
         except Exception as exc:
             logger.debug("Could not record injected retrieval: %s", exc)
+
+    # -- chain-unfold (ships off; scaffolding for the Hy-Memory headline) -----
+
+    # Change-intent patterns: queries that ask about HOW or WHY a fact changed.
+    # When chain_unfold="auto", a top result with a chain + one of these
+    # triggers a compact arc injection (budget-controlled).
+    _CHANGE_INTENT_PATTERNS = (
+        r"why did (i|you) (stop|start|switch|leave|change|quit|drop|abandon)",
+        r"used to\b",
+        r"what changed\b",
+        r"before vs now\b",
+        r"why.*no longer\b",
+        r"when did (i|you) (change|switch|start|stop|leave|move)",
+        r"how come (i|you) (don't|no longer|stopped|switched)",
+        r"what did i (use to|used to) (think|believe|use|like|prefer)",
+    )
+
+    def _change_intent_match(self, query: str) -> bool:
+        """True if the query signals change-intent (arc-relevant)."""
+        import re
+        q = query.lower()
+        return any(re.search(p, q) for p in self._CHANGE_INTENT_PATTERNS)
+
+    def _build_chain_arc(self, versions: List[Any]) -> str:
+        """Compact one-line-per-version arc text (token-cheap)."""
+        lines = []
+        for i, v in enumerate(versions, 1):
+            if getattr(v, "status", None) == "quarantined":
+                lines.append(f"v{i} [quarantined]")
+                continue
+            content = v.content
+            if len(content) > 120:
+                content = content[:117] + "..."
+            marker = " (current)" if v.valid_to is None else ""
+            lines.append(f"v{i}{marker}: {content}")
+        return "\n".join(lines)
+
+    def _maybe_unfold_chain(self, query: str, results: List[Any]) -> str | None:
+        """Chain-unfold trigger (budget-controlled, separate accounting).
+
+        Returns a compact arc string to inject when chain_unfold is enabled,
+        the query signals change-intent, a top-3 result has a chain, and the
+        arc cost is within budget. Returns None otherwise. Chain versions
+        pulled by the walk do NOT touch retrieval counters — only the
+        separate _chain_unfolded_stats counter is updated.
+        """
+        if self._chain_unfold == "off" or not results or self._store is None:
+            return None
+        if self._chain_unfold == "auto" and not self._change_intent_match(query):
+            return None
+        try:
+            membership = self._store.get_chain_membership(
+                [r.memory_id for r in results[:3]]
+            )
+        except Exception:
+            return None
+        # Find the first top-3 result that has a chain.
+        target_id = None
+        for r in results[:3]:
+            info = membership.get(r.memory_id)
+            if info and info.get("has_history"):
+                target_id = r.memory_id
+                break
+        if target_id is None:
+            return None
+        try:
+            versions = self._store.get_memory_history(
+                target_id, max_versions=self._chain_max_versions,
+            )
+        except Exception:
+            return None
+        if len(versions) < 2:
+            return None
+        arc = self._build_chain_arc(versions)
+        # Rough token estimate: ~4 chars/token.
+        token_cost = max(1, len(arc) // 4)
+        if token_cost > self._chain_max_inject:
+            return None
+        self._chain_unfolded_stats["count"] += 1
+        self._chain_unfolded_stats["tokens_injected"] += token_cost
+        return arc
+
+    def get_chain_unfold_stats(self) -> Dict[str, int]:
+        """Return chain-unfold accounting (count + tokens injected)."""
+        return dict(self._chain_unfolded_stats)
 
     def get_scale_metrics(self) -> Dict[str, Any]:
         """Return current scale-trigger state (delegates to the store).
@@ -1715,6 +1860,7 @@ class HybridMemoryProvider(MemoryProvider):
             RESTORE_SCHEMA,
             FEEDBACK_SCHEMA,
             MAINTENANCE_SCHEMA,
+            CHAIN_SCHEMA,
         ]
         # Always include graph tool schemas so they are registered in the
         # MemoryManager routing table at add_provider() time — before
@@ -1743,10 +1889,27 @@ class HybridMemoryProvider(MemoryProvider):
                 query, limit=top_k, category_filter=category,
                 project_id=project_id,
             )
+            # Chain-presence annotation: a light, batched marker on each hit
+            # so the agent KNOWS a fact has a history (trigger to call
+            # memory_chain when the conversation is about change). Does NOT
+            # unfold chains — annotation only. Fail-soft: any store error
+            # leaves results intact with no chain field.
+            result_payloads = [r.to_dict() for r in results]
+            if results and hasattr(self._store, "get_chain_membership"):
+                try:
+                    membership = self._store.get_chain_membership(
+                        [r.memory_id for r in results]
+                    )
+                    for payload in result_payloads:
+                        mid = payload.get("memory_id", "")
+                        if mid in membership:
+                            payload["chain"] = membership[mid]
+                except Exception as exc:
+                    logger.debug("Chain membership annotation failed: %s", exc)
             return json.dumps({
                 "query": query,
                 "count": len(results),
-                "results": [r.to_dict() for r in results],
+                "results": result_payloads,
             })
 
         elif tool_name == "memory_save":
@@ -1807,15 +1970,31 @@ class HybridMemoryProvider(MemoryProvider):
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
-            deleted = self._store.delete_memory(memory_id=memory_id)
-            if not deleted:
+            result = self._store.delete_memory(memory_id=memory_id)
+            if not result:
                 return tool_error(f"Memory not found: {memory_id}")
             if getattr(self, "_graph", None):
                 try:
                     self._graph.remove_memory(memory_id)
                 except Exception as exc:
                     logger.debug("Graph evidence cleanup failed for %s: %s", memory_id, exc)
-            return json.dumps({"status": "deleted", "memory_id": memory_id})
+                # Head deletion promotes the predecessor to current —
+                # re-index it so the graph points at the live version.
+                promoted = None
+                if isinstance(result, dict):
+                    promoted = result.get("promoted_memory_id")
+                if promoted:
+                    restored = self._store.get_memories_by_ids([promoted])
+                    if restored:
+                        self._index_memory_graph(
+                            restored[0].memory_id,
+                            restored[0].category,
+                            restored[0].content,
+                            restored[0].tags,
+                            restored[0].created_at,
+                        )
+            action = result.get("action", "deleted") if isinstance(result, dict) else "deleted"
+            return json.dumps({"status": action, "memory_id": memory_id, "result": result})
 
         elif tool_name == "memory_candidate_list":
             status = args.get("status", "pending")
@@ -1836,12 +2015,14 @@ class HybridMemoryProvider(MemoryProvider):
             decision = args.get("decision", "")
             if not candidate_id or not decision:
                 return tool_error("Missing required parameter: candidate_id or decision")
+            supersedes_memory_id = args.get("supersedes_memory_id")
             try:
                 result = self._store.review_candidate(
                     evidence_retention=self._evidence_retention,
                     candidate_id=candidate_id,
                     decision=decision,
                     reason=args.get("reason", ""),
+                    supersedes_memory_id=supersedes_memory_id,
                 )
             except ValueError as exc:
                 return tool_error(str(exc))
@@ -1856,6 +2037,17 @@ class HybridMemoryProvider(MemoryProvider):
                     memory.get("tags", []),
                     memory.get("created_at"),
                 )
+                # approve-with-supersede: the old (now-superseded) memory_id
+                # must be removed from the graph (it resolves to 0 records
+                # post-supersession), mirroring the memory_update graph path.
+                if supersedes_memory_id and result.get("superseded"):
+                    try:
+                        self._graph.remove_memory(supersedes_memory_id)
+                    except Exception as exc:
+                        logger.debug(
+                            "Graph cleanup for superseded %s failed: %s",
+                            supersedes_memory_id, exc,
+                        )
             return json.dumps(result)
 
         elif tool_name == "memory_restore":
@@ -1918,6 +2110,101 @@ class HybridMemoryProvider(MemoryProvider):
                     except Exception as exc:
                         logger.debug("Graph cleanup failed for %s: %s", memory_id, exc)
             return json.dumps(report)
+
+        elif tool_name == "memory_chain":
+            memory_id = args.get("memory_id", "")
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            mode = args.get("mode", "arc")
+            if mode not in {"arc", "versions", "diff"}:
+                return tool_error("Invalid mode. Valid: arc, versions, diff")
+            try:
+                max_versions = max(1, min(int(args.get("max_versions", 5)), 10))
+            except (TypeError, ValueError):
+                max_versions = 5
+            versions = self._store.get_memory_history(
+                memory_id, max_versions=max_versions,
+            )
+            if not versions:
+                return tool_error(f"No memory chain found for: {memory_id}")
+            # Batched evidence join (retention-aware: hash→digest, none→absent).
+            try:
+                evidence_map = self._store.get_evidence_batch(
+                    [v.memory_id for v in versions]
+                )
+            except Exception:
+                evidence_map = {}
+            if mode == "versions":
+                return json.dumps({
+                    "memory_id": memory_id,
+                    "mode": "versions",
+                    "count": len(versions),
+                    "versions": [
+                        {**v.to_dict(), "evidence": evidence_map.get(v.memory_id)}
+                        for v in versions
+                    ],
+                })
+            if mode == "diff":
+                steps = []
+                for i in range(len(versions)):
+                    cur = versions[i]
+                    step = {
+                        "version": i + 1,
+                        "memory_id": cur.memory_id,
+                        "valid_from": cur.valid_from,
+                        "valid_to": cur.valid_to,
+                        "category": cur.category,
+                        "content": cur.content,
+                        "tags": cur.tags,
+                        "evidence": evidence_map.get(cur.memory_id),
+                    }
+                    if i > 0:
+                        prev = versions[i - 1]
+                        content_delta = list(difflib.unified_diff(
+                            prev.content.splitlines(keepends=True) or [prev.content],
+                            cur.content.splitlines(keepends=True) or [cur.content],
+                            fromfile=f"v{i}", tofile=f"v{i+1}", lineterm="",
+                        ))
+                        changes = {"content_diff": content_delta}
+                        if prev.category != cur.category:
+                            changes["category"] = f"{prev.category} → {cur.category}"
+                        if set(prev.tags) != set(cur.tags):
+                            changes["tags"] = {
+                                "added": sorted(set(cur.tags) - set(prev.tags)),
+                                "removed": sorted(set(prev.tags) - set(cur.tags)),
+                            }
+                        step["changes_from_previous"] = changes
+                    steps.append(step)
+                return json.dumps({
+                    "memory_id": memory_id, "mode": "diff",
+                    "count": len(versions), "steps": steps,
+                })
+            # arc mode (default): compact one-line-per-version rendering.
+            # Quarantined versions are marked as a gap (never break the walk).
+            arc_lines = []
+            for i, v in enumerate(versions, 1):
+                if v.status == "quarantined":
+                    arc_lines.append(f"v{i} [{v.valid_from or '?'}] [quarantined]")
+                    continue
+                content = v.content
+                if len(content) > 120:
+                    content = content[:117] + "..."
+                marker = " (current)" if v.valid_to is None else ""
+                arc_lines.append(
+                    f"v{i} [{v.valid_from or '?'}]{marker} ({v.category}): {content}"
+                )
+            return json.dumps({
+                "memory_id": memory_id, "mode": "arc",
+                "count": len(versions),
+                "arc": "\n".join(arc_lines),
+                "versions": [
+                    {"memory_id": v.memory_id, "valid_from": v.valid_from,
+                     "valid_to": v.valid_to, "category": v.category,
+                     "content": v.content,
+                     "evidence": evidence_map.get(v.memory_id)}
+                    for v in versions
+                ],
+            })
 
         elif tool_name == "memory_graph_search":
             if self._graph is None:

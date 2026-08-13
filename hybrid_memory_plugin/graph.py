@@ -583,6 +583,28 @@ def extract_graph_relations_hybrid(
     return merged
 
 
+_GRAPH_TYPED_RELATIONS = frozenset({
+    # Relations that carry real semantic meaning for traversal. The generic
+    # set (mentions/related_to/context_about/insight_about/about_user/
+    # working_toward/interested_in) connects everything to everything and
+    # must NOT be traversed — that noise is what made the old boost useless.
+    "uses", "has", "works_on", "works_at", "works_with", "prefers",
+    "has_goal", "has_attribute", "has_wife", "has_pet", "has_project",
+    "has_trait", "lives_in", "knows", "develops", "plans_to_use",
+    "goal_involves", "completed", "concerned_about", "experiences",
+    "fears", "struggles_with", "includes", "attends", "married_to",
+    "delegates_finances_to", "owns", "uses", "provided_by",
+    "insured_by", "related_to_finance", "sold", "built", "recommends",
+    "recommended", "manages", "leads", "joined", "left", "hired_by",
+    "reports_to", "trained_in", "interested_in_work", "evaluates",
+    "monitors", "involved_in", "part_of", "member_of", "cares_for",
+    "communicates_with", "supports", "influenced_by", "caused_by",
+    "affects", "replaces", "upgraded_to", "costs", "earns", "pays",
+    "finances", "negotiates", "plans_to_buy", "plans_to_sell",
+    "sold_out", "tracks", "measures", "solves", "pain_point_of",
+})
+
+
 class KuzuGraphStore:
     """Kuzu-backed relationship graph with thread-safe access.
 
@@ -1008,6 +1030,127 @@ class KuzuGraphStore:
                         if memory_id:
                             scores[memory_id] = scores.get(memory_id, 0) + 1
         ordered = sorted(scores, key=lambda memory_id: (-scores[memory_id], memory_id))
+        return ordered[:max(1, min(int(limit), 500))]
+
+    def traversal_memory_ids(
+        self,
+        query: str,
+        depth: int = 2,
+        limit: int = 100,
+        require_specific_seed: bool = True,
+    ) -> List[str]:
+        """Traversal-based retrieval: walk TYPED relations from seed entities.
+
+        Unlike memory_ids_for_query (lexical term→edge matching), this
+        actually walks the graph: ground query terms to seed entities,
+        BFS up to `depth` hops over TYPED relations only (generic
+        mentions/related_to edges are excluded — they connect everything
+        and carry no traversal value), and collect memory IDs attached to
+        the traversed edges. Weight: hop-1 = 2, hop-2 = 1.
+
+        require_specific_seed=True (default): return [] unless at least one
+        grounded seed is a NON-CONCEPT entity (person/organization/place/
+        item/technology/tool/event/goal). Broad queries ("current
+        relationships personal context") ground only to generic concepts —
+        their traversal output is hub-adjacent noise that regresses
+        precision, so the caller skips the boost floor for them.
+
+        Returns memory IDs ordered by traversal weight (desc).
+        """
+        stop_words = _GRAPH_STOP_ENTITIES | {
+            "about", "and", "are", "does", "from", "have", "into", "more",
+            "that", "the", "this", "what", "when", "where", "which", "with",
+            "who", "how", "why", "did", "was", "were", "been", "for", "our",
+        }
+        terms = []
+        seen_terms = set()
+        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", str(query or "").lower()):
+            if term in stop_words or term in seen_terms:
+                continue
+            seen_terms.add(term)
+            terms.append(term)
+            if len(terms) >= 8:
+                break
+        if not terms:
+            return []
+
+        # Ground: find seed entities for each query term (fuzzy node match).
+        # Exclude the "user" hub node — in a personal memory graph
+        # EVERYTHING touches user, so traversing from it is meaningless.
+        seeds = set()
+        seed_types: Dict[str, str] = {}
+        for term in terms:
+            try:
+                for edge in self.search_graph(term, limit=20):
+                    for endpoint in (edge["source"], edge["target"]):
+                        eid = str(endpoint)
+                        if eid != "user" and not eid.startswith("memory:"):
+                            seeds.add(eid)
+                            node = self._query_node(eid)
+                            if node:
+                                seed_types[eid] = str(
+                                    node.get("entity_type", "concept"))
+            except Exception:
+                continue
+        if not seeds:
+            return []
+        if require_specific_seed:
+            non_concept = sum(1 for t in seed_types.values() if t != "concept")
+            if non_concept < 2:
+                # Broad query: only generic-concept seeds or a single weak
+                # non-concept hit (relationships, preferences, goals...).
+                # Traversal output would be hub-adjacent noise — the boost
+                # floor regresses precision on these.
+                return []
+
+        # BFS over meaningful relations only, hop-weighted. Meaningful =
+        # typed relations (real semantics) OR LLM-extracted edges (entity
+        # validity gated by the LLM). Regex generic edges (related_to,
+        # context_about, insight_about, mentions...) connect everything to
+        # everything and carry no traversal value.
+        def _traversable_node(eid: str) -> bool:
+            """Skip junk/path-like nodes that break Kuzu IN-list literals."""
+            if len(eid) > 60 or any(ch in eid for ch in ("\\", "'", '"', ":", "/")):
+                return False
+            return not eid.startswith("memory:")
+
+        scores: Dict[str, float] = {}
+        frontier = [s for s in seeds if _traversable_node(s)]
+        visited = set(frontier)
+        for hop in range(1, depth + 1):
+            if not frontier:
+                break
+            if len(frontier) > 40:  # keep per-hop queries bounded
+                frontier = frontier[:40]
+            edges = self._query_edges_for_nodes(frontier)
+            next_frontier = []
+            for edge in edges:
+                rel = edge.get("relation")
+                attrs = edge.get("attributes") or {}
+                extractor = attrs.get("extractor", "graph_patterns")
+                if rel not in _GRAPH_TYPED_RELATIONS and extractor != "llm":
+                    continue
+                src, tgt = edge.get("source"), edge.get("target")
+                mem_ids = attrs.get("memory_ids", [])
+                if not isinstance(mem_ids, list):
+                    mem_ids = [mem_ids] if mem_ids else []
+                weight = 2.0 if hop == 1 else 1.0
+                for mid in mem_ids:
+                    if mid:
+                        scores[str(mid)] = scores.get(str(mid), 0.0) + weight
+                # memory: nodes carry explicit memory evidence
+                for endpoint in (src, tgt):
+                    if str(endpoint).startswith("memory:"):
+                        scores[str(endpoint)[len("memory:"):]] = (
+                            scores.get(str(endpoint)[len("memory:"):], 0.0) + weight
+                        )
+                    elif (_traversable_node(str(endpoint))
+                          and endpoint not in visited and len(visited) < 200):
+                        visited.add(endpoint)
+                        next_frontier.append(endpoint)
+            frontier = next_frontier
+
+        ordered = sorted(scores, key=lambda mid: (-scores[mid], mid))
         return ordered[:max(1, min(int(limit), 500))]
 
     def query_graph(self, entity_id: str) -> List[Dict[str, Any]]:

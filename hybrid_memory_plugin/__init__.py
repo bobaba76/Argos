@@ -81,6 +81,9 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "graph_inject_candidates": "false",
         "graph_boost_min_similarity": "0.15",
         "alias_expansion_boost": "0.7",
+        "graph_traversal_enabled": "true",
+        "graph_traversal_depth": "2",
+        "graph_traversal_boost": "0.60",
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
@@ -363,6 +366,9 @@ class HybridMemoryProvider(MemoryProvider):
         self._graph_inject_candidates: bool = False
         self._graph_boost_min_similarity: float = 0.15
         self._alias_expansion_boost: float = 0.7
+        self._graph_traversal_enabled: bool = False
+        self._graph_traversal_depth: int = 2
+        self._graph_traversal_boost: float = 0.0
         self._consolidation_enabled: bool = False
         self._consolidation_min_age_days: int = 30
         self._consolidation_max_actions: int = 25
@@ -481,6 +487,19 @@ class HybridMemoryProvider(MemoryProvider):
                 "required": False,
             },
             {
+                "key": "graph_traversal_enabled",
+                "description": "Enable traversal-based retrieval: walk typed relations from query seed entities (hop-weighted BFS) and inject graph-only candidates under the similarity floor",
+                "default": "false",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "graph_traversal_depth",
+                "description": "Max hops for traversal-based retrieval (1-4)",
+                "default": "2",
+                "required": False,
+            },
+            {
                 "key": "alias_expansion_boost",
                 "description": "Minimum similarity floor for alias-expanded candidates (identity mappings like 'my role'→'Sam'). Alias expansion is definitive, not fuzzy — the candidate IS about the query entity, so its similarity is floored to this value when the raw embedding similarity is lower.",
                 "default": "0.7",
@@ -578,6 +597,23 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._graph_boost_min_similarity = 0.15
+        graph_trav = self._config.get("graph_traversal_enabled", "false")
+        self._graph_traversal_enabled = (
+            graph_trav.lower() in ("true", "1", "yes")
+            if isinstance(graph_trav, str) else bool(graph_trav)
+        )
+        try:
+            self._graph_traversal_depth = max(
+                1, min(int(self._config.get("graph_traversal_depth", 2)), 4)
+            )
+        except (TypeError, ValueError):
+            self._graph_traversal_depth = 2
+        try:
+            self._graph_traversal_boost = max(
+                0.0, min(float(self._config.get("graph_traversal_boost", 0.0)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._graph_traversal_boost = 0.0
         try:
             self._alias_expansion_boost = max(
                 0.0, min(float(self._config.get("alias_expansion_boost", 0.7)), 1.0)
@@ -1084,6 +1120,27 @@ class HybridMemoryProvider(MemoryProvider):
             graph_ids = self._graph.memory_ids_for_query(
                 effective_query, limit=max(10, candidate_limit)
             )
+            # Traversal-based candidates: walk TYPED relations from seed
+            # entities (hop-weighted BFS). These are graph-only candidates
+            # eligible for injection under the same similarity floor as
+            # alias-expanded IDs. Disabled unless graph_traversal_enabled
+            # (config) — measured A/B gate.
+            traversal_ids: list[str] = []
+            if self._graph_traversal_enabled:
+                try:
+                    traversal_ids = self._graph.traversal_memory_ids(
+                        effective_query, depth=self._graph_traversal_depth,
+                        limit=max(10, candidate_limit),
+                    )
+                    logger.debug("TRAVERSAL-DBG: %d ids for %r", len(traversal_ids), effective_query[:40])
+                    if traversal_ids:
+                        seen = set(graph_ids)
+                        for tid in traversal_ids:
+                            if tid not in seen:
+                                graph_ids.append(tid)
+                                seen.add(tid)
+                except Exception:
+                    traversal_ids = []
             # Also query the graph for each canonical entity from aliases
             for canonical in alias_expansions:
                 try:
@@ -1129,6 +1186,10 @@ class HybridMemoryProvider(MemoryProvider):
                 #    Records from get_memories_by_ids have no similarity
                 #    computed, so we compute it here via the store's embedder.
                 injectable_ids = set(alias_expanded_ids) if alias_expanded_ids else set()
+                if self._graph_traversal_enabled:
+                    injectable_ids.update(traversal_ids)
+                    logger.debug("TRAVERSAL-DBG: injectable=%d (traversal=%d, alias=%d)",
+                                 len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
                 if self._graph_inject_candidates:
                     injectable_ids.update(graph_ids)
                 if injectable_ids:
@@ -1167,9 +1228,15 @@ class HybridMemoryProvider(MemoryProvider):
                         record.raw_similarity = sim
                         if sim >= self._graph_boost_min_similarity:
                             results.append(record)
+                            if str(record.memory_id).startswith("mem-4d83cf06"):
+                                logger.debug("TRAVERSAL-DBG: INDWE injected sim=%.3f", sim)
+                        elif str(record.memory_id).startswith("mem-4d83cf06"):
+                            logger.debug("TRAVERSAL-DBG: INDWE rejected sim=%.3f < %.2f",
+                                         sim, self._graph_boost_min_similarity)
                 graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
                 graph_count = max(len(graph_ids), 1)
                 alias_id_set = set(alias_expanded_ids)
+                traversal_id_set = set(traversal_ids)
                 for record in results:
                     # Alias-expanded candidates: alias expansion is a
                     # definitive identity mapping (e.g. "my role" =
@@ -1182,6 +1249,18 @@ class HybridMemoryProvider(MemoryProvider):
                     if record.memory_id in alias_id_set:
                         record.similarity = max(
                             record.similarity, self._alias_expansion_boost
+                        )
+                        continue
+                    # Traversal candidates: memory reached by walking TYPED
+                    # relations from a query seed entity. Evidence is
+                    # relational (e.g. Indwe broker <- uses <- user with car
+                    # finance) — semantically meaningful even if the surface
+                    # text doesn't overlap. Floor lifts it above the cutoff
+                    # without a full identity claim (alias-level).
+                    if (self._graph_traversal_enabled
+                            and record.memory_id in traversal_id_set):
+                        record.similarity = max(
+                            record.similarity, self._graph_traversal_boost
                         )
                         continue
                     rank = graph_rank.get(record.memory_id)

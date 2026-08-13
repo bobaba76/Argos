@@ -373,6 +373,44 @@ def capture(repo: Path, manifest: dict[str, Any], version: str) -> None:
             print(f"  {path}")
 
 
+def snapshot(repo: Path, home: Path, manifest: dict[str, Any], version: str, message: str | None,
+             python_path: str | None = None) -> None:
+    """One-command ritual: capture code changes, back up live data, push the bundle.
+
+    Runs after every customization session so the bundle repo (the single
+    source of truth) never drifts from the live Hermes checkout:
+      1. capture   - regenerate patches/<version>-custom.patch from the live tree
+      2. backup    - stop memory service, copy duckdb/kuzu/state.db to backups/
+      3. commit    - stage and commit the whole bundle repo
+      4. push      - off-machine copy on origin
+    """
+    if not version:
+        version = manifest["upstream"]["version"]
+    try:
+        capture(repo, manifest, version)
+        print(f"snapshot: patch + manifest regenerated for v{version}")
+    except CustomizationError as exc:
+        print(f"snapshot: capture skipped ({exc})")
+
+    backup_script = ROOT / "scripts" / "backup_data.py"
+    backup_python = target_python(repo, python_path)
+    run([backup_python, str(backup_script), "--hermes-home", str(home)])
+
+    status = git(ROOT, "status", "--porcelain").stdout.strip()
+    if not status:
+        print("snapshot: bundle repo clean; nothing to commit")
+        return
+    git(ROOT, "add", "-A")
+    staged = git(ROOT, "diff", "--cached", "--name-only").stdout.splitlines()
+    print(f"snapshot: staging {len(staged)} changed file(s)")
+    for path in staged:
+        print(f"  + {path}")
+    commit_msg = message or f"snapshot {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    git(ROOT, "commit", "-m", commit_msg)
+    git(ROOT, "push")
+    print("snapshot: committed and pushed to origin")
+
+
 def rollback(repo: Path, home: Path, manifest: dict[str, Any], backup: Path) -> None:
     if not backup.exists():
         raise CustomizationError(f"Backup does not exist: {backup}")
@@ -409,8 +447,9 @@ def rollback(repo: Path, home: Path, manifest: dict[str, Any], backup: Path) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Apply or verify the Hermes customization bundle safely.")
-    parser.add_argument("command", choices=("apply", "verify", "capture", "rollback"))
-    parser.add_argument("--version", default=None, help="Upstream version for capture")
+    parser.add_argument("command", choices=("apply", "verify", "capture", "rollback", "snapshot"))
+    parser.add_argument("--version", default=None, help="Upstream version for capture/snapshot")
+    parser.add_argument("--message", default=None, help="Commit message for snapshot")
     parser.add_argument("--hermes-repo", type=Path, default=None)
     parser.add_argument("--hermes-home", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -427,6 +466,9 @@ def main() -> int:
             raise CustomizationError(f"Not a Hermes Git checkout: {repo}")
         if args.command == "capture":
             capture(repo, manifest, args.version or "")
+            return 0
+        if args.command == "snapshot":
+            snapshot(repo, home, manifest, args.version or "", args.message, args.python_path)
             return 0
         if args.command == "verify":
             verify(repo, home, manifest, run_tests=not args.skip_tests, python_path=args.python_path)

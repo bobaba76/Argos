@@ -1906,6 +1906,17 @@ class HybridMemoryProvider(MemoryProvider):
                             payload["chain"] = membership[mid]
                 except Exception as exc:
                     logger.debug("Chain membership annotation failed: %s", exc)
+            # Chain-unfold: when enabled (off|auto|always), inject a compact
+            # arc for a top result with history on change-intent queries.
+            # Fail-soft: any error leaves the response unchanged. The arc
+            # rides in a separate "chain_arc" field so the agent can use it
+            # without conflating it with search results.
+            try:
+                arc = self._maybe_unfold_chain(query, results)
+                if arc:
+                    result_payloads.append({"chain_arc": arc})
+            except Exception as exc:
+                logger.debug("Chain unfold failed: %s", exc)
             return json.dumps({
                 "query": query,
                 "count": len(results),

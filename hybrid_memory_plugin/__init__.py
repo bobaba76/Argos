@@ -85,6 +85,10 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "graph_traversal_enabled": "true",
         "graph_traversal_depth": "2",
         "graph_traversal_boost": "0.60",
+        "chain_unfold": "auto",
+        "chain_unfold_min_similarity": "0.30",
+        "chain_max_versions": "3",
+        "chain_max_inject": "150",
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
@@ -414,6 +418,7 @@ class HybridMemoryProvider(MemoryProvider):
         # "auto". Accounting is separate from retrieval counters (see
         # _chain_unfolded_stats).
         self._chain_unfold: str = "off"  # "off" | "auto" | "always"
+        self._chain_unfold_min_similarity: float = 0.30
         self._chain_max_versions: int = 3
         self._chain_max_inject: int = 150  # soft token cap per chain
         self._chain_unfolded_stats: Dict[str, int] = {
@@ -784,6 +789,12 @@ class HybridMemoryProvider(MemoryProvider):
         if self._chain_unfold not in {"off", "auto", "always"}:
             self._chain_unfold = "off"
         try:
+            self._chain_unfold_min_similarity = max(
+                0.0, min(float(self._config.get("chain_unfold_min_similarity", 0.30)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._chain_unfold_min_similarity = 0.30
+        try:
             self._chain_max_versions = max(
                 1, min(int(self._config.get("chain_max_versions", 3)), 10)
             )
@@ -1091,30 +1102,39 @@ class HybridMemoryProvider(MemoryProvider):
         """Chain-unfold trigger (budget-controlled, separate accounting).
 
         Returns a compact arc string to inject when chain_unfold is enabled,
-        the query signals change-intent, a top-3 result has a chain, and the
-        arc cost is within budget. Returns None otherwise. Chain versions
-        pulled by the walk do NOT touch retrieval counters — only the
-        separate _chain_unfolded_stats counter is updated.
+        the query signals change-intent, the TOP result has a chain at
+        sufficient similarity, and the arc cost is within budget. Returns
+        None otherwise. Chain versions pulled by the walk do NOT touch
+        retrieval counters — only the separate _chain_unfolded_stats
+        counter is updated.
+
+        Gate (measured 2026-08-13, eval_chain_unfold.py): the original
+        top-3-any-chain gate fired on unrelated queries (weather query ->
+        Chain A arc) and injected wrong arcs (Query X -> Chain Y arc).
+        Tightened to: TOP-1 result only, raw_similarity >= 0.30 floor
+        (same convention as query-expansion's floor), so a chain only
+        unfolds when the top hit is genuinely about the query.
         """
         if self._chain_unfold == "off" or not results or self._store is None:
             return None
         if self._chain_unfold == "auto" and not self._change_intent_match(query):
             return None
+        top = results[0]
+        # Similarity floor: the top hit must be a genuine match, not a
+        # low-similarity filler that happens to carry a chain.
+        top_raw = getattr(top, "raw_similarity", None)
+        if top_raw is None:
+            top_raw = getattr(top, "similarity", 0.0) or 0.0
+        if top_raw < self._chain_unfold_min_similarity:
+            return None
         try:
-            membership = self._store.get_chain_membership(
-                [r.memory_id for r in results[:3]]
-            )
+            membership = self._store.get_chain_membership([top.memory_id])
         except Exception:
             return None
-        # Find the first top-3 result that has a chain.
-        target_id = None
-        for r in results[:3]:
-            info = membership.get(r.memory_id)
-            if info and info.get("has_history"):
-                target_id = r.memory_id
-                break
-        if target_id is None:
+        info = membership.get(top.memory_id)
+        if not info or not info.get("has_history"):
             return None
+        target_id = top.memory_id
         try:
             versions = self._store.get_memory_history(
                 target_id, max_versions=self._chain_max_versions,

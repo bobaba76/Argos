@@ -420,6 +420,16 @@ def extract_graph_relations(
 _GRAPH_LLM_MIN_LENGTH = 60
 _GRAPH_LLM_TIMEOUT = 15.0
 
+# Relations that carry no traversal/typing signal. Regex produces these
+# generically (mentions/related_to/context_about/insight_about/about_user/
+# working_toward/interested_in) — they connect everything to everything.
+# Used by the hybrid gate (count TYPED relations, not raw ones) and by
+# traversal (never walk generic edges).
+_GRAPH_GENERIC_RELATIONS = frozenset({
+    "mentions", "about_user", "related_to", "context_about",
+    "insight_about", "working_toward", "interested_in",
+})
+
 _GRAPH_LLM_PROMPT = """You are a knowledge-graph entity extractor. Given a stored memory, extract typed relationships between the user and entities mentioned.
 
 Return a JSON array of objects with these keys:
@@ -561,8 +571,17 @@ def extract_graph_relations_hybrid(
     if not use_llm:
         return regex_relations
 
-    # Only invoke LLM when regex found little and the message is substantial.
-    if len(regex_relations) >= 3 or len(content.strip()) < _GRAPH_LLM_MIN_LENGTH:
+    # Only invoke LLM when regex found little TYPED structure and the
+    # message is substantial. Counting raw regex relations is wrong:
+    # regex produces 3+ generic junk edges (related_to/context_about/
+    # insight_about/mentions...) on content-rich memories, so the LLM
+    # never fired on exactly the memories that need typing — the graph
+    # slowly rotted back to concept soup. Count typed relations instead.
+    typed_regex = [
+        r for r in regex_relations
+        if r.get("relation") not in _GRAPH_GENERIC_RELATIONS
+    ]
+    if len(typed_regex) >= 3 or len(content.strip()) < _GRAPH_LLM_MIN_LENGTH:
         return regex_relations
 
     llm_relations = extract_graph_relations_llm(content, category)

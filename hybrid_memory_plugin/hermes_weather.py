@@ -97,11 +97,18 @@ _WMO_CODES: dict[int, str] = {
 
 
 def _resolve_location_name() -> str:
-    """Read the configured location string (or empty string).
+    """Resolve the location string (or empty string).
 
-    Mirrors hermes_location._resolve_location_name — kept local to avoid a
-    circular import and so this module is self-contained.
+    Delegates to hermes_location so weather follows the same resolution as
+    the Location hint (env override → SSID map → IP geolocation → config
+    fallback). Falls back to the local read (env → config) if the module is
+    unavailable — this module stays self-contained.
     """
+    try:
+        from .hermes_location import _resolve_location_name as _resolve
+        return _resolve()
+    except Exception:
+        pass
     loc_env = os.getenv("HERMES_LOCATION", "").strip()
     if loc_env:
         return loc_env

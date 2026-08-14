@@ -15,7 +15,14 @@ Resolution order (``location_mode: auto`` — the default):
         SSID to a place name (``{MyHomeNetwork: Suburb-Y}``). Exact match,
         deterministic, offline, zero latency. Skipped when not on Wi-Fi
         (ethernet, disconnected, non-Windows).
-     b. **IP geolocation fallback** — free ip-api.com lookup (no key),
+     b. **Windows location platform** (Wi-Fi triangulation, ~10-50m
+        accuracy — the same mechanism Google Maps uses; see
+        ``_os_location``). Requires the ``winsdk`` package and Windows
+        location consent. The resulting lat/lon is resolved to a place
+        name via the nearest entry in ``known_places`` (offline, exact
+        for home/work, default radius 5km) or, failing that, a
+        Nominatim/OpenStreetMap reverse-geocode lookup.
+     c. **IP geolocation fallback** — free ip-api.com lookup (no key),
         city-level accuracy (~10-20km), normalized through
         ``location_aliases`` in config.yaml (e.g. IP says "City-Z"
         but you want "Riverton" displayed while on that line).
@@ -69,6 +76,16 @@ _IP_GEO_URL = "http://ip-api.com/json/"
 
 _SSID_RE = re.compile(r"^\s*SSID\s*:\s*(.+?)\s*$")
 
+# Windows location platform (winsdk) — Wi-Fi triangulation, the same
+# mechanism Google Maps uses. Needs `pip install winsdk` + Windows
+# location consent (Settings → Privacy → Location → allow desktop apps).
+_OS_LOCATION_TIMEOUT_S = 10
+_KNOWN_PLACES_RADIUS_KM = 5.0  # default; override via known_places_radius_km
+_NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
+_NOMINATIM_TIMEOUT_S = 5
+# OSM usage policy requires an identifying User-Agent.
+_USER_AGENT = "hermes-agent/0.20.0 (hermes location autodetection)"
+
 
 def _load_raw_config() -> dict:
     """Read the user config dict (or {} on any failure). Cheap: the shared
@@ -102,6 +119,28 @@ def _normalize(value) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()
+
+
+def _as_dict(value) -> dict:
+    """Normalize a config value to a dict.
+
+    Accepts a real dict, a JSON-string dict (what ``hermes config set``
+    writes for complex values, e.g. ``known_places``), and empty/garbage
+    → {}. Never raises.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return {}
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
 
 
 def _ssid_from_netsh() -> Optional[str]:
@@ -142,21 +181,128 @@ def _city_from_ip() -> Optional[str]:
         return None
 
 
+def _os_location() -> Optional[Tuple[float, float]]:
+    """Return (lat, lon) from the Windows location platform, or None.
+
+    Uses ``winsdk`` (Windows.Devices.Geolocation) — the same platform that
+    powers Windows Maps and the browser Geolocation API: Wi-Fi
+    triangulation from the passively-scanned nearby access points,
+    accurate to ~10-50m, even when not connected to any network. No GPS
+    chip required.
+
+    Never raises: lazy-imports winsdk (missing package → None), catches
+    AccessDenied (location consent off → None) and timeouts. The first
+    call can take several seconds (platform warm-up); callers should go
+    through the TTL cache, not invoke this per turn.
+    """
+    try:
+        import asyncio
+        import winsdk.windows.devices.geolocation as wdg
+
+        async def _get():
+            locator = wdg.Geolocator()
+            pos = await locator.get_geoposition_async()
+            return (pos.coordinate.latitude, pos.coordinate.longitude)
+
+        return asyncio.run(
+            asyncio.wait_for(_get(), timeout=_OS_LOCATION_TIMEOUT_S)
+        )
+    except Exception:
+        return None
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km between two coordinates."""
+    import math
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _reverse_geocode(lat: float, lon: float, cfg: dict) -> Optional[str]:
+    """Resolve (lat, lon) to a place name: nearest ``known_places`` entry
+    (offline, deterministic) within ``known_places_radius_km``, else a
+    Nominatim reverse-geocode (first display-name element). Never raises."""
+    known = _as_dict(cfg.get("known_places"))
+    if known:
+        radius = _KNOWN_PLACES_RADIUS_KM
+        try:
+            radius = float(cfg.get("known_places_radius_km") or radius)
+        except (TypeError, ValueError):
+            pass
+        best_name, best_d = None, radius
+        for name, coords in known.items():
+            try:
+                plat, plon = coords
+                d = _haversine_km(lat, lon, float(plat), float(plon))
+                if d <= best_d:
+                    best_name, best_d = str(name).strip() or None, d
+            except (TypeError, ValueError):
+                continue
+        if best_name:
+            return best_name
+    try:
+        import urllib.parse
+        q = urllib.parse.urlencode({
+            "lat": f"{lat:.6f}", "lon": f"{lon:.6f}",
+            "format": "jsonv2", "accept-language": "en",
+        })
+        req = urllib.request.Request(
+            f"{_NOMINATIM_REVERSE_URL}?{q}",
+            headers={"User-Agent": _USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=_NOMINATIM_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        # Prefer the structured address object over display_name: the raw
+        # first display_name element is often street-level ("16th Road"),
+        # not a place name. Suburb-first suits SA naming (Riverton and
+        # Suburb-Y are suburbs of City-Z).
+        addr = data.get("address")
+        if isinstance(addr, dict):
+            for key in ("suburb", "city", "town", "village", "municipality", "county"):
+                name = _normalize(addr.get(key))
+                if name:
+                    return name
+        display = _normalize(data.get("display_name"))
+        if display:
+            return display.split(",")[0].strip()
+    except Exception:
+        pass
+    return None
+
+
 def _detect_once(cfg: dict) -> Optional[str]:
-    """One detection pass: SSID map first, then IP geolocation + alias."""
+    """One detection pass: SSID map → OS location → IP geolocation."""
     # 1. Wi-Fi SSID → location_map (exact, deterministic, offline)
     ssid = _ssid_from_netsh()
     if ssid:
-        loc_map = cfg.get("location_map") or {}
-        if isinstance(loc_map, dict):
+        loc_map = _as_dict(cfg.get("location_map"))
+        if loc_map:
             mapped = _normalize(loc_map.get(ssid))
             if mapped:
                 return mapped
-    # 2. IP geolocation → location_aliases normalization
+    # 2. Windows location platform (Wi-Fi triangulation) → place name.
+    # _os_location/_reverse_geocode self-catch, but never trust a third-party
+    # boundary: guard the call site too so detection always degrades.
+    try:
+        coords = _os_location()
+    except Exception:
+        coords = None
+    if coords:
+        try:
+            place = _reverse_geocode(coords[0], coords[1], cfg)
+        except Exception:
+            place = None
+        if place:
+            return place
+    # 3. IP geolocation → location_aliases normalization
     city = _city_from_ip()
     if city:
-        aliases = cfg.get("location_aliases") or {}
-        if isinstance(aliases, dict):
+        aliases = _as_dict(cfg.get("location_aliases"))
+        if aliases:
             alias = _normalize(aliases.get(city))
             if alias:
                 return alias

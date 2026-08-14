@@ -31,7 +31,8 @@
     "dependencies": [
       "duckdb",
       "kuzu",
-      "sentence-transformers"
+      "sentence-transformers",
+      "winsdk"
     ],
     "excluded_names": [
       "*.duckdb",

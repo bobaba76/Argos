@@ -1,0 +1,93 @@
+diff --git a/plugins/memory/__init__.py b/plugins/memory/__init__.py
+index 53eeb998a0e..897eccbbaff 100644
+--- a/plugins/memory/__init__.py
++++ b/plugins/memory/__init__.py
+@@ -305,7 +305,14 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
+ 
+     # Try register(ctx) pattern first (how our plugins are written)
+     if hasattr(mod, "register"):
+-        collector = _ProviderCollector()
++        # Pass the real PluginManager so the provider can register
++        # skills and slash commands alongside its memory provider.
++        try:
++            from hermes_cli.plugins import get_plugin_manager
++            _mgr = get_plugin_manager()
++        except Exception:
++            _mgr = None
++        collector = _ProviderCollector(plugin_name=name, manager=_mgr)
+         try:
+             mod.register(collector)
+             if collector.provider:
+@@ -328,20 +335,68 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
+ 
+ 
+ class _ProviderCollector:
+-    """Fake plugin context that captures register_memory_provider calls."""
++    """Fake plugin context that captures register_memory_provider calls.
++
++    Also delegates ``register_skill``, ``register_command``, and
++    ``register_hook`` to the real ``PluginManager`` so memory provider
++    plugins can ship skills, slash commands, and lifecycle hooks alongside
++    their provider.  Other registration methods are no-ops (memory providers
++    are exclusive and don't register tools).
++    """
+ 
+-    def __init__(self):
++    def __init__(self, plugin_name: str = "memory", manager=None):
+         self.provider = None
++        self._plugin_name = plugin_name
++        self._manager = manager
+ 
+     def register_memory_provider(self, provider):
+         self.provider = provider
+ 
++    def _delegate_ctx(self):
++        """Build a real PluginContext for skill/command/hook registration."""
++        if self._manager is None:
++            return None
++        try:
++            from hermes_cli.plugins import PluginManifest, PluginContext
++            manifest = PluginManifest(name=self._plugin_name, kind="exclusive")
++            return PluginContext(manifest, self._manager)
++        except Exception:
++            return None
++
++    def register_skill(self, name, path, description=""):
++        """Register a skill via the real PluginManager (if available)."""
++        ctx = self._delegate_ctx()
++        if ctx is not None:
++            try:
++                ctx.register_skill(name, path, description)
++            except Exception as e:
++                logger.debug("register_skill failed for %s: %s", self._plugin_name, e)
++
++    def register_command(self, name, handler, description="", args_hint=""):
++        """Register a slash command via the real PluginManager (if available)."""
++        ctx = self._delegate_ctx()
++        if ctx is not None:
++            try:
++                ctx.register_command(name, handler, description, args_hint)
++            except Exception as e:
++                logger.debug("register_command failed for %s: %s", self._plugin_name, e)
++
+     # No-op for other registration methods
+     def register_tool(self, *args, **kwargs):
+         pass
+ 
+-    def register_hook(self, *args, **kwargs):
+-        pass
++    def register_hook(self, hook_name, callback):
++        """Register a lifecycle hook via the real PluginManager (if available).
++
++        Lets memory providers ride native hooks like ``pre_llm_call`` for
++        ambient context injection without a core source patch.
++        """
++        ctx = self._delegate_ctx()
++        if ctx is not None:
++            try:
++                ctx.register_hook(hook_name, callback)
++            except Exception as e:
++                logger.debug("register_hook failed for %s: %s", self._plugin_name, e)
+ 
+     def register_cli_command(self, *args, **kwargs):
+         pass  # CLI registration happens via discover_plugin_cli_commands()

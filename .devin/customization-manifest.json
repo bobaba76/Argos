@@ -1,40 +1,30 @@
 {
-  "bundle_version": 2,
+  "bundle_version": 3,
   "upstream": {
     "version": "0.20.0",
     "base_commit": "6bdeb2df24d2d1d47cc08862a6bbc3171105746b"
   },
-  "core_patch": "patches/hermes-v0.20.0-custom.patch",
-  "core_copies": [
+  "core_patches": [
     {
-      "source": "ambient_context/hermes_time.py",
-      "target": "hermes_time.py"
+      "name": "desktop-lifecycle",
+      "path": "patches/desktop-lifecycle.patch",
+      "required": true,
+      "description": "Windows orphaned python.exe cleanup + will-quit safety net in the Electron main process"
     },
     {
-      "source": "ambient_context/hermes_location.py",
-      "target": "hermes_location.py"
+      "name": "memory-provider-registry",
+      "path": "patches/memory-provider-registry.patch",
+      "required": true,
+      "description": "Lets memory providers register skills, slash commands, and lifecycle hooks via the real PluginManager"
     },
     {
-      "source": "ambient_context/hermes_weather.py",
-      "target": "hermes_weather.py"
-    },
-    {
-      "source": "ambient_context/hermes_file_activity.py",
-      "target": "hermes_file_activity.py"
-    },
-    {
-      "source": "ambient_context/tests/test_location.py",
-      "target": "tests/test_location.py"
-    },
-    {
-      "source": "ambient_context/tests/test_weather.py",
-      "target": "tests/test_weather.py"
-    },
-    {
-      "source": "ambient_context/tests/test_file_activity.py",
-      "target": "tests/test_file_activity.py"
+      "name": "tool-compression",
+      "path": "patches/tool-compression.patch",
+      "required": false,
+      "description": "Compressed tool descriptions (~1.8K fewer schema tokens per API call). Silently skipped when it doesn't apply cleanly."
     }
   ],
+  "core_copies": [],
   "plugin": {
     "source": "hybrid_memory_plugin",
     "target": "plugins/hybrid_memory",

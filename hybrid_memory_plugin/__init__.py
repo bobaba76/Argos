@@ -2297,14 +2297,128 @@ class HybridMemoryProvider(MemoryProvider):
 
 
 # ---------------------------------------------------------------------------
+# Ambient context — per-turn time/location/weather/file-activity hints
+#
+# These ride the native ``pre_llm_call`` plugin hook (not the async prefetch
+# path) so they are built synchronously and injected unconditionally on every
+# turn — including slow turns where prefetch times out and returns "".  The
+# hook returns ``{"context": "..."}`` which Hermes appends to the API copy of
+# the user message via the native ``plugin_user_context`` injection path,
+# keeping the cached system prompt byte-stable.  No core source patch needed.
+# ---------------------------------------------------------------------------
+
+def _build_timestamp_hint() -> str:
+    """Render the per-turn local-time line, e.g. ``Current time: Friday 2026-07-31 19:55 SAST``.
+
+    Uses the native ``hermes_time.now()`` so the user's configured IANA timezone
+    wins (``HERMES_TIMEZONE`` env → ``config.yaml`` ``timezone`` → server-local).
+    Returns ``""`` on any failure so the injection path is unaffected — the
+    agent simply gets no time hint that turn. Kept to one short line (~10-15
+    tokens) for ambient awareness without per-turn overhead.
+    """
+    try:
+        from hermes_time import now as _hermes_now
+        _now = _hermes_now()
+        return "Current time: " + _now.strftime("%A %Y-%m-%d %H:%M %Z").strip()
+    except Exception:
+        return ""
+
+
+def _build_location_hint() -> str:
+    """Render the per-turn location line, e.g. ``Location: City-X``.
+
+    Resolves the location fresh each turn via ``hermes_location._resolve_location_name()``
+    (bypassing the module-level cache) so that a mid-session
+    ``hermes config set location "Riverton"`` is picked up on the very next
+    turn — even in a long-lived CLI session.
+
+    Returns ``""`` when unset or on any failure. Kept to one short line
+    (~5-10 tokens) for ambient awareness.
+    """
+    try:
+        from .hermes_location import _resolve_location_name as _resolve
+        _loc = _resolve().strip()
+        return f"Location: {_loc}" if _loc else ""
+    except Exception:
+        return ""
+
+
+def _build_weather_hint() -> str:
+    """Render the per-turn weather line, e.g. ``Weather: 14°C, light rain``.
+
+    Uses ``hermes_weather.get_weather()`` which geocodes the configured
+    location and fetches current weather from Open-Meteo (free, no API key).
+    Cached for ~20 minutes so most turns are zero-network cache hits.
+
+    Returns ``""`` when disabled, no location, or the network call fails.
+    """
+    try:
+        from .hermes_weather import get_weather as _get_weather
+        _w = _get_weather().strip()
+        return f"Weather: {_w}" if _w else ""
+    except Exception:
+        return ""
+
+
+def _build_file_activity_hint() -> str:
+    """Render the per-turn file activity line, e.g. ``Last edited: ~/project/foo.py (4 min ago)``.
+
+    Uses ``hermes_file_activity.get_recent_files()`` which scans the
+    configured working directory for recently modified files. Cached for ~5
+    minutes so most turns are zero-I/O cache hits.
+
+    Returns ``""`` when disabled, no recent files, or the scan fails.
+    """
+    try:
+        from .hermes_file_activity import get_recent_files as _get_recent
+        _r = _get_recent().strip()
+        return f"Last edited: {_r}" if _r else ""
+    except Exception:
+        return ""
+
+
+def _on_pre_llm_call(**kwargs) -> dict:
+    """``pre_llm_call`` hook — build ambient context hints synchronously.
+
+    Called by Hermes on every turn before the LLM call.  Returns a dict with
+    a ``context`` key whose value is injected into the API copy of the user
+    message (via the native ``plugin_user_context`` path).  Each hint is
+    built independently so a failure in one (e.g. weather network timeout)
+    never suppresses the others.
+
+    This replaces the former core-source patch to ``turn_context.py`` /
+    ``conversation_loop.py`` that added 4 parameters to ``compose_user_api_content``
+    and 4 fields to ``TurnContext``.  The native hook delivers the same
+    per-turn, byte-stable injection with zero core changes.
+    """
+    parts: list[str] = []
+    for builder in (
+        _build_timestamp_hint,
+        _build_location_hint,
+        _build_weather_hint,
+        _build_file_activity_hint,
+    ):
+        try:
+            line = builder()
+            if line:
+                parts.append(line)
+        except Exception:
+            pass  # never let one hint break the others
+    if not parts:
+        return {}
+    return {"context": "\n".join(parts)}
+
+
+# ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
     """Register HybridMemory as a memory provider plugin.
 
-    Also registers the insight-log skill and /ilog + /revisit slash
-    commands if the plugin context supports them.
+    Also registers the insight-log skill, /ilog + /revisit slash commands,
+    and a ``pre_llm_call`` hook for ambient context (time/location/weather/
+    file-activity) — if the plugin context supports them.
     """
     try:
         ctx.register_memory_provider(HybridMemoryProvider())
@@ -2316,6 +2430,20 @@ def register(ctx) -> None:
             "hybrid_memory: register() failed: %s\n%s", _e, traceback.format_exc()
         )
         raise
+
+    # Register the pre_llm_call hook for ambient context (time/location/
+    # weather/file-activity).  Rides the native plugin_user_context injection
+    # path — no core source patch needed.
+    try:
+        if hasattr(ctx, "register_hook"):
+            ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+            logging.getLogger("hybrid_memory").info(
+                "hybrid_memory: registered pre_llm_call hook for ambient context"
+            )
+    except Exception as _e:
+        logging.getLogger("hybrid_memory").debug(
+            "hybrid_memory: pre_llm_call hook registration skipped: %s", _e
+        )
 
     # Register the insight-log skill (if the context supports skill registration).
     try:

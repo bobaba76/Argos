@@ -87,6 +87,28 @@ def target_python(repo: Path, explicit: str | None = None) -> str:
     return sys.executable
 
 
+def _patch_targets(manifest: dict[str, Any]) -> set[str]:
+    """Collect all file paths that any core patch or core copy will touch."""
+    targets: set[str] = set()
+    import re as _re
+    for patch_entry in manifest.get("core_patches", []):
+        patch_path = ROOT / patch_entry["path"]
+        if patch_path.exists():
+            patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+            for m in _re.finditer(r"^(?:---|\+\+\+) [ab]/(.+)$", patch_text, _re.MULTILINE):
+                targets.add(m.group(1).replace("/", os.sep))
+    # Legacy monolithic patch (bundle_version < 3)
+    if "core_patch" in manifest:
+        patch_path = ROOT / manifest["core_patch"]
+        if patch_path.exists():
+            patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+            for m in _re.finditer(r"^(?:---|\+\+\+) [ab]/(.+)$", patch_text, _re.MULTILINE):
+                targets.add(m.group(1).replace("/", os.sep))
+    for item in manifest.get("core_copies", []):
+        targets.add(item["target"].replace("/", os.sep))
+    return targets
+
+
 def ensure_repo_clean(repo: Path) -> None:
     status = git(repo, "status", "--porcelain").stdout.strip()
     if not status:
@@ -98,18 +120,8 @@ def ensure_repo_clean(repo: Path) -> None:
         # Porcelain format: XY <path> or XY <orig> -> <path> for renames
         path = line[3:].split(" -> ")[-1].strip()
         dirty_files.add(path.replace("/", os.sep))
-    # Files the patch and core_copies will touch.
     manifest = load_manifest()
-    patch_targets: set[str] = set()
-    # Parse the patch to find which files it modifies.
-    patch_path = ROOT / manifest["core_patch"]
-    if patch_path.exists():
-        import re as _re
-        patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
-        for m in _re.finditer(r"^(?:---|\+\+\+) [ab]/(.+)$", patch_text, _re.MULTILINE):
-            patch_targets.add(m.group(1).replace("/", os.sep))
-    for item in manifest["core_copies"]:
-        patch_targets.add(item["target"].replace("/", os.sep))
+    patch_targets = _patch_targets(manifest)
     overlap = dirty_files & patch_targets
     if overlap:
         raise CustomizationError(
@@ -256,27 +268,72 @@ def base_blob(repo: Path, commit: str, relative: str) -> bytes | None:
 
 
 def apply_core(repo: Path, manifest: dict[str, Any], *, dry_run: bool) -> None:
-    patch = ROOT / manifest["core_patch"]
     base = manifest["upstream"]["base_commit"]
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
     if head != base:
         print(
             f"WARNING: Hermes HEAD ({head[:12]}) does not match the manifest's "
-            f"base commit ({base[:12]}). The patch will be tested against the "
-            f"current checkout; if it applies cleanly, the customizations will work."
+            f"base commit ({base[:12]}). Patches will be tested against the "
+            f"current checkout; if they apply cleanly, the customizations will work."
         )
 
-    # Check if the patch applies cleanly before doing anything else.
-    check = git(repo, "apply", "--check", "--whitespace=nowarn", str(patch), check=False)
-    if check.returncode:
-        raise CustomizationError(
-            f"Core patch does not apply cleanly to HEAD {head[:12]}. "
-            "Create a new versioned patch for this upstream revision.\n" +
-            (check.stderr or check.stdout).strip()
-        )
+    # --- Sub-patch mode (bundle_version >= 3) ---
+    patches = manifest.get("core_patches", [])
+    if patches:
+        applied: list[str] = []
+        skipped: list[str] = []
+        for entry in patches:
+            name = entry["name"]
+            patch = ROOT / entry["path"]
+            required = entry.get("required", True)
+            if not patch.exists():
+                if required:
+                    raise CustomizationError(f"Missing required patch file: {patch}")
+                print(f"SKIP (optional, file missing): {name} — {entry.get('description', '')}")
+                skipped.append(name)
+                continue
+            check = git(repo, "apply", "--check", "--whitespace=nowarn", str(patch), check=False)
+            if check.returncode:
+                detail = (check.stderr or check.stdout).strip()
+                if required:
+                    raise CustomizationError(
+                        f"Required sub-patch '{name}' does not apply cleanly to HEAD {head[:12]}. "
+                        f"Create a new versioned patch for this upstream revision.\n{detail}"
+                    )
+                # Optional patch that doesn't fit — skip loudly.
+                print(
+                    f"SKIP (optional, does not apply cleanly): {name} — "
+                    f"{entry.get('description', '')}\n  {detail.splitlines()[0] if detail else ''}"
+                )
+                skipped.append(name)
+                continue
+            if dry_run:
+                print(f"would apply sub-patch: {name} ({patch})")
+            else:
+                git(repo, "apply", "--whitespace=nowarn", str(patch))
+            applied.append(name)
+        if applied:
+            print(f"core patches applied: {', '.join(applied)}")
+        if skipped:
+            print(f"core patches skipped: {', '.join(skipped)}")
+    else:
+        # --- Legacy monolithic patch (bundle_version < 3) ---
+        patch = ROOT / manifest["core_patch"]
+        check = git(repo, "apply", "--check", "--whitespace=nowarn", str(patch), check=False)
+        if check.returncode:
+            raise CustomizationError(
+                f"Core patch does not apply cleanly to HEAD {head[:12]}. "
+                "Create a new versioned patch for this upstream revision.\n" +
+                (check.stderr or check.stdout).strip()
+            )
+        if dry_run:
+            print(f"would apply core patch: {patch}")
+        else:
+            git(repo, "apply", "--whitespace=nowarn", str(patch))
 
+    # --- Core file copies (empty in bundle_version >= 3) ---
     copy_plan: list[tuple[Path, Path]] = []
-    for item in manifest["core_copies"]:
+    for item in manifest.get("core_copies", []):
         source = ROOT / item["source"]
         target = repo / item["target"]
         if not source.exists():
@@ -289,11 +346,6 @@ def apply_core(repo: Path, manifest: dict[str, Any], *, dry_run: bool) -> None:
                     "It will be overwritten with the bundle version."
                 )
         copy_plan.append((source, target))
-
-    if dry_run:
-        print(f"would apply core patch: {patch}")
-    else:
-        git(repo, "apply", "--whitespace=nowarn", str(patch))
     for source, target in copy_plan:
         if dry_run:
             print(f"would copy core file: {source} -> {target}")
@@ -359,14 +411,37 @@ def capture(repo: Path, manifest: dict[str, Any], version: str) -> None:
     status = git(repo, "status", "--porcelain").stdout.strip()
     if not status:
         raise CustomizationError("Nothing to capture; Hermes checkout has no local custom changes.")
-    patch_path = ROOT / "patches" / f"hermes-v{version}-custom.patch"
-    git(repo, "diff", "HEAD", "--binary", f"--output={patch_path}")
+    # Sub-patch mode: re-capture each named sub-patch independently.
+    patches = manifest.get("core_patches", [])
+    if patches:
+        for entry in patches:
+            name = entry["name"]
+            patch_path = ROOT / entry["path"]
+            # Determine which files this sub-patch covers from the existing patch.
+            sub_files: list[str] = []
+            if patch_path.exists():
+                import re as _re
+                patch_text = patch_path.read_text(encoding="utf-8", errors="replace")
+                for m in _re.finditer(r"^(?:---|\+\+\+) [ab]/(.+)$", patch_text, _re.MULTILINE):
+                    sub_files.append(m.group(1))
+            if sub_files:
+                git(repo, "diff", "HEAD", "--binary",
+                    f"--output={patch_path}", "--", *sub_files)
+                print(f"captured sub-patch '{name}': {patch_path} ({len(sub_files)} file(s))")
+            else:
+                # Fallback: capture the full diff into this patch (first-time setup).
+                git(repo, "diff", "HEAD", "--binary", f"--output={patch_path}")
+                print(f"captured sub-patch '{name}' (full diff): {patch_path}")
+    else:
+        # Legacy monolithic mode.
+        patch_path = ROOT / "patches" / f"hermes-v{version}-custom.patch"
+        git(repo, "diff", "HEAD", "--binary", f"--output={patch_path}")
+        manifest["core_patch"] = str(patch_path.relative_to(ROOT)).replace(os.sep, "/")
+        print(f"captured {patch_path} from base {head}")
     manifest["upstream"]["version"] = version
     manifest["upstream"]["base_commit"] = head
-    manifest["core_patch"] = str(patch_path.relative_to(ROOT)).replace(os.sep, "/")
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     untracked = [line[3:] for line in status.splitlines() if line.startswith("?? ")]
-    print(f"captured {patch_path} from base {head}")
     if untracked:
         print("Review these untracked files and add them to core_copies if they are customization source:")
         for path in untracked:
@@ -414,13 +489,33 @@ def snapshot(repo: Path, home: Path, manifest: dict[str, Any], version: str, mes
 def rollback(repo: Path, home: Path, manifest: dict[str, Any], backup: Path) -> None:
     if not backup.exists():
         raise CustomizationError(f"Backup does not exist: {backup}")
-    patch = ROOT / manifest["core_patch"]
-    reverse = git(repo, "apply", "--check", "-R", "--whitespace=nowarn", str(patch), check=False)
-    if reverse.returncode:
-        raise CustomizationError("Core patch is no longer in a reversible state; refusing rollback.")
-    git(repo, "apply", "-R", "--whitespace=nowarn", str(patch))
+    # Reverse each sub-patch (or the legacy monolithic patch).
+    patches = manifest.get("core_patches", [])
+    if patches:
+        for entry in patches:
+            patch = ROOT / entry["path"]
+            if not patch.exists():
+                continue
+            reverse = git(repo, "apply", "--check", "-R", "--whitespace=nowarn", str(patch), check=False)
+            if reverse.returncode:
+                # Optional patches may have been skipped during apply —
+                # a failed reverse just means it was never applied. Warn and continue.
+                if entry.get("required", True):
+                    raise CustomizationError(
+                        f"Required sub-patch '{entry['name']}' is no longer in a reversible state; refusing rollback."
+                    )
+                print(f"SKIP (optional, not reversible — was likely skipped during apply): {entry['name']}")
+                continue
+            git(repo, "apply", "-R", "--whitespace=nowarn", str(patch))
+            print(f"reversed sub-patch: {entry['name']}")
+    elif "core_patch" in manifest:
+        patch = ROOT / manifest["core_patch"]
+        reverse = git(repo, "apply", "--check", "-R", "--whitespace=nowarn", str(patch), check=False)
+        if reverse.returncode:
+            raise CustomizationError("Core patch is no longer in a reversible state; refusing rollback.")
+        git(repo, "apply", "-R", "--whitespace=nowarn", str(patch))
     base = manifest["upstream"]["base_commit"]
-    for item in manifest["core_copies"]:
+    for item in manifest.get("core_copies", []):
         source = ROOT / item["source"]
         target = repo / item["target"]
         if target.exists() and target.read_bytes() != source.read_bytes():

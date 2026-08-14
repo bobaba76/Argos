@@ -294,6 +294,20 @@ def apply_core(repo: Path, manifest: dict[str, Any], *, dry_run: bool) -> None:
                 continue
             check = git(repo, "apply", "--check", "--whitespace=nowarn", str(patch), check=False)
             if check.returncode:
+                # Fork era: the customization may already be committed in the
+                # tree (fork main carries the code). Reverse-check detects that
+                # and skips instead of failing.
+                rev_check = git(
+                    repo, "apply", "--reverse", "--check", "--whitespace=nowarn",
+                    str(patch), check=False,
+                )
+                if not rev_check.returncode:
+                    print(
+                        f"SKIP (already in tree): {name} — "
+                        f"{entry.get('description', '')}"
+                    )
+                    skipped.append(name)
+                    continue
                 detail = (check.stderr or check.stdout).strip()
                 if required:
                     raise CustomizationError(

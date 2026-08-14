@@ -80,7 +80,7 @@ _SSID_RE = re.compile(r"^\s*SSID\s*:\s*(.+?)\s*$")
 # mechanism Google Maps uses. Needs `pip install winsdk` + Windows
 # location consent (Settings → Privacy → Location → allow desktop apps).
 _OS_LOCATION_TIMEOUT_S = 10
-_KNOWN_PLACES_RADIUS_KM = 5.0  # default; override via known_places_radius_km
+_KNOWN_PLACES_RADIUS_KM = 10.0  # default; override via known_places_radius_km
 _NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 _NOMINATIM_TIMEOUT_S = 5
 # OSM usage policy requires an identifying User-Agent.
@@ -264,8 +264,15 @@ def _reverse_geocode(lat: float, lon: float, cfg: dict) -> Optional[str]:
         if isinstance(addr, dict):
             for key in ("suburb", "city", "town", "village", "municipality", "county"):
                 name = _normalize(addr.get(key))
-                if name:
-                    return name
+                if not name:
+                    continue
+                # Skip ward/sector-style administrative labels (e.g.
+                # "City-Z Ward 1"): they're not real place names and
+                # Open-Meteo can't geocode them. The next key (usually
+                # city/town) wins instead.
+                if key == "suburb" and re.search(r"\bward\b", name, re.IGNORECASE):
+                    continue
+                return name
         display = _normalize(data.get("display_name"))
         if display:
             return display.split(",")[0].strip()
@@ -370,6 +377,21 @@ def get_location() -> str:
         _cached_location = _resolve_location_name()
         _cache_resolved = True
     return _cached_location or ""
+
+
+def get_location_coords() -> Optional[Tuple[float, float]]:
+    """Return current OS-tier coordinates (lat, lon), or None.
+
+    Uses the Windows location platform (Wi-Fi triangulation) — the same
+    coordinate source that drives name resolution. Exposed separately so
+    consumers (e.g. the weather module) can query by coordinates directly
+    and never depend on a place-name string, which may be ungeocodable
+    (e.g. "City-Z Ward 1"). Never raises.
+    """
+    try:
+        return _os_location()
+    except Exception:
+        return None
 
 
 def reset_cache() -> None:

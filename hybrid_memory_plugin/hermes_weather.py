@@ -20,9 +20,12 @@ Caching strategy (keeps it off the time-to-first-token critical path):
     injection path is unaffected — the agent simply gets no weather line.
 
 Resolution order for the location to look up:
-  1. ``HERMES_LOCATION`` environment variable
-  2. ``location`` key in ``~/.hermes/config.yaml``
-  3. Empty → no weather (returns ``""``)
+  1. OS coordinates (Windows location platform via
+     ``hermes_location.get_location_coords()``) — exact lat/lon, never
+     depends on a place-name string
+  2. ``HERMES_LOCATION`` environment variable
+  3. ``location`` key in ``~/.hermes/config.yaml``
+  4. Empty → no weather (returns ``""``)
 
 Set the location with::
 
@@ -61,6 +64,18 @@ _geocode_cache: dict[str, Tuple[float, float]] = {}
 # after WEATHER_CACHE_TTL_S. Populated lazily.
 _weather_cache: dict[Tuple[float, float], Tuple[float, str]] = {}
 _cache_lock = threading.Lock()
+
+# OS-coordinate provider (Windows location platform), imported lazily-safe:
+# relative import inside the package, absolute import when this module is
+# loaded standalone (tests), None when hermes_location is unavailable —
+# get_weather() then falls back to name-based geocoding.
+try:
+    from .hermes_location import get_location_coords
+except ImportError:
+    try:
+        from hermes_location import get_location_coords
+    except Exception:
+        get_location_coords = None
 
 # WMO weather interpretation codes → short human-readable description.
 # https://open-meteo.com/en/docs (scroll to "WMO Weather interpretation codes")
@@ -245,6 +260,28 @@ def _fetch_weather(coords: Tuple[float, float]) -> Optional[str]:
     return temp_str
 
 
+def _weather_for_coords(coords: Tuple[float, float]) -> str:
+    """Weather string for exact coordinates, using the shared weather cache.
+
+    Extracted so the OS-coords path and the name-geocode path share one
+    cache/fetch boundary. Returns ``""`` on fetch failure.
+    """
+    now_ts = time.time()
+    with _cache_lock:
+        cached = _weather_cache.get(coords)
+        if cached is not None:
+            ts, weather = cached
+            if now_ts - ts < WEATHER_CACHE_TTL_S:
+                return weather
+
+    weather = _fetch_weather(coords)
+    if not weather:
+        return ""
+    with _cache_lock:
+        _weather_cache[coords] = (time.time(), weather)
+    return weather
+
+
 def get_weather() -> str:
     """Return a short weather string for the configured location, or ``""``.
 
@@ -262,6 +299,14 @@ def get_weather() -> str:
     """
     if not _is_weather_enabled():
         return ""
+
+    # Prefer exact OS coordinates: weather by lat/lon never depends on a
+    # place-name string, so an ungeocodable name (e.g. "City-Z Ward
+    # 97") can't kill the weather line.
+    coords = get_location_coords() if get_location_coords is not None else None
+    if coords:
+        return _weather_for_coords(coords)
+
     location = _resolve_location_name()
     if not location:
         return ""
@@ -274,22 +319,7 @@ def get_weather() -> str:
             return ""
         _geocode_cache[location] = coords
 
-    # Weather cache: refresh after TTL. Most turns hit this cache — a dict
-    # lookup, zero network, zero latency.
-    now_ts = time.time()
-    with _cache_lock:
-        cached = _weather_cache.get(coords)
-        if cached is not None:
-            ts, weather = cached
-            if now_ts - ts < WEATHER_CACHE_TTL_S:
-                return weather
-
-    weather = _fetch_weather(coords)
-    if not weather:
-        return ""
-    with _cache_lock:
-        _weather_cache[coords] = (time.time(), weather)
-    return weather
+    return _weather_for_coords(coords)
 
 
 def reset_cache() -> None:

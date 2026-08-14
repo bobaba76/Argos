@@ -14,8 +14,8 @@
     {
       "name": "memory-provider-registry",
       "path": "patches/memory-provider-registry.patch",
-      "required": true,
-      "description": "Lets memory providers register skills, slash commands, and lifecycle hooks via the real PluginManager"
+      "required": false,
+      "description": "Lets memory providers register skills, slash commands, and lifecycle hooks via the real PluginManager. Optional since fork era: upstream's _ProviderCollector rewrite supersedes this fix."
     },
     {
       "name": "tool-compression",

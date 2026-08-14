@@ -1535,7 +1535,7 @@ class HybridMemoryProvider(MemoryProvider):
             }
             final_status = decision_map.get(decision, "pending_user_confirmation")
             result = self._store.review_candidate(
-                evidence_retention=self._evidence_retention,
+                evidence_retention=getattr(self, "_evidence_retention", "full"),
                 candidate_id=candidate["candidate_id"],
                 decision=final_status,
                 reason=review.get("reason", ""),
@@ -2049,7 +2049,7 @@ class HybridMemoryProvider(MemoryProvider):
             supersedes_memory_id = args.get("supersedes_memory_id")
             try:
                 result = self._store.review_candidate(
-                    evidence_retention=self._evidence_retention,
+                    evidence_retention=getattr(self, "_evidence_retention", "full"),
                     candidate_id=candidate_id,
                     decision=decision,
                     reason=args.get("reason", ""),

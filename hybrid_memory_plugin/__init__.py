@@ -1187,7 +1187,7 @@ class HybridMemoryProvider(MemoryProvider):
         # pronouns/references that need resolution.
         effective_query = self._enrich_query_with_context(query)
         effective_project = project_id if project_id is not None else self._current_project_id
-        candidate_limit = min(50, max(limit, limit * 4))
+        candidate_limit = min(512, max(limit, limit * 4))
         results = self._store.search(
             effective_query,
             limit=candidate_limit,

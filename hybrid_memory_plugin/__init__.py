@@ -1482,7 +1482,9 @@ class HybridMemoryProvider(MemoryProvider):
                         if len(content) > _INJECT_CONTENT_CHAR_CAP:
                             content = content[:_INJECT_CONTENT_CHAR_CAP].rsplit(" ", 1)[0] + "..."
                         sim = f" (score: {r.similarity:.2f})" if r.similarity > 0 else ""
-                        lines.append(f"- [{cat}] {content}{sim}")
+                        date = (r.created_at or "")[:10]
+                        date_s = f"[{date}] " if date else ""
+                        lines.append(f"- {date_s}[{cat}] {content}{sim}")
                     sections.append("## Recalled Memories\n" + "\n".join(lines))
                 body = "\n\n".join(sections)
             except Exception as e:

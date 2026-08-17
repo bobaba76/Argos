@@ -232,13 +232,13 @@ GRAPH_SEARCH_SCHEMA = {
     "description": (
         "Search the relationship graph for connections between people, tools, "
         "concepts, and entities in the user's life. Use this to find how things "
-        "relate (e.g., 'who is Pat' or 'what tools does the user use'). "
+        "relate (e.g., 'who is Entity-B' or 'what tools does the user use'). "
         "Returns edges showing source -> relation -> target."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "term": {"type": "string", "description": "Entity name to search for (e.g., 'Pat', 'FocusTool')."},
+            "term": {"type": "string", "description": "Entity name to search for (e.g., 'Entity-B', 'FocusTool')."},
         },
         "required": ["term"],
     },
@@ -255,7 +255,7 @@ GRAPH_QUERY_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "entity_id": {"type": "string", "description": "Entity name or ID to start from (e.g., 'Pat', 'memory:<id>')."},
+            "entity_id": {"type": "string", "description": "Entity name or ID to start from (e.g., 'Entity-B', 'memory:<id>')."},
             "depth": {"type": "integer", "description": "Traversal depth from 1 to 4 (default: 2)."},
             "limit": {"type": "integer", "description": "Maximum nodes/edges to return (default: 100)."},
         },
@@ -556,7 +556,7 @@ class HybridMemoryProvider(MemoryProvider):
             },
             {
                 "key": "alias_expansion_boost",
-                "description": "Minimum similarity floor for alias-expanded candidates (identity mappings like 'my role'→'Sam'). Alias expansion is definitive, not fuzzy — the candidate IS about the query entity, so its similarity is floored to this value when the raw embedding similarity is lower.",
+                "description": "Minimum similarity floor for alias-expanded candidates (identity mappings like 'my role'→'Entity-A'). Alias expansion is definitive, not fuzzy — the candidate IS about the query entity, so its similarity is floored to this value when the raw embedding similarity is lower.",
                 "default": "0.7",
                 "required": False,
             },
@@ -1311,7 +1311,7 @@ class HybridMemoryProvider(MemoryProvider):
         try:
             # Entity alias resolution: expand the query with canonical
             # entity names for any aliases found in the query text.
-            # Example: "tell me about my role" → also search for "Sam"
+            # Example: "tell me about my role" → also search for "Entity-A"
             alias_expansions: list[str] = []
             if hasattr(self._store, "resolve_aliases"):
                 canonicals = self._store.resolve_aliases(effective_query)
@@ -1413,7 +1413,7 @@ class HybridMemoryProvider(MemoryProvider):
                 # Graph-only candidate injection. Two guards prevent noise:
                 # 1. graph_inject_candidates must be true (the global gate),
                 #    OR the candidate came from alias expansion specifically
-                #    (the Ticket 1 path:  "Entity-A"→ "my role" → graph IDs).
+                #    (the Ticket 1 path: "Entity-A" → "my role" → graph IDs).
                 # 2. The candidate's semantic similarity to the query must
                 #    clear graph_boost_min_similarity — a precision guard
                 #    that stops unrelated graph neighbors from being injected.
@@ -1474,7 +1474,7 @@ class HybridMemoryProvider(MemoryProvider):
                 for record in results:
                     # Alias-expanded candidates: alias expansion is a
                     # definitive identity mapping (e.g. "my role" =
-                    # "Sam"), not a fuzzy graph neighbor.  The raw
+                    # "Entity-A"), not a fuzzy graph neighbor.  The raw
                     # embedding similarity is low only because the memory
                     # text doesn't contain the query word — but semantically
                     # it IS about the query entity.  Floor the similarity
@@ -1831,8 +1831,8 @@ class HybridMemoryProvider(MemoryProvider):
         so short memories don't pay the token cost.
 
         Also extracts role→canonical-name aliases at index time: when a
-        memory contains "my role is Sam" or "Role is Entity-A", writes
-        add_alias("my role", "Sam") so that searching for "Entity-A"
+        memory contains "my role is Entity-A" or "Role is Entity-A", writes
+        add_alias("my role", "Entity-A") so that searching for "Entity-A"
         also finds memories that say "my role" without naming Entity-A.
         """
         graph = getattr(self, "_graph", None)
@@ -1855,7 +1855,7 @@ class HybridMemoryProvider(MemoryProvider):
         # Index-time alias expansion: extract role→canonical-name mappings
         # from the same content and write aliases so both directions work:
         #   alias→canonical (query "my role" → matches Entity-A) [already works]
-        #   canonical→alias (query  "Entity-A"→ matches "my role") [NEW]
+        #   canonical→alias (query "Entity-A" → matches "my role") [NEW]
         self._extract_role_aliases(content, tags or [])
 
     def _extract_role_aliases(
@@ -1863,10 +1863,10 @@ class HybridMemoryProvider(MemoryProvider):
     ) -> None:
         """Extract role→canonical-person aliases from memory content.
 
-        When a memory contains a pattern like "my role is Sam" or
-        "Role is Entity-A", writes add_alias("my role", "Sam") so that:
+        When a memory contains a pattern like "my role is Entity-A" or
+        "Role is Entity-A", writes add_alias("my role", "Entity-A") so that:
         - searching "my role" resolves to Entity-A (alias→canonical)
-        - searching  "Entity-A"also finds memories mentioning "my role"
+        - searching "Entity-A" also finds memories mentioning "my role"
           (canonical→alias, via aliases_for_canonical at query time)
 
         Guards against over-minting:
@@ -2400,7 +2400,7 @@ def _build_location_hint() -> str:
 
     Resolves the location fresh each turn via ``hermes_location._resolve_location_name()``
     (bypassing the module-level cache) so that a mid-session
-    ``hermes config set location  "City-X"`` is picked up on the very next
+    ``hermes config set location "City-X"`` is picked up on the very next
     turn — even in a long-lived CLI session.
 
     Returns ``""`` when unset or on any failure. Kept to one short line

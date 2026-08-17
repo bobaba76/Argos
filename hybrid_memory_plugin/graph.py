@@ -187,7 +187,7 @@ def extract_graph_relations(
             },
         })
 
-    # Relationships: "Pat is my role", "my advisor is Entity-B",
+    # Relationships: "Entity-B is my role", "my advisor is Entity-B",
     # "I am related to Entity-B", and equivalent generated memory wording.
     relationship = re.compile(
         r"\b([A-Za-z][A-Za-z0-9'_-]*(?:\s+[A-Za-z][A-Za-z0-9'_-]*)?)"
@@ -213,7 +213,7 @@ def extract_graph_relations(
     # The name group MUST start with a capital letter to prevent matching
     # "boss is expecting", "doctor is happy", "ex is a director" etc. —
     # those are verbs/adjectives, not names. The role word is case-insensitive
-    # (matches both "Wife" and "wife") but the name is NOT.
+    # (matches both "Role" and "role") but the name is NOT.
     bare_role = re.compile(
         r"\b(?i:(wife|husband|partner|boyfriend|girlfriend|ex|boss|advisor|"
         r"doctor|doc|teacher|mentor|friend|colleague|manager|supervisor|"

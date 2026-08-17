@@ -1,7 +1,7 @@
 """Hybrid Memory provider plugin — DuckDB + Kuzu + local embeddings.
 
 Three-tier local memory for anything the user discusses — personal life,
-work, tech, hobbies, health, relationships, goals. Fully offline storage
+work, tech, hobbies, relationships, goals. Fully offline storage
 (no cloud, no API keys). Vector search via DuckDB's list_cosine_similarity
 with text-search fallback. Relationship graph via Kuzu. Embeddings via
 sentence-transformers with graceful degradation. Auto-extraction uses
@@ -167,7 +167,7 @@ SAVE_SCHEMA = {
         "a lasting preference, personal detail, tool choice, relationship fact, "
         "insight, goal, or any information worth recalling in future conversations. "
         "Do not store transient chit-chat. The content should be a clear, "
-        "self-contained statement. For non-trivial reasoning (medical, attributetic, "
+        "self-contained statement. For non-trivial reasoning (technical, analytical, "
         "decision-making), include the REASONING that led to the conclusion — "
         "what evidence supports it, what was ruled out, and the uncertainty level. "
         "Long content (200-800 chars) is fine and encouraged for complex topics."
@@ -886,7 +886,7 @@ class HybridMemoryProvider(MemoryProvider):
             "# Hybrid Memory (Local)\n"
             f"Active. Relationship graph: {graph_status}.\n"
             "You have persistent memory of this user from past conversations — "
-            "any topic: personal life, work, tech, health, hobbies, relationships. "
+            "any topic: personal life, work, tech, hobbies, relationships. "
             "Relevant memories are auto-injected before each turn. For deeper or "
             "multi-hop lookups, call memory_search with different wording.\n"
             "Categories: personal_fact (stable facts), preference (how they like things), "
@@ -901,7 +901,7 @@ class HybridMemoryProvider(MemoryProvider):
             "\n"
             "## Save reasoning, not just conclusions\n"
             "When you work through a non-trivial topic with the user — technical reasoning, "
-            "analytical reasoning, trade-off analysis, decision approaches, important "
+            "analytical reasoning, trade-off analysis, decision-making, important "
             "decisions — save the REASONING CHAIN, not just the final conclusion. "
             "A bare fact like 'Fact-A might be Fact-B' is far less useful than the full "
             "reasoning: what evidence supports it, what was considered and ruled out, "

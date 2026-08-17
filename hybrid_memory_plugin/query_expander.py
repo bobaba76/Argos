@@ -49,7 +49,7 @@ _DEFAULT_SIMILARITY_FLOOR = 0.3
 _LLM_SYSTEM_PROMPT = """You are a query expansion assistant for a personal memory system.
 
 The user's memory store contains short, fragmented notes about their life,
-work, topics, relationships, and projects. The search uses embedding
+work, relationships, and projects. The search uses embedding
 similarity, so queries need to match the vocabulary of the stored memories.
 
 Your job: rewrite the user's query into 1-3 alternative search queries that

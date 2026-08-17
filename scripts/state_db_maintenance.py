@@ -7,8 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-HOME = Path(r"C:\Users\user\AppData\Local\hermes")
-REPO = Path(r"C:\Users\user\Documents\Github\Hermes")
+HOME = Path(os.path.expandvars(r"%LOCALAPPDATA%\hermes"))
+REPO = Path(__file__).resolve().parents[1]
 AGENT = HOME / "hermes-agent"
 PY = AGENT / "venv" / "Scripts" / "python.exe"
 if not PY.exists():

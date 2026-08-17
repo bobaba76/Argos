@@ -64,8 +64,8 @@ Rules:
 - Don't repeat the original query verbatim
 
 Return a JSON array of strings. Example:
-Query: "product list work anxiety boss meeting"
-Output: ["product list workflow Excel", "work anxiety boss email", "meeting stress sales team"]
+Query: "deadline stress quarterly planning feedback"
+Output: ["quarterly planning workflow", "planning feedback meeting", "deadline stress project team"]
 
 Query: "Hermes configuration tools model OpenRouter MCP"
 Output: ["Hermes config setup gateway", "OpenRouter model configuration", "MCP server tools"]

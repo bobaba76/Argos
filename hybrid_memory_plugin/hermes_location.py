@@ -2,7 +2,7 @@
 Location resolution for Hermes.
 
 Provides a single ``get_location()`` helper that returns the user's location
-string (e.g. ``"Suburb-Y"``, ``"Riverton"``) for ambient context injection.
+string (e.g. `` "City-X"``, `` "City-Y"``) for ambient context injection.
 
 Resolution order (``location_mode: auto`` — the default):
 
@@ -12,7 +12,7 @@ Resolution order (``location_mode: auto`` — the default):
      = 2h — the user doesn't move often enough to warrant a shorter TTL):
 
      a. **Wi-Fi SSID map** — ``location_map`` in config.yaml maps a Wi-Fi
-        SSID to a place name (``{MyHomeNetwork: Suburb-Y}``). Exact match,
+        SSID to a place name (``{HomeWiFi: City-X}``). Exact match,
         deterministic, offline, zero latency. Skipped when not on Wi-Fi
         (ethernet, disconnected, non-Windows).
      b. **Windows location platform** (Wi-Fi triangulation, ~10-50m
@@ -24,8 +24,8 @@ Resolution order (``location_mode: auto`` — the default):
         Nominatim/OpenStreetMap reverse-geocode lookup.
      c. **IP geolocation fallback** — free ip-api.com lookup (no key),
         city-level accuracy (~10-20km), normalized through
-        ``location_aliases`` in config.yaml (e.g. IP says "City-Z"
-        but you want "Riverton" displayed while on that line).
+        ``location_aliases`` in config.yaml (e.g. IP says  "City-X"
+        but you want  "City-Y" displayed while on that line).
   3. ``location`` key in ``~/.hermes/config.yaml`` — static fallback used
      when detection is unavailable (offline, API down, unknown network).
 
@@ -258,8 +258,8 @@ def _reverse_geocode(lat: float, lon: float, cfg: dict) -> Optional[str]:
             data = json.loads(resp.read().decode("utf-8", "replace"))
         # Prefer the structured address object over display_name: the raw
         # first display_name element is often street-level ("16th Road"),
-        # not a place name. Suburb-first suits SA naming (Riverton and
-        # Suburb-Y are suburbs of City-Z).
+        # not a place name. Suburb-first suits SA naming (e.g. Sandton and
+        # Suburb-X are suburbs of City-Z).
         addr = data.get("address")
         if isinstance(addr, dict):
             for key in ("suburb", "city", "town", "village", "municipality", "county"):
@@ -267,7 +267,7 @@ def _reverse_geocode(lat: float, lon: float, cfg: dict) -> Optional[str]:
                 if not name:
                     continue
                 # Skip ward/sector-style administrative labels (e.g.
-                # "City-Z Ward 1"): they're not real place names and
+                # "City Ward 1"): they're not real place names and
                 # Open-Meteo can't geocode them. The next key (usually
                 # city/town) wins instead.
                 if key == "suburb" and re.search(r"\bward\b", name, re.IGNORECASE):
@@ -386,7 +386,7 @@ def get_location_coords() -> Optional[Tuple[float, float]]:
     coordinate source that drives name resolution. Exposed separately so
     consumers (e.g. the weather module) can query by coordinates directly
     and never depend on a place-name string, which may be ungeocodable
-    (e.g. "City-Z Ward 1"). Never raises.
+    (e.g. "City Ward 1"). Never raises.
     """
     try:
         return _os_location()

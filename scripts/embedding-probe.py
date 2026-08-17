@@ -7,8 +7,8 @@ identifies the embedding space the DB was built with.
 import duckdb
 import numpy as np
 
-DB = r"C:\Users\user\AppData\Local\hermes\backups\hybrid-memory-20260814T102553\hybrid_memory.duckdb"
-BGE = r"C:\Users\user\AppData\Local\hermes\models\bge-small-en-v1.5"
+DB = os.path.expandvars(r"%LOCALAPPDATA%\hermes\hybrid_memory.duckdb")
+BGE = os.path.expandvars(r"%LOCALAPPDATA%\hermes\models\bge-small-en-v1.5")
 MQA = "sentence-transformers/multi-qa-MiniLM-L6-cos-v1"
 
 con = duckdb.connect(DB, read_only=True)

@@ -89,7 +89,7 @@ def _valid_graph_entity(value: str) -> bool:
         return False
     # Entity extraction should produce names or short noun phrases, not a
     # sentence/paragraph accidentally captured by a broad pattern or LLM.
-    # Keep five-word goals such as "know more about the watcher", but reject
+    # Keep five-word goals such as "learn more about marine biology", but reject
     # longer payloads before they can create visible graph noise.
     if len(words) >= 6 or len(cleaned) >= 80:
         return False
@@ -1584,7 +1584,7 @@ class KuzuGraphStore:
                 or len(node_id.strip()) >= 80
             )
             # Recognized extractor-leak payloads that the generic heuristics
-            # can't isolate from legitimate short names (e.g. "Tom").
+            # can't isolate from legitimate short names (e.g. "Entity-A").
             curated_leak = str(node_id).strip() in self._CURATED_JUNK_ENTITY_IDS
             if (
                 first_word in self._JUNK_ENTITY_PREFIXES

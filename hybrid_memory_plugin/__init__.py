@@ -2331,7 +2331,7 @@ def _build_location_hint() -> str:
 
     Resolves the location fresh each turn via ``hermes_location._resolve_location_name()``
     (bypassing the module-level cache) so that a mid-session
-    ``hermes config set location "Riverton"`` is picked up on the very next
+    ``hermes config set location  "City-X"`` is picked up on the very next
     turn — even in a long-lived CLI session.
 
     Returns ``""`` when unset or on any failure. Kept to one short line
@@ -2379,6 +2379,42 @@ def _build_file_activity_hint() -> str:
         return ""
 
 
+def _build_coder_directive(user_message: str = "") -> str:
+    """Per-turn coder-MCP usage directive (conditional).
+
+    The coder MCP tools are registered but deferred behind Hermes'
+    ``tool_search`` bridge — the model only reaches for them when told to.
+    This returns a short instruction to prefer ``mcp__coder__*`` for code
+    questions whenever the turn looks code-adjacent (indexed repo names,
+    code terms, or an explicit coder mention).  Returns ``""`` otherwise,
+    so non-coding chats cost nothing.
+
+    Keep the repo-name list in sync as new repos get indexed.
+    """
+    text = (user_message or "").lower()
+    repo_signals = (
+        "salesdash", "miser", "codebrain", "hybrid-memory", "hybrid_memory",
+        "hermes-agent", "longmemeval", "documents\\github", "documents/github",
+        "github\\", "github/", "coder mcp", "coder",
+    )
+    code_signals = (
+        "traceback", "refactor", "compile", "exception", "semantic search",
+        "find_symbols", "callers", "callees", "impact_analysis", "reindex",
+        "symbol", "kuzu", "duckdb", "lancedb", "embedding",
+    )
+    if not (any(s in text for s in repo_signals) or any(s in text for s in code_signals)):
+        return ""
+    return (
+        "Tooling note: for code questions about indexed repos (SalesDash, Coder, "
+        "Stock, Miser, Hermes, hermes-agent) prefer the coder MCP tools — "
+        "mcp__coder__semantic_code_search, mcp__coder__find_symbols, "
+        "mcp__coder__get_callers_and_callees, mcp__coder__impact_analysis, "
+        "mcp__coder__unified_context — loaded via tool_search when not active, "
+        "before falling back to grep/search_files. Coder only covers repos it "
+        "has already indexed."
+    )
+
+
 def _on_pre_llm_call(**kwargs) -> dict:
     """``pre_llm_call`` hook — build ambient context hints synchronously.
 
@@ -2406,6 +2442,12 @@ def _on_pre_llm_call(**kwargs) -> dict:
                 parts.append(line)
         except Exception:
             pass  # never let one hint break the others
+    try:
+        coder_line = _build_coder_directive(kwargs.get("user_message", ""))
+        if coder_line:
+            parts.append(coder_line)
+    except Exception:
+        pass  # directive failure must never suppress ambient hints
     if not parts:
         return {}
     return {"context": "\n".join(parts)}

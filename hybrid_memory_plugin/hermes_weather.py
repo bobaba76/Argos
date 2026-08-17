@@ -301,7 +301,7 @@ def get_weather() -> str:
         return ""
 
     # Prefer exact OS coordinates: weather by lat/lon never depends on a
-    # place-name string, so an ungeocodable name (e.g. "City-Z Ward
+    # place-name string, so an ungeocodable name (e.g. "City Ward
     # 97") can't kill the weather line.
     coords = get_location_coords() if get_location_coords is not None else None
     if coords:

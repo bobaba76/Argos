@@ -2,7 +2,7 @@
   "bundle_version": 3,
   "upstream": {
     "version": "0.20.0",
-    "base_commit": "6bdeb2df24d2d1d47cc08862a6bbc3171105746b"
+    "base_commit": "a84cecdc7253e09b16b24cae259caadf2d75fcfe"
   },
   "core_patches": [
     {

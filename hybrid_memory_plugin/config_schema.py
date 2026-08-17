@@ -276,5 +276,25 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Soft token cap per chain unfold (rough 4 chars/token estimate).",
             group="Chains",
         ),
+        ProviderField(
+            key="chain_unfold_top_k",
+            label="Chain unfold top-K",
+            kind=KIND_TEXT,
+            default="3",
+            description="How many top search results to scan for a chain anchor (1-20). The per-candidate similarity floor is the precision guard.",
+            group="Chains",
+        ),
+        ProviderField(
+            key="chain_unfold_query_fallback",
+            label="Chain unfold query fallback",
+            kind=KIND_SELECT,
+            default="false",
+            description="When no top-K result has a chain, search deeper for a chain matching the query (same similarity floor).",
+            options=(
+                ProviderFieldOption("false", "Off"),
+                ProviderFieldOption("true", "On (deeper search fallback)"),
+            ),
+            group="Chains",
+        ),
     ),
 )

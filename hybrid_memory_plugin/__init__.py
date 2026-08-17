@@ -89,6 +89,8 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "chain_unfold_min_similarity": "0.30",
         "chain_max_versions": "3",
         "chain_max_inject": "150",
+        "chain_unfold_top_k": "3",
+        "chain_unfold_query_fallback": "false",
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
@@ -421,6 +423,12 @@ class HybridMemoryProvider(MemoryProvider):
         self._chain_unfold_min_similarity: float = 0.30
         self._chain_max_versions: int = 3
         self._chain_max_inject: int = 150  # soft token cap per chain
+        # Recall rebalance (2026-08-17): scan top-K results for a chain
+        # anchor instead of top-1 only, with an optional query-side
+        # fallback that searches deeper when no top-K result has a chain.
+        # The 0.30 per-candidate floor is the precision guard.
+        self._chain_unfold_top_k: int = 3
+        self._chain_unfold_query_fallback: bool = False
         self._chain_unfolded_stats: Dict[str, int] = {
             "count": 0, "tokens_injected": 0,
         }
@@ -806,6 +814,15 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._chain_max_inject = 150
+        try:
+            self._chain_unfold_top_k = max(
+                1, min(int(self._config.get("chain_unfold_top_k", 3)), 20)
+            )
+        except (TypeError, ValueError):
+            self._chain_unfold_top_k = 3
+        self._chain_unfold_query_fallback = str(
+            self._config.get("chain_unfold_query_fallback", "false")
+        ).lower() in {"1", "true", "yes", "on"}
 
         # Reranker (lazy — model loads on first rerank call).
         if self._reranker_enabled:
@@ -1098,11 +1115,59 @@ class HybridMemoryProvider(MemoryProvider):
             lines.append(f"v{i}{marker}: {content}")
         return "\n".join(lines)
 
+    def _find_chain_anchor(self, results: List[Any], top_k: int) -> str | None:
+        """Scan the top-K search results for the first one with a chain at
+        >= the similarity floor. Returns the memory_id of the chain head, or
+        None. The per-candidate floor is the precision guard — a chain only
+        unfolds when the hit is genuinely about the query.
+        """
+        candidates = results[:top_k]
+        if not candidates or self._store is None:
+            return None
+        try:
+            membership = self._store.get_chain_membership(
+                [r.memory_id for r in candidates]
+            )
+        except Exception:
+            return None
+        for r in candidates:
+            raw = getattr(r, "raw_similarity", None)
+            if raw is None:
+                raw = getattr(r, "similarity", 0.0) or 0.0
+            if raw < self._chain_unfold_min_similarity:
+                continue
+            info = membership.get(r.memory_id)
+            if info and info.get("has_history"):
+                return r.memory_id
+        return None
+
+    def _query_side_chain_lookup(self, query: str) -> str | None:
+        """Fallback: search deeper for a chain matching the query.
+
+        When change-intent matched but no top-K result has a chain, probe
+        the store for a chain whose content is semantically close to the
+        query (same 0.30 cosine floor). Uses suppress_retrieval=True so the
+        deep search does NOT inflate retrieval counters. This is the
+        "latest version exists but the semantic query didn't rank it in
+        top-K" case.
+        """
+        if self._store is None:
+            return None
+        try:
+            deep = self._store.search(
+                query, limit=20, suppress_retrieval=True,
+            )
+        except Exception:
+            return None
+        if not deep:
+            return None
+        return self._find_chain_anchor(deep, len(deep))
+
     def _maybe_unfold_chain(self, query: str, results: List[Any]) -> str | None:
         """Chain-unfold trigger (budget-controlled, separate accounting).
 
         Returns a compact arc string to inject when chain_unfold is enabled,
-        the query signals change-intent, the TOP result has a chain at
+        the query signals change-intent, a TOP-K result has a chain at
         sufficient similarity, and the arc cost is within budget. Returns
         None otherwise. Chain versions pulled by the walk do NOT touch
         retrieval counters — only the separate _chain_unfolded_stats
@@ -1114,27 +1179,31 @@ class HybridMemoryProvider(MemoryProvider):
         Tightened to: TOP-1 result only, raw_similarity >= 0.30 floor
         (same convention as query-expansion's floor), so a chain only
         unfolds when the top hit is genuinely about the query.
+
+        Recall rebalance (2026-08-17): the top-1 gate was recall-starved
+        (eval 100% precision / 20% recall — 4/5 misses were
+        retrieval-driven: a real memory outranked the synthetic chain
+        seed). Widened to scan TOP-K results (default K=3) for a chain
+        anchor at >= 0.30, with an optional query-side fallback that
+        searches deeper when no top-K result has a chain. The 0.30
+        per-candidate floor is the precision guard — it targets exactly
+        the measured failure class (chain ranked 2-4 behind a stronger
+        real memory) without re-opening the false-trigger hole.
         """
         if self._chain_unfold == "off" or not results or self._store is None:
             return None
         if self._chain_unfold == "auto" and not self._change_intent_match(query):
             return None
-        top = results[0]
-        # Similarity floor: the top hit must be a genuine match, not a
-        # low-similarity filler that happens to carry a chain.
-        top_raw = getattr(top, "raw_similarity", None)
-        if top_raw is None:
-            top_raw = getattr(top, "similarity", 0.0) or 0.0
-        if top_raw < self._chain_unfold_min_similarity:
+        # Scan top-K results for a chain anchor at >= similarity floor.
+        target_id = self._find_chain_anchor(results, self._chain_unfold_top_k)
+        # Query-side fallback: if no anchor in top-K, search deeper for a
+        # chain whose content is semantically close to the query. Catches
+        # the "chain exists but didn't rank in top-K" case without
+        # lowering the per-candidate similarity floor.
+        if target_id is None and self._chain_unfold_query_fallback:
+            target_id = self._query_side_chain_lookup(query)
+        if target_id is None:
             return None
-        try:
-            membership = self._store.get_chain_membership([top.memory_id])
-        except Exception:
-            return None
-        info = membership.get(top.memory_id)
-        if not info or not info.get("has_history"):
-            return None
-        target_id = top.memory_id
         try:
             versions = self._store.get_memory_history(
                 target_id, max_versions=self._chain_max_versions,

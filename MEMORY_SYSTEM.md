@@ -48,7 +48,7 @@ Retrieval combines:
 Memories are indexed into a KuzuDB graph at save time. The graph stores:
 - **Entity nodes** — people, places, concepts, organizations extracted from
   memory content.
-- **Typed relations** — `married_to`, `works_at`, `has_attribute`, etc.
+- **Typed relations** — `married_to`, `works_at`, `uses`, `has_attribute`, etc.
 - **Alias mappings** — "my role" → "Entity-A" so a query for either finds
   memories mentioning the other.
 - **Memory-to-entity links** — each memory node links to the entities it

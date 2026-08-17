@@ -3,7 +3,7 @@
 Stage 1 — Generic syntactic regex patterns (fast, local, zero latency).
     Matches the *syntactic shape* of durable statements, not topic-specific
     keywords.  Works across ANY domain: personal life, work, tech, hobbies,
-    finance, health, etc.  Catches ~80% of durable facts.
+    finance, hobbies, etc.  Catches ~80% of durable facts.
 
 Stage 2 — LLM fallback (higher recall, adds latency + token cost).
     If Stage 1 found zero or very few facts AND the user's message is
@@ -77,7 +77,7 @@ _TRIVIAL_FACTS = frozenset({
 # Content that looks like a sentence fragment (starts with lowercase,
 # no subject, or is a partial clause).
 _FRAGMENT_RE = re.compile(
-    r'^(?:the item|the\s+list|i\'ll\s|let me|so\s+now|that\'s\s+why'
+    r'^(?:the\s+list|i\'ll\s|let me|so\s+now|that\'s\s+why'
     r'|which\s+means|because\s+|so\s+that|in\s+order\s+to)',
     re.IGNORECASE,
 )
@@ -288,10 +288,10 @@ _ONGOING_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "I was attributeed with X" — still useful but now just one of many patterns.
+# "I have/own/use/take X" — generic attribute extraction.
 _ATTRIBUTE_RE = re.compile(
-    r'\b(?:i\s+(?:was\s+attributeed\s+with|\'ve\s+been\s+attributeed\s+with)\s+)'
-    r'(.+?)(?:\.|$)',
+    r'\b(?:i\s+(?:have|own|use|take)\s+)'
+    r'(.+?)(?:[.,;]|$)',
     re.IGNORECASE,
 )
 
@@ -334,16 +334,16 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
                 "payload": {"old": old, "new": new, "event_type": "switch"},
             }
 
-    # Attributeis (checked before generic "I have" to get the more specific tag).
+    # Attribute (checked before generic "I have" to get the more specific tag).
     m = _ATTRIBUTE_RE.search(sentence)
     if m:
-        condition = m.group(1).strip().rstrip('.')
-        if len(condition) > 3:
+        attribute = m.group(1).strip().rstrip('.')
+        if len(attribute) > 3:
             return {
                 "category": "personal_fact",
-                "content": f"User has: {condition}",
+                "content": f"User has: {attribute}",
                 "tags": ["personal_fact"],
-                "payload": { "attribute": condition, "fact_type": "attribute"},
+                "payload": {"attribute": attribute, "fact_type": "attribute"},
             }
 
     # Work context: "I work at Google" / "I'm working at a startup"

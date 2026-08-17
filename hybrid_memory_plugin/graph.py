@@ -1,6 +1,6 @@
 """Kuzu graph layer for hybrid memory.
 
-Stores entity and memory nodes (people, concepts, items, concepts,
+Stores entity and memory nodes (people, concepts, items, tools,
 events, organizations, places, and source memories) and RelatesTo edges
 with relation_type (e.g. "uses", "married_to", "works_at",
 "insight_about", "mentions"). Graph indexing is category-agnostic:
@@ -112,9 +112,9 @@ def _infer_graph_type(entity: str, relation: str, default: str = "concept") -> s
     """Infer a useful node type for generic extracted targets."""
     relation = relation.lower()
     entity_lower = entity.casefold()
-    if relation in {"uses", "uses"}:
+    if relation in {"uses"}:
         return "item"
-    if relation in {"has_attribute", "has_attribute"}:
+    if relation in {"has_attribute"}:
         return "attribute"
     if relation in {"works_at", "employed_by"}:
         return "organization"
@@ -287,20 +287,20 @@ def extract_graph_relations(
         add("user", "person", relation, thing, target_type)
 
     # Attributes and item/tool usage.
-    attributeis = re.search(
-        r"\b(?:i|user)\s+(?:was\s+attributeed\s+with|has|have)\s+"
-        r"(?:a\s+attributeis\s+of\s+)?(.+?)(?:[.,;]|$)",
+    attribute = re.search(
+        r"\b(?:i|user)\s+(?:has|have)\s+"
+        r"(?:a\s+(?:trait|preference|skill|interest)\s+of\s+)?(.+?)(?:[.,;]|$)",
         text,
         re.IGNORECASE,
     )
-    attributeis_context = re.search(
-        r"\b(?:attribute|condition|depression|anxiety|adhd|bipolar|ptsd|ocd)\b",
+    attribute_context = re.search(
+        r"\b(?:attribute|trait|preference|skill|interest)\b",
         text,
         re.IGNORECASE,
     )
-    if attributeis and attributeis_context:
-        condition = re.split(r"\s+(?:and|but|for)\s+", attributeis.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
-        add("user", "person", "has_attribute", condition, "attribute")
+    if attribute and attribute_context:
+        attr = re.split(r"\s+(?:and|but|for)\s+", attribute.group(1), maxsplit=1, flags=re.IGNORECASE)[0]
+        add("user", "person", "has_attribute", attr, "attribute")
 
     usage_pattern = re.compile(
         r"(?:\b(?:i|user)\s+|\band\s+)(take|takes|use|uses|own|owns|have|has|"

@@ -12,7 +12,7 @@ else:
 
 _SENSITIVE_RE = re.compile(
     r"\b(?:financial|salary|password|secret|private|personal|confidential|"
-    r"sensitive|classified|internal|restricted|proprietary|relationship|"
+    r"sensitive|classified|internal|restricted|proprietary|"
     r"wife|husband|partner|girlfriend|boyfriend|age|birthday|location|lives\s+in|"
     r"works?\s+(?:at|for)|job|identity|name)\b",
     re.IGNORECASE,

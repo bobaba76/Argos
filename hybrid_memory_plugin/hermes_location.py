@@ -2,7 +2,7 @@
 Location resolution for Hermes.
 
 Provides a single ``get_location()`` helper that returns the user's location
-string (e.g. `` "City-X"``, `` "City-Y"``) for ambient context injection.
+string (e.g. ``"City-X"``, ``"City-Y"``) for ambient context injection.
 
 Resolution order (``location_mode: auto`` — the default):
 
@@ -24,8 +24,8 @@ Resolution order (``location_mode: auto`` — the default):
         Nominatim/OpenStreetMap reverse-geocode lookup.
      c. **IP geolocation fallback** — free ip-api.com lookup (no key),
         city-level accuracy (~10-20km), normalized through
-        ``location_aliases`` in config.yaml (e.g. IP says  "City-X"
-        but you want  "City-Y" displayed while on that line).
+        ``location_aliases`` in config.yaml (e.g. IP says "City-X"
+        but you want "City-Y" displayed while on that line).
   3. ``location`` key in ``~/.hermes/config.yaml`` — static fallback used
      when detection is unavailable (offline, API down, unknown network).
 

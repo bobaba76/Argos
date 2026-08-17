@@ -2145,8 +2145,8 @@ class DuckDBMemoryStore:
     def add_alias(self, alias: str, canonical_entity: str) -> None:
         """Map an alias to a canonical entity name.
 
-        Example: add_alias("my role", "Sam") means that searching for
-        "my role" will also match graph entities for "Sam".
+        Example: add_alias("my role", "Entity-A") means that searching for
+        "my role" will also match graph entities for "Entity-A".
         """
         alias = alias.strip().lower()
         canonical = canonical_entity.strip()
@@ -2187,7 +2187,7 @@ class DuckDBMemoryStore:
         """Given a text query, return canonical entity names for any aliases
         found in the text.
 
-        Example: resolve_aliases("tell me about my role") → ["Sam"]
+        Example: resolve_aliases("tell me about my role") → ["Entity-A"]
         """
         if not text:
             return []
@@ -2219,8 +2219,8 @@ class DuckDBMemoryStore:
     def aliases_for_canonical(self, canonical_entity: str) -> List[str]:
         """Return all aliases that map to a canonical entity name.
 
-        This is the reverse of resolve_aliases: given "Sam", returns
-        ["my role", "the role"] — so a search for  "Entity-A"can also
+        This is the reverse of resolve_aliases: given "Entity-A", returns
+        ["my role", "the role"] — so a search for "Entity-A" can also
         search for memories that mention "my role" without naming Entity-A.
         """
         canonical = canonical_entity.strip().lower()

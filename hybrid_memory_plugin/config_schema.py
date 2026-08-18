@@ -21,6 +21,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
     name="hybrid_memory",
     label="Argos (Local)",
     storage=STORAGE_FLAT_JSON,
+    config_file="hybrid_memory.json",
     fields=(
         ProviderField(
             key="local_embedding_model",

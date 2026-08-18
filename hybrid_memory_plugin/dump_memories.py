@@ -311,7 +311,7 @@ def main():
     home = Path(args.home) if args.home else _get_hermes_home()
     print()
     print("=" * 70)
-    print(f"  Hybrid Memory Dump — {home}")
+    print(f"  Argos Memory Dump — {home}")
     print("=" * 70)
     print()
 

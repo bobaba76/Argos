@@ -1,4 +1,4 @@
-"""Hybrid Memory provider plugin — DuckDB + Kuzu + local embeddings.
+"""Argos memory provider plugin — DuckDB + Kuzu + local embeddings.
 
 Three-tier local memory for anything the user discusses — personal life,
 work, tech, hobbies, relationships, goals. Fully offline storage
@@ -77,6 +77,10 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "llm_fallback": "true",
         "extraction_shadow_diff": "false",
         "auto_review": "true",
+        "stale_review_sweep_enabled": "true",
+        "stale_review_interval_min": "15",
+        "stale_review_min_age_min": "30",
+        "stale_review_max_batch": "25",
         "graph_aware_retrieval": "true",
         "graph_retrieval_boost": "0.0",
         "graph_inject_candidates": "false",
@@ -516,6 +520,31 @@ class HybridMemoryProvider(MemoryProvider):
                 "required": False,
             },
             {
+                "key": "stale_review_sweep_enabled",
+                "description": "Periodically re-review memory proposals stranded in 'pending' (e.g. after a failed/rate-limited reviewer call)",
+                "default": "true",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "stale_review_interval_min",
+                "description": "Minutes between stale-pending re-review sweeps",
+                "default": "15",
+                "required": False,
+            },
+            {
+                "key": "stale_review_min_age_min",
+                "description": "Only re-review 'pending' proposals older than this many minutes (fresh ones may still be mid-review)",
+                "default": "30",
+                "required": False,
+            },
+            {
+                "key": "stale_review_max_batch",
+                "description": "Maximum proposals re-reviewed per sweep (bounds LLM cost on a large backlog)",
+                "default": "25",
+                "required": False,
+            },
+            {
                 "key": "graph_aware_retrieval",
                 "description": "Boost memory results supported by graph entities",
                 "default": "true",
@@ -630,6 +659,32 @@ class HybridMemoryProvider(MemoryProvider):
             auto_review.lower() in ("true", "1", "yes")
             if isinstance(auto_review, str) else bool(auto_review)
         )
+        # Stale-pending review sweep: re-review proposals stranded in
+        # `pending` after a failed/rate-limited reviewer call, so a rate-limit
+        # hiccup no longer condemns a proposal to sit unreviewed forever.
+        stale_sweep = self._config.get("stale_review_sweep_enabled", "true")
+        self._stale_review_sweep_enabled = (
+            stale_sweep.lower() in ("true", "1", "yes")
+            if isinstance(stale_sweep, str) else bool(stale_sweep)
+        )
+        try:
+            self._stale_review_interval_min = max(
+                1, int(self._config.get("stale_review_interval_min", 15))
+            )
+        except (TypeError, ValueError):
+            self._stale_review_interval_min = 15
+        try:
+            self._stale_review_min_age_min = max(
+                0, int(self._config.get("stale_review_min_age_min", 30))
+            )
+        except (TypeError, ValueError):
+            self._stale_review_min_age_min = 30
+        try:
+            self._stale_review_max_batch = max(
+                1, min(int(self._config.get("stale_review_max_batch", 25)), 500)
+            )
+        except (TypeError, ValueError):
+            self._stale_review_max_batch = 25
         graph_aware = self._config.get("graph_aware_retrieval", "true")
         self._graph_aware_retrieval = (
             graph_aware.lower() in ("true", "1", "yes")
@@ -883,7 +938,7 @@ class HybridMemoryProvider(MemoryProvider):
         # The prefetch() method injects dynamic recall context separately.
         graph_status = "available" if self._graph else "unavailable"
         return (
-            "# Hybrid Memory (Local)\n"
+            "# Argos (Local)\n"
             f"Active. Relationship graph: {graph_status}.\n"
             "You have persistent memory of this user from past conversations — "
             "any topic: personal life, work, tech, hobbies, relationships. "

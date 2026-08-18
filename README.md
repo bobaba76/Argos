@@ -133,10 +133,8 @@ precision/recall, and the shared-service RPC path.
 ## Who is this for?
 
 Argos is a private, local-first memory layer — built to keep your data on
-your machine. It's used as a two-user system (Michael + Alex's Hermes
-instances share one service). If you want an agent that *actually remembers
-you* across sessions, without sending your life story to a cloud vendor,
-this is the idea.
+your machine. If you want an agent that *actually remembers* you across
+sessions, without sending your life story to a cloud vendor, this is the idea.
 
 ---
 

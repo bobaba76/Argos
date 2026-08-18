@@ -4,10 +4,19 @@
 > and never misses a thing. A fitting name for a memory system that watches
 > your whole life, keeps it, and recalls it faithfully.
 
-Argos is a **local-first, hybrid memory system** for AI agents. It combines a
-dense vector store (DuckDB) with a knowledge graph (Kùzu) to give an assistant
-persistent, entity-aware, self-evolving memory — fully offline, private, and
-yours.
+Argos is a **hybrid memory system** for AI agents. It combines a dense
+vector store (DuckDB) with a knowledge graph (Kùzu) to give an assistant
+persistent, entity-aware, self-evolving memory.
+
+**Where data lives:** all memory records, embeddings, and the relationship
+graph are stored **locally** on your machine — flat files in the Hermes home
+directory. They're never shipped to a hosted memory vendor.
+
+**Where the LLM is:** Argos calls an LLM for extraction, candidate review,
+and query expansion. Today that's the configured cloud model — there is **no
+native local-LLM support yet**. (Local embeddings via BGE-small are offline;
+the *storage* is fully local; the *LLM plumbing* is cloud until a local runtime
+is wired in.)
 
 It started life as the "Hermes Memory" / "hybrid memory" plugin; the name is
 now **Argos**. The internal identifiers (`hybrid_memory`, the database files,
@@ -131,9 +140,12 @@ precision/recall, and the shared-service RPC path.
 
 ## Who is this for?
 
-Argos is a private, local-first memory layer — built to keep your data on
-your machine. If you want an agent that *actually remembers* you across
-sessions, without sending your life story to a cloud vendor, this is the idea.
+Argos keeps all of its memory data local to your machine — you don't hand
+your memory over to a hosted memory vendor. Note that Argos itself still
+calls an LLM (today, the cloud model you configure) for extraction and
+review; native local-LLM support isn't here yet. If you want an agent that
+actually remembers you across sessions — with memory stored under your own
+control — this is the idea.
 
 ---
 

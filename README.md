@@ -62,8 +62,7 @@ machinery).
 
 Two storage modes: **`direct`** (plugin opens the DuckDB file directly,
 single-process) and **`shared_service`** (a standalone RPC service owns the
-DB; the plugin connects over a socket — multi-process safe, the default for
-two-user installs).
+DB; the plugin connects over a socket — multi-process safe, the default).
 
 ## Repository layout
 

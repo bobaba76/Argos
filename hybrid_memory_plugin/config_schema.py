@@ -19,7 +19,7 @@ from plugins.memory.config_schema import (
 
 CONFIG_SCHEMA = ProviderConfigSchema(
     name="hybrid_memory",
-    label="Hybrid Memory (Local)",
+    label="Argos (Local)",
     storage=STORAGE_FLAT_JSON,
     fields=(
         ProviderField(

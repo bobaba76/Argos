@@ -1,6 +1,6 @@
 name: hybrid_memory
 version: 1.0.0
-description: "Local-first shared memory service — one canonical DuckDB + Kùzu relationship graph with local sentence-transformers embeddings. Automatic extraction creates reviewable proposals; works across personal, work, tech, relationship, and goal contexts."
+description: "Argos — local-first shared memory service — one canonical DuckDB + Kùzu relationship graph with local sentence-transformers embeddings. Automatic extraction creates reviewable proposals; works across personal, work, tech, health, relationship, and goal contexts."
 pip_dependencies:
   - duckdb
   - kuzu

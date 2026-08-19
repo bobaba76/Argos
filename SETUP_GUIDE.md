@@ -8,6 +8,8 @@
   - `duckdb` — vector + text search storage
   - `kuzu` — relationship graph database
   - `sentence-transformers` — local embedding model (BGE-small-en-v1.5)
+- *(Optional)* `BAAI/bge-reranker-base` — cross-encoder reranker, downloaded
+  on first use only if `reranker_enabled=true` (~420MB).
 
 ## Installation
 
@@ -25,7 +27,11 @@
    ```
    hermes tools
    ```
-   You should see `memory_search`, `memory_save`, `memory_update`, `memory_chain`, and `memory_delete` in the tool list.
+   You should see all twelve `memory_*` tools: `memory_search`,
+   `memory_save`, `memory_update`, `memory_delete`, `memory_chain`,
+   `memory_graph_search`, `memory_graph_query`, `memory_candidate_list`,
+   `memory_candidate_review`, `memory_restore`, `memory_feedback`, and
+   `memory_maintenance`.
 
 ### Option B: Manual pip install
 
@@ -36,25 +42,40 @@ pip install duckdb kuzu sentence-transformers
 
 ## Configuration
 
-The config file lives at `~/.hermes/hybrid_memory.json` (created on first run with defaults). Key settings:
+The config file lives at `~/.hermes/hybrid_memory.json` (created on first run with defaults). A representative subset:
 
 ```json
 {
   "storage_mode": "shared_service",
+  "max_injected_items": "20",
+  "local_embedding_model": "BAAI/bge-small-en-v1.5",
+  "auto_extract": "true",
+  "llm_fallback": "true",
+  "auto_review": "true",
+  "graph_aware_retrieval": "true",
+  "graph_retrieval_boost": "0.0",
+  "alias_expansion_boost": "0.7",
+  "context_aware_retrieval": "true",
+  "query_expansion_enabled": "true",
+  "query_expansion_similarity_floor": "0.3",
   "chain_unfold": "auto",
-  "chain_unfold_min_similarity": 0.30,
-  "chain_unfold_top_k": 3,
-  "chain_unfold_query_fallback": true,
-  "chain_max_versions": 3,
-  "chain_max_inject": 150,
-  "graph_aware_retrieval": true,
-  "alias_expansion_boost": 0.7,
-  "query_expansion_enabled": true,
-  "context_aware_retrieval": true
+  "chain_unfold_min_similarity": "0.30",
+  "chain_unfold_top_k": "3",
+  "chain_unfold_query_fallback": "false",
+  "chain_max_versions": "3",
+  "chain_max_inject": "150",
+  "reranker_enabled": "false",
+  "consolidation_enabled": "false"
 }
 ```
 
-See `MEMORY_SYSTEM.md` for a full description of each setting.
+A few settings have different display defaults in the desktop UI schema than
+in the runtime defaults above: `max_injected_items` (UI `8` vs runtime `20`),
+`graph_retrieval_boost` (UI `0.05` vs runtime `0.0`), and `chain_unfold`
+(UI `off` vs runtime `auto`). Your saved `hybrid_memory.json` wins either way.
+
+See `MEMORY_SYSTEM.md` for the full config table and a description of every
+setting.
 
 ## Storage modes
 
@@ -83,6 +104,15 @@ The plugin uses `BGE-small-en-v1.5` by default, loaded locally (no API calls, no
    hermes tools memory_graph_query --entity "Vim"
    ```
    Should show the entity node and its relationships.
+
+4. Ambient context (time/location/weather/file-activity) is injected
+   automatically every turn via a `pre_llm_call` hook — no setup needed
+   beyond setting `location` in `~/.hermes/config.yaml` (or
+   `HERMES_LOCATION`) if you want the location/weather hints.
+
+5. Insight log: share a realization in chat ("I just realised…") and it's
+   captured as an `insight`-category memory. Browse with `/ilog` or surface
+   a random older one with `/revisit`.
 
 ## Troubleshooting
 

@@ -10,7 +10,9 @@ persistent, entity-aware, self-evolving memory.
 
 **Where data lives:** all memory records, embeddings, and the relationship
 graph are stored **locally** on your machine — flat files in the Hermes home
-directory. They're never shipped to a hosted memory vendor.
+directory. They're never shipped to a hosted memory vendor *(your memory
+store is local — though the text that becomes memory still transits the
+cloud LLM during processing)*.
 
 **Where the LLM is:** Argos calls an LLM for extraction, candidate review,
 and query expansion. Today that's the configured cloud model — there is **no

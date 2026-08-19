@@ -18,10 +18,6 @@ native local-LLM support yet**. (Local embeddings via BGE-small are offline;
 the *storage* is fully local; the *LLM plumbing* is cloud until a local runtime
 is wired in.)
 
-It started life as the "Hermes Memory" / "hybrid memory" plugin; the name is
-now **Argos**. The internal identifiers (`hybrid_memory`, the database files,
-plugin keys) are kept as the stable plumbing — the visible name is Argos.
-
 ---
 
 ## What it does

@@ -919,6 +919,15 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._chain_unfold_min_similarity = 0.30
+        # Option A semantic-arc floor: cosine(query, current-version content)
+        # that the unfolded chain must clear before the arc is injected
+        # (precision guard — filters false triggers while keeping top-K recall).
+        try:
+            self._chain_unfold_arc_min_similarity = max(
+                0.0, min(float(self._config.get("chain_unfold_arc_min_similarity", 0.15)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._chain_unfold_arc_min_similarity = 0.15
         try:
             self._chain_max_versions = max(
                 1, min(int(self._config.get("chain_max_versions", 3)), 10)
@@ -1210,6 +1219,16 @@ class HybridMemoryProvider(MemoryProvider):
         r"when did (i|you) (change|switch|start|stop|leave|move)",
         r"how come (i|you) (don't|no longer|stopped|switched)",
         r"what did i (use to|used to) (think|believe|use|like|prefer)",
+        # Current-state contrast probes: "where do I live NOW", "what car do
+        # I drive NOW", "do I STILL ..." — imply a past->present change and
+        # are the phrasing real users actually use. Added 2026-08-20 after
+        # the scaled eval showed the 8 explicit regexes rejected 90% of
+        # real change queries (recall 10%).
+        r"\b(what|where|which|who)\b[^?]*(now|currently|these days)\b",
+        r"\bhow (much|many|old|tall|long)\b[^?]*(now|currently|these days)\b",
+        r"\bdo i still\b",
+        r"\bam i still\b",
+        r"\bstill (live|drive|work|take|use|play|eat|have|go|plan)\b",
     )
 
     def _change_intent_match(self, query: str) -> bool:
@@ -1330,6 +1349,14 @@ class HybridMemoryProvider(MemoryProvider):
         if len(versions) < 2:
             return None
         arc = self._build_chain_arc(versions)
+        # Option A semantic-arc check: the chain's CURRENT version content
+        # must be semantically close enough to the query (cosine >= floor)
+        # before we inject. This is the precision guard that replaces the
+        # recall-starving top-1 rule — it filters false triggers while still
+        # scanning top-K/fallback for the actual chain. Cheap: one seek + one
+        # dot against already-loaded embedder.
+        if not self._arc_clears_similarity_floor(query, versions):
+            return None
         # Rough token estimate: ~4 chars/token.
         token_cost = max(1, len(arc) // 4)
         if token_cost > self._chain_max_inject:
@@ -1337,6 +1364,27 @@ class HybridMemoryProvider(MemoryProvider):
         self._chain_unfolded_stats["count"] += 1
         self._chain_unfolded_stats["tokens_injected"] += token_cost
         return arc
+
+    def _arc_clears_similarity_floor(self, query: str, versions: List[Any]) -> bool:
+        """Cosine(query, current-version content) >= arc floor (Option A)."""
+        try:
+            current = next((v for v in versions if getattr(v, "valid_to", None) is None), None)
+            if current is None:
+                current = versions[-1]
+            content = getattr(current, "content", "") or ""
+            if not content.strip() or self._embedder is None:
+                return True  # fail-open on missing embedder/content
+            qe = self._embedder.embed(query, is_query=True)
+            ce = self._embedder.embed(content)
+            if not qe or not ce or len(qe) != len(ce):
+                return True
+            denom = (sum(a * a for a in qe) ** 0.5) * (sum(b * b for b in ce) ** 0.5)
+            if denom <= 0:
+                return True
+            cos = sum(a * b for a, b in zip(qe, ce)) / denom
+            return cos >= self._chain_unfold_arc_min_similarity
+        except Exception:
+            return True  # fail-open: never let the guard crash inference
 
     def get_chain_unfold_stats(self) -> Dict[str, int]:
         """Return chain-unfold accounting (count + tokens injected)."""

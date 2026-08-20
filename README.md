@@ -36,7 +36,7 @@ is wired in.)
 - **Relationship graph** — memories are indexed into a Kùzu graph at save
   time: entities (people, places, concepts), typed relations
   (`married_to`, `works_at`, `uses`, …), and bidirectional alias resolution
-  (so "my wife" and her name both find the same memories).
+  (so "my partner" and their name both find the same memories).
 - **Memory evolution** — facts aren't deleted, they're *versioned*. Updates
   supersede old versions into chronological chains; `memory_chain` walks the
   arc, and `chain_unfold` auto-injects a compact history when you ask

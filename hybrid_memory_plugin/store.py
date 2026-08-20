@@ -1161,7 +1161,7 @@ class DuckDBMemoryStore:
         2. Substring containment (case-insensitive, for >20 char strings).
         3. Semantic similarity (cosine similarity on embeddings, when an
            embedder is available).  Catches paraphrased duplicates like
-           "User is married to Sam" vs "Sam is the user's wife".
+           "User is married to Sam" vs "Sam is the user's partner".
         """
         with self._lock:
             assert self.connection is not None

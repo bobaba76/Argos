@@ -20,7 +20,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = ROOT / ".devin" / "customization-manifest.json"
-PLUGIN_EXCLUDED_NAMES = ("*.duckdb", "*.wal", "*_kuzu", "__pycache__", ".pytest_cache")
+PLUGIN_EXCLUDED_NAMES = ("*.duckdb", "*.wal", "*_kuzu", "__pycache__", ".pytest_cache", "_mh_analysis.txt")
 
 
 class CustomizationError(RuntimeError):

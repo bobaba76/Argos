@@ -40,12 +40,59 @@ _GRAPH_STOP_ENTITIES = frozenset({
     "something", "someone", "people", "today", "tomorrow", "yesterday",
     "now", "then", "here", "there", "nothing", "everything",
 })
-_GRAPH_RELATIONSHIP_WORDS = frozenset({
+# Role words for "my X is Name" / "X is Name" alias extraction.
+# Expanded seed list — user-extensible via config (role_words) and
+# self-extending via LLM ambiguity gate (see _add_learned_role_word).
+_DEFAULT_ROLE_WORDS = frozenset({
     "wife", "husband", "partner", "boyfriend", "girlfriend", "ex",
     "boss", "advisor", "doctor", "doc", "teacher", "mentor", "friend",
     "colleague", "manager", "supervisor", "sibling", "brother", "sister",
     "parent", "mother", "father", "son", "daughter", "child",
+    "therapist", "shrink", "accountant", "lawyer", "coach", "physio",
+    "physiotherapist", "landlord", "roommate", "sponsor", "counselor",
+    "nurse", "carer", "caregiver", "midwife", "dentist", "pharmacist",
+    "trainer", "tutor", "professor", "intern", "assistant", "secretary",
+    "receptionist", "neighbor", "housemate", "flatmate",
 })
+# Config-driven override (set by __init__.py from hybrid_memory.json).
+# Union of defaults + user-configured + LLM-learned words.
+_role_words_override: set[str] = set()
+_role_words_lock = threading.Lock()
+
+
+def _get_role_words() -> frozenset[str]:
+    """Return the active set of role words (defaults + config + learned)."""
+    with _role_words_lock:
+        if _role_words_override:
+            return _DEFAULT_ROLE_WORDS | _role_words_override
+        return _DEFAULT_ROLE_WORDS
+
+
+def _is_role_word(word: str) -> bool:
+    """Check if a word is a known person-role word (wife, therapist, etc.)."""
+    return word.casefold() in _get_role_words()
+
+
+def _add_learned_role_word(word: str) -> None:
+    """Add a role word learned by the LLM ambiguity gate.
+
+    Thread-safe. The caller is responsible for persisting the word to
+    config so it survives restarts; this only updates the in-memory set.
+    """
+    w = word.casefold().strip()
+    if not w or len(w) < 2:
+        return
+    with _role_words_lock:
+        _role_words_override.add(w)
+
+
+def _set_role_words_override(words: set[str]) -> None:
+    """Replace the config-driven override set (called at init from config)."""
+    with _role_words_lock:
+        _role_words_override.clear()
+        _role_words_override.update(
+            w.casefold().strip() for w in words if w.strip()
+        )
 _GRAPH_TECH_TERMS = frozenset({
     "python", "javascript", "typescript", "rust", "go", "java", "react",
     "docker", "kubernetes", "vim", "neovim", "vscode", "git", "github",
@@ -84,7 +131,7 @@ def _valid_graph_entity(value: str) -> bool:
     # even though their first word is a stopword. These are valid graph
     # entities that alias to canonical person names.
     if words[0].casefold() in _GRAPH_STOP_ENTITIES:
-        if len(words) >= 2 and words[1].casefold() in _GRAPH_RELATIONSHIP_WORDS:
+        if len(words) >= 2 and _is_role_word(words[1]):
             return True
         return False
     # Entity extraction should produce names or short noun phrases, not a
@@ -128,7 +175,7 @@ def _infer_graph_type(entity: str, relation: str, default: str = "concept") -> s
         if entity_lower in _GRAPH_TECH_TERMS:
             return "technology"
         return "tool" if relation in {"has_tool", "uses"} else default
-    if relation.startswith("has_") and relation[4:] in _GRAPH_RELATIONSHIP_WORDS:
+    if relation.startswith("has_") and _is_role_word(relation[4:]):
         return "person"
     return default
 
@@ -205,7 +252,7 @@ def extract_graph_relations(
     )
     for match in my_relation.finditer(text):
         relation, name = match.group(1).lower(), match.group(2)
-        if relation in _GRAPH_RELATIONSHIP_WORDS:
+        if _is_role_word(relation):
             add("user", "person", f"has_{relation}", name, "person")
 
     # Bare role-name pattern: "Role is Entity-A", "Contact is Entity-B"
@@ -214,15 +261,17 @@ def extract_graph_relations(
     # "boss is expecting", "doctor is happy", "ex is a director" etc. —
     # those are verbs/adjectives, not names. The role word is case-insensitive
     # (matches both "Role" and "role") but the name is NOT.
+    # Broadened from a hardcoded alternation to any lowercase word — the
+    # _is_role_word() gate filters non-role words so we don't need to
+    # maintain a regex alternation in sync with the word set.
     bare_role = re.compile(
-        r"\b(?i:(wife|husband|partner|boyfriend|girlfriend|ex|boss|advisor|"
-        r"doctor|doc|teacher|mentor|friend|colleague|manager|supervisor|"
-        r"sibling|brother|sister|parent|mother|father|son|daughter|child))"
-        r"\s+is\s+([A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*)?)",
+        r"\b(?i:([a-z][a-z_-]+))\s+is\s+"
+        r"([A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*)?)",
     )
     for match in bare_role.finditer(text):
         role, name = match.group(1).lower(), match.group(2)
-        add("user", "person", f"has_{role}", name, "person")
+        if _is_role_word(role):
+            add("user", "person", f"has_{role}", name, "person")
 
     direct_relationship = re.compile(
         r"\b(?:i\s+am\s+|i\s+)?(married|dating|seeing|friends?)"
@@ -243,7 +292,7 @@ def extract_graph_relations(
     )
     for match in role_mention:
         role = match.group(1).lower()
-        if role in _GRAPH_RELATIONSHIP_WORDS:
+        if _is_role_word(role):
             add("user", "person", f"has_{role}", f"my {role}", "person", "role_mention")
 
     # Work and location.

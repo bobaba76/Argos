@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 _TEMPORAL_PATTERNS = (
     # Relative time / date-math triggers — the measured +26pp bucket.
     re.compile(r"\b(how long ago|how long has it been|how many days)\b", re.I),
-    re.compile(r"\b(when (did|was|were|is|are|was it|did i))\b", re.I),
+    re.compile(r"\bwhen (?:last |first |ever |exactly |earlier |just )?(?:did|was|were|is|are|was it|did i)", re.I),
     re.compile(r"\b(what (year|date|month|day))\b", re.I),
     re.compile(r"\b(in \d{4}|on \d{1,2}(st|nd|rd|th)? [a-z]+ \d{4})\b", re.I),
     re.compile(r"\b(before|after|since|until|by) (then|that|last|this|next)\b", re.I),

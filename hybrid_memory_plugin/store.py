@@ -5,7 +5,7 @@ and a DOUBLE[] embedding column for vector search via ``list_cosine_similarity``
 Falls back to ILIKE text search when embeddings are unavailable.
 
 Categories (general-purpose — any topic):
-  personal_fact  — stable things about the user (age, location, job, tools, traits)
+  personal_fact  — stable things about the user (age, location, job, tools, diagnoses)
   preference     — how the user likes things (tools, communication style, habits)
   insight        — self-observations, realizations, patterns noticed
   event          — notable events with date context (job changes, milestones)
@@ -825,6 +825,68 @@ class DuckDBMemoryStore:
             r.similarity = max(0.0, r.similarity + base + feedback)
         records.sort(key=lambda r: r.similarity, reverse=True)
 
+    # -- P2C: recency/supersede-aware rank demotion (flag-gated, default OFF) --
+    # Formally-superseded versions are already filtered out at retrieval time
+    # (valid_to IS NULL), so this only covers the rarer case of two UNLINKED flat
+    # memories that state the same fact (old address + new address) with separate
+    # memory_ids. When a near-duplicate pair surfaces in the same result set, the
+    # newer one should outrank the older. Gated by _P2C_ENABLED (default False) so
+    # this never changes behaviour out of the box. Cheap: token-overlap only, no
+    # LLM, no embeddings. Bounded: an older memory sinks at most a few ranks.
+    _P2C_ENABLED = False
+    _P2C_MIN_OVERLAP = 0.60        # token-Jaccard above this = "same fact"
+    _P2C_MAX_SINK = 3              # bounded: never leapfrog more than this many ranks
+    _P2C_SINK_EPSILON = 0.005      # newer must clear older by this tiny margin
+
+    @staticmethod
+    def _p2c_overlap(a: str, b: str) -> float:
+        """Token Jaccard similarity between two content strings (casefolded)."""
+        if not a or not b:
+            return 0.0
+        sa = set(a.casefold().split())
+        sb = set(b.casefold().split())
+        if not sa or not sb:
+            return 0.0
+        inter = len(sa & sb)
+        union = len(sa | sb)
+        return inter / union if union else 0.0
+
+    @staticmethod
+    def _p2c_ts(content: str) -> float:
+        """Parse an ISO created_at to an epoch float, or -inf if unparseable."""
+        if not content:
+            return float("-inf")
+        try:
+            return datetime.fromisoformat(content.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return float("-inf")
+
+    @classmethod
+    def _apply_p2c(cls, records: List[MemoryRecord]) -> None:
+        """If enabled, demote the newer member of each near-duplicate pair above the older."""
+        if not cls._P2C_ENABLED:
+            return
+        for i in range(len(records)):
+            for j in range(i + 1, len(records)):
+                ri, rj = records[i], records[j]
+                if cls._p2c_overlap(ri.content or "", rj.content or "") < cls._P2C_MIN_OVERLAP:
+                    continue
+                ti, tj = cls._p2c_ts(ri.created_at), cls._p2c_ts(rj.created_at)
+                if ti == tj:
+                    continue
+                # Identical facts at two timestamps; assert older < newer order.
+                if ti > tj:
+                    ri, rj, i, j = rj, ri, j, i  # now i is the older, j the newer
+                # Only demote when the older currently ranks higher AND the pair
+                # is within the bounded sink window (no big leapfrogs).
+                if i < j and (j - i) <= cls._P2C_MAX_SINK:
+                    older, newer = records[i], records[j]
+                    # Guarantee the newer outranks the older by a small epsilon.
+                    target = min(1.0, older.similarity + cls._P2C_SINK_EPSILON)
+                    if newer.similarity < target:
+                        newer.similarity = target
+        records.sort(key=lambda r: r.similarity, reverse=True)
+
     def _record_retrieval(self, records: List[MemoryRecord]) -> None:
         """Record only memories that were actually returned to the caller."""
         if not records:
@@ -1006,7 +1068,7 @@ class DuckDBMemoryStore:
         excluded; global memories (project_id IS NULL) remain visible.
 
         When *suppress_retrieval* is True, _record_retrieval is skipped —
-        eval/attributetic runs won't inflate retrieval_count on the memories
+        eval/diagnostic runs won't inflate retrieval_count on the memories
         they search. This prevents eval self-pollution where repeated eval
         runs pump the retrieval_count of eval-relevant memories to the cap,
         flattening the retrieval signal as a discriminator.
@@ -1080,6 +1142,7 @@ class DuckDBMemoryStore:
 
         # Apply feedback weighting and recency boost, then truncate.
         self._apply_feedback_and_recency(fused)
+        self._apply_p2c(fused)  # P2C: demote older of a near-duplicate pair (flag-gated)
         final = fused[:limit]
         if not suppress_retrieval:
             self._record_retrieval(final)
@@ -1098,7 +1161,7 @@ class DuckDBMemoryStore:
         2. Substring containment (case-insensitive, for >20 char strings).
         3. Semantic similarity (cosine similarity on embeddings, when an
            embedder is available).  Catches paraphrased duplicates like
-           "User is related to Entity-B" vs "Entity-B is the user's role".
+           "User is married to Sam" vs "Sam is the user's wife".
         """
         with self._lock:
             assert self.connection is not None
@@ -1511,7 +1574,7 @@ class DuckDBMemoryStore:
 
         Used by the reviewer path to offer an approve-with-supersede option
         when a candidate is a replacement/contradiction of an existing
-        current fact (e.g. residence, employer, tools). Returns current
+        current fact (e.g. residence, employer, medication). Returns current
         (valid_to IS NULL) memories ranked by raw similarity, each with its
         chain length so the reviewer can see what would be chained behind.
         Confirm-first: this only SURFACES options; it never writes.
@@ -2145,8 +2208,8 @@ class DuckDBMemoryStore:
     def add_alias(self, alias: str, canonical_entity: str) -> None:
         """Map an alias to a canonical entity name.
 
-        Example: add_alias("my role", "Entity-A") means that searching for
-        "my role" will also match graph entities for "Entity-A".
+        Example: add_alias("my wife", "Alex") means that searching for
+        "my wife" will also match graph entities for "Alex".
         """
         alias = alias.strip().lower()
         canonical = canonical_entity.strip()
@@ -2187,7 +2250,7 @@ class DuckDBMemoryStore:
         """Given a text query, return canonical entity names for any aliases
         found in the text.
 
-        Example: resolve_aliases("tell me about my role") → ["Entity-A"]
+        Example: resolve_aliases("tell me about my wife") → ["Alex"]
         """
         if not text:
             return []
@@ -2219,9 +2282,9 @@ class DuckDBMemoryStore:
     def aliases_for_canonical(self, canonical_entity: str) -> List[str]:
         """Return all aliases that map to a canonical entity name.
 
-        This is the reverse of resolve_aliases: given "Entity-A", returns
-        ["my role", "the role"] — so a search for "Entity-A" can also
-        search for memories that mention "my role" without naming Entity-A.
+        This is the reverse of resolve_aliases: given "Alex", returns
+        ["my wife", "the wife"] — so a search for "Alex" can also
+        search for memories that mention "my wife" without naming Alex.
         """
         canonical = canonical_entity.strip().lower()
         if not canonical:

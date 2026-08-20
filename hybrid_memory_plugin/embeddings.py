@@ -39,6 +39,7 @@ _QUERY_INSTRUCTIONS: Dict[str, str] = {
     "bge-small-en-v1.5": "Represent this sentence for searching relevant passages: ",
     "bge-base-en-v1.5": "Represent this sentence for searching relevant passages: ",
     "bge-large-en-v1.5": "Represent this sentence for searching relevant passages: ",
+    "bge-m3": "Represent this sentence for searching relevant passages: ",
     "e5-small-v2": "query: ",
     "e5-base-v2": "query: ",
     "e5-large-v2": "query: ",
@@ -59,10 +60,12 @@ def _resolve_embedding_model_path(
 ) -> str:
     """Resolve a configured model name to a fully local path when possible.
 
-    Priority: explicit existing path > ``<hermes_home>/models/<name>`` > hub
-    name.  Local-first avoids the network HEAD-check sentence-transformers
-    performs when loading by hub name — which fails behind firewalls and
-    previously degraded to silent text-only search on fresh installs.
+    Priority: explicit existing path > ``<hermes_home>/models/<name>`` > HF
+    cache lookup (resolves bare names like ``bge-small-en-v1.5`` to full hub
+    names like ``BAAI/bge-small-en-v1.5``) > hub name.  Local-first avoids
+    the network HEAD-check sentence-transformers performs when loading by
+    hub name — which fails behind firewalls and previously degraded to
+    silent text-only search on fresh installs.
     """
     name = (model_name or "").strip() or _DEFAULT_MODEL
     p = Path(name)
@@ -72,7 +75,59 @@ def _resolve_embedding_model_path(
         candidate = Path(hermes_home) / "models" / Path(name).name
         if candidate.is_dir():
             return str(candidate)
+    # Bare name (no org prefix): try to resolve to a full hub name via the
+    # HF cache. This fixes "bge-small-en-v1.5" → "BAAI/bge-small-en-v1.5"
+    # so sentence-transformers can find it in the cache.
+    if "/" not in name:
+        for org in ("BAAI", "sentence-transformers"):
+            full = f"{org}/{name}"
+            if _is_in_hf_cache(full):
+                return full
     return name
+
+
+def _is_in_hf_cache(hub_name: str) -> bool:
+    """Check if a HuggingFace hub model name is present in the local cache.
+
+    sentence-transformers downloads models to the HuggingFace hub cache
+    (``~/.cache/huggingface/hub/models--<org>--<name>/snapshots/...``).
+    When a model is already cached, we can load it with
+    ``local_files_only=True`` to avoid the network HEAD-check that
+    fails behind firewalls and adds latency on every load.
+    """
+    if not hub_name or "/" not in hub_name:
+        # Short names like "bge-small-en-v1.5" (no org prefix) — check
+        # both the bare name and common org prefixes.
+        candidates = [
+            f"models--BAAI--{hub_name}",
+            f"models--sentence-transformers--{hub_name}",
+        ]
+    else:
+        org, _, model = hub_name.partition("/")
+        candidates = [f"models--{org}--{model}"]
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+    for candidate in candidates:
+        snap_dir = cache_root / candidate / "snapshots"
+        if snap_dir.is_dir() and any(snap_dir.iterdir()):
+            return True
+    return False
+
+
+def _ensure_offline_mode(resolved: str) -> None:
+    """Set HF_HUB_OFFLINE=1 when the model is in the local cache.
+
+    sentence-transformers' ``local_files_only=True`` flag does not fully
+    suppress network HEAD-checks in all versions — the underlying
+    huggingface_hub client still tries to reach huggingface.co for
+    metadata. Setting ``HF_HUB_OFFLINE=1`` (and the older
+    ``TRANSFORMERS_OFFLINE=1``) forces true offline behavior. We only
+    set it when we know the model is cached, so a genuinely uncached
+    model can still be downloaded on first use.
+    """
+    if not os.environ.get("HF_HUB_OFFLINE"):
+        if Path(resolved).is_dir() or _is_in_hf_cache(resolved):
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
 class LocalEmbedder:
@@ -140,7 +195,8 @@ class LocalEmbedder:
                 resolved = _resolve_embedding_model_path(
                     self._model_name, self._hermes_home
                 )
-                use_local_only = Path(resolved).is_dir()
+                use_local_only = Path(resolved).is_dir() or _is_in_hf_cache(resolved)
+                _ensure_offline_mode(resolved)
                 logger.info(
                     "Loading embedding model: %s (local_files_only=%s)",
                     resolved, use_local_only,
@@ -277,7 +333,8 @@ class CrossEncoderReranker:
                 resolved = _resolve_embedding_model_path(
                     self._model_name, self._hermes_home
                 )
-                use_local_only = Path(resolved).is_dir()
+                use_local_only = Path(resolved).is_dir() or _is_in_hf_cache(resolved)
+                _ensure_offline_mode(resolved)
                 model = CrossEncoder(
                     resolved, max_length=512,
                     local_files_only=use_local_only,

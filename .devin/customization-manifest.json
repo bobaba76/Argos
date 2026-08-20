@@ -39,7 +39,8 @@
       "*.wal",
       "*_kuzu",
       "__pycache__",
-      ".pytest_cache"
+      ".pytest_cache",
+      "_mh_analysis.txt"
     ]
   },
   "config": {
@@ -77,7 +78,9 @@
       "query_expansion_similarity_floor": "0.3",
       "llm_model": "",
       "llm_provider": "",
-      "entity_aliases": ""
+      "entity_aliases": "",
+      "role_words": "",
+      "role_alias_llm_fallback": "true"
     }
   },
   "tests": {

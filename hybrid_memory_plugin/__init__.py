@@ -51,7 +51,12 @@ _DEFAULT_MAX_INJECTED = 20
 # Per-memory content cap in the auto-injection block. Without this, a few
 # long memories (3000+ chars) can blow the token budget at N=20. 200 chars
 # preserves the key fact while keeping the injection block compact.
-_INJECT_CONTENT_CHAR_CAP = 200
+# Effective per-memory char cap in the injection block comes from config key
+# `inject_content_char_cap` (default 800). 200 truncated long facts on the
+# LongMemEval raw-turn corpus; 800 covers ~97% of the personal store while
+# keeping the block compact. 1200-1500 only pays off on raw-turn evals.
+_DEFAULT_INJECT_CONTENT_CHAR_CAP = 800
+_INJECT_CONTENT_CHAR_CAP = _DEFAULT_INJECT_CONTENT_CHAR_CAP  # backward-compat alias
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _AUTO_EXTRACT_PAUSE_MARKER = "hybrid_memory.auto_extract.paused"
 
@@ -72,6 +77,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "graph_dirname": "hybrid_memory_kuzu",
         "storage_mode": "shared_service",
         "max_injected_items": str(_DEFAULT_MAX_INJECTED),
+        "inject_content_char_cap": str(_DEFAULT_INJECT_CONTENT_CHAR_CAP),
         "local_embedding_model": _DEFAULT_MODEL,
         "auto_extract": "true",
         "llm_fallback": "true",
@@ -109,6 +115,8 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "llm_model": "",
         "llm_provider": "",
         "entity_aliases": "",
+        "role_words": "",
+        "role_alias_llm_fallback": "true",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -380,6 +388,25 @@ CHAIN_SCHEMA = {
     },
 }
 
+FETCH_FULL_SCHEMA = {
+    "name": "memory_fetch_full",
+    "description": (
+        "Fetch the FULL stored text of a memory by its memory_id. The recalled-"
+        "memory preview injected at the start of a turn is capped for token "
+        "budget (long memories show a head+tail preview with an [id: ...] tag). "
+        "When a previewed memory looks relevant but the preview is incomplete, "
+        "call this with its memory_id to retrieve the complete, untruncated "
+        "content. Reads existing data only — no re-ingest, no new storage."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "The memory_id shown in the recalled-memory preview ([id: ...] tag)."},
+        },
+        "required": ["memory_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -496,6 +523,12 @@ class HybridMemoryProvider(MemoryProvider):
                 "key": "max_injected_items",
                 "description": "Max memories to auto-inject per turn",
                 "default": str(_DEFAULT_MAX_INJECTED),
+                "required": False,
+            },
+            {
+                "key": "inject_content_char_cap",
+                "description": "Per-memory max chars in the auto-injected Recalled-Memories block (200 truncated long facts; 800 covers ~97% of a personal store; higher only helps raw-turn evals)",
+                "default": str(_DEFAULT_INJECT_CONTENT_CHAR_CAP),
                 "required": False,
             },
             {
@@ -639,6 +672,11 @@ class HybridMemoryProvider(MemoryProvider):
             self._max_injected = int(self._config.get("max_injected_items", _DEFAULT_MAX_INJECTED))
         except (ValueError, TypeError):
             self._max_injected = _DEFAULT_MAX_INJECTED
+
+        try:
+            self._inject_cap = int(self._config.get("inject_content_char_cap", _DEFAULT_INJECT_CONTENT_CHAR_CAP))
+        except (ValueError, TypeError):
+            self._inject_cap = _DEFAULT_INJECT_CONTENT_CHAR_CAP
 
         auto = self._config.get("auto_extract", "true")
         self._auto_extract = (
@@ -838,6 +876,24 @@ class HybridMemoryProvider(MemoryProvider):
                     logger.info("Loaded %d entity aliases from config", len(alias_map))
             except (json.JSONDecodeError, Exception) as exc:
                 logger.warning("Failed to parse entity_aliases config: %s", exc)
+
+        # Role words: load user-configured words into the graph module so
+        # _is_role_word() includes them. Defaults (therapist, accountant,
+        # lawyer, etc.) are already in _DEFAULT_ROLE_WORDS; this adds any
+        # user-configured extras and LLM-learned words persisted from prior
+        # sessions. Format: comma-separated string or JSON array.
+        role_words_cfg = str(self._config.get("role_words", "")).strip()
+        if role_words_cfg:
+            try:
+                if role_words_cfg.startswith("["):
+                    extra = json.loads(role_words_cfg)
+                else:
+                    extra = [w.strip() for w in role_words_cfg.split(",")]
+                from graph import _set_role_words_override
+                _set_role_words_override(set(extra))
+                logger.debug("Loaded %d role words from config", len(extra))
+            except Exception as exc:
+                logger.warning("Failed to parse role_words config: %s", exc)
 
         # Embedder (lazy — model loads on first embed call).
         resolved_model = _resolve_embedding_model_path(model_name, home)
@@ -1603,12 +1659,17 @@ class HybridMemoryProvider(MemoryProvider):
                     for r in results:
                         cat = r.category
                         content = r.content
-                        if len(content) > _INJECT_CONTENT_CHAR_CAP:
-                            content = content[:_INJECT_CONTENT_CHAR_CAP].rsplit(" ", 1)[0] + "..."
+                        _cap = getattr(self, "_inject_cap", _DEFAULT_INJECT_CONTENT_CHAR_CAP)
+                        if len(content) > _cap:
+                            content = content[:_cap].rsplit(" ", 1)[0] + "..."
                         sim = f" (score: {r.similarity:.2f})" if r.similarity > 0 else ""
                         date = (r.created_at or "")[:10]
                         date_s = f"[{date}] " if date else ""
-                        lines.append(f"- {date_s}[{cat}] {content}{sim}")
+                        # Expose memory_id so the agent can call memory_fetch_full
+                        # when a capped preview looks relevant but incomplete.
+                        mid = getattr(r, "memory_id", "") or ""
+                        id_s = f" [id: {mid}]" if mid else ""
+                        lines.append(f"- {date_s}[{cat}] {content}{sim}{id_s}")
                     sections.append("## Recalled Memories\n" + "\n".join(lines))
                 body = "\n\n".join(sections)
             except Exception as e:
@@ -1924,17 +1985,35 @@ class HybridMemoryProvider(MemoryProvider):
         - searching "Entity-A" also finds memories mentioning "my role"
           (canonical→alias, via aliases_for_canonical at query time)
 
+        Two-tier extraction:
+        1. Regex-fast path: known role words (from _DEFAULT_ROLE_WORDS +
+           config + previously learned) produce aliases immediately.
+        2. LLM ambiguity gate: when "my X is Name" matches but X is not a
+           known role word and Name is capitalized, a tiny LLM call checks
+           if X is a person-role. If yes, the alias is written AND X is
+           added to the role words set (self-extending) so future
+           occurrences are regex-fast. Gated by role_alias_llm_fallback
+           config flag.
+
         Guards against over-minting:
         - Only fires on has_<role> relations with a person target
         - The canonical name must start with a capital letter (a real name,
           not a verb/adjective — same guard as the bare_role pattern)
+        - Skip if the "name" is actually a role word capitalized
         - Idempotent: INSERT OR REPLACE in add_alias
         """
         store = getattr(self, "_store", None)
         if not store or not content:
             return
         try:
-            from graph import extract_graph_relations, _GRAPH_RELATIONSHIP_WORDS
+            from graph import (
+                extract_graph_relations,
+                _is_role_word,
+                _add_learned_role_word,
+                _get_role_words,
+            )
+
+            # Stage 1: regex-fast path for known role words.
             relations = extract_graph_relations(content, "context_note", tags)
             for rel in relations:
                 relation = rel.get("relation", "")
@@ -1948,8 +2027,7 @@ class HybridMemoryProvider(MemoryProvider):
                 if not canonical or not canonical[0].isupper():
                     continue
                 # Skip if the "name" is actually a role word capitalized
-                # (e.g. "Role" — not a person name)
-                if canonical.lower() in _GRAPH_RELATIONSHIP_WORDS:
+                if _is_role_word(canonical):
                     continue
                 alias = f"my {role}"
                 store.add_alias(alias, canonical)
@@ -1957,8 +2035,139 @@ class HybridMemoryProvider(MemoryProvider):
                     "Index-time alias: %r -> %r (from: %s)",
                     alias, canonical, content[:60],
                 )
+
+            # Stage 2: LLM ambiguity gate for unknown role words.
+            # Detect "my X is Name" patterns where X is NOT a known role
+            # word and Name is capitalized. These are structurally
+            # unambiguous (possessive + lowercase word + "is" + Capitalized)
+            # but the role word is unknown. A tiny LLM call classifies it.
+            llm_fallback = str(
+                self._config.get("role_alias_llm_fallback", "true")
+            ).lower() in ("true", "1", "yes")
+            if not llm_fallback:
+                return
+
+            import re as _re
+            # Match "my X is Name" where X is lowercase and Name is capitalized.
+            # This is the same pattern as my_relation in graph.py but without
+            # the role-word filter — we want the UNKNOWN ones.
+            # Note: (?i:...) on the prefix only — the name group [A-Z] must
+            # stay case-sensitive (requires a capital letter).
+            ambiguous = _re.compile(
+                r"\b(?i:(?:my|the\s+user'?s?))\s+([a-z][a-z_-]*)\s+is\s+"
+                r"([A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*)?)",
+            )
+            known_words = _get_role_words()
+            for match in ambiguous.finditer(content):
+                role_word = match.group(1).lower()
+                name = match.group(2)
+                if role_word in known_words:
+                    continue  # Already handled by Stage 1
+                if not name or not name[0].isupper():
+                    continue
+                if _is_role_word(name):
+                    continue  # "my wife is Wife" — not a real name
+                # LLM ambiguity gate: is this word a person-role?
+                if self._llm_classify_role_word(role_word):
+                    # Self-extending: add to in-memory set + persist to config
+                    _add_learned_role_word(role_word)
+                    known_words = _get_role_words()  # refresh for next iteration
+                    self._persist_learned_role_word(role_word)
+                    alias = f"my {role_word}"
+                    store.add_alias(alias, name)
+                    logger.info(
+                        "LLM-learned role alias: %r -> %r (role word: %s)",
+                        alias, name, role_word,
+                    )
         except Exception as exc:
             logger.debug("Role-alias extraction failed: %s", exc)
+
+    def _llm_classify_role_word(self, word: str) -> bool:
+        """Ask the auxiliary LLM if a word is a person-role word.
+
+        Fires only at the ambiguity gate (unknown word in "my X is Name").
+        Returns True if the LLM classifies X as a person-role (therapist,
+        accountant, coach, etc.). Never raises — returns False on any
+        failure so the alias is simply not written.
+        """
+        if not word or len(word) < 2:
+            return False
+        try:
+            from agent.auxiliary_client import call_llm
+        except ImportError:
+            return False
+        except Exception:
+            return False
+
+        prompt = (
+            f'Is "{word}" a person role word — a word that describes a '
+            f"relationship between a person and another person, like "
+            f'"wife", "therapist", "boss", "accountant", "coach"? '
+            f"Answer with only JSON: "
+            f'{{"is_role": true}} or {{"is_role": false}}'
+        )
+        try:
+            response = call_llm(
+                task="role_word_classification",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=20,
+                timeout=5.0,
+            )
+        except Exception:
+            return False
+        if response is None:
+            return False
+        try:
+            text = response.choices[0].message.content.strip()
+        except (AttributeError, IndexError, KeyError):
+            return False
+        # Parse minimal JSON or bare true/false
+        try:
+            import json as _json
+            if text.startswith("{"):
+                result = _json.loads(text)
+                return bool(result.get("is_role", False))
+            return text.lower().strip() in ("true", "yes")
+        except Exception:
+            return text.lower().strip() in ("true", "yes")
+
+    def _persist_learned_role_word(self, word: str) -> None:
+        """Persist a learned role word to hybrid_memory.json so it survives restarts.
+
+        Reads the current config, adds the word to the role_words list,
+        and writes back. Thread-safe via atomic write. Never raises —
+        persistence failure just means the word won't survive a restart
+        (it's still in the in-memory set for this session).
+        """
+        if not word:
+            return
+        try:
+            home = self._hermes_home or os.path.expanduser("~/.hermes")
+            config_path = Path(home) / "hybrid_memory.json"
+            if config_path.exists():
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            else:
+                cfg = {}
+
+            # role_words is stored as a JSON array string
+            raw = str(cfg.get("role_words", "")).strip()
+            if raw.startswith("["):
+                words = json.loads(raw)
+            elif raw:
+                words = [w.strip() for w in raw.split(",")]
+            else:
+                words = []
+
+            if word not in words:
+                words.append(word)
+                cfg["role_words"] = json.dumps(words)
+                config_path.write_text(
+                    json.dumps(cfg, indent=2), encoding="utf-8"
+                )
+                logger.debug("Persisted learned role word: %s", word)
+        except Exception as exc:
+            logger.debug("Failed to persist role word %r: %s", word, exc)
 
     def _try_graph_relationship(self, content: str) -> None:
         """Attempt to extract a relationship from content text and add to graph.
@@ -2007,6 +2216,7 @@ class HybridMemoryProvider(MemoryProvider):
             FEEDBACK_SCHEMA,
             MAINTENANCE_SCHEMA,
             CHAIN_SCHEMA,
+            FETCH_FULL_SCHEMA,
         ]
         # Always include graph tool schemas so they are registered in the
         # MemoryManager routing table at add_provider() time — before
@@ -2363,6 +2573,28 @@ class HybridMemoryProvider(MemoryProvider):
                 ],
             })
 
+        elif tool_name == "memory_fetch_full":
+            # LEVER 2: on-demand full-memory fetch. The injection preview caps
+            # content for token budget; this returns the complete stored record
+            # by id so the agent never has to act on a mangled preview. Reads
+            # existing data only (store.get_memories_by_ids), no re-ingest.
+            memory_id = args.get("memory_id", "")
+            if not memory_id:
+                return tool_error("Missing required parameter: memory_id")
+            records = self._store.get_memories_by_ids([memory_id])
+            if not records:
+                return tool_error(f"Memory not found or no longer active: {memory_id}")
+            rec = records[0]
+            return json.dumps({
+                "memory_id": rec.memory_id,
+                "category": rec.category,
+                "content": rec.content,
+                "tags": rec.tags,
+                "created_at": rec.created_at,
+                "updated_at": rec.updated_at,
+                "status": "full",
+            })
+
         elif tool_name == "memory_graph_search":
             if self._graph is None:
                 return tool_error("Relationship graph is not available")
@@ -2573,8 +2805,26 @@ def _on_pre_llm_call(**kwargs) -> dict:
     except Exception:
         pass  # directive failure must never suppress ambient hints
     if not parts:
-        return {}
-    return {"context": "\n".join(parts)}
+        result: dict = {}
+    else:
+        result = {"context": "\n".join(parts)}
+
+    # P2A intent routing: optionally return {"model", "provider"} for the
+    # answerer.  The core pre_llm_call path (agent/turn_context.py) honors a
+    # "model" key and calls switch_model() when it differs from the current
+    # answerer.  Always returns an explicit pick (smart for temporal/multi-hop,
+    # default otherwise) so turns self-correct, unless routing is disabled.
+    try:
+        from .intent_router import route_answerer
+        _cfg = _load_config()
+        _route = route_answerer(_cfg, kwargs.get("user_message", ""))
+        if _route:
+            result["model"] = _route["model"]
+            if _route.get("provider"):
+                result["provider"] = _route["provider"]
+    except Exception:
+        pass  # routing failures must never break ambient context
+    return result
 
 
 # ---------------------------------------------------------------------------

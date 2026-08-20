@@ -23,6 +23,15 @@ __pycache__/
 venv/
 env/
 
+# Diagnostic chain-unfold eval/probe files — carry personally-identifying
+# example content (names, medication) for the recall investigation.
+# NEVER commit these to a public repo; the analysis is done.
+hybrid_memory_plugin/eval/eval_chain_unfold*.py
+hybrid_memory_plugin/eval/probe_chain_miss.py
+hybrid_memory_plugin/eval/probe_cosines.py
+hybrid_memory_plugin/eval/probe_deep_search.py
+hybrid_memory_plugin/eval/probe_fp.py
+
 # Node/Electron artifacts
 node_modules/
 dist/

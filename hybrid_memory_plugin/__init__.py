@@ -678,6 +678,12 @@ class HybridMemoryProvider(MemoryProvider):
         except (ValueError, TypeError):
             self._inject_cap = _DEFAULT_INJECT_CONTENT_CHAR_CAP
 
+        chrono = self._config.get("chronological_injection", "false")
+        self._chronological_injection = (
+            chrono.lower() in ("true", "1", "yes")
+            if isinstance(chrono, str) else bool(chrono)
+        )
+
         auto = self._config.get("auto_extract", "true")
         self._auto_extract = (
             auto.lower() in ("true", "1", "yes") if isinstance(auto, str) else bool(auto)
@@ -1654,6 +1660,20 @@ class HybridMemoryProvider(MemoryProvider):
                     sections.append(confirmation)
 
                 results = self._search_memories(query, limit=max_items)
+                if results and getattr(self, "_chronological_injection", False):
+                    # P2B: on temporal/multi-hop turns, re-sort the top-k by
+                    # creation timestamp (oldest first) so the model reads a
+                    # timeline in order instead of relevance-scrambled order.
+                    # Relevance order is preserved for ordinary turns.
+                    try:
+                        from .intent_router import is_temporal_or_multihop
+                        if is_temporal_or_multihop(query):
+                            def _ts_key(r):
+                                ts = getattr(r, "created_at", None) or ""
+                                return ts
+                            results = sorted(results, key=_ts_key)
+                    except Exception:
+                        pass  # P2B is best-effort; never break injection
                 if results:
                     lines = []
                     for r in results:

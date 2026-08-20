@@ -370,5 +370,15 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             info="Example: 'opencode-go'.",
             group="Routing",
         ),
+        ProviderField(
+            key="chronological_injection",
+            label="Chronological injection (temporal)",
+            kind=KIND_BOOL,
+            default="false",
+            description="On temporal/multi-hop turns, re-sort the injected memories by timestamp (oldest first) so the model reads a timeline in order instead of relevance-scrambled order.",
+            info="Ships OFF. Fixes 'temporal whiplash' — when a 'when did / how long ago / what happened first' question retrieves memories in relevance order, the model sees events out of sequence. This only re-orders the injection for temporal queries; ordinary turns keep relevance order. No token cost; reuse of the P2A temporal classifier.",
+            inline=True,
+            group="Temporal",
+        ),
     ),
 )

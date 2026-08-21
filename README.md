@@ -1,361 +1,79 @@
-# Argos 👁️
+# Argos
 
-> **Argos** — from the hundred-eyed watchman of Greek myth who never sleeps
-> and never misses a thing. A fitting name for a memory system that watches
-> your whole life, keeps it, and recalls it faithfully.
+Persistent memory for AI agents, running on your own machine.
 
-Argos is a **hybrid memory system** for AI agents. It combines a dense
-vector store (DuckDB) with a knowledge graph (Kùzu) to give an assistant
-persistent, entity-aware, self-evolving memory — plus an ambient-context
-layer that feeds the agent live time, location, weather, and file-activity
-every turn, and an insight-log skill that captures and resurfaces personal
-realizations.
+## What Argos is
 
-**Where data lives:** all memory records, embeddings, and the relationship
-graph are stored **locally** on your machine — flat files in the Hermes home
-directory. They're never shipped to a hosted memory vendor *(your memory
-store is local — though the text that becomes memory still transits the
-cloud LLM during processing)*.
+Argos is a plugin for Hermes Agent that gives your agent a real memory. Instead of forgetting everything the moment a conversation ends, it keeps track of who you are, what you care about, and what you've told it before, and brings that back up when it's relevant. It's named after the hundred-eyed watchman from Greek myth who never slept and never missed a thing. Under the hood it combines a vector store, a knowledge graph, and local embeddings, but you don't need to know any of that to use it. You just talk to your agent, and it starts remembering.
 
-**Where the LLM is:** Argos calls an LLM for extraction, candidate review,
-and query expansion. Today that's the configured cloud model — there is **no
-native local-LLM support yet**. (Local embeddings via BGE-small are offline;
-the *storage* is fully local; the *LLM plumbing* is cloud until a local runtime
-is wired in.)
+## What it does for you
 
----
+- **Remembers facts across sessions.** Tell it once that you're allergic to shellfish or that your team ships on Fridays, and it doesn't need you to say it again. Ask "what do you know about my work schedule?" three weeks later and it'll still know.
+- **Tracks how things change over time.** If your job title changes or your address moves, Argos doesn't erase the old fact, it versions it. Ask "what changed about my role this year?" and it can walk you through the history instead of just giving you the latest snapshot.
+- **Finds things by meaning, not just keywords.** Ask "what did we agree about the budget in March?" and it searches by intent, fuses that with keyword matches, and surfaces the memory even if you never used the word "budget" when you first mentioned it.
+- **Understands relationships between things it remembers.** Ask "who works with my sister?" and it can traverse a graph of people, places, and concepts instead of just doing flat text lookup.
+- **Knows the context of right now.** It's aware of the current time in your timezone, roughly where you are, the weather, and files you've recently touched, so it can answer things like "should I bring an umbrella later?" without you spelling out where "later" and "here" mean.
+- **Catches your own realizations.** When you say something like "I just realized I've been avoiding this project because I'm scared of the scope," it logs that as an insight and can bring it back up later if the topic resurfaces. You can browse them with `/ilog` or pull one back into the conversation with `/revisit`.
+- **Cleans up after itself, reversibly.** Old or duplicate memories get quarantined rather than deleted, and you can restore them if it turns out you needed them after all.
 
-## What it does
+## How it earns trust
 
-- **Persistent memory** across sessions — the agent remembers who you are,
-  what you care about, and your *history*, not just this conversation.
-- **Hybrid search** — dense vector similarity + keyword text search, fused
-  by Reciprocal Rank Fusion, with recency / retrieval-frequency /
-  helpful-dismissed importance boosts, optional cross-encoder re-ranking,
-  and graph-supported retrieval.
-- **Relationship graph** — memories are indexed into a Kùzu graph at save
-  time: entities (people, places, concepts), typed relations
-  (`married_to`, `works_at`, `uses`, …), and bidirectional alias resolution
-  (so "my partner" and their name both find the same memories).
-- **Memory evolution** — facts aren't deleted, they're *versioned*. Updates
-  supersede old versions into chronological chains; `memory_chain` walks the
-  arc, and `chain_unfold` auto-injects a compact history when you ask
-  "what changed?".
-- **Auto-extraction + candidate review** — every turn is mined for durable
-  facts (regex first, optional LLM fallback). Proposals are *pending*, not
-  active — an auxiliary LLM auto-reviews them, obvious junk is quarantined,
-  and the rest wait for explicit approval. Nothing becomes memory silently.
-- **Reversible maintenance** — stale temporary memories and low-quality
-  duplicates can be *quarantined* (never hard-deleted) via `memory_maintenance`,
-  and restored with `memory_restore`.
-- **Ambient context** — a `pre_llm_call` hook injects per-turn hints: current
-  time (IANA-timezone-aware), configured location, weather (Open-Meteo, cached
-  ~20 min), and recently edited files. Each hint is independent and fail-soft.
-- **Insight log** — an `insight-log` skill captures personal realizations
-  verbatim and resurfaces them contextually; `/ilog` browses the log and
-  `/revisit` brings back an older insight for re-engagement.
+Memory systems fail when they either forget things that matter or remember things you never agreed to. Argos is built around not doing either.
 
-## Tools it exposes
+Nothing becomes a memory silently. Every conversation turn gets mined for durable facts, first with regex, then with an LLM fallback if needed, but what comes out of that is a *proposal*, not a stored memory. An auxiliary review step quarantines obvious junk automatically, and everything else sits pending until you explicitly approve it. Argos never puts words in your mouth and calls them memories.
 
-Twelve agent-callable tools (verified with `hermes tools`):
+Updating a fact never destroys the old version. When something changes, Argos chains a new version onto the old one instead of overwriting it. You can look at the arc, compare versions, or just ask "what changed?" and get a compact history injected automatically. Your past self doesn't get erased just because your present self said something different.
 
-| Tool | Purpose |
-|------|---------|
-| `memory_search` | Search memory by meaning (vector + text + RRF + boosts). Supports `category` and `project_id` filters. |
-| `memory_save` | Store a durable fact explicitly (with reasoning, not just conclusions). |
-| `memory_update` | Update a memory by ID — creates a new version, superseding the old. |
-| `memory_delete` | Delete a memory by ID; head deletion promotes the predecessor. |
-| `memory_chain` | Walk a memory's version arc. Modes: `arc` (compact), `versions` (full), `diff` (per-step deltas). |
-| `memory_graph_search` | Search the relationship graph for edges matching an entity term. |
-| `memory_graph_query` | Traverse the graph around an entity (depth 1–4), returning connected nodes, relations, and supporting memories. |
-| `memory_candidate_list` | List pending extraction proposals by status (`pending`, `approved`, `rejected`, `quarantined`, `pending_user_confirmation`, …). |
-| `memory_candidate_review` | Approve / reject / quarantine a proposal. Pass `supersedes_memory_id` to chain a replacement behind an existing fact. |
-| `memory_restore` | Restore a quarantined memory to active retrieval. |
-| `memory_feedback` | Mark an active memory `helpful`, `dismissed`, or `incorrect` (incorrect also detaches it from the graph). |
-| `memory_maintenance` | Preview (`dry_run=true`, default) or apply reversible quarantine of stale/duplicate memories. Never hard-deletes. |
+Cleanup is reversible too. Maintenance can quarantine stale or duplicate memories, but quarantine isn't deletion. If the cleanup was wrong, you restore it and move on.
 
-## Architecture
+And underneath all of this is a habit worth mentioning: every feature in Argos is gated by an actual measurement in the eval harness. Several ideas that sounded good on paper, plain chronological ordering, a stronger graph boost, wider context injection, got turned off because the numbers said they didn't help. That's not a failure, it's the point. Features earn their place with evidence, not intuition.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                  Provider Layer                          │
-│   (12 memory_* tools + pre_llm_call ambient hook +       │
-│    insight-log skill + /ilog, /revisit commands)         │
-├─────────────────────────────────────────────────────────┤
-│                  Retrieval Pipeline                      │
-│   prefetch → context-aware enrichment → query expansion  │
-│   → vector + text search → RRF fusion → importance       │
-│   boosts → graph boost → alias expansion → optional      │
-│   cross-encoder reranker → chain annotation →            │
-│   chain-unfold injection                                 │
-├──────────────────┬──────────────────────────────────────┤
-│   DuckDB Store   │         Kùzu Graph                   │
-│  (memory records,│   (entities, relations, aliases,      │
-│   embeddings,    │    memory-to-entity links,            │
-│   version chains,│    graph-traversal boost)             │
-│   candidates,    │                                      │
-│   feedback)      │                                      │
-└──────────────────┴──────────────────────────────────────┘
-```
+## The tools
 
-Two storage modes: **`shared_service`** (default — a standalone RPC service
-owns the DB; the plugin connects over a socket; multi-process safe) and
-**`direct`** (plugin opens the DuckDB file directly, single-process;
-diagnostics only).
+Argos exposes twelve tools your agent can call directly:
 
-## Ambient context
+| Tool | What it's for |
+|---|---|
+| `memory_search` | Hybrid vector + keyword search |
+| `memory_save` | Store a new memory |
+| `memory_update` | Version an existing memory |
+| `memory_delete` | Delete a memory; the previous version takes its place |
+| `memory_chain` | Walk a memory's version history (arc, versions, diff) |
+| `memory_graph_search` | Search the relationship graph |
+| `memory_graph_query` | Run a direct graph traversal |
+| `memory_candidate_list` | See pending extraction proposals |
+| `memory_candidate_review` | Approve or reject a proposal |
+| `memory_restore` | Bring a quarantined memory back |
+| `memory_feedback` | Tag a memory helpful, dismissed, or incorrect |
+| `memory_maintenance` | Run cleanup and dedup passes |
 
-A `pre_llm_call` hook runs on every turn and injects short, fail-soft hints
-into the user-message context (via the native `plugin_user_context` path —
-no core source patch). Each hint is built independently so a failure in one
-(weather network timeout, missing location) never suppresses the others:
+## The honest numbers
 
-- **Time** — `Current time: Friday 2026-07-31 19:55 SAST`, via `hermes_time`
-  (respects `HERMES_TIMEZONE` → `config.yaml` `timezone` → server-local).
-- **Location** — `Location: City-X`, resolved fresh each turn from
-  `HERMES_LOCATION` → `config.yaml` `location`.
-- **Weather** — `Weather: 14°C, light rain`, via `hermes_weather`
-  (geocodes location, fetches Open-Meteo; cached ~20 min; free, no API key).
-- **File activity** — `Last edited: ~/project/foo.py (4 min ago)`, via
-  `hermes_file_activity` (scans the working directory for recently modified
-  files; cached ~5 min).
+On LongMemEval_S (500 questions, judged by gpt-4o), Argos scores 70.4% overall. In the builder's own comparison against other open memory systems it came in second, behind Perseus (73.8) and ahead of Zep (63.8), though those are vendor-published numbers under different protocols, so treat the cross-system gap as directional, not a lab-controlled result.
 
-A conditional coder-MCP directive is also injected when the turn looks
-code-adjacent (indexed repo names or code terms), steering the agent toward
-the `mcp__coder__*` tools. Non-coding turns cost nothing.
+A few numbers worth knowing:
 
-## Insight log
+- 99.6% of answer-bearing memories get retrieved into the top 96 candidates. Recall isn't the weak point.
+- On the hardest category, temporal questions, it gets 82% correct across all 133 questions, under one uniform protocol.
+- The benchmark runs on synthetic conversation data. Real conversations are messier, and your results may differ.
 
-The `insight-log` skill captures personal realizations verbatim (no
-sanitizing, no judgment) when the user shares a "I just realised…" moment,
-saving them as `insight`-category memories. In future sessions it
-proactively resurfaces relevant insights when the topic overlaps.
+No claim here is "we beat vendor X." The comparison numbers are there so you can judge for yourself, not so we can win an argument.
 
-Two slash commands (registered by the plugin):
+## What it can't do yet
 
-- **`/ilog [tag]`** — list saved insights, newest first (up to 20). Optional
-  tag filter (`/ilog work`, `/ilog ex shame`).
-- **`/revisit`** — surface a random older insight (≥3 days old when
-  available) for re-engagement.
-
-## Auto-extraction pipeline
-
-Every turn (`sync_turn`) is processed by a background worker:
-
-1. **Regex extraction** — pattern-based fact detection (fast, zero cost).
-2. **LLM fallback** (optional, `llm_fallback=true`) — when regex misses, the
-   auxiliary LLM proposes facts. Adds latency + token cost; proposals stay
-   pending until reviewed.
-3. **Shadow-diff** (optional, `extraction_shadow_diff=true`) — runs LLM
-   extraction alongside regex and logs what each found that the other
-   missed. Validation mode only; does not change proposals.
-4. **Auto-review** (`auto_review=true`) — the auxiliary LLM reviews each new
-   proposal: obvious junk is quarantined, sensitive/contextless proposals
-   stay `pending_user_confirmation`, clear facts are approved.
-5. **Stale-review sweep** — periodically re-reviews proposals that have sat
-   pending too long.
-6. **Role-word learning** (`role_alias_llm_fallback=true`) — when an unknown
-   word appears in "my X is Name", the LLM is asked if X is a person-role;
-   learned words are persisted to `role_words` so future occurrences are
-   regex-fast.
-
-Proposals are never active memory until reviewed. The agent can also save
-explicitly via `memory_save`, bypassing the proposal queue.
-
-## Repository layout
-
-```
-├── hybrid_memory_plugin/        The Argos provider plugin (core of this repo)
-│   ├── __init__.py              Provider: 12 tools, retrieval pipeline, hooks
-│   ├── store.py                 DuckDB store: CRUD, search, chains, evidence,
-│   │                            candidates, feedback, consolidation
-│   ├── graph.py                 Kùzu graph: entities, relations, aliases,
-│   │                            traversal, junk-entity purge
-│   ├── embeddings.py            Local embeddings (BGE-small) + optional
-│   │                            cross-encoder reranker (BGE-reranker-base)
-│   ├── retriever.py             Retrieval seam (pluggable retriever protocol)
-│   ├── extractor.py             Regex + LLM fact/relation extraction
-│   ├── reviewer.py              Candidate review + dedup + supersede logic
-│   ├── query_expander.py        LLM query rewriting for weak results
-│   ├── config_schema.py         Config fields surfaced in the setup UI
-│   ├── memory_service.py        Shared-service RPC server
-│   ├── service_client.py        RPC client facade
-│   ├── confirmation.py          Pending-confirmation block builder
-│   ├── routing.py               Provider routing helpers
-│   ├── hermes_location.py       Ambient: location resolution
-│   ├── hermes_weather.py        Ambient: Open-Meteo weather (cached)
-│   ├── hermes_file_activity.py  Ambient: recently-edited file scan
-│   ├── backfill_graph.py        Rebuild graph from existing memories
-│   ├── rebuild_graph.py         Graph rebuild helper
-│   ├── reembed_memories.py      Re-embed all memories (model swap)
-│   ├── cleanup_memories.py      Manual cleanup utility
-│   ├── dump_memories.py         Export memories for inspection
-│   ├── migrate_gateway.py       Gateway migration helper
-│   ├── review_pending.py        Bulk review helper
-│   ├── plugin.yaml              Plugin manifest
-│   ├── skills/insight-log/      Insight-log skill (capture + recall)
-│   ├── tests/                   pytest suite (see Testing below)
-│   └── eval/                    Evaluation harness
-├── ambient_context/             Ambient-context source modules + tests
-├── tool_compression/            Compressed tool definitions (browser, code,
-│                                terminal, delegate, memory, session_search…)
-├── desktop_plugins/             Desktop-side plugins (aux-models)
-├── desktop_fix/                 Desktop fix patches
-├── scripts/                     Helper/dev scripts (apply_customizations,
-│                                backup_data, embedding-check, memory-check,
-│                                state_db_maintenance, fork-switchover)
-├── patches/                     Customization patches applied to Hermes
-├── database/                    Local DuckDB + Kùzu files (gitignored data)
-├── data/                        Runtime data (duckdb, kuzu, lancedb, manifests)
-├── SETUP_GUIDE.md               How to install & configure (start here)
-├── REINSTALL.md                 Wipe / reinstall / recovery & migration
-└── MEMORY_SYSTEM.md             Deep dive: architecture, concepts, config
-```
+Be direct about this one: your memory data, embeddings, and graph all live locally, as flat files on your machine, and never go to a hosted memory vendor. But the LLM calls Argos makes for fact extraction and review currently go through whatever cloud model you've configured in Hermes. There's no native local-LLM support yet. If you want a fully offline setup, you're not there today, only the embedding step is offline right now.
 
 ## Quick start
 
-Full instructions are in **[SETUP_GUIDE.md](SETUP_GUIDE.md)**. The short
-version:
+1. Copy the plugin folder to your Hermes plugins directory (on Windows: `%LOCALAPPDATA%\hermes\plugins\hybrid_memory`).
+2. Restart Hermes.
+3. Run `hermes tools` and confirm the twelve `memory_*` tools show up.
+4. Configure it in `hybrid_memory.json`, or through the settings UI under Memory -> Argos (Local).
 
-1. Place `hybrid_memory_plugin/` in your Hermes plugins directory
-   (`%LOCALAPPDATA%\hermes\plugins\hybrid_memory\` on Windows,
-   `~/.hermes/plugins/hybrid_memory/` on Linux/macOS).
-2. Restart Hermes — the plugin auto-installs its dependencies
-   (`duckdb`, `kuzu`, `sentence-transformers`) on first load.
-3. Verify with `hermes tools` — the twelve `memory_*` tools should appear.
-4. Configure via `hybrid_memory.json` in the Hermes home directory, or in
-   the Hermes settings UI under **Memory → Argos (Local)**.
+Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md).
 
-## Configuration
+One honest note: Argos is developed and tested on the maintainer's own build of Hermes. It only uses stock Hermes plugin APIs (the memory provider, the pre-call hook, the user-context injection path), so it's expected to work on a plain install, but a plain upstream build hasn't been through the test suite yet. If you hit something on a stock build, an issue is the fastest way to get it fixed.
 
-All settings live in `hybrid_memory.json` in the Hermes home directory. The
-defaults below are the **runtime defaults** from `_load_config()` (what runs
-when no config file is present). The desktop settings UI (`config_schema.py`)
-shows its own display defaults in a couple of cases — those are footnoted.
+## More docs
 
-> The settings panel reads the *same* `hybrid_memory.json` the running
-> service uses — what you see in the UI is what's live (no separate,
-> diverging store).
-
-### Storage
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `storage_mode` | `shared_service` | `shared_service` (RPC service owns the DB, multi-process safe) or `direct` (plugin opens DuckDB directly, single-process; diagnostics only). |
-| `database_filename` | `hybrid_memory.duckdb` | DuckDB filename (in HERMES_HOME). |
-| `graph_dirname` | `hybrid_memory_kuzu` | Kùzu graph directory (in HERMES_HOME). |
-
-### Embeddings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `local_embedding_model` | `BAAI/bge-small-en-v1.5` | Sentence-transformers model (~130MB, offline). Falls back to text search if it fails to load. |
-| `reranker_enabled` | `false` | Cross-encoder re-ranking of top candidates (~300ms/query on CPU). Experimental — evaluate before relying on it. |
-| `reranker_model` | `BAAI/bge-reranker-base` | HuggingFace reranker model (~420MB, downloaded on first use). |
-| `reranker_top_n` | `10` | Number of top candidates to re-rank (5–100). |
-
-### Retrieval
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `max_injected_items` | `20` ¹ | Max memories auto-injected as context before each turn. |
-| `context_aware_retrieval` | `true` | Prepend recent conversation context to queries with pronouns/references ("that", "he", "the thing"). Zero latency, no LLM calls. |
-| `context_window_size` | `3` | Recent user messages used as context (1–10). |
-| `context_max_chars` | `500` | Max total chars of context to prepend (100–2000). |
-| `query_expansion_enabled` | `true` | LLM rewrites weak queries into sub-queries for better recall. Fires only when top hit is below the similarity floor; cached 1h; fail-soft. |
-| `query_expansion_similarity_floor` | `0.3` | Trigger expansion when top hit similarity is below this (0.0–1.0). |
-
-### Graph
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `graph_aware_retrieval` | `true` | Boost memories supported by graph entities during normal search. |
-| `graph_retrieval_boost` | `0.0` ² | Max similarity boost for graph-supported memories (0.0–0.5). |
-| `graph_boost_min_similarity` | `0.15` | Minimum semantic similarity for a memory to receive the graph boost. |
-| `graph_inject_candidates` | `false` | Inject memories found *only* by the graph (not semantic search). Off by default — adds noise that hurt recall in benchmarks. |
-| `graph_traversal_enabled` | `true` | Enable graph-traversal boost for multi-hop retrieval. |
-| `graph_traversal_depth` | `2` | Traversal depth for graph-traversal boost. |
-| `graph_traversal_boost` | `0.60` | Boost strength for graph-traversal candidates. |
-| `alias_expansion_boost` | `0.7` | Similarity floor for alias-expanded candidates. |
-| `entity_aliases` | *(empty)* | JSON mapping of aliases → canonical entity names, e.g. `{"my role": "Entity-A"}`. |
-| `role_words` | *(empty)* | Extra role words for "my X is Name" alias extraction (comma-separated or JSON array). 40+ defaults built in; LLM-learned words auto-added. |
-
-### Chains (version evolution)
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `chain_unfold` | `auto` ³ | Auto-inject a compact version arc on change-intent queries. `off` (on-demand only), `auto` (change-intent trigger), or `always` (every chained result). |
-| `chain_unfold_min_similarity` | `0.30` | Per-candidate similarity floor for unfold (the precision guard). |
-| `chain_unfold_top_k` | `3` | How many top results to scan for a chain anchor (1–20). |
-| `chain_unfold_query_fallback` | `false` | Search deeper for a chain matching the query if no top-K result has one. |
-| `chain_max_versions` | `3` | Max versions to inject per chain unfold (1–10). |
-| `chain_max_inject` | `150` | Soft token cap per chain injection (~4 chars/token estimate). |
-
-### Extraction
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `auto_extract` | `true` | Extract memory proposals from each conversation turn. |
-| `llm_fallback` | `true` | Use the host LLM to create proposals when regex misses. Adds latency + token cost; proposals stay pending until reviewed. |
-| `extraction_shadow_diff` | `false` | Run LLM extraction in parallel with regex and log the diff (validation mode; no proposal changes). |
-| `auto_review` | `true` | Auxiliary LLM reviews new proposals; obvious junk quarantined, sensitive ones stay pending. |
-| `stale_review_sweep_enabled` | `true` | Periodically re-review proposals pending too long. |
-| `stale_review_interval_min` | `15` | Sweep interval in minutes. |
-| `stale_review_min_age_min` | `30` | Min proposal age (minutes) before it's eligible for the stale sweep. |
-| `stale_review_max_batch` | `25` | Max proposals re-reviewed per sweep. |
-| `role_alias_llm_fallback` | `true` | Ask the LLM if an unknown "my X is Name" word is a person-role; learned words persist to `role_words`. |
-
-### LLM
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `llm_model` | *(empty)* | Model ID for auxiliary LLM tasks (extraction, review, query expansion). Empty = host auxiliary default. |
-| `llm_provider` | *(empty)* | Provider override for auxiliary tasks (`openrouter`, `openai`, `anthropic`, …). Empty = host default. |
-
-### Maintenance
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `consolidation_enabled` | `false` | Reversible maintenance of expired/duplicate memories at session end. Preview with `memory_maintenance` `dry_run=true` first. |
-| `consolidation_min_age_days` | `30` | Age threshold for stale temporary memories. |
-| `consolidation_max_actions` | `25` | Max records to quarantine per run. |
-
-> ¹ The desktop UI schema shows `8` as its display default; the runtime
-> default is `20`. Your saved `hybrid_memory.json` wins either way.
-> ² The desktop UI schema shows `0.05`; the runtime default is `0.0`.
-> ³ The desktop UI schema shows `off` ("ships OFF"); the runtime default
-> is `auto`. The `memory_chain` tool is always available on-demand
-> regardless of this setting.
-
-## Testing
-
-```bash
-cd hybrid_memory_plugin
-python -m pytest tests/ -v
-```
-
-Test files and coverage:
-
-- `test_hybrid_memory.py` — store CRUD, search, dedup, version chains, cycle
-  guards, scope isolation, graph extraction, alias resolution, chain-unfold
-  trigger precision/recall.
-- `test_shared_service.py` — shared-service RPC path.
-- `test_candidate_review_integration.py` — candidate review + supersede flow.
-- `test_reviewer.py` — reviewer unit tests.
-- `test_ambient_location.py`, `test_ambient_weather.py`,
-  `test_ambient_file_activity.py` — ambient-context modules.
-
-## Who is this for?
-
-Argos keeps all of its memory data local to your machine — you don't hand
-your memory over to a hosted memory vendor. Note that Argos itself still
-calls an LLM (today, the cloud model you configure) for extraction and
-review; native local-LLM support isn't here yet. If you want an agent that
-actually remembers you across sessions — with memory stored under your own
-control — this is the idea.
-
----
-
-📖 Start with **[SETUP_GUIDE.md](SETUP_GUIDE.md)** · Deep dive in
-**[MEMORY_SYSTEM.md](MEMORY_SYSTEM.md)** · Recovery in
-**[REINSTALL.md](REINSTALL.md)**
+Settings and every configuration option live in [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md), not in this file. For how the memory system actually works under the hood, see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md). If something breaks or you need to migrate, see [REINSTALL.md](REINSTALL.md). Tests live under `hybrid_memory_plugin`, run them with `python -m pytest tests/ -v`.

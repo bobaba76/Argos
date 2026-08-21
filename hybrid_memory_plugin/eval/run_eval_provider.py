@@ -89,12 +89,12 @@ def build_arm_home(snapshot: Path, arm_cfg: dict, workdir: Path) -> Path:
     # Local-first model resolution: <hermes_home>/models/<name> must exist or
     # the embedder falls back to the hub (401/network) → silent text-only
     # search. Link the cached model from the real hermes home.
-    src_models = Path(r"C:\Users\michael\AppData\Local\hermes\models")
+    src_models = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "hermes" / "models"
     for name in ("bge-small-en-v1.5", "bge-reranker-base"):
         model_dir = src_models / name
         if not model_dir.is_dir() and name == "bge-reranker-base":
             # HF hub cache layout: models--BAAI--bge-reranker-base/snapshots/<hash>
-            hub = Path(r"C:\Users\michael\.cache\huggingface\hub") / "models--BAAI--bge-reranker-base" / "snapshots"
+            hub = Path.home() / ".cache" / "huggingface" / "hub" / "models--BAAI--bge-reranker-base" / "snapshots"
             snaps = sorted(hub.iterdir()) if hub.is_dir() else []
             if snaps:
                 model_dir = snaps[0]
@@ -116,9 +116,7 @@ def build_snapshot_graph(home: Path, use_llm: bool = False) -> int:
     use_llm=True: hybrid extraction (regex + LLM supplement) — the
     "properly typed graph" arm. SLOW: LLM per memory (~15s each).
     """
-    sys.path.insert(0, r"C:\Users\michael\Documents\Github\Hermes")
-    from hybrid_memory_plugin.store import DuckDBMemoryStore
-    from hybrid_memory_plugin.embeddings import LocalEmbedder, _resolve_embedding_model_path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from hybrid_memory_plugin.graph import KuzuGraphStore
 
     model = _resolve_embedding_model_path("bge-small-en-v1.5",
@@ -151,7 +149,7 @@ def build_snapshot_graph(home: Path, use_llm: bool = False) -> int:
 
 
 def run_arm(home: Path, eval_set: dict) -> dict:
-    sys.path.insert(0, r"C:\Users\michael\Documents\Github\Hermes")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from hybrid_memory_plugin import HybridMemoryProvider as Provider
 
     provider = Provider()
@@ -204,7 +202,7 @@ def build_typed_graph(home: Path, llm_report: dict) -> int:
     about_user edge, typed relation edges, and mentions edges — but the
     relation set comes from the LLM typing report (regex + LLM merged).
     """
-    sys.path.insert(0, r"C:\Users\michael\Documents\Github\Hermes")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from hybrid_memory_plugin.graph import KuzuGraphStore
 
     graph = KuzuGraphStore(home / "hybrid_memory_kuzu", user_id="default_user")

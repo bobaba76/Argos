@@ -1165,7 +1165,7 @@ class DuckDBMemoryStore:
         _alpha = getattr(self, "_phrase_lift_alpha", 0.0)
         if _alpha and _alpha > 0.0:
             qwords = re.findall(r"[a-z0-9']+", query.lower())
-            qwords = [w for w in qwords if w not in _PHRASE_STOPWORDS]
+            qwords = [w for w in qwords if w not in self._PHRASE_STOPWORDS]
             qbigrams = [(t0, t1) for t0, t1 in zip(qwords, qwords[1:])]
             for r in fused:
                 if not qbigrams or not r.content:

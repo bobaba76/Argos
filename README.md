@@ -74,6 +74,10 @@ Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md).
 
 One honest note: Argos is developed and tested on the maintainer's own build of Hermes. It only uses stock Hermes plugin APIs (the memory provider, the pre-call hook, the user-context injection path), so it's expected to work on a plain install, but a plain upstream build hasn't been through the test suite yet. If you hit something on a stock build, an issue is the fastest way to get it fixed.
 
+## License
+
+Argos is licensed under the **Business Source License 1.1** (BSL 1.1): free to read, modify, and self-host for personal and non-production use; production or commercial use requires a license from the author. It converts to **Apache 2.0** automatically on August 21, 2030. MIT-licensed components from the Hermes Agent base stay MIT. Full terms and the commercial-licensing contact path: [LICENSE](LICENSE).
+
 ## More docs
 
 Settings and every configuration option live in [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md), not in this file. For how the memory system actually works under the hood, see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md). If something breaks or you need to migrate, see [REINSTALL.md](REINSTALL.md). Tests live under `hybrid_memory_plugin`, run them with `python -m pytest tests/ -v`.

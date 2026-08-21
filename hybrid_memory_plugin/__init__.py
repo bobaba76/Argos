@@ -684,6 +684,12 @@ class HybridMemoryProvider(MemoryProvider):
             if isinstance(chrono, str) else bool(chrono)
         )
 
+        da = self._config.get("date_anchor_rerank", "false")
+        self._date_anchor_rerank = (
+            da.lower() in ("true", "1", "yes")
+            if isinstance(da, str) else bool(da)
+        )
+
         auto = self._config.get("auto_extract", "true")
         self._auto_extract = (
             auto.lower() in ("true", "1", "yes") if isinstance(auto, str) else bool(auto)
@@ -1739,6 +1745,19 @@ class HybridMemoryProvider(MemoryProvider):
                             results = sorted(results, key=_ts_key)
                     except Exception:
                         pass  # P2B is best-effort; never break injection
+                if results and getattr(self, "_date_anchor_rerank", False):
+                    # P2B2: date-anchored re-rank — when the temporal turn
+                    # carries an explicit date expression ("10 days ago",
+                    # "last Tuesday", "on March 2nd"), re-sort the top-k by
+                    # proximity to the resolved target date so the model
+                    # reads the right time window first. Zero-LLM; best-effort.
+                    try:
+                        from .intent_router import is_temporal_or_multihop
+                        if is_temporal_or_multihop(query):
+                            from .date_anchor import reorder_by_date
+                            results, _t, _l = reorder_by_date(results, query)
+                    except Exception:
+                        pass  # P2B2 is best-effort; never break injection
                 if results:
                     lines = []
                     for r in results:
@@ -2899,17 +2918,79 @@ def _on_pre_llm_call(**kwargs) -> dict:
     # "model" key and calls switch_model() when it differs from the current
     # answerer.  Always returns an explicit pick (smart for temporal/multi-hop,
     # default otherwise) so turns self-correct, unless routing is disabled.
+    #
+    # When router_subcall_enabled is set, genuine temporal/multi-hop queries
+    # do NOT switch the whole (expensive ~124k-token) turn to the smart model.
+    # Instead Argos makes ONE cheap smart-model sub-call on a TRIMMED context
+    # (question + a handful of dated memories) and injects the short answer
+    # back as a hint — staying on the cheap Flash answerer throughout.
     try:
         from .intent_router import route_answerer
         _cfg = _load_config()
-        _route = route_answerer(_cfg, kwargs.get("user_message", ""))
+        _q = (kwargs.get("user_message") or "").strip()
+        _route = route_answerer(_cfg, _q)
         if _route:
-            result["model"] = _route["model"]
-            if _route.get("provider"):
-                result["provider"] = _route["provider"]
+            _smart = str(_cfg.get("router_smart_model") or "").strip()
+            _subcall_on = _as_flag(cfg_value=_cfg.get("router_subcall_enabled"))
+            _is_smart = bool(_smart) and _route.get("model") == _smart
+            if _is_smart and _subcall_on:
+                _hint = _build_temporal_hint(_q)
+                if _hint:
+                    parts.append(
+                        "[Temporal fact hint (smart model, trimmed context)]\n" + _hint
+                    )
+                    result["context"] = "\n\n".join(parts)
+                # deliberately do NOT set result["model"] — stay on cheap Flash;
+                # the hint carries the temporal answer.
+            else:
+                result["model"] = _route["model"]
+                if _route.get("provider"):
+                    result["provider"] = _route["provider"]
     except Exception:
         pass  # routing failures must never break ambient context
     return result
+
+
+def _as_flag(cfg_value) -> bool:
+    """Small bool parse for plugin config strings ('true'/'1'/'yes'/'on')."""
+    if cfg_value is None:
+        return False
+    if isinstance(cfg_value, bool):
+        return cfg_value
+    return str(cfg_value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _build_temporal_hint(question: str) -> str:
+    """One trimmed smart-model sub-call; returns a short answer or "".
+
+    Retrieves a handful of dated memories for the question and asks the
+    smart model to stitch the temporal answer on that small context.
+    Fail-soft: any error returns "" (the cheap answerer just answers).
+    """
+    try:
+        from .temporal_subcall import temporal_answer, format_evidence
+
+        hint = ""
+        store = _get_insight_store()
+        if store is not None:
+            recs = []
+            try:
+                if hasattr(store, "search"):
+                    recs = store.search(question, limit=8) or []
+            except Exception:
+                recs = []
+            try:
+                store.close()
+            except Exception:
+                pass
+            if recs:
+                evidence = format_evidence(recs)
+                if evidence.strip():
+                    hint = temporal_answer(question, evidence)
+        return (hint or "").strip()
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.getLogger("hybrid_memory").warning("temporal hint build failed: %s", exc)
+        return ""
 
 
 # ---------------------------------------------------------------------------

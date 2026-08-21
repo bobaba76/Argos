@@ -4,15 +4,19 @@ Decides which ANSWERER model this turn should use, based on lightweight
 temporal / multi-hop query detection, and returns it as a ``model`` key that
 the core ``pre_llm_call`` hook path honors (see agent/turn_context.py).
 
-Design (v2 — class-based, confidence-scored):
-  * Temporal and multi-hop are scored as *evidence classes*, not literal
-    regex hits.  Verb groups (reporting/comparison), date/time NER-lite,
-    weekday/month/year tables, relative-time adverbs, and entity-pair
-    heuristics each contribute additive confidence.
-  * A SINGLE strong multi-hop signal now routes (e.g. "what did she say about
-    about the move") — the old two-marker rule let the whole class fall
-    through to Flash.  Ordinary turns score ~0 and stay on the default
-    model, preserving the cost win.
+Design (v3 — precision-fixed):
+  * v2 over-routed: a SINGLE reporting verb (said/told/asked/... = 0.35) beat
+    the 0.32 multi-hop threshold and a single relative-time weekday/month word
+    (today/morning/friday = 0.45-0.50) beat the 0.38 temporal threshold, so
+    ordinary chat was being switched to the smart model.  Probing 2026-08-21
+    with realistic casual messages showed 5/10 question-shaped casual queries
+    falsely routed to deepseek-v4-pro (openrouter) — burning real money.
+  * v3: single weak signals never route.  Multi-hop requires a reporting verb
+    AND a proper-noun entity (Alex/Devin/...) or an "about X" topic phrase.
+    Temporal requires a genuine time anchor: an actual date/year, an
+    order/interrogative structure ("when did", "how long", "between M and M"),
+    or a past-tense fact probe combined with another signal.  Bare "friday",
+    "today", "last night", "morning" in a casual question stay on Flash.
   * Thresholds are module constants, config-overridable
     (router_temporal_threshold / router_multihop_threshold).
   * Always returns an explicit model (smart for temporal/multi-hop, default
@@ -29,18 +33,11 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 # -- Default routing thresholds -------------------------------------------------
-# Temporal evidence is the strongest measured signal (+26pp bucket), so its
-# threshold is lower.  Multi-hop requires a little more confidence to avoid
-# erasing the cost win with over-routing, but a single reporting verb + entity
-# must clear it (that was the dead-class bug).
-ROUTE_TEMPORAL_THRESHOLD = 0.38
-# Multi-hop confidence above this routes to the smart model.
-# NOTE: deliberately low. A single strong reporting/comparison verb PLUS a
-# topic or entity is already genuine multi-hop ("what did she say about
-# the move") — the old 2-marker gate (≥2 signals ≈ 0.70+) silently starved
-# the whole class. Probe 2026-08-21: 6 multi-hop queries at 0.35, plain
-# queries at 0.00 → 0.32 separates cleanly with zero precision loss.
-ROUTE_MULTI_HOP_THRESHOLD = 0.32
+# v3: raised from (0.38, 0.32).  A single weak signal must NOT route; the
+# deliberate gaps below each single-signal weight let casual chat stay on the
+# cheap default model.  Genuine queries clear by wide margins.
+ROUTE_TEMPORAL_THRESHOLD = 0.50
+ROUTE_MULTI_HOP_THRESHOLD = 0.50
 
 # ---------------------------------------------------------------------------
 # Temporal evidence classes
@@ -56,6 +53,7 @@ _WEEKDAYS = {
     "sunday", "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri",
     "sat", "sun",
 }
+# Relative-time adverbs: weak on their own (casual chat is full of them).
 _RELATIVE_TIME = {
     "yesterday", "today", "tomorrow", "ago", "earlier", "previously",
     "recently", "back then", "last week", "last month", "last year",
@@ -73,11 +71,19 @@ _DATE_RE = re.compile(
     r"october|november|december)[a-z]*\b", re.I,
 )
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+# Strong time-interrogative structures (these anchor a genuine temporal query).
+# "what happened" added in v3 so "what happened last night" clears via the
+# weak-relative-time + interrogative combination.
 _WHEN_RE = re.compile(
     r"\b(how long|when\s+(?:did|was|were|is|are|does|do|will|has|have)|"
     r"what\s+(?:year|date|month|day)|how many (?:days|weeks|months|years)|"
-    r"has it been|since|until|before|after|between\s+\d{4}\s+and\s+\d{4}|"
-    r"how old)\b", re.I,
+    r"has it been|since|until|how old|what happened)\b"
+    r"|between\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"january|february|march|april|june|july|august|september|october|"
+    r"november|december)[a-z]*\s+and\s+(?:jan|feb|mar|apr|may|jun|jul|aug|"
+    r"sep|sept|oct|nov|dec|january|february|march|april|june|july|august|"
+    r"september|october|november|december)[a-z]*",
+    re.I,
 )
 _PAST_TENSE_FACT_RE = re.compile(
     r"\b(what|when|how)\s+(did|was|were)\s+(i|we|you|the|my|our|"
@@ -94,14 +100,15 @@ _ORDER_RE = re.compile(
 # Multi-hop evidence classes
 # ---------------------------------------------------------------------------
 
-# Reporting verbs: one hit with an entity/topic nearby is a strong signal.
+# Reporting verbs are DEMOTED in v3: a bare verb alone (0.25) must not route;
+# it only pays when an entity or "about X" topic is present.
 _REPORTING_VERBS = {
     "said", "says", "say", "told", "tell", "mentioned", "mentions",
     "discussed", "discuss", "agreed", "agree", "explained", "explain",
     "wrote", "write", "sent", "send", "asked", "ask", "recommended",
     "recommend", "suggested", "suggest", "claimed", "claim", "stated",
-    "state", "replied", "reply", "messaged", "mentioned", "talked about",
-    "talk about", "brought up", "raised",
+    "state", "replied", "reply", "messaged", "talked about", "talk about",
+    "brought up", "raised",
 }
 _COMPARISON_VERBS = {
     "compare", "compared", "comparison", "versus", "vs", "different",
@@ -117,9 +124,6 @@ _YOU_SAID_RE = re.compile(
     r"\b(you\s+(said|told|wrote|mentioned|agreed|suggested|recommended|"
     r"advised|claimed|explained|sent))\b", re.I,
 )
-# Entity-pair: two capitalized names or "X (and|then) Y" where both look like
-# people/places (proper-noun heuristic).  Avoids "A and B products" false hits
-# by requiring at least one reporting/comparison/chain verb nearby.
 _QUESTION_RE = re.compile(
     r"\b(?:what|when|where|who|which|why|how)\b"
     r"|\b(?:did|does|do|is|are|was|were|has|have|had)\s+\w+"
@@ -131,7 +135,38 @@ _ENTITY_PAIR_RE = re.compile(
     r"\b([A-Z][a-z]+)\s+(and|vs|versus|then|compared to)\s+([A-Z][a-z]+)\b"
 )
 
+# "about X" / "regarding X" topic phrase — the strongest single multi-hop
+# marker ("what did she say about the move").  The target word must be a real
+# topic: adverbs/pronouns ("about earlier", "about that") are not topics.
+_TOPIC_RE = re.compile(
+    r"\b(?:about|regarding)\s+(?:(?:the|my|our|your|this|that|a|an)\s+)?"
+    r"(?!earlier|later|before|after|today|yesterday|tomorrow|tonight|now|"
+    r"then|here|there|it|them|him|her|us|me|you|this|that|these|those|"
+    r"what|when|where|why|how)[a-z0-9'-]{2,}",
+    re.I,
+)
+
 _WORDS_RE = re.compile(r"[a-z0-9']+", re.I)
+
+# English sentence-starters / function words that get capitalized at
+# sentence start but are NOT proper nouns.  Excluded from entity detection.
+_NON_ENTITY_CAPS = {
+    "the", "this", "that", "these", "those", "there", "what", "when",
+    "where", "why", "which", "who", "whose", "how", "did", "does", "do",
+    "is", "are", "was", "were", "have", "has", "had", "can", "could",
+    "would", "should", "will", "shall", "may", "might", "must", "i", "im",
+    "ive", "id", "ill", "you", "your", "yours", "my", "mine", "our", "ours",
+    "we", "they", "she", "he", "it", "its", "a", "an", "and", "but", "so",
+    "or", "if", "of", "for", "to", "in", "on", "at", "not", "no", "yes",
+    "ok", "okay", "hey", "hi", "hello", "then", "now", "also", "just",
+    "well", "right", "wait", "sure", "yeah", "ya", "yep", "please", "thanks",
+    "thank", "actually", "honestly", "literally", "basically", "really",
+    "though", "though", "although", "because", "while", "after", "before",
+    "during", "with", "without", "from", "by", "via", "etc", "e", "g",
+    "vs",
+}
+# Months/weekdays are calendar words, not entities.
+_NON_ENTITY_CAPS |= _MONTHS | _WEEKDAYS
 
 
 def _words(text: str):
@@ -142,6 +177,32 @@ def _has_any(text_lower: str, items) -> bool:
     return any(item in text_lower for item in items)
 
 
+def _proper_nouns(query: str) -> int:
+    """Count capitalized words that are plausibly named entities.
+
+    Excludes the query's first word (sentence-start capitalization) and a
+    stopword set of common capitalized function words.  Case-sensitive on the
+    ORIGINAL query — "alex" lowercase is not an entity, "Alex" is.
+    """
+    tokens = re.findall(r"[A-Za-z][A-Za-z']*", query)
+    if not tokens:
+        return 0
+    first = tokens[0].lower()
+    count = 0
+    for tok in tokens:
+        low = tok.lower()
+        if low == first:
+            continue  # skip the sentence-initial word
+        if (
+            len(tok) >= 3
+            and tok[0].isupper()
+            and tok[1:].islower()
+            and low not in _NON_ENTITY_CAPS
+        ):
+            count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
@@ -149,25 +210,30 @@ def _has_any(text_lower: str, items) -> bool:
 def temporal_score(query: str) -> float:
     """Additive temporal confidence in [0, 1].
 
-    A single strong signal (year, dated month, "when did", relative-day)
-    scores >= 0.5; anything above ROUTE_TEMPORAL_THRESHOLD routes.
+    v3: single weak calendar/time words (weeks, months, relative adverbs)
+    are deliberately below the 0.50 threshold on their own.  Genuine anchors
+    (explicit dates, years, time-interrogatives, order questions, month
+    intervals) still clear by wide margins.
     """
     q = " ".join(query.lower().split())
     if not q:
         return 0.0
     score = 0.0
     words = set(_words(q))
-    # Month / weekday mentions (any tense-reference context).
-    if words & _MONTHS:
-        score += 0.50
+
+    # Calendar words: weak alone, additive with each other.
+    month_hits = words & _MONTHS
+    if month_hits:
+        score += 0.25 + 0.10 * min(len(month_hits) - 1, 2)
     if _WEEKDAYS & words:
-        score += 0.50
-    # Chronological ordering ("what came first", "what happened before/after X").
+        score += 0.20
+
+    # Chronological ordering ("what came first", "happened before/after").
     if _ORDER_RE.search(q):
         score += 0.50
-    # Relative-time adverbs.
+    # Relative-time adverbs: weak on purpose.
     if _has_any(q, _RELATIVE_TIME):
-        score += 0.45
+        score += 0.25
     # Explicit durations, dated formats, years.
     if _DURATION_RE.search(q):
         score += 0.45
@@ -175,7 +241,7 @@ def temporal_score(query: str) -> float:
         score += 0.60
     if _YEAR_RE.search(q):
         score += 0.55
-    # Time-interrogative structures.
+    # Time-interrogative structures (incl. month intervals, "what happened").
     if _WHEN_RE.search(q):
         score += 0.50
     # Past-tense fact probes ("what did I…", "when was my…") — weak but real.
@@ -187,9 +253,11 @@ def temporal_score(query: str) -> float:
 def multi_hop_score(query: str) -> float:
     """Additive multi-hop confidence in [0, 1].
 
-    Reporting verb + entity/topic reference is the classic dead class; a
-    single reporting verb alone scores ~0.35 (below threshold), but with an
-    entity (proper noun) or a chain/comparison term it clears 0.50.
+    v3: a bare reporting verb scores 0.25 — below the 0.45 threshold.  It
+    routes only when paired with a proper-noun entity (+0.30), an "about X"
+    topic phrase (+0.35), or a chain/comparison signal.  This kills the
+    casual-chat false positives ("what did you suggest", "she said...")
+    while keeping the designed class ("what did alex say about the move").
     """
     q = " ".join(query.lower().split())
     if not q:
@@ -201,16 +269,22 @@ def multi_hop_score(query: str) -> float:
     chain_hits = words & _CHAIN_TERMS
 
     if reporting_hits:
-        score += 0.35 * min(len(reporting_hits), 2)
+        score += 0.25 * min(len(reporting_hits), 2)
     if comparison_hits:
-        score += 0.35 * min(len(comparison_hits), 2)
+        score += 0.25 * min(len(comparison_hits), 2)
     if chain_hits:
-        score += 0.30 * min(len(chain_hits), 2)
+        score += 0.20 * min(len(chain_hits), 2)
     if _YOU_SAID_RE.search(q):
+        score += 0.30
+    # Proper-noun entity — only pays when >=1 verb class hit already present.
+    if (reporting_hits or comparison_hits or chain_hits) and _proper_nouns(query):
+        score += 0.30
+    # "about X / regarding X" topic phrase — the strongest multi-hop marker.
+    if (reporting_hits or comparison_hits or chain_hits) and _TOPIC_RE.search(q):
         score += 0.35
-    # Entity-pair / proper-noun adjacency — only pays when >=1 verb class hit
-    # already present (prevents "X and Y products" false positives).
-    if _ENTITY_PAIR_RE.search(q) and (reporting_hits or comparison_hits or chain_hits):
+    # Entity-pair ("X and Y") — only pays when >=1 verb class hit present
+    # (prevents "X and Y products" false positives).
+    if _ENTITY_PAIR_RE.search(query) and (reporting_hits or comparison_hits or chain_hits):
         score += 0.30
     return min(1.0, score)
 
@@ -219,8 +293,8 @@ def is_temporal_or_multihop(query: str) -> bool:
     """Return True when the query reads as temporal and/or multi-hop.
 
     Only genuine questions route (interrogative word, auxiliary-led
-    question, or "?"); commands and statements ("tell me a joke",
-    "schedule a meeting for friday") never pay the smart-model cost.
+    question, or "?"); commands and statements never pay the smart-model
+    cost.
     """
     if not query or not query.strip():
         return False

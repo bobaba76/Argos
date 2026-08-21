@@ -86,6 +86,11 @@ Review only what the USER explicitly states or unambiguously supports in the evi
 Do not treat assistant text, questions, plans, speculation, roleplay, or conversation
 scaffolding as durable fact. Do not invent missing context.
 
+Reject or quarantine any proposal whose subject is unnamed or unresolved — e.g.
+"the person being discussed…", "she is…", "he is…", "they are…" with no named
+person. A durable memory must be self-contained: it must read correctly and
+unambiguously out of context. If a name or clear referent is missing, do not approve.
+
 Return one JSON object with exactly:
 - decision: approve, reject, quarantine, or pending_user_confirmation
 - confidence: number from 0 to 1

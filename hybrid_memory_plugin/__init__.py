@@ -812,6 +812,20 @@ class HybridMemoryProvider(MemoryProvider):
             ctx_aware.lower() in ("true", "1", "yes")
             if isinstance(ctx_aware, str) else bool(ctx_aware)
         )
+        # Exact-phrase lift config (default on? off? read global toggle).
+        # alpha 0.0 disables; ~0.25 is the measured sweet spot.
+        try:
+            self._phrase_lift_alpha = max(
+                0.0, min(float(self._config.get("phrase_lift_alpha", 0.0)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._phrase_lift_alpha = 0.0
+        try:
+            self._phrase_lift_pool = max(
+                0, min(int(self._config.get("phrase_lift_pool", 200)), 1000)
+            )
+        except (TypeError, ValueError):
+            self._phrase_lift_pool = 200
         try:
             self._context_window_size = max(
                 1, min(int(self._config.get("context_window_size", 3)), 10)
@@ -980,6 +994,9 @@ class HybridMemoryProvider(MemoryProvider):
                 reranker=self._reranker,
             )
             self._store._reranker_top_n = self._reranker_top_n
+            # Exact-phrase lift: pass alpha + pool into the store's ranking.
+            self._store._phrase_lift_alpha = self._phrase_lift_alpha
+            self._store._phrase_lift_pool = self._phrase_lift_pool
             try:
                 graph_path = home / graph_dirname
                 self._graph = KuzuGraphStore(graph_path, user_id=self._user_id)

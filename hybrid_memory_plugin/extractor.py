@@ -149,6 +149,18 @@ _ASSISTANT_INSTRUCTION_RE = re.compile(
     r"\b(?:stop|help|ask|tell|remind)\s+you\b",
     re.IGNORECASE,
 )
+# Unanchored / unresolved subject: the memory names nobody, so it cannot be
+# self-contained. Catches "the person being discussed...", "this person...",
+# "the subject...", and facts opening on a bare third-person pronoun
+# ("she is...", "he is...", "they are...") with no named referent.
+_UNANCHORED_SUBJECT_RE = re.compile(
+    r"\b(?:the\s+person(?:\s+being\s+discussed|\s+in\s+question|\s+referenced)?|"
+    r"this\s+person|that\s+person|"
+    r"the\s+subject(?:\s+being\s+discussed|\s+referenced|\s+in\s+question)?|"
+    r"the\s+(?:man|woman|girl|boy|guy|lady)(?:\s+being\s+discussed|\s+referenced)?)\b",
+    re.IGNORECASE,
+)
+_UNANCHORED_PRONOUN_START_RE = re.compile(r"^(?:she|he|they)\b", re.IGNORECASE)
 
 
 def quality_flags_for_fact(fact: Dict[str, Any]) -> List[str]:
@@ -164,6 +176,8 @@ def quality_flags_for_fact(fact: Dict[str, Any]) -> List[str]:
         flags.append("conversation_meta")
     if _WRONG_SUBJECT_RE.search(content):
         flags.append("wrong_subject")
+    if _UNANCHORED_SUBJECT_RE.search(content) or _UNANCHORED_PRONOUN_START_RE.search(content):
+        flags.append("unanchored_subject")
     if _ASSISTANT_INSTRUCTION_RE.search(content):
         flags.append("assistant_instruction")
     if _FRAGMENT_START_RE.search(content) or _FRAGMENT_END_RE.search(content):
@@ -181,7 +195,7 @@ def hard_quality_flags(flags: List[str]) -> List[str]:
     """Flags strong enough to keep a candidate out of active memory."""
     hard = {
         "syntax_junk", "assistant_language", "assistant_instruction",
-        "wrong_subject", "sentence_fragment",
+        "wrong_subject", "sentence_fragment", "unanchored_subject",
     }
     return [flag for flag in flags if flag in hard]
 

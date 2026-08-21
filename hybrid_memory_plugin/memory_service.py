@@ -96,6 +96,19 @@ class MemoryService:
             )
         except (TypeError, ValueError):
             self.store._reranker_top_n = 20
+        # Exact-phrase lift (parity with provider config)
+        try:
+            self.store._phrase_lift_alpha = max(
+                0.0, min(float(config.get("phrase_lift_alpha", 0.0)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self.store._phrase_lift_alpha = 0.0
+        try:
+            self.store._phrase_lift_pool = max(
+                0, min(int(config.get("phrase_lift_pool", 200)), 1000)
+            )
+        except (TypeError, ValueError):
+            self.store._phrase_lift_pool = 200
         try:
             self.graph = KuzuGraphStore(home / graph_name, user_id="default_user")
         except Exception as exc:

@@ -17,14 +17,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import logging
+import math
+import threading
 
 try:
     from .retriever import DuckDBRetriever
 except ImportError:  # store.py imported as a top-level module (tests)
     from retriever import DuckDBRetriever
-import logging
-import math
-import threading
 import time
 import uuid
 from collections import deque
@@ -616,6 +617,15 @@ class DuckDBMemoryStore:
 
     # -- ranking: RRF + feedback + recency -----------------------------------
 
+    _PHRASE_STOPWORDS = frozenset(
+        ("the", "a", "an", "is", "are", "was", "were", "am", "be", "been",
+         "i", "me", "my", "you", "your", "we", "our", "us", "this", "that",
+         "these", "those", "it", "its", "of", "to", "in", "for", "and", "or",
+         "but", "on", "with", "at", "by", "from", "as", "do", "does", "did",
+         "what", "who", "how", "where", "when", "why", "which", "about", "so",
+         "am", "very", "have", "has", "had", "would", "will", "can", "could")
+    )
+
     _RRF_K = 20  # Lowered from 60 to sharpen relevance discrimination.
     # With k=60, rank 1 → 0.0164 and rank 10 → 0.0143 (spread ~0.002).
     # With k=20, rank 1 → 0.0476 and rank 10 → 0.0323 (spread ~0.015).
@@ -1080,8 +1090,14 @@ class DuckDBMemoryStore:
 
         # Retrieve more candidates than requested so the reranker has a
         # larger pool to work with. If no reranker, just use limit.
+        # Phrase-lift needs a wider pool so exact-phrase matches sitting just
+        # outside the window can be pulled in.
         reranker_top_n = getattr(self, "_reranker_top_n", 20)
-        pool_size = max(limit, reranker_top_n) if self.reranker else limit
+        phrase_pool = getattr(self, "_phrase_lift_pool", 0)
+        if phrase_pool:
+            pool_size = max(limit, reranker_top_n, phrase_pool)
+        else:
+            pool_size = max(limit, reranker_top_n) if self.reranker else limit
 
         # Gather candidate results from both paths.
         vector_results: List[MemoryRecord] = []
@@ -1139,6 +1155,26 @@ class DuckDBMemoryStore:
         # pure retrieval strength (e.g. query expansion trigger).
         for r in fused:
             r.raw_similarity = r.similarity
+
+        # Exact-phrase lift (optional, default off): reward contiguous
+        # query bigrams present verbatim in the memory, which the unigram-
+        # only text search never scores. Fixes the class of query where the
+        # gold memory shares the exact phrase (e.g. "who is the sales
+        # director" -> "...Raymond is the Sales Director...") but was ranked
+        # low because token overlap tied it with merely-similar content.
+        _alpha = getattr(self, "_phrase_lift_alpha", 0.0)
+        if _alpha and _alpha > 0.0:
+            qwords = re.findall(r"[a-z0-9']+", query.lower())
+            qwords = [w for w in qwords if w not in _PHRASE_STOPWORDS]
+            qbigrams = [(t0, t1) for t0, t1 in zip(qwords, qwords[1:])]
+            for r in fused:
+                if not qbigrams or not r.content:
+                    continue
+                c = r.content.lower()
+                ngram_win = sum(1 for a, b in qbigrams if f"{a} {b}" in c)
+                if ngram_win:
+                    r.similarity += _alpha * (ngram_win / len(qbigrams))
+            fused.sort(key=lambda r: r.similarity, reverse=True)
 
         # Apply feedback weighting and recency boost, then truncate.
         self._apply_feedback_and_recency(fused)

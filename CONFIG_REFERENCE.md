@@ -96,6 +96,21 @@ shows its own display defaults in a couple of cases — those are footnoted.
 | `consolidation_min_age_days` | `30` | Age threshold for stale temporary memories. |
 | `consolidation_max_actions` | `25` | Max records to quarantine per run. |
 
+### Distillation (the dream)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `distillation_enabled` | `false` | Enable the gated LLM distillation pass at session boundaries (session end + chat rotation). Proposals only — nothing enters active memory without review. |
+| `distillation_min_new_records` | `20` | Novelty gate: minimum new/updated records since the last run to fire. |
+| `distillation_cooldown_hours` | `24` | Cooldown gate: minimum hours between runs. |
+| `distillation_max_records_per_run` | `100` | Budget: max records considered per run. |
+| `distillation_max_calls` | `10` | Budget: max LLM calls per run (1 per cluster + 1 feedback scan). Adjust this to trade cost against coverage. |
+
+> The distillation pass reuses the auxiliary LLM (`llm_model`/`llm_provider`
+> above). To route it to a cheaper model without touching the plugin, set
+> `auxiliary.distillation.model` in the host's config — the auxiliary client
+> picks up per-task overrides automatically.
+
 > ¹ The desktop UI schema shows `8` as its display default; the runtime
 > default is `20`. Your saved `hybrid_memory.json` wins either way.
 > ² The desktop UI schema shows `0.05`; the runtime default is `0.0`.

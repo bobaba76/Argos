@@ -3,8 +3,9 @@
 A hybrid retrieval-augmented memory store for AI agents. Combines dense vector
 search (DuckDB + sentence-transformers) with a knowledge graph (Kùzu) for
 entity-aware retrieval, alias resolution, and memory evolution tracking — plus
-an ambient-context layer, an auto-extraction + candidate-review pipeline, and
-an insight-log skill.
+an ambient-context layer, an auto-extraction + candidate-review pipeline, an
+insight-log skill, and a gated LLM distillation pass ("the dream") that
+proposes insights and guardrails from accumulated records.
 
 This is the deep dive. For installation see **[SETUP_GUIDE.md](SETUP_GUIDE.md)**;
 for the front-door overview see **[README.md](README.md)**.
@@ -109,8 +110,25 @@ chronological chain of versions for each fact.
   ("why did I switch...", "what changed...") triggers automatic injection of
   a compact version arc into the search results, so the agent can answer
   "how did this fact evolve?" without an extra tool call.
+  - **Measured (2026-08-20, eval harness):** ~93% recall and ~93% precision
+    on change-intent questions after widening the intent matcher. The
+    `Arc(0.15)` + `anchor(0.30)` similarity floors are *pure precision
+    gates* — sweeps showed they have zero recall cost.
+  - **Diagnosed ceiling:** the residual false positives sit just inside the
+    true-positive similarity band (one FP at 0.548), so no cosine threshold
+    separates them; ~93% precision is floor-independent. The trigger matcher
+    is the lever that moved recall, not the thresholds.
 - **Head-deletion promotion** — deleting the current version promotes the
   predecessor to current (and re-indexes it in the graph).
+
+### Date-anchored retrieval
+
+Time expressions ("two weeks ago", "last Friday", "that Valentine's") are
+extracted by regex, resolved relative to the question date (shift-preserved
+for multi-hop references), and used to re-rank the result slice by recency —
+so a question like "what did we decide at last week's meeting?" weights the
+matching records by their true date position instead of pure similarity.
+Added 2026-08-21; evaluation bucket covers 133 temporal questions.
 
 ### Candidate review
 
@@ -155,6 +173,49 @@ explicitly via `memory_save`, bypassing the proposal queue.
 - **`memory_feedback`** with `incorrect` — detaches the memory from the graph.
 - **Junk-entity purge** — at session end, the graph purges orphaned junk
   entities (cheap maintenance).
+- **Semantic merge (P4.1)** — `consolidate()`'s duplicate leg was upgraded
+  from exact/containment string matching to embedding-similarity merging:
+  records within a high similarity threshold of an existing active record
+  are consolidated (newest wins, older version chained or appended
+  deterministically). Reversible, never hard-deletes.
+
+### Distillation pass (the dream)
+
+A bounded, LLM-assisted consolidation pass that turns accumulated records +
+feedback into *proposed* insights, guardrails, and contradiction warnings.
+Enabled by default? **No** — ships under `distillation_enabled: false`.
+
+- **Trigger** — runs at session boundaries. In the desktop app, sessions are
+  resumable tiles and true `on_session_end` boundaries don't exist under the
+  default reset policy, so the pass also fires from `on_session_switch`
+  (every chat rotation). Both hooks call the same self-gating method.
+- **Gates (all store-side, before any LLM call)** — novelty: ≥ 20 new or
+  updated records since the last run; cooldown: ≥ 24h since the last run;
+  budget: ≤ 100 records and ≤ 10 LLM calls per run.
+- **Cluster scan (free, deterministic)** — seed-star greedy grouping over
+  the eligible records: the newest record seeds a cluster, members are
+  records with cosine ≥ 0.75 *to the seed only* (no transitive chaining, so
+  subject-dense stores can't collapse into one giant cluster), capped at 8
+  per cluster.
+- **LLM distill** — one call per cluster with a strict JSON prompt:
+  insights, contradictions (`a_id`/`b_id`/`reason`), and guardrails; short
+  items only; contradictions are honored only for IDs the model was actually
+  shown in that cluster. One additional call scans high-feedback records
+  (helpful/dismissed counters) for lessons.
+- **Proposals only** — every output is saved via `save_candidate()`
+  (`source="distillation"`, `dedup=True`) with grounding (`evidence_text` +
+  `payload.sources` listing source memory IDs). Proposals are pending —
+  invisible to retrieval — until the existing auto-review pipeline and the
+  user approve them. The pass never writes, edits, or deletes active memory.
+- **Run state** — values live in a small `system_state` KV table
+  (`distillation_last_run`, `distillation_last_count`). Advances only on
+  *completed* runs (including zero-proposal runs); fail-soft aborts leave it
+  unadvanced so the next clean boundary retries.
+- **Fail-soft throughout** — LLM error, bad JSON, or client import failure
+  skips the affected leg; session lifecycle is never blocked.
+- **Auxiliary LLM** — reuses the same model/provider as other auxiliary
+  tasks; can be pointed at a cheaper model via the host's
+  `auxiliary.distillation.model` config without any plugin change.
 
 ### Ambient context
 
@@ -287,6 +348,16 @@ a couple of cases — those are footnoted.
 | `consolidation_min_age_days` | `30` | Age threshold for stale temporary memories. |
 | `consolidation_max_actions` | `25` | Max records to quarantine per run. |
 
+### Distillation (the dream)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `distillation_enabled` | `false` | Enable the gated LLM distillation pass at session boundaries. |
+| `distillation_min_new_records` | `20` | Novelty gate: minimum new/updated records since the last run to fire. |
+| `distillation_cooldown_hours` | `24` | Cooldown gate: minimum hours between runs. |
+| `distillation_max_records_per_run` | `100` | Budget: max records considered per run. |
+| `distillation_max_calls` | `10` | Budget: max LLM calls per run (1 per cluster + 1 feedback scan). |
+
 > ¹ The desktop UI schema shows `8` as its display default; the runtime
 > default is `20`. Your saved `hybrid_memory.json` wins either way.
 > ² The desktop UI schema shows `0.05`; the runtime default is `0.0`.
@@ -316,6 +387,8 @@ hybrid_memory_plugin/
 ├── retriever.py             Retrieval seam (pluggable retriever protocol)
 ├── extractor.py             Regex + LLM fact/relation extraction
 ├── reviewer.py              Candidate review + dedup + supersede logic
+├── distillation.py          Gated LLM distillation pass ("the dream"):
+│                            seed-star clustering + proposal emission
 ├── query_expander.py        LLM query rewriting for weak results
 ├── config_schema.py         Config fields surfaced in the setup UI
 ├── memory_service.py        Shared-service RPC server
@@ -352,6 +425,10 @@ Test files and coverage:
   trigger precision/recall.
 - `test_shared_service.py` — shared-service RPC path.
 - `test_candidate_review_integration.py` — candidate review + supersede flow.
-- `test_reviewer.py` — reviewer unit tests.
+- `test_semantic_dedup.py` — semantic merge / duplicate consolidation (P4.1).
+- `test_distillation.py` — distillation gates, clustering, proposal shape,
+  contradiction ID validation, run-state semantics (P4.2). **Run with
+  `HF_HUB_OFFLINE=1`** — loading the embedder by name performs a network
+  HEAD-check that hangs for minutes otherwise.
 - `test_ambient_location.py`, `test_ambient_weather.py`,
   `test_ambient_file_activity.py` — ambient-context modules.

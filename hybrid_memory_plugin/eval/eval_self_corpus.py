@@ -569,12 +569,6 @@ def compute_metrics(
     # Overall recall@K.
     metrics["overall"] = {f"recall@{k}": round(_recall_at(probes, k), 4) for k in ladder}
     # By category.
-    metrics["by_category"] = {
-        k: {f"recall@{kk}": round(_group_recall(probes, kk, lambda p: p["target_category"] or "context_note").get(p["target_category"] or "context_note", 0.0), 4)
-            for kk in ladder}
-        for k in sorted({p["target_category"] or "context_note" for p in probes})
-    }
-    # Rebuild by_category properly (the comprehension above is wrong; fix below).
     metrics["by_category"] = {}
     for k in ladder:
         metrics["by_category"][f"recall@{k}"] = {

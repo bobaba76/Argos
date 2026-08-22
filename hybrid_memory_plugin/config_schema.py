@@ -134,6 +134,23 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Maintenance",
         ),
         ProviderField(
+            key="duplicate_min_similarity",
+            label="Semantic dedup threshold",
+            kind=KIND_TEXT,
+            default="0.88",
+            description="Minimum embedding cosine similarity for two memories to be considered semantic near-duplicates (0.0–1.0). Conservative default; tune from real cluster examples.",
+            info="Pairs with cosine ≥ this threshold are candidates for quarantine (lower-quality one quarantined, keeper stays). Within-category only. Quarantine is reversible via memory_restore.",
+            group="Maintenance",
+        ),
+        ProviderField(
+            key="duplicate_semantic_max_pairs",
+            label="Semantic dedup pair limit",
+            kind=KIND_TEXT,
+            default="20000",
+            description="Maximum pairwise comparisons per consolidate() run. Bounds detection time on large stores.",
+            group="Maintenance",
+        ),
+        ProviderField(
             key="reranker_enabled",
             label="Cross-encoder re-ranking",
             kind=KIND_BOOL,

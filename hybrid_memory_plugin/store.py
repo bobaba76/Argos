@@ -35,6 +35,11 @@ from typing import Any, Dict, List, Optional
 
 import duckdb
 
+try:
+    import numpy as np
+except ImportError:
+    np = None  # semantic dedup falls back to skip if numpy unavailable
+
 logger = logging.getLogger(__name__)
 
 VALID_CATEGORIES = frozenset({
@@ -2616,19 +2621,174 @@ class DuckDBMemoryStore:
             + min(len(record.content or "") / 1000.0, 1.0)
         )
 
+    def _detect_semantic_duplicates(
+        self,
+        records: List[MemoryRecord],
+        min_similarity: float,
+        max_pairs: int,
+        add_candidate_fn,
+    ) -> int:
+        """Detect semantic near-duplicates via embedding cosine similarity.
+
+        Within each category, builds a normalized embedding matrix and
+        computes pairwise cosine via numpy dot product. Pairs with cosine
+        ≥ *min_similarity* are clustered greedily: the highest-quality
+        record in each cluster is the keeper, the rest are candidates for
+        quarantine with reason ``duplicate_semantic``.
+
+        Safety invariants:
+        - Within-category only (cross-category is OFF for v1).
+        - Skips records with no embedding, expired, quarantined, or
+          superseded (valid_to IS NOT NULL).
+        - Skips records with content < 20 chars.
+        - Never merges across user_scope or project_id.
+        - No LLM calls; deterministic; no content rewriting.
+
+        Returns the number of semantic duplicate candidates found.
+        """
+        if np is None or not records:
+            return 0
+
+        # Filter to records eligible for semantic dedup:
+        # active, non-superseded, non-expired, has embedding, content ≥ 20 chars.
+        eligible: List[MemoryRecord] = []
+        for r in records:
+            if r.embedding is None:
+                continue
+            if self._is_expired(r.expires_at):
+                continue
+            if r.valid_to is not None:
+                continue
+            if r.status != "active":
+                continue
+            if len((r.content or "").strip()) < 20:
+                continue
+            eligible.append(r)
+
+        if len(eligible) < 2:
+            return 0
+
+        # Group by (category, user_scope, project_id) so we never merge
+        # across scope boundaries.
+        groups: Dict[tuple, List[MemoryRecord]] = {}
+        for r in eligible:
+            scope_key = r.payload.get("user_scope") if isinstance(r.payload, dict) else None
+            key = (r.category, scope_key, r.project_id)
+            groups.setdefault(key, []).append(r)
+
+        total_candidates = 0
+        pairs_checked = 0
+
+        for key, group_records in groups.items():
+            if len(group_records) < 2:
+                continue
+            # Build the embedding matrix for this group.
+            try:
+                emb_dim = len(group_records[0].embedding)
+                mat = np.zeros((len(group_records), emb_dim), dtype=np.float32)
+                for i, r in enumerate(group_records):
+                    mat[i] = np.asarray(r.embedding, dtype=np.float32)
+            except (ValueError, TypeError):
+                continue
+
+            # Normalize rows to unit length for cosine similarity.
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0  # avoid div-by-zero
+            normed = mat / norms
+
+            # Compute pairwise cosine = dot product of normalized vectors.
+            # Only the upper triangle matters (symmetric matrix).
+            sim_matrix = normed @ normed.T
+            pairs_checked += len(group_records) * (len(group_records) - 1) // 2
+            if pairs_checked > max_pairs:
+                logger.debug(
+                    "Semantic dedup max_pairs (%d) reached; stopping", max_pairs,
+                )
+                break
+
+            # Find pairs above threshold using the upper triangle.
+            n = len(group_records)
+            # Build adjacency: which records are connected to which.
+            # Use a simple union-find / connected-components approach.
+            parent = list(range(n))
+
+            def find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a: int, b: int) -> None:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if sim_matrix[i, j] >= min_similarity:
+                        union(i, j)
+
+            # Group records by connected component.
+            clusters: Dict[int, List[int]] = {}
+            for i in range(n):
+                root = find(i)
+                clusters.setdefault(root, []).append(i)
+
+            # For each cluster with > 1 member, pick keeper and quarantine rest.
+            for root, members in clusters.items():
+                if len(members) < 2:
+                    continue
+                # Sort by quality score descending, then recency, then content length.
+                member_records = [group_records[i] for i in members]
+                member_records.sort(
+                    key=lambda r: (
+                        -self._memory_quality_score(r),
+                        r.created_at or "",
+                        -len(r.content or ""),
+                    ),
+                )
+                keeper = member_records[0]
+                cluster_size = len(member_records)
+                for dup in member_records[1:]:
+                    # Encode keeper link in the reason for audit trail.
+                    reason = f"duplicate_semantic:keeper={keeper.memory_id}"
+                    add_candidate_fn(
+                        dup, reason, keeper.memory_id,
+                        cluster_size=cluster_size,
+                        cosine=float(sim_matrix[
+                            group_records.index(dup),
+                            group_records.index(keeper),
+                        ]),
+                    )
+                    total_candidates += 1
+
+        return total_candidates
+
     def consolidate(
         self,
         *,
         dry_run: bool = True,
         max_actions: int = 25,
         min_age_days: int = 30,
+        duplicate_min_similarity: float = 0.88,
+        duplicate_semantic_max_pairs: int = 20000,
     ) -> Dict[str, Any]:
         """Preview or apply conservative, reversible memory maintenance.
 
         The operation never permanently deletes records. It quarantines only
-        expired records, stale unused temporary records, and lower-quality
-        exact/containment duplicates. Durable memories are not forgotten merely
-        because they are old or rarely retrieved.
+        expired records, stale unused temporary records, lower-quality
+        exact/containment duplicates, and semantic near-duplicates
+        (embedding cosine ≥ ``duplicate_min_similarity``). Durable memories
+        are not forgotten merely because they are old or rarely retrieved.
+
+        Semantic dedup (P4.1):
+        - Within-category only (cross-category OFF for v1).
+        - Never merges across user_scope or project_id.
+        - Never touches chain members (valid_to IS NOT NULL) or expired records.
+        - Keeper stays byte-identical (no content fusion — that's P4.2).
+        - Quarantine reason encodes the keeper link for audit:
+          ``duplicate_semantic:keeper=mem-abc123``.
+        - Everything reversible via ``memory_restore``.
         """
         max_actions = max(1, min(int(max_actions), 500))
         min_age_days = max(1, int(min_age_days))
@@ -2655,6 +2815,8 @@ class DuckDBMemoryStore:
             record: MemoryRecord,
             reason: str,
             keeper_id: str | None = None,
+            cluster_size: int = 0,
+            cosine: float = 0.0,
         ) -> None:
             if record.memory_id in candidates:
                 return
@@ -2666,6 +2828,8 @@ class DuckDBMemoryStore:
                 "age_days": age_days(record),
                 "retrieval_count": record.retrieval_count,
                 "confidence": record.confidence,
+                "cluster_size": cluster_size,
+                "cosine": round(cosine, 4) if cosine else 0.0,
             }
 
         for record in records:
@@ -2704,7 +2868,20 @@ class DuckDBMemoryStore:
                         duplicate, keeper = record, other
                     add_candidate(duplicate, "duplicate_containment", keeper.memory_id)
 
-        priority = {"expired": 0, "duplicate_containment": 1, "stale_unused_temporary": 2}
+        # Semantic dedup (P4.1): embedding-similarity near-duplicate detection.
+        semantic_count = self._detect_semantic_duplicates(
+            records,
+            min_similarity=duplicate_min_similarity,
+            max_pairs=duplicate_semantic_max_pairs,
+            add_candidate_fn=add_candidate,
+        )
+
+        priority = {
+            "expired": 0,
+            "duplicate_containment": 1,
+            "duplicate_semantic": 1,
+            "stale_unused_temporary": 2,
+        }
         selected = sorted(
             candidates.values(),
             key=lambda item: (priority.get(item["reason"], 9), item["memory_id"]),
@@ -2713,7 +2890,9 @@ class DuckDBMemoryStore:
         quarantined_ids: List[str] = []
         if not dry_run:
             for item in selected:
-                if self.quarantine_memory(item["memory_id"], item["reason"]):
+                # Use the full reason string (includes keeper link for semantic).
+                reason = item["reason"]
+                if self.quarantine_memory(item["memory_id"], reason):
                     quarantined += 1
                     quarantined_ids.append(item["memory_id"])
 
@@ -2744,6 +2923,13 @@ class DuckDBMemoryStore:
         except Exception as exc:
             logger.debug("Expiry count query failed: %s", exc)
 
+        # Count candidates by reason for the report.
+        reason_counts: Dict[str, int] = {}
+        for item in selected:
+            # Normalize reason: strip the keeper link suffix for counting.
+            base_reason = item["reason"].split(":")[0]
+            reason_counts[base_reason] = reason_counts.get(base_reason, 0) + 1
+
         return {
             "dry_run": bool(dry_run),
             "candidate_count": len(selected),
@@ -2755,6 +2941,9 @@ class DuckDBMemoryStore:
             "expired_count": expired_count,
             "expiring_soon_count": expiring_soon_count,
             "expired_revivable_count": expired_count,
+            "semantic_duplicate_count": semantic_count,
+            "reason_counts": reason_counts,
+            "duplicate_min_similarity": duplicate_min_similarity,
         }
 
     # -- Spec 2: explain_retrieval (memory_why_not) --------------------------

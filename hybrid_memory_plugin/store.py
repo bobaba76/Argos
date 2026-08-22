@@ -53,6 +53,10 @@ _DEFAULT_TTL_DAYS = {
     "goal": 180,
 }
 
+# Sentinel for "parameter not provided" — distinguishes explicit None
+# (clear/revive expiry) from "caller didn't pass this kwarg" (carry forward).
+_NOT_PROVIDED = object()
+
 
 class MemoryRecord:
     """In-memory representation of a stored memory row."""
@@ -189,6 +193,13 @@ class DuckDBMemoryStore:
         self._scale_warnings_fired = 0
         self._scale_last_count_check = 0
         self._scale_record_count: Optional[int] = None
+        # Expiry (Spec 1): configurable TTL tiers. When expiry_enabled is
+        # False, the hardcoded _DEFAULT_TTL_DAYS is used (current behavior).
+        # When True, the provider sets ttl_days from config and the tool
+        # surface can pass durability/expires_at explicitly.
+        self.expiry_enabled: bool = False
+        self.ttl_days: Dict[str, int] = dict(_DEFAULT_TTL_DAYS)
+        self.expiry_default_days: int = 90
 
     # -- connection management ------------------------------------------------
 
@@ -506,6 +517,7 @@ class DuckDBMemoryStore:
         category_filter: str | None = None,
         project_id: str | None = None,
         as_of: str | None = None,
+        include_expired: bool = False,
     ) -> List[MemoryRecord]:
         """ILIKE text search. Returns filtered records ranked by token overlap.
 
@@ -514,6 +526,9 @@ class DuckDBMemoryStore:
         that matched the content) so downstream fusion has a comparable signal.
         When *project_id* is provided, memories from other projects are
         excluded; global memories (project_id IS NULL) remain visible.
+
+        When *include_expired* is True, the expiry filter is omitted (expired
+        memories are returned, ranked normally).
         """
         words = [t for t in query.split() if len(t) > 2][:4]
         if not words:
@@ -522,7 +537,13 @@ class DuckDBMemoryStore:
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
         project_clause = ""
         expiry_ref = as_of if as_of else self._now()
-        params: list = [self.user_id, expiry_ref]
+        if include_expired:
+            expiry_clause = ""
+            expiry_params: list = []
+        else:
+            expiry_clause = "AND (expires_at IS NULL OR expires_at > ?) "
+            expiry_params = [expiry_ref]
+        params: list = [self.user_id, *expiry_params]
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -543,7 +564,7 @@ class DuckDBMemoryStore:
             "WHERE COALESCE(status, 'active') = 'active' "
             f"{temporal_clause} "
             "AND (user_scope IS NULL OR user_scope = ?) "
-            "AND (expires_at IS NULL OR expires_at > ?) "
+            f"{expiry_clause}"
             f"{project_clause} AND ("
             f"{conditions}) LIMIT 200"
         )
@@ -554,7 +575,9 @@ class DuckDBMemoryStore:
                 continue
             if category_filter and r.category != category_filter:
                 continue
-            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at, at=expiry_ref):
+            if not self._matches_scope(r.payload):
+                continue
+            if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
                 continue
             # Text-match score: fraction of query tokens found in content.
             content_lower = (r.content or "").lower()
@@ -570,6 +593,7 @@ class DuckDBMemoryStore:
         category_filter: str | None = None,
         project_id: str | None = None,
         as_of: str | None = None,
+        include_expired: bool = False,
     ) -> List[MemoryRecord]:
         """Vector similarity search. Returns filtered records ranked by cosine.
 
@@ -577,6 +601,9 @@ class DuckDBMemoryStore:
         Raises on vector search errors so the caller can fall back.
         When *project_id* is provided, memories from other projects are
         excluded; global memories (project_id IS NULL) remain visible.
+
+        When *include_expired* is True, the expiry filter is omitted (expired
+        memories are returned, ranked normally).
         """
         project_clause = ""
         # String-cast the query vector as a fixed-size array constant.
@@ -600,7 +627,11 @@ class DuckDBMemoryStore:
             temporal_clause = "AND valid_to IS NULL "
         expiry_ref = as_of if as_of else self._now()
         params.append(self.user_id)
-        params.append(expiry_ref)
+        if include_expired:
+            expiry_clause = ""
+        else:
+            expiry_clause = "  AND (expires_at IS NULL OR expires_at > ?) "
+            params.append(expiry_ref)
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -612,7 +643,7 @@ class DuckDBMemoryStore:
             f"  {temporal_clause} "
             "  AND embedding IS NOT NULL "
             "  AND (user_scope IS NULL OR user_scope = ?) "
-            "  AND (expires_at IS NULL OR expires_at > ?) "
+            f"{expiry_clause}"
             f"{project_clause} "
             "ORDER BY sim DESC "
             "LIMIT ?"
@@ -624,7 +655,9 @@ class DuckDBMemoryStore:
                 continue
             if category_filter and r.category != category_filter:
                 continue
-            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at, at=expiry_ref):
+            if not self._matches_scope(r.payload):
+                continue
+            if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
                 continue
             out.append(r)
         return out
@@ -1080,6 +1113,7 @@ class DuckDBMemoryStore:
         project_id: str | None = None,
         as_of: str | None = None,
         suppress_retrieval: bool = False,
+        include_expired: bool = False,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with optional cross-encoder
         re-ranking, feedback, and recency.
@@ -1100,6 +1134,9 @@ class DuckDBMemoryStore:
         they search. This prevents eval self-pollution where repeated eval
         runs pump the retrieval_count of eval-relevant memories to the cap,
         flattening the retrieval signal as a discriminator.
+
+        When *include_expired* is True, expired memories are included in
+        results (ranked normally) — for auditing "what did I know then".
         """
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
@@ -1122,6 +1159,7 @@ class DuckDBMemoryStore:
         text_results: List[MemoryRecord] = self._text_search_raw(
             query, pool_size, excluded, category_filter,
             project_id=project_id, as_of=as_of,
+            include_expired=include_expired,
         )
 
         if emb:
@@ -1129,6 +1167,7 @@ class DuckDBMemoryStore:
                 vector_results = self._vector_search_raw(
                     emb, pool_size, excluded, category_filter,
                     project_id=project_id, as_of=as_of,
+                    include_expired=include_expired,
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):
@@ -1285,8 +1324,15 @@ class DuckDBMemoryStore:
         scope: str = "profile",
         project_id: str | None = None,
         status: str = "active",
+        expires_at: Any = _NOT_PROVIDED,
     ) -> MemoryRecord | None:
-        """Insert a memory record. Returns None if deduped away."""
+        """Insert a memory record. Returns None if deduped away.
+
+        *expires_at* semantics (Spec 1):
+        - ``_NOT_PROVIDED`` (default): auto-TTL logic applies (current behavior).
+        - ``None``: explicitly no expiry (skip auto-TTL, store NULL).
+        - ISO-8601 string: set to that value (explicit wins over TTL map).
+        """
         if not content or not content.strip():
             return None
         if category not in VALID_CATEGORIES:
@@ -1307,14 +1353,24 @@ class DuckDBMemoryStore:
             status = "active"
         record_payload.setdefault("source", source)
 
+        # Explicit expires_at wins over the TTL map.  None = no expiry.
+        skip_auto_ttl = expires_at is not _NOT_PROVIDED
+        if expires_at is not _NOT_PROVIDED and expires_at is not None:
+            record_payload["expires_at"] = expires_at
+
         if dedup and self._content_exists(content, category):
             logger.debug("Deduped memory: %s", content[:60])
             return None
 
         memory_id = f"mem-{uuid.uuid4().hex}"
         now = self._now()
-        if not record_payload.get("expires_at") and durability == "temporary":
-            ttl_days = _DEFAULT_TTL_DAYS.get(category)
+        if not skip_auto_ttl and not record_payload.get("expires_at") and durability == "temporary":
+            if getattr(self, "expiry_enabled", False):
+                ttl_map = getattr(self, "ttl_days", _DEFAULT_TTL_DAYS)
+                default_days = getattr(self, "expiry_default_days", 90)
+                ttl_days = ttl_map.get(category, default_days)
+            else:
+                ttl_days = _DEFAULT_TTL_DAYS.get(category)
             if ttl_days:
                 record_payload["expires_at"] = (
                     datetime.now(timezone.utc) + timedelta(days=ttl_days)
@@ -1497,6 +1553,7 @@ class DuckDBMemoryStore:
         scope: str | None = None,
         evidence_retention: str = "full",
         supersedes_memory_id: str | None = None,
+        expires_at: Any = _NOT_PROVIDED,
     ) -> dict | None:
         """Approve, reject, quarantine, or classify a pending proposal.
 
@@ -1505,6 +1562,9 @@ class DuckDBMemoryStore:
         (the old record is superseded: valid_to set, superseded_by pointed
         at the new version). This is the confirm-first way chains grow —
         never automatic, always a reviewer decision.
+
+        *expires_at* (Spec 1): when provided (not _NOT_PROVIDED), passed to
+        remember() for the new memory. None = no expiry; string = set.
         """
         decision = decision.strip().lower()
         allowed = {
@@ -1526,7 +1586,7 @@ class DuckDBMemoryStore:
         if decision in {"approved", "reviewed_approved"}:
             selected_durability = durability or candidate["durability"]
             selected_scope = scope or candidate["scope"]
-            memory = self.remember(
+            remember_kwargs: Dict[str, Any] = dict(
                 category=candidate["category"],
                 content=candidate["content"],
                 tags=candidate["tags"],
@@ -1537,6 +1597,10 @@ class DuckDBMemoryStore:
                 scope=selected_scope,
                 project_id=candidate["project_id"],
             )
+            # Pass explicit expires_at through to remember() (Spec 1).
+            if expires_at is not _NOT_PROVIDED:
+                remember_kwargs["expires_at"] = expires_at
+            memory = self.remember(**remember_kwargs)
             if memory is None:
                 final_status = "deduplicated"
             elif supersedes_memory_id:
@@ -1907,7 +1971,7 @@ class DuckDBMemoryStore:
         content: str | None = None,
         tags: List[str] | None = None,
         payload_updates: Dict[str, Any] | None = None,
-        expires_at: str | None = None,
+        expires_at: Any = _NOT_PROVIDED,
     ) -> MemoryRecord | None:
         """Update an existing memory by creating a new version.
 
@@ -1916,8 +1980,10 @@ class DuckDBMemoryStore:
         2. Sets the old record's valid_to = now and superseded_by = new_id
         3. Returns the new version
 
-        *expires_at* sets a new expiry on the version (ISO string); when None,
-        the existing expiry is carried forward unchanged.
+        *expires_at* semantics (Spec 1):
+        - ``_NOT_PROVIDED`` (default): carry the old expiry forward unchanged.
+        - ``None``: clear the expiry (revive the memory).
+        - ISO-8601 string: set to that value.
 
         The old record is preserved for history queries (as_of parameter).
         If no content/tags/payload changes are provided, returns the existing
@@ -1939,9 +2005,16 @@ class DuckDBMemoryStore:
         if payload_updates:
             new_payload.update(payload_updates)
 
+        # Resolve effective expires_at:
+        # _NOT_PROVIDED → carry forward; None → clear (revive); str → set.
+        if expires_at is _NOT_PROVIDED:
+            effective_expires = rec.expires_at
+        else:
+            effective_expires = expires_at  # None or string
+
         # If nothing actually changed, return the existing record
         if (content is None and tags is None and not payload_updates
-                and expires_at is None):
+                and expires_at is _NOT_PROVIDED):
             return rec
 
         # Re-embed if content changed
@@ -1971,7 +2044,7 @@ class DuckDBMemoryStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                 [new_id, rec.category, new_content, new_tags,
                  json.dumps(new_payload), now, now,
-                 expires_at if expires_at is not None else rec.expires_at,
+                 effective_expires,
                  new_emb if new_emb else None,
                  rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
                  rec.project_id,
@@ -2643,6 +2716,34 @@ class DuckDBMemoryStore:
                 if self.quarantine_memory(item["memory_id"], item["reason"]):
                     quarantined += 1
                     quarantined_ids.append(item["memory_id"])
+
+        # Expiry reporting (Spec 1): count expired and expiring-soon rows.
+        # These are filtered from retrieval but never auto-deleted.
+        expired_count = 0
+        expiring_soon_count = 0
+        now_iso = now.isoformat()
+        soon_iso = (now + timedelta(days=7)).isoformat()
+        try:
+            expired_count = int(self.connection.execute(
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE COALESCE(status, 'active') = 'active'
+                     AND valid_to IS NULL
+                     AND expires_at IS NOT NULL
+                     AND expires_at <= ?""",
+                [now_iso],
+            ).fetchone()[0])
+            expiring_soon_count = int(self.connection.execute(
+                """SELECT COUNT(*) FROM memory_records
+                   WHERE COALESCE(status, 'active') = 'active'
+                     AND valid_to IS NULL
+                     AND expires_at IS NOT NULL
+                     AND expires_at > ?
+                     AND expires_at <= ?""",
+                [now_iso, soon_iso],
+            ).fetchone()[0])
+        except Exception as exc:
+            logger.debug("Expiry count query failed: %s", exc)
+
         return {
             "dry_run": bool(dry_run),
             "candidate_count": len(selected),
@@ -2651,6 +2752,207 @@ class DuckDBMemoryStore:
             "max_actions": max_actions,
             "min_age_days": min_age_days,
             "candidates": selected,
+            "expired_count": expired_count,
+            "expiring_soon_count": expiring_soon_count,
+            "expired_revivable_count": expired_count,
+        }
+
+    # -- Spec 2: explain_retrieval (memory_why_not) --------------------------
+
+    def explain_retrieval(
+        self,
+        query: str,
+        expected_memory_id: str,
+        *,
+        top_k: int = 20,
+        project_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Diagnose why a memory did not surface in retrieval.
+
+        Deterministic, free (no LLM), strictly read-only. Runs a parallel
+        diagnostic pass that does NOT touch the production pipeline:
+        - suppress_retrieval=True on all searches
+        - no writes, no quarantine, no consolidation
+        - no reranker side-effects
+
+        When *project_id* is provided, the diagnostic search is scoped to
+        that project (matching the production path). If the expected memory
+        belongs to a different project, a project_scope_mismatch reason is
+        reported — one of the top-3 causes of "why didn't this surface".
+
+        Returns a structured explanation with:
+        - expected: the target memory (or None if not found)
+        - found_in_results: whether it appeared in the top-k
+        - rank: its rank if found (1-indexed), else None
+        - top_results: the top-k results with scores
+        - reasons: list of human-readable reason strings
+        - diagnostics: per-stage scores (vector_sim, text_score, etc.)
+        """
+        # 1. Fetch the expected memory.
+        expected_rows = self._fetch_records(
+            """SELECT * FROM memory_records WHERE memory_id = ?""",
+            [expected_memory_id],
+        )
+        if not expected_rows:
+            return {
+                "expected_memory_id": expected_memory_id,
+                "expected": None,
+                "found_in_results": False,
+                "rank": None,
+                "top_results": [],
+                "reasons": ["memory_not_found: no record with this memory_id"],
+                "diagnostics": {},
+            }
+        expected = expected_rows[0]
+
+        # 2. Run a diagnostic search (suppress_retrieval=True, include_expired
+        #    so we can see if expiry is the reason). Thread project_id so
+        #    the diagnostic search matches the production scoping path.
+        results = self._hybrid_search(
+            query, limit=top_k, suppress_retrieval=True, include_expired=True,
+            project_id=project_id,
+        )
+
+        # 3. Check if the expected memory is in the results.
+        result_ids = [r.memory_id for r in results]
+        found = expected_memory_id in result_ids
+        rank = result_ids.index(expected_memory_id) + 1 if found else None
+
+        # 4. Build the top_results summary.
+        top_results = []
+        for r in results[:top_k]:
+            top_results.append({
+                "memory_id": r.memory_id,
+                "content": (r.content or "")[:120],
+                "category": r.category,
+                "similarity": round(r.similarity, 4) if r.similarity else 0.0,
+                "raw_similarity": round(getattr(r, "raw_similarity", 0.0), 4),
+            })
+
+        # 5. Compute per-stage diagnostics for the expected memory.
+        diagnostics: Dict[str, Any] = {}
+        reasons: List[str] = []
+
+        # Vector similarity vs the query — reuse DuckDB's list_cosine_similarity
+        # so the diagnostic score matches the production ranking score exactly.
+        # A hand-rolled Python cosine can diverge from DuckDB's if the stored
+        # embedding was normalized differently at write time; for a diagnostic
+        # tool, that discrepancy is worse than useless (the user sees 0.41 and
+        # concludes "not low" when the pipeline scored it 0.38 and filtered it).
+        vec_sim = None
+        if self.embedder and hasattr(self.embedder, "embed") and expected.embedding:
+            try:
+                query_emb = self.embedder.embed(query, is_query=True)
+                if query_emb and expected.embedding:
+                    # Use the same string-cast + list_cosine_similarity path
+                    # as _vector_search_raw so the score is identical to what
+                    # the production pipeline computed.
+                    vec_text = "[" + ",".join(
+                        repr(float(x)) for x in query_emb
+                    ) + "]"
+                    row = self.connection.execute(
+                        f"""SELECT list_cosine_similarity(
+                                embedding, CAST(? AS DOUBLE[{len(query_emb)}])
+                            ) AS sim
+                            FROM memory_records WHERE memory_id = ?""",
+                        [vec_text, expected_memory_id],
+                    ).fetchone()
+                    if row and row[0] is not None:
+                        vec_sim = float(row[0])
+                        diagnostics["vector_similarity"] = round(vec_sim, 4)
+            except Exception as exc:
+                diagnostics["vector_similarity_error"] = str(exc)
+
+        # Text match score.
+        words = [t for t in query.split() if len(t) > 2][:4]
+        if words and expected.content:
+            content_lower = expected.content.lower()
+            matched = sum(1 for w in words if w.lower() in content_lower)
+            text_score = matched / len(words) if words else 0.0
+            diagnostics["text_match_score"] = round(text_score, 4)
+
+        # Status check.
+        status = getattr(expected, "status", "active") or "active"
+        diagnostics["status"] = status
+        if status != "active":
+            reasons.append(f"status={status}: memory is not active (quarantined)")
+
+        # Superseded check.
+        if expected.valid_to is not None:
+            reasons.append(
+                f"superseded: valid_to={expected.valid_to}, "
+                f"superseded_by={expected.superseded_by}"
+            )
+            diagnostics["superseded"] = True
+
+        # Expiry check.
+        if expected.expires_at:
+            now_iso = self._now()
+            diagnostics["expires_at"] = expected.expires_at
+            if expected.expires_at <= now_iso:
+                reasons.append(
+                    f"expired: expires_at={expected.expires_at} is in the past"
+                )
+
+        # User scope check.
+        if not self._matches_scope(expected.payload):
+            reasons.append(
+                f"scope_mismatch: memory user_scope does not match "
+                f"current user_id={self.user_id}"
+            )
+            diagnostics["scope_mismatch"] = True
+
+        # Project scope check (Spec 2 fix): if the expected memory is
+        # project-scoped and the diagnostic query used a different project_id
+        # (or None), that's a top-3 cause of "why didn't this surface".
+        expected_project = getattr(expected, "project_id", None)
+        diagnostics["memory_project_id"] = expected_project
+        diagnostics["query_project_id"] = project_id
+        if expected_project is not None and expected_project != project_id:
+            reasons.append(
+                f"project_scope_mismatch: memory belongs to project "
+                f"'{expected_project}' but the query was scoped to "
+                f"'{project_id or 'None (global)'}'"
+            )
+            diagnostics["project_scope_mismatch"] = True
+
+        # Low similarity.
+        if vec_sim is not None and vec_sim < 0.3:
+            reasons.append(
+                f"low_vector_similarity: {round(vec_sim, 4)} < 0.3 threshold"
+            )
+        if not found and not reasons:
+            # Present and not expired, but not in top-k → ranked too low.
+            if vec_sim is not None:
+                reasons.append(
+                    f"ranked_below_top_{top_k}: vector_sim={round(vec_sim, 4)} "
+                    f"did not make the cutoff"
+                )
+            else:
+                reasons.append(
+                    f"ranked_below_top_{top_k}: not in top-{top_k} results"
+                )
+
+        if not reasons:
+            reasons.append("found: memory is in the results (no issue detected)")
+
+        return {
+            "expected_memory_id": expected_memory_id,
+            "expected": {
+                "memory_id": expected.memory_id,
+                "content": (expected.content or "")[:200],
+                "category": expected.category,
+                "status": status,
+                "expires_at": expected.expires_at,
+                "valid_to": expected.valid_to,
+                "superseded_by": expected.superseded_by,
+                "project_id": expected_project,
+            },
+            "found_in_results": found,
+            "rank": rank,
+            "top_results": top_results,
+            "reasons": reasons,
+            "diagnostics": diagnostics,
         }
 
     # -- lifecycle ------------------------------------------------------------

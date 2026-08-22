@@ -41,7 +41,7 @@ from .confirmation import build_confirmation_block
 from .extractor import extract_from_turn
 from .routing import resolve_storage_names
 from .service_client import SharedGraphStore, SharedMemoryStore
-from .reviewer import review_candidate_with_llm
+from .reviewer import review_candidate_with_llm, suggest_expiry
 from .query_expander import QueryExpander
 
 logger = logging.getLogger(__name__)
@@ -117,6 +117,10 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "entity_aliases": "",
         "role_words": "",
         "role_alias_llm_fallback": "true",
+        "expiry_enabled": "false",
+        "expiry_ttl_days": '{"context_note":30,"event":180,"goal":180}',
+        "expiry_default_days": "90",
+        "expiry_auto_suggest": "false",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -167,6 +171,10 @@ SEARCH_SCHEMA = {
                 "type": "string",
                 "description": "Restrict results to this project's memories plus global memories (optional).",
             },
+            "include_expired": {
+                "type": "boolean",
+                "description": "Include expired memories in results (default false). Use to audit what was known before a best-before date passed.",
+            },
         },
         "required": ["query"],
     },
@@ -198,6 +206,14 @@ SAVE_SCHEMA = {
                 "items": {"type": "string"},
                 "description": "Optional tags for this memory.",
             },
+            "durability": {
+                "type": "string",
+                "description": "durable (default) or temporary. Only 'temporary' triggers the TTL map (best-before date). Use when the fact has a shelf life.",
+            },
+            "expires_at": {
+                "type": "string",
+                "description": "Explicit best-before date (ISO-8601 UTC, e.g. '2026-12-31T23:59:59+00:00'). Wins over the TTL map. Use null to clear.",
+            },
         },
         "required": ["content", "category"],
     },
@@ -218,6 +234,10 @@ UPDATE_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "New tags (optional, replaces existing).",
+            },
+            "expires_at": {
+                "type": "string",
+                "description": "Set or clear the best-before date. ISO-8601 UTC string to set; null to clear (revive an expired memory). Omit to carry forward the existing value.",
             },
         },
         "required": ["memory_id"],
@@ -315,6 +335,10 @@ CANDIDATE_REVIEW_SCHEMA = {
                 "type": "string",
                 "description": "Existing current memory_id this candidate replaces (optional). Chains the new memory behind the old one, preserving history. Use when the candidate is a replacement/contradiction of an existing fact.",
             },
+            "expires_at": {
+                "type": "string",
+                "description": "Best-before date for the approved memory (ISO-8601 UTC). Use null to clear. Only applies on approval.",
+            },
         },
         "required": ["candidate_id", "decision"],
     },
@@ -329,6 +353,37 @@ RESTORE_SCHEMA = {
             "memory_id": {"type": "string", "description": "Memory ID to restore."},
         },
         "required": ["memory_id"],
+    },
+}
+
+WHY_NOT_SCHEMA = {
+    "name": "memory_why_not",
+    "description": (
+        "Diagnose why a memory did not surface in retrieval. Deterministic, "
+        "free (no LLM), read-only. Use to debug recall gaps: pass the query "
+        "you used and the memory_id you expected to see."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query that failed to surface the expected memory.",
+            },
+            "expected_memory_id": {
+                "type": "string",
+                "description": "The memory_id you expected to see in results.",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "How many top results to inspect (default 20).",
+            },
+            "project_id": {
+                "type": "string",
+                "description": "Project scope to match the production search path (optional). If omitted, the provider's current project is used.",
+            },
+        },
+        "required": ["query", "expected_memory_id"],
     },
 }
 
@@ -478,6 +533,11 @@ class HybridMemoryProvider(MemoryProvider):
         self._query_expansion_enabled: bool = True
         self._query_expansion_similarity_floor: float = 0.3
         self._query_expander: Optional[QueryExpander] = None
+        # Expiry (Spec 1): TTL tiers / best-before dates.
+        self._expiry_enabled: bool = False
+        self._expiry_ttl_days: Dict[str, int] = {"context_note": 30, "event": 180, "goal": 180}
+        self._expiry_default_days: int = 90
+        self._expiry_auto_suggest: bool = False
         # LLM model/provider for auxiliary tasks (extraction, review, expansion)
         # Empty string = use the auxiliary client's default model
         self._llm_model: str = ""
@@ -859,6 +919,45 @@ class HybridMemoryProvider(MemoryProvider):
         # LLM model/provider config (empty = use auxiliary client default)
         self._llm_model = str(self._config.get("llm_model", "")).strip()
         self._llm_provider = str(self._config.get("llm_provider", "")).strip()
+        # Expiry config (Spec 1): TTL tiers / best-before dates.
+        expiry_enabled = self._config.get("expiry_enabled", "false")
+        self._expiry_enabled = (
+            expiry_enabled.lower() in ("true", "1", "yes")
+            if isinstance(expiry_enabled, str) else bool(expiry_enabled)
+        )
+        # Parse the TTL map (JSON object of category→days). Fail-soft:
+        # fall back to the default on bad input, log a warning.
+        default_ttl = '{"context_note":30,"event":180,"goal":180}'
+        try:
+            ttl_raw = self._config.get("expiry_ttl_days", default_ttl)
+            if isinstance(ttl_raw, dict):
+                parsed_ttl = ttl_raw
+            else:
+                parsed_ttl = json.loads(str(ttl_raw))
+            self._expiry_ttl_days = {
+                str(k): max(1, int(v))
+                for k, v in parsed_ttl.items()
+                if isinstance(v, (int, float)) and int(v) > 0
+            }
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("expiry_ttl_days parse failed (%s); using default", exc)
+            self._expiry_ttl_days = {"context_note": 30, "event": 180, "goal": 180}
+        try:
+            self._expiry_default_days = max(
+                1, min(int(self._config.get("expiry_default_days", 90)), 3650)
+            )
+        except (TypeError, ValueError):
+            self._expiry_default_days = 90
+        expiry_suggest = self._config.get("expiry_auto_suggest", "false")
+        self._expiry_auto_suggest = (
+            expiry_suggest.lower() in ("true", "1", "yes")
+            if isinstance(expiry_suggest, str) else bool(expiry_suggest)
+        )
+        # Push expiry config to the store so remember() uses the right TTL map.
+        if self._store is not None:
+            self._store.expiry_enabled = self._expiry_enabled
+            self._store.ttl_days = dict(self._expiry_ttl_days)
+            self._store.expiry_default_days = self._expiry_default_days
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,
@@ -1432,11 +1531,15 @@ class HybridMemoryProvider(MemoryProvider):
         limit: int,
         category_filter: str | None = None,
         project_id: str | None = None,
+        include_expired: bool = False,
     ) -> List[Any]:
         """Run hybrid search and apply a bounded graph-supported boost.
 
         When *project_id* is provided, memories from other projects are
         excluded. When None, the provider's current project scope is used.
+
+        When *include_expired* is True, expired memories are included in
+        results (for auditing).
         """
         if self._store is None:
             return []
@@ -1451,6 +1554,7 @@ class HybridMemoryProvider(MemoryProvider):
             category_filter=category_filter,
             project_id=effective_project or None,
             suppress_retrieval=True,
+            include_expired=include_expired,
         )
 
         # Query expansion: if the top hit's RAW similarity (pre-importance)
@@ -1835,6 +1939,31 @@ class HybridMemoryProvider(MemoryProvider):
                 durability=review.get("durability"),
                 scope=review.get("scope"),
             )
+            # Spec 1: deterministic expiry suggestion on approval. The
+            # suggestion is logged but NOT auto-applied — the user confirms
+            # via memory_update(expires_at=...) before it sticks. This keeps
+            # the confirm-first invariant: no silent lifecycle changes.
+            if (
+                self._expiry_auto_suggest
+                and final_status == "approved"
+                and result
+                and result.get("memory")
+            ):
+                try:
+                    suggested = suggest_expiry(
+                        candidate,
+                        ttl_days=self._expiry_ttl_days,
+                        default_days=self._expiry_default_days,
+                    )
+                    if suggested:
+                        logger.info(
+                            "Expiry suggestion for %s: %s (confirm with "
+                            "memory_update expires_at)",
+                            result["memory"].get("memory_id", ""),
+                            suggested,
+                        )
+                except Exception:
+                    pass
             # Index the promoted memory in the graph. This closes the gap
             # where auto-approved candidates never reached the graph.
             if result and result.get("memory"):
@@ -2321,6 +2450,7 @@ class HybridMemoryProvider(MemoryProvider):
             MAINTENANCE_SCHEMA,
             CHAIN_SCHEMA,
             FETCH_FULL_SCHEMA,
+            WHY_NOT_SCHEMA,
         ]
         # Always include graph tool schemas so they are registered in the
         # MemoryManager routing table at add_provider() time — before
@@ -2345,9 +2475,11 @@ class HybridMemoryProvider(MemoryProvider):
             if category and category not in VALID_CATEGORIES:
                 return tool_error(f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
             project_id = args.get("project_id")
+            include_expired = bool(args.get("include_expired", False))
             results = self._search_memories(
                 query, limit=top_k, category_filter=category,
                 project_id=project_id,
+                include_expired=include_expired,
             )
             # Chain-presence annotation: a light, batched marker on each hit
             # so the agent KNOWS a fact has a history (trigger to call
@@ -2391,7 +2523,14 @@ class HybridMemoryProvider(MemoryProvider):
             if category not in VALID_CATEGORIES:
                 return tool_error(f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
             tags = args.get("tags", [])
-            rec = self._store.remember(category=category, content=content, tags=tags, dedup=True)
+            # Expiry (Spec 1): pass durability/expires_at only when enabled.
+            save_kwargs: Dict[str, Any] = {"category": category, "content": content, "tags": tags, "dedup": True}
+            if getattr(self, "_expiry_enabled", False):
+                if "durability" in args:
+                    save_kwargs["durability"] = args["durability"]
+                if "expires_at" in args:
+                    save_kwargs["expires_at"] = args["expires_at"]
+            rec = self._store.remember(**save_kwargs)
             if rec is None:
                 return json.dumps({"status": "deduplicated", "message": "Similar memory already exists"})
             # Index every memory category; entity links are additive and
@@ -2416,7 +2555,12 @@ class HybridMemoryProvider(MemoryProvider):
             # service path. Passing it positionally raises TypeError on the live
             # memory_update tool path (the direct DuckDBMemoryStore path accepted
             # positional args, so store-level tests missed this).
-            rec = self._store.update_memory(memory_id=memory_id, content=content, tags=tags)
+            update_kwargs: Dict[str, Any] = {"memory_id": memory_id, "content": content, "tags": tags}
+            # Expiry (Spec 1): pass expires_at only when enabled AND the
+            # caller explicitly provided it (None = clear/revive, str = set).
+            if getattr(self, "_expiry_enabled", False) and "expires_at" in args:
+                update_kwargs["expires_at"] = args["expires_at"]
+            rec = self._store.update_memory(**update_kwargs)
             if rec is None:
                 return tool_error(f"Memory not found: {memory_id}")
             if getattr(self, "_graph", None):
@@ -2488,13 +2632,17 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: candidate_id or decision")
             supersedes_memory_id = args.get("supersedes_memory_id")
             try:
-                result = self._store.review_candidate(
+                review_kwargs: Dict[str, Any] = dict(
                     evidence_retention=getattr(self, "_evidence_retention", "full"),
                     candidate_id=candidate_id,
                     decision=decision,
                     reason=args.get("reason", ""),
                     supersedes_memory_id=supersedes_memory_id,
                 )
+                # Spec 1: pass expires_at through when expiry is enabled.
+                if getattr(self, "_expiry_enabled", False) and "expires_at" in args:
+                    review_kwargs["expires_at"] = args["expires_at"]
+                result = self._store.review_candidate(**review_kwargs)
             except ValueError as exc:
                 return tool_error(str(exc))
             if result is None:
@@ -2707,6 +2855,30 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: term")
             edges = self._graph.search_graph(term)
             return json.dumps({"term": term, "count": len(edges), "edges": edges})
+
+        elif tool_name == "memory_why_not":
+            # Spec 2: deterministic, free, read-only retrieval diagnostic.
+            query = args.get("query", "")
+            expected_memory_id = args.get("expected_memory_id", "")
+            if not query:
+                return tool_error("Missing required parameter: query")
+            if not expected_memory_id:
+                return tool_error("Missing required parameter: expected_memory_id")
+            top_k = int(args.get("top_k", 20))
+            # Thread project_id so the diagnostic search matches the
+            # production scoping path (project_scope_mismatch is a top-3
+            # cause of "why didn't this surface").
+            effective_project = args.get("project_id")
+            if effective_project is None:
+                effective_project = self._current_project_id
+            try:
+                explanation = self._store.explain_retrieval(
+                    query, expected_memory_id, top_k=top_k,
+                    project_id=effective_project,
+                )
+            except Exception as exc:
+                return tool_error(f"explain_retrieval failed: {exc}")
+            return json.dumps(explanation, default=str)
 
         elif tool_name == "memory_graph_query":
             if self._graph is None:

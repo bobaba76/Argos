@@ -132,6 +132,7 @@ class MemoryService:
                     project_id=args.get("project_id"),
                     as_of=args.get("as_of"),
                     suppress_retrieval=bool(args.get("suppress_retrieval", False)),
+                    include_expired=bool(args.get("include_expired", False)),
                 )
             ]
         if method == "remember":

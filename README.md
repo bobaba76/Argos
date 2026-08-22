@@ -70,8 +70,13 @@ Argos's headline measurements, each under a stated protocol:
   default answerer) — and head-to-head runs showed the *answerer*, not the
   memory layer, is the bigger lever (a stronger answerer measured ~80+).
   The benchmark runs on synthetic conversation data; real conversations are
-  messier and your results may differ.
-- In the builder's own comparison against other open memory systems Argos
+    messier and your results may differ.
+
+  Every number above is independently re-measurable — dataset SHA-256, per-category
+  denominators, model versions, prompts, exact commands, and the judged outputs
+  themselves: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
+
+  - In the builder's own comparison against other open memory systems Argos
   came in second, behind Perseus (73.8) and ahead of Zep (63.8) — but those
   are vendor-published numbers under different protocols, so treat the
   cross-system gap as directional, not lab-controlled.

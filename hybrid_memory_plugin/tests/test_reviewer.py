@@ -20,9 +20,9 @@ def test_sensitive_candidate_requires_confirmation_when_reviewer_unavailable():
 
     result = review_candidate_with_llm({
         "category": "personal_fact",
-        "content": "User has a medical diagnosis",
+        "content": "Alex has a medical diagnosis",
         "payload": {},
-        "evidence_text": "I have a medical diagnosis.",
+        "evidence_text": "My name is Alex and I have a medical diagnosis.",
     })
     assert result["decision"] == "pending_user_confirmation"
 

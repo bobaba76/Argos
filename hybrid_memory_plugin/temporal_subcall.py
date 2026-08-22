@@ -68,6 +68,10 @@ def temporal_answer(question: str, evidence_text: str) -> str:
     question = (question or "").strip()
     if not question:
         return ""
+    from egress import gate as _egress_gate
+    if not _egress_gate("temporal_subcall", question):
+        return ""
+
     try:
         from agent.auxiliary_client import call_llm
     except Exception as exc:

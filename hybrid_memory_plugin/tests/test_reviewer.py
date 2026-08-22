@@ -15,16 +15,14 @@ def test_obvious_garbage_is_quarantined_without_llm():
     assert result["review_model"] == "deterministic_gate"
 
 
-def test_sensitive_candidate_requires_confirmation_when_reviewer_unavailable():
+def test_sensitive_candidate_requires_confirmation_when_reviewer_unavailable(monkeypatch):
+    import sys
+
     from reviewer import review_candidate_with_llm
 
-    result = review_candidate_with_llm({
-        "category": "personal_fact",
-        "content": "Alex has a medical diagnosis",
-        "payload": {},
-        "evidence_text": "My name is Alex and I have a medical diagnosis.",
-    })
-    assert result["decision"] == "pending_user_confirmation"
+    # Deterministic: force the "no LLM client" state. A full-suite process
+    # may already have imported the real agent client, in which case the
+    # revie...[truncated]
 
 
 def test_missing_evidence_never_auto_approves():

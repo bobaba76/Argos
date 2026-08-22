@@ -494,5 +494,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Maximum LLM calls per run (1 per cluster + 1 high-signal scan). Bounds cost.",
             group="Distillation",
         ),
+        ProviderField(
+            key="local_only",
+            label="Local-only mode",
+            kind=KIND_BOOL,
+            default="false",
+            description="Block every plugin-owned LLM call (extraction, review, graph typing, expansion, temporal sub-call, distillation).",
+            info="When ON, no stored or conversational memory data is sent to any LLM by this plugin — all egress sites fail soft (regex-only extraction, proposals wait for user review, no expansion, no sub-call hints). Embeddings are always local. See scripts/egress_report.py for the full inventory.",
+            group="Privacy",
+        ),
     ),
 )

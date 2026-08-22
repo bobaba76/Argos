@@ -434,6 +434,18 @@ class DuckDBMemoryStore:
             except Exception as exc:
                 logger.warning("user_scope index creation failed: %s", exc)
 
+            # System state KV table (P4.2 distillation run state, future
+            # maintenance passes). Zero migration — CREATE IF NOT EXISTS.
+            try:
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS system_state (
+                        key    VARCHAR PRIMARY KEY,
+                        value  VARCHAR
+                    )
+                """)
+            except Exception as exc:
+                logger.warning("system_state table creation failed: %s", exc)
+
     # -- helpers --------------------------------------------------------------
 
     def set_user_scope(self, user_id: str | None) -> None:
@@ -3164,6 +3176,33 @@ class DuckDBMemoryStore:
             "reasons": reasons,
             "diagnostics": diagnostics,
         }
+
+    # -- system state KV (P4.2 distillation, future maintenance) -------------
+
+    def get_state(self, key: str) -> str | None:
+        """Read a value from the ``system_state`` KV table."""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                row = self.connection.execute(
+                    "SELECT value FROM system_state WHERE key = ?", [key],
+                ).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def set_state(self, key: str, value: str) -> None:
+        """Write a value to the ``system_state`` KV table (upsert)."""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                self.connection.execute(
+                    """INSERT INTO system_state (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    [key, value],
+                )
+        except Exception as exc:
+            logger.debug("set_state(%s) failed: %s", key, exc)
 
     # -- lifecycle ------------------------------------------------------------
 

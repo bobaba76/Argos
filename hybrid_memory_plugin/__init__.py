@@ -43,6 +43,7 @@ from .routing import resolve_storage_names
 from .service_client import SharedGraphStore, SharedMemoryStore
 from .reviewer import review_candidate_with_llm, suggest_expiry
 from .query_expander import QueryExpander
+from .distillation import run_distillation
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,12 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "expiry_ttl_days": '{"context_note":30,"event":180,"goal":180}',
         "expiry_default_days": "90",
         "expiry_auto_suggest": "false",
+        # Distillation (P4.2)
+        "distillation_enabled": "false",
+        "distillation_min_new_records": "20",
+        "distillation_cooldown_hours": "24",
+        "distillation_max_records_per_run": "100",
+        "distillation_max_calls": "10",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -542,6 +549,12 @@ class HybridMemoryProvider(MemoryProvider):
         self._expiry_ttl_days: Dict[str, int] = {"context_note": 30, "event": 180, "goal": 180}
         self._expiry_default_days: int = 90
         self._expiry_auto_suggest: bool = False
+        # Distillation (P4.2): LLM-assisted consolidation pass at session end.
+        self._distillation_enabled: bool = False
+        self._distillation_min_new_records: int = 20
+        self._distillation_cooldown_hours: int = 24
+        self._distillation_max_records_per_run: int = 100
+        self._distillation_max_calls: int = 10
         # LLM model/provider for auxiliary tasks (extraction, review, expansion)
         # Empty string = use the auxiliary client's default model
         self._llm_model: str = ""
@@ -975,6 +988,36 @@ class HybridMemoryProvider(MemoryProvider):
             self._store.expiry_enabled = self._expiry_enabled
             self._store.ttl_days = dict(self._expiry_ttl_days)
             self._store.expiry_default_days = self._expiry_default_days
+        # Distillation config (P4.2)
+        distillation_enabled = self._config.get("distillation_enabled", "false")
+        self._distillation_enabled = (
+            distillation_enabled.lower() in ("true", "1", "yes")
+            if isinstance(distillation_enabled, str) else bool(distillation_enabled)
+        )
+        try:
+            self._distillation_min_new_records = max(
+                1, int(self._config.get("distillation_min_new_records", 20))
+            )
+        except (TypeError, ValueError):
+            self._distillation_min_new_records = 20
+        try:
+            self._distillation_cooldown_hours = max(
+                0, int(self._config.get("distillation_cooldown_hours", 24))
+            )
+        except (TypeError, ValueError):
+            self._distillation_cooldown_hours = 24
+        try:
+            self._distillation_max_records_per_run = max(
+                10, min(int(self._config.get("distillation_max_records_per_run", 100)), 1000)
+            )
+        except (TypeError, ValueError):
+            self._distillation_max_records_per_run = 100
+        try:
+            self._distillation_max_calls = max(
+                1, min(int(self._config.get("distillation_max_calls", 10)), 100)
+            )
+        except (TypeError, ValueError):
+            self._distillation_max_calls = 10
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,
@@ -2161,6 +2204,34 @@ class HybridMemoryProvider(MemoryProvider):
                                 pass
                 except Exception as e:
                     logger.debug("Consolidation failed: %s", e)
+            # Distillation (P4.2): LLM-assisted proposal pass at session end.
+            # Runs after consolidation. Gated by distillation_enabled.
+            # Fail-soft: never blocks session end.
+            if self._distillation_enabled:
+                try:
+                    dream_report = run_distillation(
+                        self._store,
+                        llm_model=self._llm_model,
+                        llm_provider=self._llm_provider,
+                        min_new_records=self._distillation_min_new_records,
+                        cooldown_hours=self._distillation_cooldown_hours,
+                        max_records_per_run=self._distillation_max_records_per_run,
+                        max_calls=self._distillation_max_calls,
+                    )
+                    if dream_report.get("ran"):
+                        logger.info(
+                            "Distillation: %d proposals, %d contradictions, "
+                            "%d calls",
+                            dream_report.get("proposals_emitted", 0),
+                            dream_report.get("contradictions_emitted", 0),
+                            dream_report.get("llm_calls", 0),
+                        )
+                    elif dream_report.get("reason"):
+                        logger.debug(
+                            "Distillation skipped: %s", dream_report["reason"],
+                        )
+                except Exception as e:
+                    logger.debug("Distillation failed: %s", e)
 
     # -- session switch ------------------------------------------------------
 

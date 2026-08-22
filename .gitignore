@@ -32,6 +32,10 @@ hybrid_memory_plugin/eval/probe_cosines.py
 hybrid_memory_plugin/eval/probe_deep_search.py
 hybrid_memory_plugin/eval/probe_fp.py
 
+# Self-corpus eval outputs — carry personal memory content; never commit.
+eval_self_corpus_out.jsonl
+*_self_corpus_out.jsonl
+
 # Node/Electron artifacts
 node_modules/
 dist/

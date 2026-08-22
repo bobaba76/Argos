@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 if __package__:
     from .extractor import hard_quality_flags, quality_flags_for_fact
@@ -17,6 +18,102 @@ _SENSITIVE_RE = re.compile(
     r"works?\s+(?:at|for)|job|identity|name)\b",
     re.IGNORECASE,
 )
+
+# Spec 1 — deterministic expiry suggestion. No LLM; pure regex + category map.
+# Returns an ISO-8601 UTC string (the suggested expires_at) or None.
+#
+# NOTE: the duration and fixed-date regexes match English month names and
+# English prepositions only ("for 2 weeks", "until 15 Dec"). Non-English
+# content ("bis März 2026", "jusqu'au 15 déc") will not match and falls
+# through to the category TTL fallback — which is safe (the memory still
+# gets a sensible default expiry), but the explicit date won't be picked
+# up. Extending to other languages is a future enhancement; for now the
+# English bias is documented, not hidden.
+_EXPIRY_DURATION_RE = re.compile(
+    r"\b(?:for|next|in|until|through)\s+"
+    r"(\d+)\s*(day|days|week|weeks|month|months|year|years)\b",
+    re.IGNORECASE,
+)
+_EXPIRY_FIXED_RE = re.compile(
+    r"\b(?:until|through|by|before|expires?)\s+"
+    r"(\d{1,2})\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(\d{4})?\b",
+    re.IGNORECASE,
+)
+_UNIT_DAYS = {
+    "day": 1, "days": 1,
+    "week": 7, "weeks": 7,
+    "month": 30, "months": 30,
+    "year": 365, "years": 365,
+}
+_MONTH_NUM = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+# Categories that should never get an auto-suggested expiry (durable facts).
+_DURABLE_CATEGORIES = {"personal_fact", "preference", "relationship", "insight"}
+
+
+def suggest_expiry(
+    candidate: Dict[str, Any],
+    ttl_days: Optional[Dict[str, int]] = None,
+    default_days: int = 90,
+) -> Optional[str]:
+    """Deterministic, no-LLM expiry suggestion for a candidate.
+
+    Returns an ISO-8601 UTC string or None. Rules (in priority order):
+    1. Durable categories (personal_fact, preference, relationship, insight)
+       → None (no expiry suggested).
+    2. Explicit duration in content ("for 2 weeks", "next 3 months")
+       → now + that duration.
+    3. Explicit fixed date ("until 15 Dec", "by March 2026")
+       → that date (end-of-day UTC).
+    4. Category TTL map (context_note=30, event=180, goal=180, …)
+       → now + ttl_days[category].
+    5. Fallback: now + default_days.
+
+    Never raises; returns None on any parse failure.
+    """
+    category = str(candidate.get("category", "")).strip().lower()
+    content = str(candidate.get("content", "")).strip()
+    if not content:
+        return None
+    # Rule 1: durable categories never get auto-expiry.
+    if category in _DURABLE_CATEGORIES:
+        return None
+    now = datetime.now(timezone.utc)
+    # Rule 2: explicit duration.
+    m = _EXPIRY_DURATION_RE.search(content)
+    if m:
+        try:
+            n = int(m.group(1))
+            unit = m.group(2).lower()
+            days = n * _UNIT_DAYS.get(unit, 0)
+            if days > 0:
+                return (now + timedelta(days=days)).isoformat()
+        except (ValueError, KeyError):
+            pass
+    # Rule 3: explicit fixed date.
+    m = _EXPIRY_FIXED_RE.search(content)
+    if m:
+        try:
+            day = int(m.group(1))
+            month = _MONTH_NUM[m.group(2).lower()]
+            year = int(m.group(3)) if m.group(3) else now.year
+            # End of that day, UTC.
+            return datetime(
+                year, month, day, 23, 59, 59, tzinfo=timezone.utc
+            ).isoformat()
+        except (ValueError, KeyError):
+            pass
+    # Rule 4: category TTL map.
+    ttl_map = ttl_days or {}
+    days = ttl_map.get(category)
+    if days is None:
+        # Rule 5: fallback.
+        days = default_days
+    if days and days > 0:
+        return (now + timedelta(days=days)).isoformat()
+    return None
 
 
 def is_sensitive_candidate(candidate: Dict[str, Any]) -> bool:

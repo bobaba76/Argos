@@ -71,6 +71,7 @@ class MemoryRecord:
         "created_at", "updated_at", "expires_at", "embedding", "similarity",
         "raw_similarity",
         "status", "source", "confidence", "durability", "scope", "project_id",
+        "user_scope",
         "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
         "quarantine_reason", "quarantined_at",
         "valid_from", "valid_to", "superseded_by",
@@ -95,6 +96,7 @@ class MemoryRecord:
         durability: str = "durable",
         scope: str = "profile",
         project_id: str | None = None,
+        user_scope: str | None = None,
         retrieval_count: int = 0,
         last_retrieved_at: str | None = None,
         helpful_count: int = 0,
@@ -125,6 +127,7 @@ class MemoryRecord:
         self.durability = durability or "durable"
         self.scope = scope or "profile"
         self.project_id = project_id
+        self.user_scope = user_scope
         self.retrieval_count = int(retrieval_count or 0)
         self.last_retrieved_at = last_retrieved_at
         self.helpful_count = int(helpful_count or 0)
@@ -478,6 +481,7 @@ class DuckDBMemoryStore:
             durability=row.get("durability", "durable"),
             scope=row.get("scope", "profile"),
             project_id=row.get("project_id"),
+            user_scope=row.get("user_scope"),
             retrieval_count=row.get("retrieval_count", 0),
             last_retrieved_at=row.get("last_retrieved_at"),
             helpful_count=row.get("helpful_count", 0),
@@ -1362,6 +1366,11 @@ class DuckDBMemoryStore:
         skip_auto_ttl = expires_at is not _NOT_PROVIDED
         if expires_at is not _NOT_PROVIDED and expires_at is not None:
             record_payload["expires_at"] = expires_at
+        elif expires_at is None:
+            # Explicit None: clear any pre-existing payload expiry so the
+            # column (populated from record_payload below) is NULL, not
+            # a stale value from the caller's payload dict.
+            record_payload.pop("expires_at", None)
 
         if dedup and self._content_exists(content, category):
             logger.debug("Deduped memory: %s", content[:60])
@@ -2669,11 +2678,13 @@ class DuckDBMemoryStore:
             return 0
 
         # Group by (category, user_scope, project_id) so we never merge
-        # across scope boundaries.
+        # across scope boundaries. Use the record's user_scope attribute
+        # (populated from the DB column) rather than r.payload — the
+        # payload dict is the user's raw input and may be missing or stale
+        # relative to the canonical column.
         groups: Dict[tuple, List[MemoryRecord]] = {}
         for r in eligible:
-            scope_key = r.payload.get("user_scope") if isinstance(r.payload, dict) else None
-            key = (r.category, scope_key, r.project_id)
+            key = (r.category, r.user_scope, r.project_id)
             groups.setdefault(key, []).append(r)
 
         total_candidates = 0
@@ -2682,6 +2693,18 @@ class DuckDBMemoryStore:
         for key, group_records in groups.items():
             if len(group_records) < 2:
                 continue
+            # Pre-check: bail before the O(n²) matrix if this group alone
+            # would blow the budget. Without this, a single oversized
+            # category does its full dot product before the post-hoc
+            # guard fires.
+            group_pairs = len(group_records) * (len(group_records) - 1) // 2
+            if pairs_checked + group_pairs > max_pairs:
+                logger.debug(
+                    "Semantic dedup max_pairs (%d) reached; skipping group "
+                    "of %d records (%d pairs)",
+                    max_pairs, len(group_records), group_pairs,
+                )
+                break
             # Build the embedding matrix for this group.
             try:
                 emb_dim = len(group_records[0].embedding)
@@ -2699,12 +2722,7 @@ class DuckDBMemoryStore:
             # Compute pairwise cosine = dot product of normalized vectors.
             # Only the upper triangle matters (symmetric matrix).
             sim_matrix = normed @ normed.T
-            pairs_checked += len(group_records) * (len(group_records) - 1) // 2
-            if pairs_checked > max_pairs:
-                logger.debug(
-                    "Semantic dedup max_pairs (%d) reached; stopping", max_pairs,
-                )
-                break
+            pairs_checked += group_pairs
 
             # Find pairs above threshold using the upper triangle.
             n = len(group_records)
@@ -2884,7 +2902,10 @@ class DuckDBMemoryStore:
         }
         selected = sorted(
             candidates.values(),
-            key=lambda item: (priority.get(item["reason"], 9), item["memory_id"]),
+            key=lambda item: (
+                priority.get(item["reason"].split(":")[0], 9),
+                item["memory_id"],
+            ),
         )[:max_actions]
         quarantined = 0
         quarantined_ids: List[str] = []

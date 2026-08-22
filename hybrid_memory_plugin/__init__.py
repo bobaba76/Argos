@@ -2885,7 +2885,10 @@ class HybridMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: query")
             if not expected_memory_id:
                 return tool_error("Missing required parameter: expected_memory_id")
-            top_k = int(args.get("top_k", 20))
+            try:
+                top_k = max(1, min(int(args.get("top_k", 20)), 100))
+            except (TypeError, ValueError):
+                top_k = 20
             # Thread project_id so the diagnostic search matches the
             # production scoping path (project_scope_mismatch is a top-3
             # cause of "why didn't this surface").

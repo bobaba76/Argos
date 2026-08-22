@@ -29,16 +29,37 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 _plugin_dir = Path(__file__).resolve().parent.parent
 if str(_plugin_dir) not in sys.path:
     sys.path.insert(0, str(_plugin_dir))
+
+
+# NOTE: this suite loads the embedder BY NAME, which performs a network
+# HEAD-check that HANGS for minutes without a warm cache. Run with
+# HF_HUB_OFFLINE=1 (or the equivalent) or the suite will stall.
+
+_EMBEDDER = None
+_EMBEDDER_LOCK = threading.Lock()
+
+
+def _get_embedder():
+    """Shared embedder — one model load for the whole suite."""
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        with _EMBEDDER_LOCK:
+            if _EMBEDDER is None:
+                from embeddings import LocalEmbedder
+                _EMBEDDER = LocalEmbedder("BAAI/bge-small-en-v1.5")
+    return _EMBEDDER
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +70,7 @@ if str(_plugin_dir) not in sys.path:
 def store(tmp_path):
     """A fresh DuckDBMemoryStore with the BGE embedder."""
     from store import DuckDBMemoryStore
-    from embeddings import LocalEmbedder
-    embedder = LocalEmbedder("BAAI/bge-small-en-v1.5")
+    embedder = _get_embedder()
     s = DuckDBMemoryStore(
         tmp_path / "test.duckdb", user_id="test_user", embedder=embedder,
     )
@@ -92,6 +112,25 @@ def _seed_related_records(store, n: int = 25) -> List:
         if rec:
             recs.append(rec)
     return recs
+
+
+def _guaranteed_cluster_pair(store):
+    """Return two record IDs guaranteed to be in the first seed-star cluster.
+
+    Replicates the deterministic clustering: the newest record is the seed;
+    the record most similar to it is its top member. Both are always inside
+    the first cluster's source_ids.
+    """
+    records = store._fetch_records(
+        "SELECT * FROM memory_records WHERE valid_to IS NULL "
+        "ORDER BY created_at DESC"
+    )
+    emb = np.asarray([r.embedding for r in records], dtype=np.float32)
+    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+    normed = emb / np.maximum(norms, 1e-9)
+    sims = normed @ normed[0]  # similarity to the newest record (the seed)
+    top = int(np.argmax(sims[1:])) + 1  # most similar non-seed record
+    return records[0].memory_id, records[top].memory_id
 
 
 def _seed_distinct_records(store, n: int = 25) -> List:
@@ -482,13 +521,8 @@ class TestContradictions:
         from distillation import run_distillation
         _seed_related_records(store, n=25)
 
-        # Get two record IDs for the contradiction.
-        records = store._fetch_records(
-            "SELECT * FROM memory_records WHERE valid_to IS NULL LIMIT 2"
-        )
-        assert len(records) >= 2
-        a_id = records[0].memory_id
-        b_id = records[1].memory_id
+        # Get two IDs that ARE in an emitted cluster (seed + its top member).
+        a_id, b_id = _guaranteed_cluster_pair(store)
 
         response = _make_distill_response(
             contradictions=[{
@@ -556,3 +590,136 @@ class TestAutoReviewIntegration:
         assert "content" in c
         assert "status" in c
         assert c["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# 12. High-signal proposals keep a unanimous project scope
+# ---------------------------------------------------------------------------
+
+class TestHighSignalScoping:
+    def test_high_signal_proposals_keep_unanimous_project(self, store):
+        """Guardrails from single-project feedback land in that project."""
+        from distillation import run_distillation
+        recs = _seed_related_records(store, n=25)
+
+        # Give two records feedback signals + a project scope.
+        store.connection.execute(
+            "UPDATE memory_records SET helpful_count = 3, "
+            "project_id = 'proj-alpha' "
+            "WHERE memory_id IN (?, ?)",
+            [recs[0].memory_id, recs[1].memory_id],
+        )
+
+        response = _make_distill_response(
+            guardrails=[{"text": "Always confirm the schedule before starting"}],
+        )
+        # Cluster legs and the high-signal leg share the mock; give the
+        # high-signal leg a DIFFERENT text so dedup=True doesn't swallow it.
+        high_signal_response = _make_distill_response(
+            guardrails=[{"text": "Always confirm the schedule before starting — twice"}],
+        )
+
+        def _mocked(*_a, **kw):
+            if kw.get("task") == "distillation_high_signal":
+                return _make_mock_response(high_signal_response)
+            return _make_mock_response(response)
+
+        with patch("distillation._get_llm_client",
+                    return_value=_mocked):
+            report = run_distillation(store, min_new_records=20, cooldown_hours=0)
+
+        assert report["ran"] is True
+        assert report["proposals_emitted"] >= 1
+        row = store.connection.execute(
+            "SELECT project_id FROM memory_candidates "
+            "WHERE source = 'distillation' "
+            "AND payload LIKE '%guardrail%' "
+            "ORDER BY created_at DESC LIMIT 1",
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "proj-alpha", \
+            "Guardrail distilled from project-scoped feedback must keep scope"
+
+    def test_mixed_project_feedback_goes_global(self, store):
+        """Feedback from different projects → global proposal, no mis-tag."""
+        from distillation import run_distillation
+        recs = _seed_related_records(store, n=25)
+
+        store.connection.execute(
+            "UPDATE memory_records SET helpful_count = 2, "
+            "project_id = 'proj-alpha' WHERE memory_id = ?",
+            [recs[0].memory_id],
+        )
+        store.connection.execute(
+            "UPDATE memory_records SET helpful_count = 2, "
+            "project_id = 'proj-beta' WHERE memory_id = ?",
+            [recs[1].memory_id],
+        )
+
+        response = _make_distill_response(
+            guardrails=[{"text": "Confirm the schedule before starting"}],
+        )
+        high_signal_response = _make_distill_response(
+            guardrails=[{"text": "Confirm the schedule before starting — from feedback"}],
+        )
+
+        def _mocked(*_a, **kw):
+            if kw.get("task") == "distillation_high_signal":
+                return _make_mock_response(high_signal_response)
+            return _make_mock_response(response)
+
+        with patch("distillation._get_llm_client",
+                    return_value=_mocked):
+            report = run_distillation(store, min_new_records=20, cooldown_hours=0)
+
+        assert report["ran"] is True
+        row = store.connection.execute(
+            "SELECT project_id FROM memory_candidates "
+            "WHERE source = 'distillation' "
+            "AND payload LIKE '%guardrail%' "
+            "ORDER BY created_at DESC LIMIT 1",
+        ).fetchone()
+        assert row is not None
+        assert row[0] is None, \
+            "Mixed-project feedback must not be tagged to either project"
+
+
+# ---------------------------------------------------------------------------
+# 13. Contradiction IDs are validated — invented IDs are dropped
+# ---------------------------------------------------------------------------
+
+class TestContradictionValidation:
+    def test_invented_contradiction_ids_dropped(self, store):
+        """Only IDs the LLM was actually shown produce contradiction proposals."""
+        from distillation import run_distillation
+        _seed_related_records(store, n=25)
+
+        a_id, b_id = _guaranteed_cluster_pair(store)
+
+        response = _make_distill_response(
+            contradictions=[
+                {"a_id": a_id, "b_id": b_id, "reason": "Real pair"},
+                {"a_id": "mem-fake-1", "b_id": "mem-fake-2",
+                 "reason": "Invented pair"},
+            ],
+        )
+        with patch("distillation._get_llm_client",
+                    return_value=lambda *a, **kw: _make_mock_response(response)):
+            report = run_distillation(store, min_new_records=20, cooldown_hours=0)
+
+        assert report["ran"] is True
+        assert report["contradictions_emitted"] == 1, \
+            "Fabricated IDs must be silently dropped"
+
+    def test_valid_contradiction_helper(self):
+        """Pure unit: validator accepts only IDs the LLM was shown."""
+        from distillation import _valid_contradiction
+        src = ["mem-a", "mem-b"]
+        assert _valid_contradiction(
+            {"a_id": "mem-a", "b_id": "mem-b"}, src) is True
+        assert _valid_contradiction(
+            {"a_id": "mem-x", "b_id": "mem-b"}, src) is False
+        assert _valid_contradiction(
+            {"a_id": "mem-a", "b_id": ""}, src) is False
+        assert _valid_contradiction("not a dict", src) is False
+        assert _valid_contradiction({}, src) is False

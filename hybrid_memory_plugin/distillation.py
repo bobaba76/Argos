@@ -79,6 +79,7 @@ def _count_eligible_since(store, since: Optional[str]) -> int:
         "COALESCE(status, 'active') = 'active'",
         "valid_to IS NULL",
         "(user_scope IS NULL OR user_scope = ?)",
+        "embedding IS NOT NULL",
     ]
     params: list[Any] = [store.user_id]
     if since:
@@ -311,6 +312,33 @@ def _parse_distill_response(response: Any) -> Optional[Dict[str, Any]]:
 # -- Proposal emission -------------------------------------------------------
 
 
+def _item_confidence(item: Any) -> float:
+    """Map an LLM item's confidence marker to a proposal confidence.
+
+    Only an explicit 'low'-style marker (case-insensitive) lowers
+    confidence; anything else keeps the default 0.7.
+    """
+    if isinstance(item, dict):
+        marker = str(item.get("confidence", "") or "").strip().lower()
+        if marker in ("low", "low confidence", "uncertain"):
+            return 0.5
+    return 0.7
+
+
+def _majority_project_id(records: List[Any]) -> Optional[str]:
+    """Project id for a batch of records, only when unanimous.
+
+    Mixed-project or unscoped batches distill to a GLOBAL proposal (None)
+    rather than mis-tagging one project with another's lessons.
+    """
+    pids = {
+        getattr(r, "project_id", None)
+        for r in records
+        if getattr(r, "project_id", None)
+    }
+    return next(iter(pids)) if len(pids) == 1 else None
+
+
 def _emit_proposal(
     store,
     content: str,
@@ -347,6 +375,19 @@ def _emit_proposal(
     )
 
 
+def _valid_contradiction(contra: Any, source_ids: List[str]) -> bool:
+    """Only honor contradiction IDs the LLM was actually shown.
+
+    Invented or out-of-cluster IDs would create unresolvable proposals,
+    so they are dropped silently.
+    """
+    if not isinstance(contra, dict):
+        return False
+    a_id = contra.get("a_id", "")
+    b_id = contra.get("b_id", "")
+    return bool(a_id and b_id and a_id in source_ids and b_id in source_ids)
+
+
 def _emit_contradiction(
     store,
     a_id: str,
@@ -356,12 +397,12 @@ def _emit_contradiction(
     evidence_text: str,
     project_id: Optional[str] = None,
 ) -> Optional[dict]:
-    """Save a contradiction proposal and wire it to find_supersede_candidates.
+    """Save a contradiction proposal as a pending candidate.
 
     Contradictions are emitted as context_note candidates with kind=
-    "contradiction".  The resolution path (chain-unfold supersede,
-    user-confirmed) is one step away via find_supersede_candidates —
-    never auto-superseded.
+    "contradiction", never auto-superseded. Resolution is left to the
+    chain-unfold flow (user-confirmed supersession). ID validity is the
+    caller's responsibility — only IDs shown to the LLM are accepted.
     """
     if not reason or not reason.strip():
         return None
@@ -515,7 +556,7 @@ def run_distillation(
         for item in parsed.get("insights", []):
             if isinstance(item, dict):
                 text = item.get("text", "")
-                conf = 0.5 if item.get("confidence") == "low" else 0.7
+                conf = _item_confidence(item)
             else:
                 text = str(item)
                 conf = 0.7
@@ -530,7 +571,7 @@ def run_distillation(
         for item in parsed.get("guardrails", []):
             if isinstance(item, dict):
                 text = item.get("text", "")
-                conf = 0.5 if item.get("confidence") == "low" else 0.7
+                conf = _item_confidence(item)
             else:
                 text = str(item)
                 conf = 0.7
@@ -548,7 +589,7 @@ def run_distillation(
             a_id = contra.get("a_id", "")
             b_id = contra.get("b_id", "")
             reason = contra.get("reason", "")
-            if not a_id or not b_id:
+            if not _valid_contradiction(contra, source_ids):
                 continue
             result = _emit_contradiction(
                 store, a_id, b_id, reason, source_ids, evidence,
@@ -588,27 +629,30 @@ def run_distillation(
                         (r.content or "")[:200] for r in high_signal
                     )[:2000]
                     source_ids = [r.memory_id for r in high_signal]
+                    project_id = _majority_project_id(high_signal)
                     for item in parsed.get("guardrails", []):
                         if isinstance(item, dict):
                             text = item.get("text", "")
-                            conf = 0.5 if item.get("confidence") == "low" else 0.7
+                            conf = _item_confidence(item)
                         else:
                             text = str(item)
                             conf = 0.7
                         result = _emit_proposal(
                             store, text, "guardrail", source_ids, evidence, conf,
+                            project_id=project_id,
                         )
                         if result:
                             proposals_emitted += 1
                     for item in parsed.get("insights", []):
                         if isinstance(item, dict):
                             text = item.get("text", "")
-                            conf = 0.5 if item.get("confidence") == "low" else 0.7
+                            conf = _item_confidence(item)
                         else:
                             text = str(item)
                             conf = 0.7
                         result = _emit_proposal(
                             store, text, "insight", source_ids, evidence, conf,
+                            project_id=project_id,
                         )
                         if result:
                             proposals_emitted += 1

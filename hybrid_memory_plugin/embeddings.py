@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +32,23 @@ _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 # Process-level shared model cache: {model_name: (model, dim)}
 _SHARED_MODELS: Dict[str, Tuple[object, int]] = {}
 _SHARED_LOCK = threading.Lock()
+
+# Bounded query-embedding cache (2026-08-22): searches re-embed the same
+# natural-language query strings repeatedly across turns ("what did we do in
+# August").  Query vectors are small (384 floats) and stable per text, so a
+# small FIFO cache removes the per-search CPU embed call (~100ms+ on-device).
+# Content embeddings (is_query=False) are NEVER cached — stored text is not
+# immutable.  Key: "<model_name>::<prepared text>"; value is a tuple so the
+# cached vector cannot be mutated by callers.
+_QUERY_EMBED_CACHE: "OrderedDict[str, Tuple[float, ...]]" = OrderedDict()
+_QUERY_EMBED_CACHE_MAX = 512
+_QUERY_EMBED_LOCK = threading.Lock()
+
+
+def clear_query_embed_cache() -> None:
+    """Drop all cached query embeddings (tests, model swaps)."""
+    with _QUERY_EMBED_LOCK:
+        _QUERY_EMBED_CACHE.clear()
 
 # Query instructions for asymmetric models.  Keys are matched by substring
 # so that local cache paths (e.g. "models--sentence-transformers--bge-small-en-v1.5")
@@ -232,21 +250,35 @@ class LocalEmbedder:
         """Return an embedding vector for *text*, or [] if unavailable.
 
         When *is_query* is True, the model's query instruction is prepended
-        (for asymmetric models like BGE/E5).  Stored content should use the
-        default (is_query=False) so documents are embedded raw.
+        (for asymmetric models like BGE/E5), and the result is served from
+        a bounded FIFO cache — search queries repeat far more often than
+        they change.  Stored content should use the default (is_query=False)
+        so documents are embedded raw and never cached.
         """
         if not text or not text.strip():
             return []
+        prepared = self._prepare_text(text, is_query)
+        if is_query:
+            cache_key = f"{self._model_name}::{prepared}"
+            with _QUERY_EMBED_LOCK:
+                cached = _QUERY_EMBED_CACHE.get(cache_key)
+            if cached is not None:
+                return list(cached)
         self._ensure_loaded()
         with _SHARED_LOCK:
             shared = _SHARED_MODELS.get(self._model_name)
         if shared is None:
             return []
         model = shared[0]
-        prepared = self._prepare_text(text, is_query)
         try:
             vec = model.encode([prepared], normalize_embeddings=True)
-            return [float(x) for x in vec[0]]
+            result = [float(x) for x in vec[0]]
+            if is_query:
+                with _QUERY_EMBED_LOCK:
+                    if len(_QUERY_EMBED_CACHE) >= _QUERY_EMBED_CACHE_MAX:
+                        _QUERY_EMBED_CACHE.popitem(last=False)
+                    _QUERY_EMBED_CACHE[cache_key] = tuple(result)
+            return result
         except Exception as e:
             logger.debug("Embedding failed for text (%s): %s", text[:60], e)
             return []

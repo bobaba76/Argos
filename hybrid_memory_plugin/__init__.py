@@ -2204,34 +2204,49 @@ class HybridMemoryProvider(MemoryProvider):
                                 pass
                 except Exception as e:
                     logger.debug("Consolidation failed: %s", e)
-            # Distillation (P4.2): LLM-assisted proposal pass at session end.
-            # Runs after consolidation. Gated by distillation_enabled.
-            # Fail-soft: never blocks session end.
-            if self._distillation_enabled:
-                try:
-                    dream_report = run_distillation(
-                        self._store,
-                        llm_model=self._llm_model,
-                        llm_provider=self._llm_provider,
-                        min_new_records=self._distillation_min_new_records,
-                        cooldown_hours=self._distillation_cooldown_hours,
-                        max_records_per_run=self._distillation_max_records_per_run,
-                        max_calls=self._distillation_max_calls,
-                    )
-                    if dream_report.get("ran"):
-                        logger.info(
-                            "Distillation: %d proposals, %d contradictions, "
-                            "%d calls",
-                            dream_report.get("proposals_emitted", 0),
-                            dream_report.get("contradictions_emitted", 0),
-                            dream_report.get("llm_calls", 0),
-                        )
-                    elif dream_report.get("reason"):
-                        logger.debug(
-                            "Distillation skipped: %s", dream_report["reason"],
-                        )
-                except Exception as e:
-                    logger.debug("Distillation failed: %s", e)
+            # Distillation (P4.2): the gated proposal pass fires at any
+            # session boundary the desktop actually delivers — end-of-session
+            # where it exists, and every chat rotation via session switch.
+            self._maybe_run_distillation()
+
+    def _maybe_run_distillation(self) -> None:
+        """Run the gated distillation pass ("the dream") when enabled.
+
+        Invoked from the session-boundary hooks Argos can rely on in the
+        desktop app: ``on_session_end`` (true boundaries: CLI exit, /new,
+        gateway expiry under a finite reset policy) and ``on_session_switch``
+        (fires on every chat rotation in the desktop, where sessions are
+        resumable tiles and true boundaries are rare by default).
+
+        Self-gating (novelty + cooldown + budget) and fail-soft: it must
+        never block session lifecycle.
+        """
+        if not self._distillation_enabled:
+            return
+        try:
+            dream_report = run_distillation(
+                self._store,
+                llm_model=self._llm_model,
+                llm_provider=self._llm_provider,
+                min_new_records=self._distillation_min_new_records,
+                cooldown_hours=self._distillation_cooldown_hours,
+                max_records_per_run=self._distillation_max_records_per_run,
+                max_calls=self._distillation_max_calls,
+            )
+            if dream_report.get("ran"):
+                logger.info(
+                    "Distillation: %d proposals, %d contradictions, %d calls",
+                    dream_report.get("proposals_emitted", 0),
+                    dream_report.get("contradictions_emitted", 0),
+                    dream_report.get("llm_calls", 0),
+                )
+            elif dream_report.get("reason"):
+                logger.debug(
+                    "Distillation skipped: %s", dream_report["reason"],
+                )
+        except Exception as e:
+            logger.debug("Distillation failed: %s", e)
+
 
     # -- session switch ------------------------------------------------------
 
@@ -2252,6 +2267,10 @@ class HybridMemoryProvider(MemoryProvider):
                 self._prefetch_query = ""
                 self._prefetch_result = ""
                 self._prefetch_done = False
+        # Desktop sessions are resumable tiles; true session boundaries are
+        # rare by default (reset policy mode="none"), so chat rotation is the
+        # reliable trigger for the gated dream pass. Cooldown keeps it ≤1/day.
+        self._maybe_run_distillation()
 
     # -- tools ---------------------------------------------------------------
 

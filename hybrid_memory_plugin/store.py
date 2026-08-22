@@ -2098,6 +2098,20 @@ class DuckDBMemoryStore:
                    WHERE memory_id = ?""",
                 [now, new_id, now, memory_id],
             )
+            # 3. Carry the evidence trail forward. memory_evidence is keyed
+            #    by memory_id, so the new version would otherwise orphan the
+            #    provenance row (review point 2: provenance after updates).
+            self.connection.execute(
+                """INSERT INTO memory_evidence
+                   (memory_id, user_scope, source_session_id, source_timestamp,
+                    evidence_role, evidence_text, extraction_method,
+                    reviewer_decision, created_at, candidate_id)
+                   SELECT ?, user_scope, source_session_id, source_timestamp,
+                          evidence_role, evidence_text, extraction_method,
+                          reviewer_decision, created_at, candidate_id
+                   FROM memory_evidence WHERE memory_id = ?""",
+                [new_id, memory_id],
+            )
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [new_id]
         )

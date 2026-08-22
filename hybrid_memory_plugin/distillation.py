@@ -460,6 +460,12 @@ def run_distillation(
         "contradictions_emitted": 0,
         "records_processed": 0,
     }
+    from egress import gate as _egress_gate
+    if not _egress_gate("distillation", ""):
+        report["ran"] = False
+        report["skipped"] = "egress_gate"
+        return report
+
 
     # -- Gate 1: LLM client availability (checked once, up front) ----------
     call_llm = _get_llm_client()

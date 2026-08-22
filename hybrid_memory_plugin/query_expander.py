@@ -196,6 +196,10 @@ class QueryExpander:
         Uses agent.auxiliary_client.call_llm if available.
         Returns empty list on any failure (fail-soft).
         """
+        from egress import gate as _egress_gate
+        if not _egress_gate("query_expansion", query):
+            return []
+
         try:
             from agent.auxiliary_client import call_llm
         except ImportError:

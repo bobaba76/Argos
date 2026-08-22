@@ -167,6 +167,20 @@ def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", pro
             "reason": "No original user evidence is available for this proposal.",
             "review_model": "evidence_gate",
         }
+    # Egress gate (review point 6): refuse the call when local_only is on
+    # or the payload carries PII identifiers — the candidate then waits for
+    # explicit user confirmation instead of being sent to any LLM.
+    from egress import gate as _egress_gate
+    if not _egress_gate(
+        "reviewer", str(candidate.get("content") or "") + " " + evidence
+    ):
+        return {
+            "decision": "pending_user_confirmation",
+            "confidence": 0.0,
+            "reason": "Egress gate blocked the review call (local_only or sensitive content); awaiting user confirmation.",
+            "review_model": "egress_gate",
+        }
+
 
     try:
         from agent.auxiliary_client import call_llm

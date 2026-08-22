@@ -597,6 +597,10 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
     """
     if not user_content or len(user_content.strip()) < _LLM_MIN_CONTENT_LENGTH:
         return []
+    from egress import gate as _egress_gate
+    if not _egress_gate("extractor", user_content):
+        return []
+
 
     try:
         from agent.auxiliary_client import call_llm

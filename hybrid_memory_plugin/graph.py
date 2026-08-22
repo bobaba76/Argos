@@ -519,6 +519,10 @@ def extract_graph_relations_llm(
     """
     if not content or len(content.strip()) < _GRAPH_LLM_MIN_LENGTH:
         return []
+    from egress import gate as _egress_gate
+    if not _egress_gate("graph_typing", content):
+        return []
+
 
     try:
         from agent.auxiliary_client import call_llm

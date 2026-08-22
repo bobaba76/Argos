@@ -104,6 +104,8 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "consolidation_enabled": "false",
         "consolidation_min_age_days": "30",
         "consolidation_max_actions": "25",
+        "duplicate_min_similarity": "0.88",
+        "duplicate_semantic_max_pairs": "20000",
         "reranker_enabled": "false",
         "reranker_model": "BAAI/bge-reranker-base",
         "reranker_top_n": "10",
@@ -495,6 +497,8 @@ class HybridMemoryProvider(MemoryProvider):
         self._consolidation_enabled: bool = False
         self._consolidation_min_age_days: int = 30
         self._consolidation_max_actions: int = 25
+        self._duplicate_min_similarity: float = 0.88
+        self._duplicate_semantic_max_pairs: int = 20000
         self._reranker_enabled: bool = False
         self._reranker_model: str = "BAAI/bge-reranker-base"
         self._reranker_top_n: int = 10
@@ -857,6 +861,19 @@ class HybridMemoryProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._consolidation_max_actions = 25
+        # Semantic dedup config (P4.1)
+        try:
+            self._duplicate_min_similarity = max(
+                0.0, min(float(self._config.get("duplicate_min_similarity", 0.88)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._duplicate_min_similarity = 0.88
+        try:
+            self._duplicate_semantic_max_pairs = max(
+                100, min(int(self._config.get("duplicate_semantic_max_pairs", 20000)), 1000000)
+            )
+        except (TypeError, ValueError):
+            self._duplicate_semantic_max_pairs = 20000
         # Reranker config
         reranker_enabled = self._config.get("reranker_enabled", "true")
         self._reranker_enabled = (
@@ -2127,6 +2144,8 @@ class HybridMemoryProvider(MemoryProvider):
                         dry_run=False,
                         max_actions=self._consolidation_max_actions,
                         min_age_days=self._consolidation_min_age_days,
+                        duplicate_min_similarity=self._duplicate_min_similarity,
+                        duplicate_semantic_max_pairs=self._duplicate_semantic_max_pairs,
                     )
                     if report.get("quarantined_count"):
                         logger.info(
@@ -2721,6 +2740,8 @@ class HybridMemoryProvider(MemoryProvider):
                 dry_run=bool(dry_run),
                 max_actions=max_actions,
                 min_age_days=min_age_days,
+                duplicate_min_similarity=getattr(self, "_duplicate_min_similarity", 0.88),
+                duplicate_semantic_max_pairs=getattr(self, "_duplicate_semantic_max_pairs", 20000),
             )
             if not dry_run and self._graph:
                 for memory_id in report.get("quarantined_ids", []):

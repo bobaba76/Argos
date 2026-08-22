@@ -574,7 +574,15 @@ class DuckDBMemoryStore:
         excluded; global memories (project_id IS NULL) remain visible.
         """
         project_clause = ""
-        params: list = [emb]
+        # String-cast the query vector as a fixed-size array constant.
+        # A Python-list parameter binds through an interpreted per-row path
+        # (~1ms/row — measured ~1.2s at 1k rows); the string-cast form is
+        # materialized once by the planner and scanned natively (~7ms at 1k,
+        # ~14ms at 5k).  Exact — identical ranking, no approximation.  The
+        # dimension is derived from the actual vector, so a model swap with a
+        # different embedding size keeps working.
+        vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
+        params: List[Any] = [vec_text]
         # Temporal filter: default to current (valid_to IS NULL),
         # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of))
         if as_of:
@@ -592,7 +600,7 @@ class DuckDBMemoryStore:
             params.append(project_id)
         params.append(limit * 4)
         sql = (
-            "SELECT *, list_cosine_similarity(embedding, ?::DOUBLE[]) AS sim "
+            f"SELECT *, list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) AS sim "
             "FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
             f"  {temporal_clause} "
@@ -906,15 +914,19 @@ class DuckDBMemoryStore:
         try:
             with self._lock:
                 assert self.connection is not None
-                for memory_id in ids:
-                    self.connection.execute(
-                        """UPDATE memory_records
-                           SET retrieval_count = COALESCE(retrieval_count, 0) + 1,
-                               last_retrieved_at = ?
-                           WHERE memory_id = ? AND COALESCE(status, 'active') = 'active'
-                           AND valid_to IS NULL""",
-                        [now, memory_id],
-                    )
+                # Single batched UPDATE (was a per-ID loop: 96 round-trips ->
+                # 1). Measured 2026-08-22: the loop cost 0.5-1.3s on a 96-row
+                # search at ~1k records; one IN-list statement is ~1 round-trip.
+                placeholders = ", ".join("?" for _ in ids)
+                self.connection.execute(
+                    f"""UPDATE memory_records
+                        SET retrieval_count = COALESCE(retrieval_count, 0) + 1,
+                            last_retrieved_at = ?
+                        WHERE memory_id IN ({placeholders})
+                          AND COALESCE(status, 'active') = 'active'
+                          AND valid_to IS NULL""",
+                    [now, *ids],
+                )
             for record in records:
                 record.retrieval_count += 1
                 record.last_retrieved_at = now
@@ -1234,14 +1246,17 @@ class DuckDBMemoryStore:
                 emb = self.embedder.embed(content)
                 if emb:
                     try:
+                        # Same string-cast constant trick as _vector_search_raw
+                        # (Python-list params bind per-row; ~1s at 1k rows).
+                        vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
                         result = self.connection.execute(
-                            """SELECT memory_id FROM memory_records
+                            f"""SELECT memory_id FROM memory_records
                               WHERE category = ? AND embedding IS NOT NULL
                                 AND valid_to IS NULL
                                 AND (user_scope IS NULL OR user_scope = ?)
-                                AND list_cosine_similarity(embedding, ?::DOUBLE[]) > ?
+                                AND list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) > ?
                                LIMIT 1""",
-                            [category, self.user_id, emb, self._DEDUP_SIMILARITY_THRESHOLD],
+                            [category, self.user_id, vec_text, self._DEDUP_SIMILARITY_THRESHOLD],
                         ).fetchone()
                         if result:
                             return True

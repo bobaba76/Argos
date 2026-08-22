@@ -1001,7 +1001,7 @@ def test_graph_extractor_all_categories():
         "personal_fact",
         ["health", "location"],
     )
-    assert any(r["relation"] == "takes_medication" for r in personal)
+    assert any(r["relation"] == "uses" and r["target"] == "Medication-X" for r in personal)
     assert any(r["relation"] == "lives_in" for r in personal)
     ongoing = extract_graph_relations("User has been using Docker", "context_note", ["devops"])
     assert any(r["relation"] == "uses" and r["target"] == "Docker" for r in ongoing)

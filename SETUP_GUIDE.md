@@ -27,11 +27,11 @@
    ```
    hermes tools
    ```
-   You should see all twelve `memory_*` tools: `memory_search`,
-   `memory_save`, `memory_update`, `memory_delete`, `memory_chain`,
-   `memory_graph_search`, `memory_graph_query`, `memory_candidate_list`,
-   `memory_candidate_review`, `memory_restore`, `memory_feedback`, and
-   `memory_maintenance`.
+   You should see all fourteen `memory_*` tools: `memory_search`,
+      `memory_save`, `memory_update`, `memory_delete`, `memory_chain`,
+      `memory_graph_search`, `memory_graph_query`, `memory_candidate_list`,
+      `memory_candidate_review`, `memory_restore`, `memory_feedback`,
+      `memory_maintenance`, `memory_why_not`, and `memory_fetch_full`.
 
 ### Option B: Manual pip install
 

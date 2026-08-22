@@ -30,14 +30,14 @@ from pathlib import Path
 # or undersized.
 CRITICAL_FILES = (
     "hybrid_memory.duckdb",
-    "hybrid_memory_kuzu",          # single ~10-90MB FILE, not a directory
+    "hybrid_memory_kuzu",          # Kuzu graph DIRECTORY (~10-90MB); safe_copy trees it
     "state.db",
 )
 OPTIONAL_FILES = (
     "hybrid_memory.duckdb.wal",
     "hybrid_memory_gateway.duckdb",
     "hybrid_memory_gateway.duckdb.wal",
-    "hybrid_memory_kuzu_gateway",  # single file
+    "hybrid_memory_kuzu_gateway",  # gateway graph directory
     "hybrid_memory.json",
     "hybrid_memory_service.json",
     "config.yaml",
@@ -111,21 +111,37 @@ def stop_memory_service(home: Path) -> bool:
     return True
 
 
+def _path_size(path: Path) -> int:
+    """File size, or the summed size of every file under a directory tree."""
+    if path.is_dir():
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def safe_copy(src: Path, dst: Path) -> bool:
-    """Copy with retries; returns True only when the backup is full-size."""
-    src_size = src.stat().st_size
+    """Copy a file (with retries) or a whole directory tree (Kuzu graphs);
+    returns True only when the backup is full-size."""
+    src_size = _path_size(src)
+    is_dir = src.is_dir()
     for attempt in range(COPY_RETRIES):
         try:
-            shutil.copy2(src, dst)
+            if is_dir:
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
         except Exception as exc:
             if attempt == COPY_RETRIES - 1:
                 print(f"  FAIL {src.name}: {exc}")
                 return False
             time.sleep(COPY_RETRY_DELAY)
             continue
-        dst_size = dst.stat().st_size
+        dst_size = _path_size(dst)
         if dst_size >= max(1, src_size * MIN_RATIO):
-            print(f"  OK   {src.name}: {src_size:,} -> {dst_size:,} bytes")
+            kind = " (dir)" if is_dir else ""
+            print(f"  OK   {src.name}: {src_size:,} -> {dst_size:,} bytes{kind}")
             return True
         print(f"  WARN {src.name}: short copy {dst_size:,}/{src_size:,} bytes; retrying")
         time.sleep(COPY_RETRY_DELAY)

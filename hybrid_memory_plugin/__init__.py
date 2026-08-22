@@ -130,6 +130,8 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "distillation_cooldown_hours": "24",
         "distillation_max_records_per_run": "100",
         "distillation_max_calls": "10",
+        # Egress (review point 6)
+        "local_only": "false",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -1983,7 +1985,12 @@ class HybridMemoryProvider(MemoryProvider):
             )
             decision = review.get("decision", "pending_user_confirmation")
             decision_map = {
-                "approve": "approved",
+                # Approval invariant: the automatic reviewer may never write
+                # "approved" — that transition is reserved for the agent-facing
+                # confirmation tool (memory_candidate_review). The ceiling for
+                # auto-review approval is "reviewed_approved" (LLM-approved,
+                # awaiting user confirmation). Enforced in store.review_candidate.
+                "approve": "reviewed_approved",
                 "reject": "rejected",
                 "quarantine": "quarantined",
                 "pending_user_confirmation": "pending_user_confirmation",
@@ -1998,6 +2005,7 @@ class HybridMemoryProvider(MemoryProvider):
                 review_model=review.get("review_model", "memory_review"),
                 durability=review.get("durability"),
                 scope=review.get("scope"),
+                review_source="auto_review",
             )
             # Spec 1: deterministic expiry suggestion on approval. The
             # suggestion is logged but NOT auto-applied — the user confirms
@@ -2434,6 +2442,10 @@ class HybridMemoryProvider(MemoryProvider):
         """
         if not word or len(word) < 2:
             return False
+        from egress import gate as _egress_gate
+        if not _egress_gate("role_word", word):
+            return False
+
         try:
             from agent.auxiliary_client import call_llm
         except ImportError:

@@ -1580,17 +1580,24 @@ class DuckDBMemoryStore:
         evidence_retention: str = "full",
         supersedes_memory_id: str | None = None,
         expires_at: Any = _NOT_PROVIDED,
+        review_source: str = "manual",
     ) -> dict | None:
         """Approve, reject, quarantine, or classify a pending proposal.
-
         When *supersedes_memory_id* is set and the decision is an approval,
         the newly created memory is chained behind the named current memory
         (the old record is superseded: valid_to set, superseded_by pointed
         at the new version). This is the confirm-first way chains grow —
         never automatic, always a reviewer decision.
-
         *expires_at* (Spec 1): when provided (not _NOT_PROVIDED), passed to
         remember() for the new memory. None = no expiry; string = set.
+        *review_source* labels who is making the transition. The storage
+        layer enforces one invariant (review point 4): the "approved"
+        transition is reserved for the agent-facing confirmation tool
+        (review_source="tool") and manual callers — an unsupervised
+        automatic review (review_source="auto_review") can never write
+        "approved"; it must use "reviewed_approved" (LLM-approved, awaiting
+        user confirmation). This is enforced here, at the storage boundary,
+        not by prompt instructions.
         """
         decision = decision.strip().lower()
         allowed = {
@@ -1599,6 +1606,12 @@ class DuckDBMemoryStore:
         }
         if decision not in allowed:
             raise ValueError("invalid candidate review decision")
+        if decision == "approved" and review_source == "auto_review":
+            raise ValueError(
+                "approval invariant: automatic review may not set 'approved'; "
+                "use 'reviewed_approved' (user confirmation happens via the "
+                "memory_candidate_review tool)"
+            )
         candidates = self.list_candidates(candidate_id=candidate_id, limit=1)
         if not candidates:
             return None

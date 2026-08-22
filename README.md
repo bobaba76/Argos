@@ -14,6 +14,7 @@ Argos is a plugin for Hermes Agent that gives your agent a real memory. Instead 
 - **Understands relationships between things it remembers.** Ask "who works with my sister?" and it can traverse a graph of people, places, and concepts instead of just doing flat text lookup.
 - **Knows the context of right now.** It's aware of the current time in your timezone, roughly where you are, the weather, and files you've recently touched, so it can answer things like "should I bring an umbrella later?" without you spelling out where "later" and "here" mean.
 - **Catches your own realizations.** When you say something like "I just realized I've been avoiding this project because I'm scared of the scope," it logs that as an insight and can bring it back up later if the topic resurfaces. You can browse them with `/ilog` or pull one back into the conversation with `/revisit`.
+- **Learns from its own feedback over time.** Once a day, gated and cost-capped, Argos looks over what it has remembered — and what you've marked helpful or dismissed — and *proposes* distilled patterns: insights, contradictions, and guardrails ("this project keeps slipping whenever X happens"). Nothing it proposes lands in memory without your approval; it all passes through the same suggestion tray you already approve.
 - **Cleans up after itself, reversibly.** Old or duplicate memories get quarantined rather than deleted, and you can restore them if it turns out you needed them after all.
 
 ## How it earns trust
@@ -25,6 +26,8 @@ Nothing becomes a memory silently. Every conversation turn gets mined for durabl
 Updating a fact never destroys the old version. When something changes, Argos chains a new version onto the old one instead of overwriting it. You can look at the arc, compare versions, or just ask "what changed?" and get a compact history injected automatically. Your past self doesn't get erased just because your present self said something different.
 
 Cleanup is reversible too. Maintenance can quarantine stale or duplicate memories, but quarantine isn't deletion. If the cleanup was wrong, you restore it and move on.
+
+The distillation pass ("the dream") follows the same rule one level up. It can suggest patterns the store never stated outright, but it can only *propose*: its output lands in the same suggestion tray your extracted memories pass through, and nothing becomes active memory until you approve it. It doesn't edit, merge, or delete anything on its own — ever.
 
 And underneath all of this is a habit worth mentioning: every feature in Argos is gated by an actual measurement in the eval harness. Several ideas that sounded good on paper, plain chronological ordering, a stronger graph boost, wider context injection, got turned off because the numbers said they didn't help. That's not a failure, it's the point. Features earn their place with evidence, not intuition.
 
@@ -49,19 +52,34 @@ Argos exposes twelve tools your agent can call directly:
 
 ## The honest numbers
 
-On LongMemEval_S (500 questions, judged by gpt-4o), Argos scores 70.4% overall. In the builder's own comparison against other open memory systems it came in second, behind Perseus (73.8) and ahead of Zep (63.8), though those are vendor-published numbers under different protocols, so treat the cross-system gap as directional, not a lab-controlled result.
+Argos's headline measurements, each under a stated protocol:
 
-A few numbers worth knowing:
+- **Chain-unfold, change-intent questions: ~93% recall / ~93% precision**
+  (2026-08-20, its own eval harness). The residual false positives sit just
+  inside the true-positive similarity band — one sits at 0.548 — so ~93%
+  precision is a *diagnosed ceiling*: no cosine threshold separates them.
+  Recall on this category moved via the intent matcher, not the thresholds.
+- **99.6% of answer-bearing memories reach the top-96 candidates.** Recall
+  (delivery) isn't the weak point.
+- **Temporal questions: 82% correct** (133 questions, one uniform protocol),
+  with date-anchored retrieval (time-expression re-ranking, added
+  2026-08-21) improving that bucket further.
+- **Overall: 70.4% on LongMemEval_S** (500 questions, judged by gpt-4o,
+  default answerer) — and head-to-head runs showed the *answerer*, not the
+  memory layer, is the bigger lever (a stronger answerer measured ~80+).
+  The benchmark runs on synthetic conversation data; real conversations are
+  messier and your results may differ.
+- In the builder's own comparison against other open memory systems Argos
+  came in second, behind Perseus (73.8) and ahead of Zep (63.8) — but those
+  are vendor-published numbers under different protocols, so treat the
+  cross-system gap as directional, not lab-controlled.
 
-- 99.6% of answer-bearing memories get retrieved into the top 96 candidates. Recall isn't the weak point.
-- On the hardest category, temporal questions, it gets 82% correct across all 133 questions, under one uniform protocol.
-- The benchmark runs on synthetic conversation data. Real conversations are messier, and your results may differ.
-
-No claim here is "we beat vendor X." The comparison numbers are there so you can judge for yourself, not so we can win an argument.
+No claim here is "we beat vendor X." The numbers are there so you can judge
+for yourself, not so we can win an argument.
 
 ## What it can't do yet
 
-Be direct about this one: your memory data, embeddings, and graph all live locally, as flat files on your machine, and never go to a hosted memory vendor. But the LLM calls Argos makes for fact extraction and review currently go through whatever cloud model you've configured in Hermes. There's no native local-LLM support yet. If you want a fully offline setup, you're not there today, only the embedding step is offline right now.
+Be direct about this one: your memory data, embeddings, and graph all live locally, as flat files on your machine, and never go to a hosted memory vendor. But the LLM calls Argos makes for fact extraction, review, and the optional distillation pass currently go through whatever cloud model you've configured in Hermes. There's no native local-LLM support yet. If you want a fully offline setup, you're not there today, only the embedding step is offline right now.
 
 ## Quick start
 

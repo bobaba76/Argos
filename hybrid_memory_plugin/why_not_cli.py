@@ -88,7 +88,7 @@ def _format_report(explanation: dict) -> str:
     found = explanation.get("found_in_results", False)
     rank = explanation.get("rank")
     if found:
-        lines.append(f"  FOUND in top-{explanation.get('top_results', []) and len(explanation['top_results'])} results at rank #{rank}")
+        lines.append(f"  FOUND in top-{len(explanation.get('top_results', []))} results at rank #{rank}")
     else:
         lines.append(f"  NOT FOUND in top-{len(explanation.get('top_results', []))} results")
     lines.append("")
@@ -144,6 +144,10 @@ def main() -> int:
         help="User scope (default 'default_user').",
     )
     parser.add_argument(
+        "--project-id", default=None,
+        help="Project scope to match the production search path (default: global).",
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Output raw JSON instead of a formatted report.",
     )
@@ -159,6 +163,7 @@ def main() -> int:
     try:
         explanation = store.explain_retrieval(
             args.query, args.expected_memory_id, top_k=args.top_k,
+            project_id=args.project_id,
         )
     except Exception as exc:
         print(f"Error: explain_retrieval failed: {exc}", file=sys.stderr)

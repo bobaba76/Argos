@@ -1,16 +1,22 @@
 """Argos temporal sub-call — the price-engineered answerer (P2A option 2).
 
 Problem: the intent router's original design switched the WHOLE answerer to
-the smart model (deepseek-v4-pro-0813 on openrouter), which sent the entire
-~124k-token context (full history + all injected memories + tool defs) to the
-expensive model on every temporal query — ~R2.50 each.
+the smart model, which sent the entire ~124k-token context (full history +
+all injected memories + tool defs) to the expensive model on every temporal
+query — ~R2.50 each.
 
 Fix: when a genuine temporal/multi-hop query is detected, instead of
-switching the whole turn, Argos makes ONE small dedicated call to the smart
-model with a TRIMMED context — just the question plus a handful of dated
-memory records (~a few k tokens) — and returns a short answer.  The cheap
-Flash answerer relays it.  Cost drops to ~1/10th while keeping the temporal
-date-math quality the smart model measured +26pp better at.
+switching the whole turn, Argos makes ONE small dedicated call with a
+TRIMMED context — just the question plus a handful of dated memory records
+(~a few k tokens) — and returns a short answer. The cheap Flash answerer
+relays it. Cost drops to ~1/10th while keeping the temporal date-math
+quality the smart model measured +26pp better at.
+
+Provider: the call goes through the host's auxiliary LLM client
+(agent.auxiliary_client.call_llm), which honors the configured provider and
+model — no hard-coded vendor endpoint. The optional ``llm_model`` /
+``llm_provider`` keys in hybrid_memory.json override the host defaults when
+set.
 
 Fail-soft: any error returns "" so the turn is never broken (Flash just
 answers as best it can).
@@ -20,17 +26,21 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.request
-import urllib.error
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_SMART_MODEL = "deepseek/deepseek-v4-pro-0813"
-_BASE_URL = "https://openrouter.ai/api/v1"
 _MAX_EVIDENCE_CHARS = 5000
 _MAX_TOKENS = 260
 _TIMEOUT_SECONDS = 30
+
+_SYSTEM_PROMPT = (
+    "You are a precise temporal fact-checker. Using ONLY the provided stored "
+    "facts, answer the user's date/time/sequence question in one or two short "
+    "sentences. State dates clearly (e.g. '10 August 2026'). If the facts are "
+    "insufficient, say you cannot determine it from the stored facts. Never "
+    "invent facts. Do not use tools."
+)
 
 
 def _hermes_home() -> Path:
@@ -41,78 +51,62 @@ def _hermes_home() -> Path:
         return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
 
 
-def _resolve_key() -> str:
-    env = _hermes_home() / ".env"
-    if env.exists():
-        try:
-            for line in env.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if line.startswith("OPENROUTER_API_KEY="):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if val:
-                        return val
-        except Exception:
-            pass
-    return os.environ.get("OPENROUTER_API_KEY", "")
+def _config_overrides() -> tuple[str | None, str | None]:
+    """Optional llm_model / llm_provider from hybrid_memory.json (empty = host defaults)."""
+    try:
+        config_path = _hermes_home() / "hybrid_memory.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            return cfg.get("llm_model") or None, cfg.get("llm_provider") or None
+    except Exception:
+        pass
+    return None, None
 
 
-def temporal_answer(question: str, evidence_text: str, api_key: str = "") -> str:
-    """One trimmed call to the smart model; returns a short answer or ''."""
+def temporal_answer(question: str, evidence_text: str) -> str:
+    """One trimmed call via the host's configured LLM client; '' fail-soft."""
     question = (question or "").strip()
     if not question:
         return ""
-    if not api_key:
-        api_key = _resolve_key()
-    if not api_key:
-        logger.warning("temporal_subcall: no OPENROUTER_API_KEY available")
-        return ""
-
-    system = (
-        "You are a precise temporal fact-checker. Using ONLY the provided stored "
-        "facts, answer the user's date/time/sequence question in one or two short "
-        "sentences. State dates clearly (e.g. '10 August 2026'). If the facts are "
-        "insufficient, say you cannot determine it from the stored facts. Never "
-        "invent facts. Do not use tools."
-    )
-    user = (
-        f"Question: {question}\n\n"
-        f"Stored facts (with dates):\n{evidence_text[: _MAX_EVIDENCE_CHARS]}"
-    )
-
-    body = {
-        "model": _SMART_MODEL,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": _MAX_TOKENS,
-        "temperature": 0.1,
-        # Turn off deep-thinking to keep the sub-call fast and cheap.
-        "reasoning": {"enabled": False, "effort": "low"},
-    }
-    req = urllib.request.Request(
-        f"{_BASE_URL}/chat/completions",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": "https://hermes.local",
-            "X-Title": "Hermes-Argos",
-        },
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_SECONDS) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        return ((data.get("choices") or [{}])[0].get("message") or {}).get(
-            "content", ""
-        ).strip()
-    except urllib.error.HTTPError as exc:
-        logger.warning("temporal_subcall HTTP %s: %s", exc.code, exc.read()[:300])
+        from agent.auxiliary_client import call_llm
+    except Exception as exc:
+        logger.warning("temporal_subcall: host LLM client unavailable: %s", exc)
         return ""
-    except Exception as exc:  # pragma: no cover - defensive
+
+    model, provider = _config_overrides()
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"Stored facts (with dates):\n{evidence_text[: _MAX_EVIDENCE_CHARS]}"
+            ),
+        },
+    ]
+    try:
+        response = call_llm(
+            task="temporal_subcall",
+            messages=messages,
+            temperature=0.1,
+            max_tokens=_MAX_TOKENS,
+            timeout=_TIMEOUT_SECONDS,
+            model=model,
+            provider=provider,
+        )
+    except Exception as exc:
         logger.warning("temporal_subcall failed: %s", exc)
         return ""
+    if response is None:
+        return ""
+    text = response
+    if hasattr(response, "choices"):
+        try:
+            text = response.choices[0].message.content
+        except Exception:
+            return ""
+    return str(text or "").strip()
 
 
 def format_evidence(records) -> str:

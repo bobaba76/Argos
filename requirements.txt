@@ -1,0 +1,9 @@
+# Runtime + eval dependencies for the Argos hybrid memory plugin.
+# Versions pinned to the maintainer's tested environment (Python 3.11, Windows).
+duckdb==1.5.5
+kuzu==0.11.3
+sentence-transformers==5.6.1
+winsdk==1.0.0b10; sys_platform == "win32"
+
+# Test runner (README: python -m pytest hybrid_memory_plugin/tests/ -v)
+pytest==9.1.1

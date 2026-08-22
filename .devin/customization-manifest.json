@@ -4,27 +4,8 @@
     "version": "0.20.0",
     "base_commit": "a84cecdc7253e09b16b24cae259caadf2d75fcfe"
   },
-  "core_patches": [
-    {
-      "name": "desktop-lifecycle",
-      "path": "patches/desktop-lifecycle.patch",
-      "required": true,
-      "description": "Windows orphaned python.exe cleanup + will-quit safety net in the Electron main process"
-    },
-    {
-      "name": "memory-provider-registry",
-      "path": "patches/memory-provider-registry.patch",
-      "required": false,
-      "description": "Lets memory providers register skills, slash commands, and lifecycle hooks via the real PluginManager. Optional since fork era: upstream's _ProviderCollector rewrite supersedes this fix."
-    },
-    {
-      "name": "tool-compression",
-      "path": "patches/tool-compression.patch",
-      "required": false,
-      "description": "Compressed tool descriptions (~1.8K fewer schema tokens per API call). Silently skipped when it doesn't apply cleanly."
-    }
-  ],
-  "core_copies": [],
+  "core_patches": [],
+    "core_copies": [],
   "plugin": {
     "source": "hybrid_memory_plugin",
     "target": "plugins/hybrid_memory",

@@ -36,7 +36,7 @@ for the front-door overview see **[README.md](README.md)**.
 
 ## Tools
 
-Twelve agent-callable tools:
+Fourteen agent-callable tools:
 
 | Tool | Purpose |
 |------|---------|
@@ -52,6 +52,8 @@ Twelve agent-callable tools:
 | `memory_restore` | Restore a quarantined memory to active retrieval. |
 | `memory_feedback` | Mark a memory `helpful`, `dismissed`, or `incorrect`. |
 | `memory_maintenance` | Preview (`dry_run=true`) or apply reversible quarantine of stale/duplicate memories. Never hard-deletes. |
+| `memory_why_not` | Diagnose why a memory missed retrieval: deterministic, free (no LLM), read-only. |
+| `memory_fetch_full` | Fetch the full stored text of a memory by ID when the injected preview was truncated. |
 
 ## Core concepts
 

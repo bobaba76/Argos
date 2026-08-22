@@ -33,7 +33,7 @@ And underneath all of this is a habit worth mentioning: every feature in Argos i
 
 ## The tools
 
-Argos exposes twelve tools your agent can call directly:
+Argos exposes fourteen tools your agent can call directly:
 
 | Tool | What it's for |
 |---|---|
@@ -49,6 +49,8 @@ Argos exposes twelve tools your agent can call directly:
 | `memory_restore` | Bring a quarantined memory back |
 | `memory_feedback` | Tag a memory helpful, dismissed, or incorrect |
 | `memory_maintenance` | Run cleanup and dedup passes |
+| `memory_why_not` | Explain why a memory didn't surface in retrieval |
+| `memory_fetch_full` | Fetch a memory's full untruncated text by ID |
 
 ## The honest numbers
 
@@ -85,7 +87,7 @@ Be direct about this one: your memory data, embeddings, and graph all live local
 
 1. Copy the plugin folder to your Hermes plugins directory (on Windows: `%LOCALAPPDATA%\hermes\plugins\hybrid_memory`).
 2. Restart Hermes.
-3. Run `hermes tools` and confirm the twelve `memory_*` tools show up.
+3. Run `hermes tools` and confirm the fourteen `memory_*` tools show up.
 4. Configure it in `hybrid_memory.json`, or through the settings UI under Memory -> Argos (Local).
 
 Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md).

@@ -425,12 +425,16 @@ class DuckDBMemoryStore:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
-    def _is_expired(expires_at: str | None) -> bool:
+    def _is_expired(expires_at: str | None, at: str | None = None) -> bool:
         if not expires_at:
             return False
         try:
             exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            return exp <= datetime.now(timezone.utc)
+            ref = (
+                datetime.fromisoformat(at.replace("Z", "+00:00"))
+                if at else datetime.now(timezone.utc)
+            )
+            return exp <= ref
         except Exception:
             return False
 
@@ -517,7 +521,8 @@ class DuckDBMemoryStore:
         tokens = [f"%{t}%" for t in words]
         conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
         project_clause = ""
-        params: list = [self.user_id, self._now()]
+        expiry_ref = as_of if as_of else self._now()
+        params: list = [self.user_id, expiry_ref]
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -549,7 +554,7 @@ class DuckDBMemoryStore:
                 continue
             if category_filter and r.category != category_filter:
                 continue
-            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at):
+            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at, at=expiry_ref):
                 continue
             # Text-match score: fraction of query tokens found in content.
             content_lower = (r.content or "").lower()
@@ -593,8 +598,9 @@ class DuckDBMemoryStore:
             params.extend([as_of, as_of])
         else:
             temporal_clause = "AND valid_to IS NULL "
+        expiry_ref = as_of if as_of else self._now()
         params.append(self.user_id)
-        params.append(self._now())
+        params.append(expiry_ref)
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
@@ -618,7 +624,7 @@ class DuckDBMemoryStore:
                 continue
             if category_filter and r.category != category_filter:
                 continue
-            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at):
+            if not self._matches_scope(r.payload) or self._is_expired(r.expires_at, at=expiry_ref):
                 continue
             out.append(r)
         return out

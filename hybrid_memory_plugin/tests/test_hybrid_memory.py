@@ -3793,3 +3793,43 @@ class TestEvolutionChains:
         store.close()
         graph.close()
 
+    def test_as_of_search_uses_as_of_for_expiry_filter(self, tmp_path):
+        """Point-in-time (as_of) queries must apply the expiry filter against
+        as_of, not against now: a memory that expired 90 days ago is still
+        visible to a history query dated BEFORE its expiry, and invisible to
+        current-time search and to queries dated after expiry. Regression for
+        the as_of/expiry mismatch in _text_search_raw / _vector_search_raw."""
+        from datetime import datetime, timedelta, timezone
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
+        now = datetime.now(timezone.utc)
+        rec = store.remember(category="event", content="User attended a work conference")
+        assert rec is not None, "remember should store the memory"
+        # Backdate the row: valid since 200 days ago (current version), expired 90 days ago.
+        store.connection.execute(
+            "UPDATE memory_records SET valid_from = ?, expires_at = ? WHERE memory_id = ?",
+            [(now - timedelta(days=200)).isoformat(),
+             (now - timedelta(days=90)).isoformat(),
+             rec.memory_id],
+        )
+
+        # Current-time search must exclude the expired memory.
+        now_results = store.search("conference", limit=5, suppress_retrieval=True)
+        assert all(r.memory_id != rec.memory_id for r in now_results)
+
+        # as_of between valid_from and expiry must still return it (history is history).
+        asof_results = store.search(
+            "conference", limit=5, suppress_retrieval=True,
+            as_of=(now - timedelta(days=150)).isoformat(),
+        )
+        assert any(r.memory_id == rec.memory_id for r in asof_results)
+
+        # as_of dated after the expiry must exclude it.
+        later_results = store.search(
+            "conference", limit=5, suppress_retrieval=True,
+            as_of=(now - timedelta(days=30)).isoformat(),
+        )
+        assert all(r.memory_id != rec.memory_id for r in later_results)
+        store.close()
+

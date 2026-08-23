@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import logging
 import os
 import queue
@@ -55,6 +56,15 @@ _DEFAULT_MAX_INJECTED = 20
 # evals (e.g. LongMemEval). Effective value comes from config key
 # `inject_content_char_cap` (default 800).
 _DEFAULT_INJECT_CONTENT_CHAR_CAP = 800
+
+# Default-off injection gates (2026-08-23): the trivial-query gate skips heavy
+# retrieval on low-information turns; the score floor drops weak-evidence
+# items.  Both are opt-in config keys — benchmark/default behavior unchanged.
+_TRIVIAL_QUERY_PATTERNS = (
+    r"^\s*(test(ing)?|just a test|this is just a test|hello+|hi+|hey+|yo|ping|pong|ok(ay)?|k|thanks|thank you|thx|ty|good (morning|evening|afternoon)|gm|gn)\s*[!.?…]*\s*$",
+    r"^\s*(?:ha\s*){2,}[!.]*\s*$",
+)
+_DEFAULT_INJECTION_MIN_SCORE = 0.0
 _INJECT_CONTENT_CHAR_CAP = _DEFAULT_INJECT_CONTENT_CHAR_CAP  # backward-compat alias
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _AUTO_EXTRACT_PAUSE_MARKER = "argos.auto_extract.paused"
@@ -609,6 +619,19 @@ class ArgosProvider(MemoryProvider):
                 "required": False,
             },
             {
+                "key": "skip_retrieval_on_trivial",
+                "description": "Skip memory retrieval on trivial turns (greetings, 'test', 'ok') to save tokens; real questions always retrieve",
+                "default": "false",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "injection_min_score",
+                "description": "Min similarity (0.0-1.0) for an item to be auto-injected; 0.0 disables the floor",
+                "default": str(_DEFAULT_INJECTION_MIN_SCORE),
+                "required": False,
+            },
+            {
                 "key": "auto_extract",
                 "description": "Enable automatic candidate extraction after each turn; proposals require review before becoming active memory",
                 "default": "true",
@@ -754,6 +777,22 @@ class ArgosProvider(MemoryProvider):
             self._inject_cap = int(self._config.get("inject_content_char_cap", _DEFAULT_INJECT_CONTENT_CHAR_CAP))
         except (ValueError, TypeError):
             self._inject_cap = _DEFAULT_INJECT_CONTENT_CHAR_CAP
+
+        # Injection gates (default OFF — benchmark parity; enable per config):
+        # skip_retrieval_on_trivial: no heavy retrieval when the turn is a
+        # low-information fragment ("test", "hi", "ok"). Explicit memory_search
+        # tool calls never pass through this path and stay unaffected.
+        # injection_min_score: drop injected items with similarity below floor.
+        tgate = self._config.get("skip_retrieval_on_trivial", "false")
+        self._skip_retrieval_on_trivial = (
+            tgate.lower() in ("true", "1", "yes") if isinstance(tgate, str) else bool(tgate)
+        )
+        try:
+            self._injection_min_score = float(
+                self._config.get("injection_min_score", _DEFAULT_INJECTION_MIN_SCORE)
+            )
+        except (ValueError, TypeError):
+            self._injection_min_score = _DEFAULT_INJECTION_MIN_SCORE
 
         chrono = self._config.get("chronological_injection", "false")
         self._chronological_injection = (
@@ -1876,6 +1915,19 @@ class ArgosProvider(MemoryProvider):
     def _start_prefetch(self, query: str) -> None:
         if not query or self._store is None:
             return
+        # Trivial-query gate (opt-in): a greeting or "just a test" has no
+        # information need; retrieving on it burns injection tokens on
+        # near-random top-k items. Short-circuit BEFORE any search work.
+        if getattr(self, "_skip_retrieval_on_trivial", False):
+            try:
+                _q = query.lower().strip()
+                if len(_q.split()) <= 6 and any(
+                    re.fullmatch(p, _q) for p in _TRIVIAL_QUERY_PATTERNS
+                ):
+                    logger.debug("Prefetch skipped (trivial-query gate)")
+                    return
+            except Exception:
+                pass  # gate failure must never break prefetch
         store = self._store
         max_items = self._max_injected
 
@@ -1899,6 +1951,12 @@ class ArgosProvider(MemoryProvider):
                     sections.append(confirmation)
 
                 results = self._search_memories(query, limit=max_items)
+                _floor = getattr(self, "_injection_min_score", 0.0)
+                if results and _floor > 0:
+                    results = [
+                        r for r in results
+                        if float(getattr(r, "similarity", 0.0) or 0.0) >= _floor
+                    ]
                 if results and getattr(self, "_chronological_injection", False):
                     # P2B: on temporal/multi-hop turns, re-sort the top-k by
                     # creation timestamp (oldest first) so the model reads a

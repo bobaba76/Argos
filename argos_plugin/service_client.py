@@ -1,4 +1,4 @@
-"""Client-side adapters for the local shared hybrid-memory service."""
+"""Client-side adapters for the local shared argos service."""
 from __future__ import annotations
 
 import json

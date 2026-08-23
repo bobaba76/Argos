@@ -3,7 +3,7 @@ Tests for weather support (hermes_weather module + hint builder).
 
 Moved from ambient_context/tests/test_weather.py when the ambient modules
 were relocated into the plugin package.  The hint builders now live in
-hybrid_memory_plugin.__init__ (not agent.turn_context) and ride the native
+argos_plugin.__init__ (not agent.turn_context) and ride the native
 pre_llm_call plugin hook instead of a core source patch.
 
 Covers:
@@ -36,14 +36,14 @@ if str(_plugin_dir.parent) not in sys.path:
 import hermes_weather
 
 # The hint builders live in the package __init__. In the bundle repo the
-# package is hybrid_memory_plugin; when installed to HERMES_HOME it's
-# hybrid_memory. Use the same try/except fallback as test_hybrid_memory.py.
+# package is argos_plugin; when installed to HERMES_HOME it's
+# argos. Use the same try/except fallback as test_argos.py.
 try:
-    from hybrid_memory_plugin import _build_weather_hint
-    _pkg_name = "hybrid_memory_plugin"
+    from argos_plugin import _build_weather_hint
+    _pkg_name = "argos_plugin"
 except ImportError:
-    from hybrid_memory import _build_weather_hint
-    _pkg_name = "hybrid_memory"
+    from argos import _build_weather_hint
+    _pkg_name = "argos"
 
 # Package-relative module paths for patch targets — __init__.py imports
 # via `from .hermes_weather import ...`, so we must patch the package

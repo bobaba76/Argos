@@ -1,4 +1,4 @@
-"""Declarative config schema for the hybrid_memory memory provider.
+"""Declarative config schema for the argos memory provider.
 
 Surfaces configuration in the Hermes desktop UI config panel. This file
 only imports from plugins.memory.config_schema (pure data, no agent runtime).
@@ -23,7 +23,7 @@ from plugins.memory.config_schema import (
 # with NO config panel). Only pass it when the running Hermes supports it, so
 # fresh installs on stock just work while the fork keeps the native path.
 _schema_kwargs: dict = {
-    "name": "hybrid_memory",
+    "name": "argos",
     "label": "Argos (Local)",
     "storage": STORAGE_FLAT_JSON,
 }

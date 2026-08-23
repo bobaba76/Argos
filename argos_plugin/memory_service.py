@@ -30,7 +30,7 @@ else:
     from graph import KuzuGraphStore
     from store import DuckDBMemoryStore
 
-logger = logging.getLogger("hybrid_memory.service")
+logger = logging.getLogger("argos.service")
 _ENDPOINT_NAME = "hybrid_memory_service.json"
 _MAX_REQUEST_BYTES = 4 * 1024 * 1024
 

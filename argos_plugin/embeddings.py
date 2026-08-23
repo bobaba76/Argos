@@ -4,7 +4,7 @@ Loads ``BAAI/bge-small-en-v1.5`` lazily on first use.
 If the model or library is unavailable, ``embed()`` returns an empty list and
 the DuckDB store falls back to text search transparently.
 
-Uses a process-level shared model so that multiple HybridMemoryProvider
+Uses a process-level shared model so that multiple ArgosProvider
 instances (Hermes creates one per agent/session) all reuse the same loaded
 model instead of reloading the ~130MB model on every new session.
 

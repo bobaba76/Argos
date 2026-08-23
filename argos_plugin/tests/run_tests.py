@@ -1,7 +1,7 @@
-﻿"""Standalone test script for the hybrid_memory plugin.
+﻿"""Standalone test script for the argos plugin.
 
 Run with:
-    python -m hybrid_memory.tests.run_tests
+    python -m argos.tests.run_tests
 
 Or from the plugin directory:
     python tests/run_tests.py
@@ -10,7 +10,7 @@ This does NOT require pytest â€” it's a plain script that prints
 PASS/FAIL for each test. Use this if you don't have pytest installed.
 
 For pytest, use:
-    python -m pytest tests/test_hybrid_memory.py -v
+    python -m pytest tests/test_argos.py -v
 """
 from __future__ import annotations
 
@@ -758,12 +758,12 @@ def test_memory_update_provider_path_keyword():
         sys.modules["tools.registry"] = _tr
 
     try:
-        import hybrid_memory_plugin
+        import argos_plugin
     except ModuleNotFoundError:
-        # The live install directory is named ``hybrid_memory`` rather than
-        # ``hybrid_memory_plugin``.
-        import hybrid_memory as hybrid_memory_plugin
-    provider = hybrid_memory_plugin.HybridMemoryProvider()
+        # The live install directory is named ``argos`` rather than
+        # ``argos_plugin``.
+        import argos as argos_plugin
+    provider = argos_plugin.ArgosProvider()
 
     class _StubRecord:
         def __init__(self, memory_id, content, tags):
@@ -1166,7 +1166,7 @@ def run_all():
     """Run all tests and report results."""
     print()
     print("=" * 60)
-    print("  Hybrid Memory Plugin â€” Test Suite")
+    print("  Argos Plugin â€” Test Suite")
     print("=" * 60)
     print()
 

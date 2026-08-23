@@ -14,7 +14,7 @@ for _path in (_plugin_dir.parent, _plugin_dir):
 
 
 def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
-    from hybrid_memory.service_client import SharedMemoryStore
+    from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
         json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
@@ -47,10 +47,10 @@ def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
             time.sleep(0.5)
 
 
-def test_hybrid_memory_tool_review_uses_keyword_arguments(tmp_path):
+def test_argos_tool_review_uses_keyword_arguments(tmp_path):
     """The provider tool path must work with SharedMemoryStore's keyword API."""
-    from hybrid_memory import HybridMemoryProvider
-    from hybrid_memory.service_client import SharedMemoryStore
+    from argos import ArgosProvider
+    from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
         json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
@@ -67,7 +67,7 @@ def test_hybrid_memory_tool_review_uses_keyword_arguments(tmp_path):
         )
         assert candidate is not None
 
-        provider = object.__new__(HybridMemoryProvider)
+        provider = object.__new__(ArgosProvider)
         provider._store = store
         provider._graph = None
         provider._evidence_retention = "full"
@@ -92,7 +92,7 @@ def test_hybrid_memory_tool_review_uses_keyword_arguments(tmp_path):
 
 def test_shared_store_delete_memory_forwards_to_service(tmp_path):
     """The shared client must expose the delete operation used by the tool."""
-    from hybrid_memory.service_client import SharedMemoryStore
+    from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
         json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
@@ -116,8 +116,8 @@ def test_shared_store_delete_memory_forwards_to_service(tmp_path):
 
 def test_shared_memory_tool_delete_works_with_shared_client(tmp_path):
     """The memory_delete tool must work when the provider uses shared storage."""
-    from hybrid_memory import HybridMemoryProvider
-    from hybrid_memory.service_client import SharedMemoryStore
+    from argos import ArgosProvider
+    from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
         json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
@@ -131,7 +131,7 @@ def test_shared_memory_tool_delete_works_with_shared_client(tmp_path):
         )
         assert record is not None
 
-        provider = object.__new__(HybridMemoryProvider)
+        provider = object.__new__(ArgosProvider)
         provider._store = store
         result = json.loads(
             provider.handle_tool_call(

@@ -4,7 +4,7 @@
 The store-level harness (run_eval.py) measures DuckDBMemoryStore.search()
 directly — it CANNOT see the provider layer (graph-aware retrieval, alias
 expansion, candidate injection, reranker, query expansion). This harness
-constructs the real HybridMemoryProvider in direct mode against a per-arm
+constructs the real ArgosProvider in direct mode against a per-arm
 snapshot home and drives its full _search_memories() pipeline.
 
 Arms (config toggles, mirroring production defaults):
@@ -117,7 +117,7 @@ def build_snapshot_graph(home: Path, use_llm: bool = False) -> int:
     "properly typed graph" arm. SLOW: LLM per memory (~15s each).
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from hybrid_memory_plugin.graph import KuzuGraphStore
+    from argos_plugin.graph import KuzuGraphStore
 
     model = _resolve_embedding_model_path("bge-small-en-v1.5",
                                           hermes_home=str(home))
@@ -150,7 +150,7 @@ def build_snapshot_graph(home: Path, use_llm: bool = False) -> int:
 
 def run_arm(home: Path, eval_set: dict) -> dict:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from hybrid_memory_plugin import HybridMemoryProvider as Provider
+    from argos_plugin import ArgosProvider as Provider
 
     provider = Provider()
     provider.initialize(
@@ -203,7 +203,7 @@ def build_typed_graph(home: Path, llm_report: dict) -> int:
     relation set comes from the LLM typing report (regex + LLM merged).
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from hybrid_memory_plugin.graph import KuzuGraphStore
+    from argos_plugin.graph import KuzuGraphStore
 
     graph = KuzuGraphStore(home / "hybrid_memory_kuzu", user_id="default_user")
     n = 0

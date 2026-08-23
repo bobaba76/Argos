@@ -15,7 +15,7 @@ for the front-door overview see **[README.md](README.md)**.
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                  Provider Layer                          │
-│   (12 memory_* tools + pre_llm_call ambient hook +       │
+│   (14 memory_* tools + pre_llm_call ambient hook +       │
 │    insight-log skill + /ilog, /revisit commands)         │
 ├─────────────────────────────────────────────────────────┤
 │                  Retrieval Pipeline                      │
@@ -379,7 +379,7 @@ a couple of cases — those are footnoted.
 
 ```
 hybrid_memory_plugin/
-├── __init__.py              Provider: 12 tools, retrieval pipeline, hooks
+├── __init__.py              Provider: 14 tools, retrieval pipeline, hooks
 ├── store.py                 DuckDB store: CRUD, search, version chains,
 │                            evidence, candidates, feedback, consolidation
 ├── graph.py                 Kùzu graph: entities, relations, aliases,

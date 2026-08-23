@@ -39,6 +39,53 @@ def test_shared_service_store_and_graph(tmp_path):
             time.sleep(0.5)
 
 
+def test_shared_service_search_forwards_provider_kwargs(tmp_path):
+    """Regression: provider._search_memories ALWAYS passes include_expired on
+    every search (memory_search tool + prefetch). The RPC client must accept
+    and forward it — a closed signature here TypeErrors on every search in
+    shared_service mode (the production default)."""
+    from service_client import SharedMemoryStore
+
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        encoding="utf-8",
+    )
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        active = store.remember(
+            category="context_note",
+            content="User remembers the timed service memory",
+        )
+        expired = store.remember(
+            category="context_note",
+            content="Timed service memory expired long ago",
+            expires_at="2000-01-01T00:00:00+00:00",
+        )
+        assert active is not None and expired is not None
+
+        # The provider's exact calling convention (search tool + prefetch path).
+        hidden = store.search(
+            "timed service memory", limit=5,
+            category_filter=None, project_id=None,
+            suppress_retrieval=True, include_expired=False,
+        )
+        visible = store.search(
+            "timed service memory", limit=5,
+            category_filter=None, project_id=None,
+            suppress_retrieval=True, include_expired=True,
+        )
+        hidden_ids = {r.memory_id for r in hidden}
+        visible_ids = {r.memory_id for r in visible}
+        assert active.memory_id in hidden_ids
+        assert expired.memory_id not in hidden_ids
+        assert expired.memory_id in visible_ids
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)
+
+
 def test_shared_graph_index_and_traverse_round_trip(tmp_path):
     """Priority 3 graph indexing/traversal must work through shared RPC."""
     from service_client import SharedGraphStore

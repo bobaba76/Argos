@@ -1718,7 +1718,7 @@ class HybridMemoryProvider(MemoryProvider):
                         effective_query, depth=self._graph_traversal_depth,
                         limit=max(10, candidate_limit),
                     )
-                    logger.debug("TRAVERSAL-DBG: %d ids for %r", len(traversal_ids), effective_query[:40])
+                    logger.debug("traversal: %d candidate ids for %r", len(traversal_ids), effective_query[:40])
                     if traversal_ids:
                         seen = set(graph_ids)
                         for tid in traversal_ids:
@@ -1774,8 +1774,8 @@ class HybridMemoryProvider(MemoryProvider):
                 injectable_ids = set(alias_expanded_ids) if alias_expanded_ids else set()
                 if self._graph_traversal_enabled:
                     injectable_ids.update(traversal_ids)
-                    logger.debug("TRAVERSAL-DBG: injectable=%d (traversal=%d, alias=%d)",
-                                 len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
+                    logger.debug("graph injectable ids: %d (traversal=%d, alias=%d)",
+                                                     len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
                 if self._graph_inject_candidates:
                     injectable_ids.update(graph_ids)
                 if injectable_ids:
@@ -1813,12 +1813,7 @@ class HybridMemoryProvider(MemoryProvider):
                         record.similarity = sim
                         record.raw_similarity = sim
                         if sim >= self._graph_boost_min_similarity:
-                            results.append(record)
-                            if str(record.memory_id).startswith("mem-4d83cf06"):
-                                logger.debug("TRAVERSAL-DBG: INDWE injected sim=%.3f", sim)
-                        elif str(record.memory_id).startswith("mem-4d83cf06"):
-                            logger.debug("TRAVERSAL-DBG: INDWE rejected sim=%.3f < %.2f",
-                                         sim, self._graph_boost_min_similarity)
+                                                    results.append(record)
                 graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
                 graph_count = max(len(graph_ids), 1)
                 alias_id_set = set(alias_expanded_ids)

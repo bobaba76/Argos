@@ -2037,6 +2037,36 @@ class DuckDBMemoryStore:
         if not existing:
             return None
         rec = existing[0]
+        # Chain-fork guard: if the caller passed a superseded (non-current)
+        # version ID, resolve forward along superseded_by to the CURRENT head
+        # before updating. Updating a stale version directly forks the chain:
+        # both the live head and the new record would end up valid_to IS NULL
+        # and be retrieved as two concurrent "current" versions of the same
+        # fact (reproduced; get_memory_history then walks only the stale
+        # branch). Cycle-guarded like get_memory_history so a corrupt
+        # superseded_by loop terminates instead of spinning.
+        head = rec
+        visited: set[str] = {rec.memory_id}
+        while head.valid_to is not None and head.superseded_by:
+            nxt_id = head.superseded_by
+            if nxt_id in visited:
+                logger.warning(
+                    "Cycle detected in memory chain at %s -> %s; updating the "
+                    "stale version instead of walking (corrupt edge).",
+                    head.memory_id, nxt_id,
+                )
+                break
+            nxt = self._fetch_records(
+                """SELECT * FROM memory_records WHERE memory_id = ?
+                   AND (user_scope IS NULL OR user_scope = ?)""",
+                [nxt_id, self.user_id],
+            )
+            if not nxt:
+                break
+            visited.add(nxt[0].memory_id)
+            head = nxt[0]
+        rec = head
+        memory_id = rec.memory_id  # supersede the head, not the stale version
         now = self._now()
         new_content = content if content is not None else rec.content
         new_tags = tags if tags is not None else rec.tags

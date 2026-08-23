@@ -1089,7 +1089,7 @@ class DuckDBMemoryStore:
             if over_latency or over_count:
                 self._scale_warnings_fired += 1
                 logger.warning(
-                    "HYBRID_MEMORY_SCALE: p95=%.0fms avg=%.0fms (warn>%.0fms) "
+                    "ARGOS_SCALE: p95=%.0fms avg=%.0fms (warn>%.0fms) "
                     "records=%s (warn>%s) — if this persists, enable ANN/BM25 "
                     "indexing or fact-family consolidation per the scaling "
                     "roadmap (trigger: %s)",

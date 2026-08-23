@@ -57,7 +57,7 @@ _DEFAULT_MAX_INJECTED = 20
 _DEFAULT_INJECT_CONTENT_CHAR_CAP = 800
 _INJECT_CONTENT_CHAR_CAP = _DEFAULT_INJECT_CONTENT_CHAR_CAP  # backward-compat alias
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
-_AUTO_EXTRACT_PAUSE_MARKER = "hybrid_memory.auto_extract.paused"
+_AUTO_EXTRACT_PAUSE_MARKER = "argos.auto_extract.paused"
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +476,7 @@ FETCH_FULL_SCHEMA = {
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
-class HybridMemoryProvider(MemoryProvider):
+class ArgosProvider(MemoryProvider):
     """Three-tier local memory: DuckDB (vector) + Kuzu (graph) + local embeddings."""
 
     def __init__(self) -> None:
@@ -574,7 +574,7 @@ class HybridMemoryProvider(MemoryProvider):
 
     @property
     def name(self) -> str:
-        return "hybrid_memory"
+        return "argos"
 
     # -- availability --------------------------------------------------------
 
@@ -1024,11 +1024,20 @@ class HybridMemoryProvider(MemoryProvider):
                 model=self._llm_model,
                 provider=self._llm_provider,
             )
+        # Argos rename (23/8): check new marker name first, then legacy
+        # pre-rename name so an old pause file still takes effect.
         pause_marker = home / _AUTO_EXTRACT_PAUSE_MARKER
-        env_pause = os.environ.get("HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", "")
-        self._auto_extract_paused = pause_marker.exists() or env_pause.lower() in {
-            "1", "true", "yes", "on"
-        }
+        legacy_pause_marker = home / "hybrid_memory.auto_extract.paused"
+        env_pause = os.environ.get("ARGOS_PAUSE_AUTO_EXTRACT", "") or os.environ.get(
+            "HERMES_HYBRID_MEMORY_PAUSE_AUTO_EXTRACT", ""
+        )
+        self._auto_extract_paused = (
+            pause_marker.exists()
+            or legacy_pause_marker.exists()
+            or env_pause.lower() in {
+                "1", "true", "yes", "on"
+            }
+        )
 
         # ---- Scale trigger instrumentation -------------------------------
         # The triage rule: build cheap/irreversible seams now, gate expensive
@@ -1171,7 +1180,7 @@ class HybridMemoryProvider(MemoryProvider):
 
         self._initialized = True
         logger.info(
-            "HybridMemory initialized: %d memories, graph=%s, embeddings=%s, "
+            "Argos initialized: %d memories, graph=%s, embeddings=%s, "
             "auto_extract=%s, auto_review=%s, paused=%s, storage=%s, proposals=on",
             self._store.count(),
             "on" if self._graph else "off",
@@ -3144,7 +3153,7 @@ def _build_coder_directive(user_message: str = "") -> str:
     """
     text = (user_message or "").lower()
     repo_signals = (
-        "salesdash", "miser", "codebrain", "hybrid-memory", "hybrid_memory",
+        "salesdash", "miser", "codebrain", "argos", "argos",
         "hermes-agent", "longmemeval", "documents\\github", "documents/github",
         "github\\", "github/", "coder mcp", "coder",
     )
@@ -3205,10 +3214,12 @@ def _on_pre_llm_call(**kwargs) -> dict:
         result = {"context": "\n".join(parts)}
 
     # P2A intent routing: optionally return {"model", "provider"} for the
-    # answerer.  The core pre_llm_call path (agent/turn_context.py) honors a
-    # "model" key and calls switch_model() when it differs from the current
-    # answerer.  Always returns an explicit pick (smart for temporal/multi-hop,
-    # default otherwise) so turns self-correct, unless routing is disabled.
+        # answerer.  The core pre_llm_call path (agent/turn_context.py) honors a
+        # "model" key and calls switch_model() when it differs from the current
+        # answerer.  Since 2026-08-23 route_answerer returns a pick ONLY for
+        # genuine smart routes (never the default model), so the hook can never
+        # stomp a session's own model choice; with router_subcall_enabled smart
+        # routes don't switch at all (hint-only).
     #
     # When router_subcall_enabled is set, genuine temporal/multi-hop queries
     # do NOT switch the whole (expensive ~124k-token) turn to the smart model.
@@ -3280,7 +3291,7 @@ def _build_temporal_hint(question: str) -> str:
                     hint = temporal_answer(question, evidence)
         return (hint or "").strip()
     except Exception as exc:  # pragma: no cover - defensive
-        logging.getLogger("hybrid_memory").warning("temporal hint build failed: %s", exc)
+        logging.getLogger("argos").warning("temporal hint build failed: %s", exc)
         return ""
 
 
@@ -3289,20 +3300,20 @@ def _build_temporal_hint(question: str) -> str:
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
-    """Register HybridMemory as a memory provider plugin.
+    """Register Argos as a memory provider plugin.
 
     Also registers the insight-log skill, /ilog + /revisit slash commands,
     and a ``pre_llm_call`` hook for ambient context (time/location/weather/
     file-activity) — if the plugin context supports them.
     """
     try:
-        ctx.register_memory_provider(HybridMemoryProvider())
-        logging.getLogger("hybrid_memory").info(
-            "hybrid_memory: register() succeeded, provider registered"
+        ctx.register_memory_provider(ArgosProvider())
+        logging.getLogger("argos").info(
+            "argos: register() succeeded, provider registered"
         )
     except Exception as _e:
-        logging.getLogger("hybrid_memory").warning(
-            "hybrid_memory: register() failed: %s\n%s", _e, traceback.format_exc()
+        logging.getLogger("argos").warning(
+            "argos: register() failed: %s\n%s", _e, traceback.format_exc()
         )
         raise
 
@@ -3312,12 +3323,12 @@ def register(ctx) -> None:
     try:
         if hasattr(ctx, "register_hook"):
             ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-            logging.getLogger("hybrid_memory").info(
-                "hybrid_memory: registered pre_llm_call hook for ambient context"
+            logging.getLogger("argos").info(
+                "argos: registered pre_llm_call hook for ambient context"
             )
     except Exception as _e:
-        logging.getLogger("hybrid_memory").debug(
-            "hybrid_memory: pre_llm_call hook registration skipped: %s", _e
+        logging.getLogger("argos").debug(
+            "argos: pre_llm_call hook registration skipped: %s", _e
         )
 
     # Register the insight-log skill (if the context supports skill registration).
@@ -3325,12 +3336,12 @@ def register(ctx) -> None:
         skill_md = Path(__file__).parent / "skills" / "insight-log" / "SKILL.md"
         if skill_md.exists() and hasattr(ctx, "register_skill"):
             ctx.register_skill("insight-log", skill_md)
-            logging.getLogger("hybrid_memory").info(
-                "hybrid_memory: registered insight-log skill"
+            logging.getLogger("argos").info(
+                "argos: registered insight-log skill"
             )
     except Exception as _e:
-        logging.getLogger("hybrid_memory").debug(
-            "hybrid_memory: skill registration skipped: %s", _e
+        logging.getLogger("argos").debug(
+            "argos: skill registration skipped: %s", _e
         )
 
     # Register /ilog and /revisit slash commands (if supported).
@@ -3349,12 +3360,12 @@ def register(ctx) -> None:
                 _handle_revisit_command,
                 description="Surface a random older insight for re-engagement",
             )
-            logging.getLogger("hybrid_memory").info(
-                "hybrid_memory: registered /ilog and /revisit commands"
+            logging.getLogger("argos").info(
+                "argos: registered /ilog and /revisit commands"
             )
     except Exception as _e:
-        logging.getLogger("hybrid_memory").debug(
-            "hybrid_memory: command registration skipped: %s", _e
+        logging.getLogger("argos").debug(
+            "argos: command registration skipped: %s", _e
         )
 
 

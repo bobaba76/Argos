@@ -1,7 +1,7 @@
-﻿"""Pytest tests for the hybrid_memory plugin.
+﻿"""Pytest tests for the argos plugin.
 
 Run with:
-    python -m pytest tests/test_hybrid_memory.py -v
+    python -m pytest tests/test_argos.py -v
 
 Or use the standalone script (no pytest needed):
     python tests/run_tests.py
@@ -588,14 +588,14 @@ class TestDuckDBStore:
         from store import DuckDBMemoryStore
         from graph import KuzuGraphStore
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
 
@@ -782,9 +782,9 @@ class TestDuckDBStore:
         from graph import KuzuGraphStore
         from embeddings import LocalEmbedder
         try:
-            import hybrid_memory_plugin as _hmp
+            import argos_plugin as _hmp
         except ModuleNotFoundError:
-            import hybrid_memory as _hmp
+            import argos as _hmp
 
         embedder = LocalEmbedder(
             "bge-small-en-v1.5",
@@ -793,7 +793,7 @@ class TestDuckDBStore:
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user", embedder=embedder)
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 
-        provider = _hmp.HybridMemoryProvider()
+        provider = _hmp.ArgosProvider()
         provider._store = store
         provider._graph = graph
         provider._graph_aware_retrieval = True
@@ -1663,14 +1663,14 @@ class TestPriority3GraphEnhancements:
         from graph import KuzuGraphStore
 
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
 
@@ -1699,14 +1699,14 @@ class TestPriority3GraphEnhancements:
         assert not _is_role_word("bartender")
 
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
         provider._config = {"role_alias_llm_fallback": "true"}
@@ -1749,14 +1749,14 @@ class TestPriority3GraphEnhancements:
         assert not _is_role_word("car")
 
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
         provider._config = {"role_alias_llm_fallback": "true"}
@@ -1791,14 +1791,14 @@ class TestPriority3GraphEnhancements:
         assert not _is_role_word("bartender")
 
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
         provider._config = {"role_alias_llm_fallback": "false"}
@@ -2247,7 +2247,7 @@ class TestProviderInit:
 
     def test_initialize_direct_mode(self, tmp_path):
         import json
-        from hybrid_memory_plugin import HybridMemoryProvider
+        from argos_plugin import ArgosProvider
 
         home = tmp_path / "home"
         home.mkdir()
@@ -2261,7 +2261,7 @@ class TestProviderInit:
         from store import DuckDBMemoryStore
         DuckDBMemoryStore(home / "test.duckdb", user_id="test_user").close()
 
-        p = HybridMemoryProvider()
+        p = ArgosProvider()
         p.initialize(session_id="t", hermes_home=str(home),
                      platform="cli", user_id="test_user")
         assert p._evidence_retention == "full"  # would NameError before fix
@@ -2398,9 +2398,9 @@ class TestKuzuGraph:
         from store import DuckDBMemoryStore
         from graph import KuzuGraphStore
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
@@ -2420,7 +2420,7 @@ class TestKuzuGraph:
         assert old_id in graph.memory_ids_for_query("Kubernetes", limit=10)
 
         # Construct a provider and attach the real store + graph
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
 
@@ -2639,13 +2639,13 @@ class TestMemoryUpdateProviderPath:
     def _make_provider_with_keyword_only_store(self):
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            # The live install directory is named ``hybrid_memory`` rather
-            # than ``hybrid_memory_plugin``.
-            import hybrid_memory as hybrid_memory_plugin
+            # The live install directory is named ``argos`` rather
+            # than ``argos_plugin``.
+            import argos as argos_plugin
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
 
         class _StubRecord:
             def __init__(self, memory_id, content, tags):
@@ -2912,11 +2912,11 @@ class TestMemoryUpdateProviderPath:
         """A query with pronouns should be enriched with recent context."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._context_aware_retrieval = True
         provider._context_window_size = 3
         provider._context_max_chars = 500
@@ -2935,11 +2935,11 @@ class TestMemoryUpdateProviderPath:
         """A keyword query should NOT be enriched with context."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._context_aware_retrieval = True
         provider._record_user_message("some recent context about the watcher")
 
@@ -2951,11 +2951,11 @@ class TestMemoryUpdateProviderPath:
         """When disabled, no enrichment should happen."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._context_aware_retrieval = False
         provider._record_user_message("recent context about the watcher")
 
@@ -2966,11 +2966,11 @@ class TestMemoryUpdateProviderPath:
         """With no recent messages, no enrichment should happen."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._context_aware_retrieval = True
 
         enriched = provider._enrich_query_with_context("tell me more about that")
@@ -2980,11 +2980,11 @@ class TestMemoryUpdateProviderPath:
         """The rolling window should only keep the last N messages."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._context_window_size = 2
         provider._record_user_message("first message")
         provider._record_user_message("second message")
@@ -3040,9 +3040,9 @@ class TestMemoryUpdateProviderPath:
         work using the existing bi-encoder ranking."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         # Create a reranker that will fail to load (bogus model name)
         from types import SimpleNamespace
@@ -3050,7 +3050,7 @@ class TestMemoryUpdateProviderPath:
             from embeddings import CrossEncoderReranker
         except ImportError:
             pass
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._reranker = CrossEncoderReranker("nonexistent/model")
         provider._reranker._load_failed = True  # skip trying to load
 
@@ -3077,9 +3077,9 @@ class TestMemoryUpdateProviderPath:
         from types import SimpleNamespace
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         class StubReranker:
             def score(self, query, documents):
@@ -3102,7 +3102,7 @@ class TestMemoryUpdateProviderPath:
             def memory_ids_for_query(self, q, limit=100):
                 return []
 
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._reranker = StubReranker()
         provider._store = StubStore()
         provider._graph = StubGraph()
@@ -3127,10 +3127,10 @@ class TestMemoryUpdateProviderPath:
         """
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+            import argos as argos_plugin
+        provider = argos_plugin.ArgosProvider()
         # Graph is NOT initialized
         provider._graph = None
         provider._store = None
@@ -3148,10 +3148,10 @@ class TestMemoryUpdateProviderPath:
         return a clear error, not 'Unknown tool'."""
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+            import argos as argos_plugin
+        provider = argos_plugin.ArgosProvider()
         provider._graph = None
 
         class StubStore:
@@ -3174,10 +3174,10 @@ class TestMemoryUpdateProviderPath:
 
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+            import argos as argos_plugin
+        provider = argos_plugin.ArgosProvider()
 
         base = SimpleNamespace(memory_id="base", similarity=0.50)
         graph_only = SimpleNamespace(memory_id="graph-only", similarity=0.0)
@@ -3211,10 +3211,10 @@ class TestMemoryUpdateProviderPath:
 
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+            import argos as argos_plugin
+        provider = argos_plugin.ArgosProvider()
 
         base = SimpleNamespace(memory_id="base", similarity=0.50)
         graph_only = SimpleNamespace(memory_id="graph-only", similarity=0.30)
@@ -3248,10 +3248,10 @@ class TestMemoryUpdateProviderPath:
 
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+            import argos as argos_plugin
+        provider = argos_plugin.ArgosProvider()
 
         base = SimpleNamespace(memory_id="base", similarity=0.10)
 
@@ -3283,10 +3283,10 @@ class TestMemoryUpdateProviderPath:
 
         self._stub_hermes_runtime()
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+            import argos as argos_plugin
+        provider = argos_plugin.ArgosProvider()
         provider._auto_extract = True
         provider._auto_extract_paused = False
         provider._agent_context = "primary"
@@ -3596,13 +3596,13 @@ class TestEvolutionChains:
         from store import DuckDBMemoryStore
         from graph import KuzuGraphStore
         try:
-            import hybrid_memory_plugin
+            import argos_plugin
         except ModuleNotFoundError:
-            import hybrid_memory as hybrid_memory_plugin
+            import argos as argos_plugin
 
         store = DuckDBMemoryStore(tmp_path / "ec_prov.duckdb", user_id=user_id)
         graph = KuzuGraphStore(tmp_path / "ec_prov_kuzu", user_id=user_id)
-        provider = hybrid_memory_plugin.HybridMemoryProvider()
+        provider = argos_plugin.ArgosProvider()
         provider._store = store
         provider._graph = graph
         provider._evidence_retention = "full"

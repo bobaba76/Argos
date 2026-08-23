@@ -681,7 +681,7 @@ class KuzuGraphStore:
     """Kuzu-backed relationship graph with thread-safe access.
 
     Uses a process-level shared database connection so that multiple
-    HybridMemoryProvider instances (Hermes creates one per agent/session)
+    ArgosProvider instances (Hermes creates one per agent/session)
     can all access the same Kuzu database without file lock conflicts.
     """
 

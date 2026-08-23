@@ -1,6 +1,6 @@
 """Egress inventory and gate for LLM-bound auxiliary calls.
 
-The hybrid-memory plugin makes its own LLM calls beyond the host's normal
+The argos plugin makes its own LLM calls beyond the host's normal
 answering loop (extraction fallback, review, graph typing, query
 expansion, the temporal sub-call, distillation). This module is the
 single place that (a) inventories every such site — what it sends, when,
@@ -185,7 +185,7 @@ def load_config() -> dict:
     cfg: dict = {}
     home = _hermes_home()
     candidates = [
-        home / "plugins" / "hybrid_memory" / "hybrid_memory.json",
+        home / "plugins" / "argos" / "hybrid_memory.json",
         home / "hybrid_memory.json",
     ]
     for path in candidates:
@@ -257,7 +257,7 @@ def report(cfg: dict | None = None) -> str:
     cfg = cfg if cfg is not None else load_config()
     lo = local_only(cfg)
     lines = [
-        "hybrid-memory egress report",
+        "argos egress report",
         "=========================",
         f"local_only: {lo}",
         "",

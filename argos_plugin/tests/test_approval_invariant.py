@@ -22,7 +22,7 @@ import pytest
 
 
 def _make_store(tmp_path):
-    from hybrid_memory.store import DuckDBMemoryStore
+    from argos.store import DuckDBMemoryStore
 
     store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
     return store
@@ -102,7 +102,7 @@ def test_auto_path_maps_approve_to_reviewed_approved(tmp_path, monkeypatch):
     """The provider's auto-reviewer maps reviewer 'approve' to reviewed_approved."""
     import importlib
 
-    hm = importlib.import_module("hybrid_memory_plugin")
+    hm = importlib.import_module("argos_plugin")
 
     fake_review = {
         "decision": "approve",
@@ -120,7 +120,7 @@ def test_auto_path_maps_approve_to_reviewed_approved(tmp_path, monkeypatch):
     try:
         cid = _add_pending(store)
 
-        class _StubProvider(hm.HybridMemoryProvider):
+        class _StubProvider(hm.ArgosProvider):
             def __init__(self, store):
                 self._store = store
                 self._llm_model = None

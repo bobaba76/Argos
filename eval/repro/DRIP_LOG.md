@@ -6,6 +6,13 @@ LIMIT 2000) replacing first-4-token ILIKE overlap scoring.
 Commit `5754df4`, pushed 2026-08-23. Live in prod since the evening restart
 of 2026-08-23 (installed copy md5-verified against repo: `68e61fc7…`).
 
+**Cross-category probe (msku20, same evening):** paired 20-question slice
+from multi-session + knowledge-update banks (14 misses + 6 pass sentinels):
+KU 3/9→8/9 (5/6 misses fixed, 0 regressions); MS 3/11→5/11 (3 fixed,
+1 judge-boundary flip). Both retrieval-heavy categories move UP.
+Full-bank overall projection revises from ~72–73% to ~84–86%
+(proven measured floor: 72.2%).
+
 **Why:** component ablation on a 100-memory real-store sample showed the
 text channel at 71/87 (r@5/r@20) while the vector leg ran 88/95 — the
 disaster-mode floor was the weakest link in an otherwise clean system.

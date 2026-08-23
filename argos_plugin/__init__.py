@@ -3471,3 +3471,6 @@ def _handle_revisit_command(raw_args: str) -> str:
         f"_tags: {tag_str}_\n\n"
         f"Does this still resonate? Has anything shifted since then?"
     )
+
+# Legacy name retained for eval harnesses importing the pre-rename symbol.
+HybridMemoryProvider = ArgosProvider

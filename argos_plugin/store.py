@@ -35,6 +35,21 @@ from typing import Any, Dict, List, Optional
 
 import duckdb
 
+# English function words excluded from text-leg scoring. Kept deliberately
+# small: these are tokens that never discriminate between memories.
+_TEXT_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "from", "was", "are",
+    "were", "been", "have", "has", "had", "will", "would", "can", "could",
+    "should", "into", "onto", "about", "after", "before", "between",
+    "what", "when", "where", "which", "while", "who", "whom", "whose",
+    "why", "how", "did", "does", "done", "doing", "not", "but", "nor",
+    "his", "her", "hers", "its", "their", "theirs", "our", "ours",
+    "your", "yours", "she", "him", "them", "they", "than", "then",
+    "there", "here", "over", "under", "out", "off", "all", "any",
+    "each", "few", "more", "most", "other", "some", "such", "only",
+    "own", "same", "too", "very", "just", "also",
+})
+
 try:
     import numpy as np
 except ImportError:
@@ -540,22 +555,28 @@ class DuckDBMemoryStore:
         as_of: str | None = None,
         include_expired: bool = False,
     ) -> List[MemoryRecord]:
-        """ILIKE text search. Returns filtered records ranked by token overlap.
+        """BM25-lite text search. Returns filtered records ranked by BM25.
 
         Does NOT record retrieval — the caller is responsible for that.
-        Sets ``similarity`` to a text-match score (fraction of query tokens
-        that matched the content) so downstream fusion has a comparable signal.
+        Sets ``similarity`` to a max-normalized BM25 score so downstream
+        fusion has a comparable signal.
         When *project_id* is provided, memories from other projects are
         excluded; global memories (project_id IS NULL) remain visible.
 
         When *include_expired* is True, the expiry filter is omitted (expired
         memories are returned, ranked normally).
         """
-        words = [t for t in query.split() if len(t) > 2][:4]
-        if not words:
+        tokens = [
+            t for t in (
+                w.lower() for w in re.findall(
+                    r"[a-z0-9]+", query, flags=re.IGNORECASE)
+            )
+            if len(t) > 2 and t not in _TEXT_STOPWORDS
+        ][:8]
+        if not tokens:
             return []
-        tokens = [f"%{t}%" for t in words]
-        conditions = " OR ".join(["content ILIKE ?" for _ in tokens])
+        patterns = [f"%{t}%" for t in tokens]
+        conditions = " OR ".join(["content ILIKE ?" for _ in patterns])
         project_clause = ""
         expiry_ref = as_of if as_of else self._now()
         if include_expired:
@@ -587,9 +608,9 @@ class DuckDBMemoryStore:
             "AND (user_scope IS NULL OR user_scope = ?) "
             f"{expiry_clause}"
             f"{project_clause} AND ("
-            f"{conditions}) LIMIT 200"
+            f"{conditions}) LIMIT 2000"
         )
-        results = self._fetch_records(sql, [*temporal_params, *params, *tokens])
+        results = self._fetch_records(sql, [*temporal_params, *params, *patterns])
         out: List[MemoryRecord] = []
         for r in results:
             if excluded and r.category.lower() in excluded:
@@ -600,11 +621,29 @@ class DuckDBMemoryStore:
                 continue
             if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
                 continue
-            # Text-match score: fraction of query tokens found in content.
-            content_lower = (r.content or "").lower()
-            matched = sum(1 for w in words if w.lower() in content_lower)
-            r.similarity = matched / len(words) if words else 0.0
             out.append(r)
+        # BM25-lite ranking over the candidate pool: per-token document
+        # frequency -> idf, term frequency -> saturation, length normalization.
+        # Pure-Python so no extension/network dependency; O(tokens x docs).
+        if out:
+            contents = [(r.content or "").lower() for r in out]
+            doc_lens = [len(c) or 1 for c in contents]
+            avg_len = max(1.0, sum(doc_lens) / len(doc_lens))
+            n_docs = len(out)
+            dfs = {t: sum(1 for c in contents if t in c) for t in tokens}
+            for r, content_lower, dlen in zip(out, contents, doc_lens):
+                score = 0.0
+                for t in tokens:
+                    tf = content_lower.count(t)
+                    if not tf:
+                        continue
+                    idf = math.log(1.0 + (n_docs - dfs[t] + 0.5) / (dfs[t] + 0.5))
+                    score += idf * (2.2 * tf / (tf + 0.75 * (dlen / avg_len)))
+                r.similarity = score
+            top = max((r.similarity for r in out), default=0.0)
+            if top > 0:
+                for r in out:
+                    r.similarity /= top
         # Sort by text-match score descending.
         out.sort(key=lambda r: r.similarity, reverse=True)
         return out

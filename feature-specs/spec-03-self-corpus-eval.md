@@ -10,7 +10,7 @@ This mirrors the design from diagnostic tooling already present (`LongMemEval\Ev
 - is **strictly read-only** and cannot pollute ranking.
 
 ## 2. Tool contract — standalone script
-`C:\Users\<user>\Documents\Github\Hermes\hybrid_memory_plugin\eval\eval_self_corpus.py`
+`C:\Users\<user>\Documents\Github\Hermes\argos_plugin\eval\eval_self_corpus.py`
 
 ```
 python eval/eval_self_corpus.py

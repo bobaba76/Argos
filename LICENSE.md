@@ -9,7 +9,7 @@ Parameters
 
 Licensor:             bobaba76 / The Argos Author
 Licensed Work:        Argos — the hybrid persistent-memory plugin for Hermes
-                      Agent (the "hybrid_memory_plugin" directory of this
+                      Agent (the "argos_plugin" directory of this
                       repository, and any files added or modified by the
                       Author outside that directory, excluding files
                       originally licensed under the MIT License by

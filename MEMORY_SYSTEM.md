@@ -378,7 +378,7 @@ a couple of cases — those are footnoted.
 ## Files
 
 ```
-hybrid_memory_plugin/
+argos_plugin/
 ├── __init__.py              Provider: 14 tools, retrieval pipeline, hooks
 ├── store.py                 DuckDB store: CRUD, search, version chains,
 │                            evidence, candidates, feedback, consolidation
@@ -416,7 +416,7 @@ hybrid_memory_plugin/
 ## Testing
 
 ```bash
-cd hybrid_memory_plugin
+cd argos_plugin
 python -m pytest tests/ -v
 ```
 

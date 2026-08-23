@@ -6,7 +6,7 @@ Some memories are only true for a while ("tenant moves out at the end of June", 
 Goal: give memories a **best-before date** (expiry). Expired memories quietly stop being *read* (excluded from every recall path), are **never deleted**, and can be revived or inspected on demand. The user's design preference: expiry over deletion (deleting a true fact is quiet data loss; expiry is honest and reversible). Tiers = different shelf lives for different kinds of facts.
 
 ## 2. Current state — MOST OF THIS IS ALREADY BUILT. Do not rebuild it.
-Verified in the fork at `C:\Users\<user>\Documents\Github\Hermes\hybrid_memory_plugin\`:
+Verified in the fork at `C:\Users\<user>\Documents\Github\Hermes\argos_plugin\`:
 
 Already exists:
 - **Schema:** `memory_records.expires_at VARCHAR` column (store.py ~line 223). No migration needed.

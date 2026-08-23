@@ -14,7 +14,7 @@ Three independent feature specs for the **Argos** memory plugin (internal name: 
 
 **Two copies of the plugin exist. Do not confuse them:**
 
-1. **DEV / fork** — `C:\Users\<user>\Documents\Github\Hermes\hybrid_memory_plugin\`
+1. **DEV / fork** — `C:\Users\<user>\Documents\Github\Hermes\argos_plugin\`
    You build, edit, and test here. The test suite and eval harness import this copy.
 2. **LIVE / deployed** — `%LOCALAPPDATA%\hermes\plugins\hybrid_memory\`
    The running Hermes desktop app executes THIS copy. **Edits to the fork are not live until copied here** and the app is restarted. Verify the deployed copy after deploying (grep for your new code, or compare file hashes) — claiming a fix is live without this check has burned us before.

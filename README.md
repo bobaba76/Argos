@@ -105,4 +105,4 @@ Argos is licensed under the **Business Source License 1.1** (BSL 1.1): free to r
 
 ## More docs
 
-Settings and every configuration option live in [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md), not in this file. For how the memory system actually works under the hood, see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md). If something breaks or you need to migrate, see [REINSTALL.md](REINSTALL.md). Tests live under `hybrid_memory_plugin`, run them with `python -m pytest tests/ -v`.
+Settings and every configuration option live in [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md), not in this file. For how the memory system actually works under the hood, see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md). If something breaks or you need to migrate, see [REINSTALL.md](REINSTALL.md). Tests live under `argos_plugin`, run them with `python -m pytest tests/ -v`.

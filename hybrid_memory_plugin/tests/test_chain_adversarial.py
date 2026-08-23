@@ -55,8 +55,14 @@ def test_high_similarity_supersession_no_data_loss(tmp_path):
     store.close()
 
 
-def test_update_mid_chain_member_no_cycle_no_loss(tmp_path):
-    """Updating an OLD chain member creates a fork leaf, never a cycle."""
+def test_update_mid_chain_member_resolves_to_head(tmp_path):
+    """Updating an OLD (superseded) chain member must resolve to the current
+    head — never fork the chain into two retrievable 'current' versions.
+
+    Regression: update_memory on a stale version ID previously created a
+    second valid_to-NULL record alongside the live head, so retrieval
+    returned two contradictory "current" versions of the same fact.
+    """
     store = DuckDBMemoryStore(tmp_path / "adv2.duckdb", user_id="alice")
     v1 = store.remember(
         category="personal_fact", content="Alice lives in Southtown"
@@ -64,8 +70,22 @@ def test_update_mid_chain_member_no_cycle_no_loss(tmp_path):
     v2 = store.update_memory(v1.memory_id, content="Alice lives in Centurion")
     v3 = store.update_memory(v2.memory_id, content="Alice lives in Bayport")
 
-    # adversarial: update the MIDDLE version
+    # adversarial: update the MIDDLE (stale) version id
     v2b = store.update_memory(v2.memory_id, content="Alice lives in Centurion West")
+
+    # no fork: exactly one current record in the whole line
+    hist_full = store.get_memory_history(v1.memory_id)
+    live = [h for h in hist_full if getattr(h, "valid_to", None) is None]
+    assert len(live) == 1 and live[0].memory_id == v2b.memory_id, (
+        f"chain forked: {len(live)} current records: {[h.memory_id for h in live]}"
+    )
+
+    # the update landed on the HEAD's line: v2 still points at v3,
+    # and v3 (the old head) is superseded by v2b
+    recs_v2 = _all_records(store, v2.memory_id)
+    assert recs_v2 and recs_v2[0].superseded_by == v3.memory_id
+    recs_v3 = _all_records(store, v3.memory_id)
+    assert recs_v3 and recs_v3[0].superseded_by == v2b.memory_id
 
     # no crash, no cycle: history from every node terminates and never
     # revisits a node
@@ -74,16 +94,11 @@ def test_update_mid_chain_member_no_cycle_no_loss(tmp_path):
         ids = [h.memory_id for h in hist]
         assert len(ids) == len(set(ids)), f"cycle detected from {start}"
 
-    # the fork leaf exists and is a proper successor of v2
-    hist_v2b = store.get_memory_history(v2b.memory_id)
-    assert hist_v2b[-1].memory_id == v2b.memory_id
-    assert hist_v2b[-1].valid_to is None
-    # original v2 still resolvable and marked superseded by v2b
-    recs = _all_records(store, v2.memory_id)
-    assert recs and recs[0].superseded_by == v2b.memory_id
-    # nothing lost: v1, v3 intact
-    for v in (v1, v3):
-        assert _all_records(store, v.memory_id)
+    # chain stays linear: v1 -> v2 -> v3 -> v2b; latest content wins
+    assert [h.memory_id for h in hist_full] == [
+        v1.memory_id, v2.memory_id, v3.memory_id, v2b.memory_id,
+    ]
+    assert hist_full[-1].content == "Alice lives in Centurion West"
     store.close()
 
 

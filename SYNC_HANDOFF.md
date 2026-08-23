@@ -1,65 +1,70 @@
-# Handoff: sync the fork, the remote repo, and the live install
+# Handoff: sync the dev repo, the remote, and the live install
 
-Three separate places hold this code, and only a manual step connects them.
-Do all three so they stop disagreeing.
+Three places hold this code. Only a manual step connects them. Do all three
+so they stop disagreeing. **This file was rewritten 2026-08-23** — the old
+version's topology (dev = the Hermes fork) is stale and must not be used.
 
-## Topology (get this right first)
+## Topology (measured 2026-08-23)
 
 | Tag | Path / URL | Type | Note |
 |-----|-----------|------|------|
-| **A. Fork (dev)** | `C:\Users\michael\Documents\Github\Hermes` | full git repo | origin = `github.com/bobaba76/Argos`. This is where all code changes and commits happen. |
-| **B. Remote** | `github.com/bobaba76/Argos` (branch `master`) | GitHub repo | Source of truth on GitHub. Currently the code you're reading here. |
-| **C. Live install** | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | **NOT a git repo** | A plain file **copy** of A's `hybrid_memory_plugin/`. This is the copy the running Hermes app actually loads. Editing A on its own does nothing live until you re-copy to here and restart Hermes. |
+| **D (dev repo, canonical)** | `C:\Users\michael\Documents\Github\Argos` | full git repo | **All code changes and commits happen here.** origin = `github.com/bobaba76/Argos`. |
+| **R (remote)** | `github.com/bobaba76/Argos` (branch `master`) | GitHub repo | Source of truth on GitHub. |
+| **F (fork, LEGACY)** | `C:\Users\michael\Documents\Github\Hermes` | git repo, stale | Old hermes-agent fork; **8 commits behind** D at last check (HEAD `b3afce7` vs D's `44eca22+`). Its `hybrid_memory_plugin/` files are old fork-era versions. **Never copy runtime modules from here. Do not commit here.** Keep only as reference. |
+| **C (live install)** | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | **NOT a git repo** | Plain file **copy** of D's `hybrid_memory_plugin/`. This is what the running Hermes app loads. Editing D alone does nothing live until you re-copy here and restart. |
 
-There is **no automatic link** from A/B to C. C is a copy-by-hand directory
-(no `.git`). Build in A → push to B → copy to C → restart Hermes.
+There is **no automatic link** from D/R to C. C is a copy-by-hand directory
+(no `.git`). Build in D → push to R → copy to C → restart Hermes.
 
-## Current known delta (measured 2026-08-22)
+**Do NOT use F as the copy source.** The old handoff's Step 3 copied from F;
+that is exactly how C ended up with 17 stale fork-era files on 2026-08-23
+while the repo had moved on. Copy from D only.
 
-C is stale on **5 runtime modules** (file hashes differ vs A):
+## CRITICAL — the include_expired signature-drift bug (fixed 2026-08-23)
 
-- `store.py`      — includes the new `as_of` expiry fix (point-in-time history queries now filter expiry against the query date, not today)
-- `graph.py`
-- `hermes_location.py`
-- `hermes_weather.py`
-- `query_expander.py`
+`SharedMemoryStore.search()` (the RPC client) had a closed signature missing
+`include_expired`, while the provider passes it on EVERY search (memory_search
+tool + per-turn prefetch). Result: TypeError on every search in
+`shared_service` mode **the moment a freshly-synced client loads** (i.e. after
+the next restart). Introduced by `b872aa4`; fixed in the repo with a
+regression test (`tests/test_shared_service.py::test_shared_service_search_forwards_provider_kwargs`).
 
-`__init__.py` and the rest already match. Don't trust this list forever — re-derive it (Step 3) before copying.
+**Rule: never copy `service_client.py` into live unless the repo state also
+has the matching `__init__.py` provider conventions — run pytest first.** When
+in doubt: `cd hybrid_memory_plugin && HF_HUB_OFFLINE=1 <venv-python> -m pytest tests/test_shared_service.py -q`.
 
-## Step 1 — A fork → make sure it's committed and pushed ("if the fork has been touched")
+## Step 1 — D: commit and push ("if the repo has been touched")
 
 ```bash
-cd /c/Users/michael/Documents/Github/Hermes
-git status --short        # if empty, A is clean — skip the commit below
-git add <your changed files>
+cd /c/Users/michael/Documents/Github/Argos
+git status --short        # if empty, skip the commit below
+git add <your changed files>     # NEVER bare `git add -A` without reviewing
 git commit -m "..."
 git push origin master
 ```
 
-**Right now A is dirty** with your (Devin's) in-progress spec-03 work:
-- `hybrid_memory_plugin/eval/eval_self_corpus.py` (untracked)
-- `hybrid_memory_plugin/tests/test_eval_self_corpus.py` (untracked)
-- `.gitignore` (modified)
-Decide if those are ready to commit; if yes, commit+push. Do NOT commit the other person's files that you didn't touch.
+Local `ENGINEERING_NOTES.md` (exploration log) is intentionally **untracked** —
+never commit it (it's a working note, not a product doc).
 
-## Step 2 — B remote → confirm it's current
-
-After Step 1's push, B is the source of truth:
+## Step 2 — R: confirm it's current
 
 ```bash
 git fetch origin && git status -sb   # expect "## master...origin/master" with nothing ahead/behind
 ```
 
-Anything in A that isn't on B needs to be pushed (Step 1) before Step 3, because Step 3 copies **from A** to C.
+## Step 3 — C: re-copy the plugin source from D (NOT from F)
 
-## Step 3 — C live install → re-copy the plugin source from A
-
-C is NOT a git repo, so this is a file copy — NOT git pull.
+C is NOT a git repo — file copy, not git pull:
 
 ```bash
-REPO="/c/Users/michael/Documents/Github/Hermes/hybrid_memory_plugin"
-LIVE="$LOCALAPPDATA/hermes/plugins/hybrid_memory"
+REPO="/c/Users/michael/Documents/Github/Argos/hybrid_memory_plugin"
+LIVE="$(cygpath -m "$LOCALAPPDATA")/hermes/plugins/hybrid_memory"   # forward slashes, no backslashes!
 ```
+
+> **MSYS trap (hit 2026-08-23):** `$LOCALAPPDATA` is `C:\Users\...` (backslashes).
+> Passing `"$LOCALAPPDATA/hermes/..."` to `md5sum`/`cmp` mangles the path and
+> produces bogus hash prefixes (`\c259...`), so every file reports DIFF even
+> when the bytes are identical. Always `cygpath -m` the home path first.
 
 Re-derive drift, then copy the changed runtime modules:
 
@@ -68,34 +73,58 @@ Re-derive drift, then copy the changed runtime modules:
 (cd "$LIVE" && md5sum *.py *.yaml) | sort -k2 > /tmp/live.md5
 join -j 2 -a 1 -a 2 -e MISSING -o '1.2,1.1,2.1' /tmp/repo.md5 /tmp/live.md5 \
   | awk '$2!=$3{print $1}'
-# For every <file> listed, run:
+# For every <file> listed (runtime modules only), run:
 cp "$REPO/<file>" "$LIVE/<file>"
 ```
 
-**Do NOT** do a blanket `rsync -av --delete` of the whole directory. Rules:
-- **Copy only the runtime modules** (top-level `.py` + `config_schema.py` + `plugin.yaml`) that differ.
-- **Do NOT touch / delete live-only runtime artifacts:** `skills/`, `*.duckdb` (the live memory DB), `hybrid_memory_service.json`, `__pycache__/`.
-- **Do NOT copy dev artifacts into live:** `tests/`, `eval/`, `*_backfill*.py`, `cleanup_memories.py`, `dump_memories.py`. These do not belong in the installed plugin.
-- **Legacy test files already sitting in live root** (`run_tests.py`, `test_hybrid_memory.py` — leftovers from an older layout where the repo now uses `tests/`): leave them alone, they're harmless.
+**Do NOT** do a blanket `rsync -av --delete`. Rules:
+- Copy only the **runtime modules** (top-level `.py` + `config_schema.py` + `plugin.yaml`) that differ.
+- Do **NOT** touch/delete live-only runtime artifacts: `skills/`, `*.duckdb` (the live memory DB), `hybrid_memory_service.json` (both copies), `__pycache__/`, `_mh_analysis.txt`.
+- Do **NOT** copy dev artifacts into live: `tests/`, `eval/`, `*_backfill*.py`, `cleanup_memories.py`, `dump_memories.py`, `migrate_gateway.py`, `rebuild_graph.py`, `reembed_memories.py`, `review_pending.py`, `why_not_cli.py`, `run_tests.py`. These do not belong in the installed plugin.
+- Legacy files already sitting in live root (`run_tests.py`, `test_hybrid_memory.py` — leftovers from an older layout): leave them alone, they're harmless.
 
 ## Step 4 — Restart so the new code actually loads
 
 Hermes loads the plugin modules at startup. Copying files under a running app
-does **not** hot-reload them. A restart of the Hermes desktop app (or the
-`serve` gateway process) is required for C to run the new modules.
+does **not** hot-reload them — the gateway process keeps running the OLD code
+until restarted. A restart of the Hermes desktop app (or the `gateway run`
+process) is required.
 
-## Step 5 — Verify
+**The shared memory SERVICE is a separate process and survives app restarts.**
+It was spawned on 2026-08-22 19:44 and will keep running the old
+`memory_service.py`/`store.py`/`graph.py`/`embeddings.py` from memory even
+after the app restarts (clients re-connect to whatever answers on the port).
+To force it onto the new code, **after** the app has fully exited, kill the
+stale service processes and let the next app start spawn fresh ones:
 
-```bash
-# hash parity after copy — these must now MATCH between REPO and LIVE:
-md5sum "$REPO/store.py" "$LIVE/store.py"
-# run the plugin's own tests against the live copy (from the LIVE dir):
-cd "$LOCALAPPDATA/hermes/plugins/hybrid_memory"
-python -m pytest   # expect 0 failures attributable to your change
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'hybrid_memory\\memory_service\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 ```
 
-Do not claim "live is synced" until Step 5's hashes match and the app has
-restarted. Verify, don't assume.
+(There may be TWO matching processes — the venv python and the system python
+run in parallel on this machine. Kill both.)
+
+## Step 5 — Verify (verify, don't assume)
+
+1. **Hash parity**: `md5sum "$REPO/store.py" "$LIVE/store.py"` etc. — the synced
+   files must now MATCH between D and C.
+2. **Service health**: after restart, the endpoint file
+   `%LOCALAPPDATA%\hermes\hybrid_memory_service.json` gets rewritten — check
+   that a new `memory_service.py` process is running (CreationDate = now).
+3. **Plugin tests against the live copy** (from the LIVE dir):
+   `cd "$LOCALAPPDATA/hermes/plugins/hybrid_memory" && python -m pytest -q 2>&1 | tail -5`
+   (expect 0 failures; `tests/` lives in live because an earlier copy brought it in).
+4. **Smoke test**: open a chat, ask "what do you remember about me?" — the
+   Recalled Memories block must appear. Then `memory_search` via a tool call
+   must return results (this is the call that used to TypeError).
+5. **md5 the drifted set again**: re-run Step 3's diff — expect no runtime
+   module differences.
 
 ## Compact version
-**A** (commit+push your dirty eval files) → **B** (fetch, confirm current) → **C** (md5-diff, copy only the 5 drifted runtime modules, preserve `skills/`+`.duckdb`+`hybrid_memory_service.json`, don't copy `tests/`/`eval`/`*_backfill*`) → **restart Hermes** → **md5 parity + pytest**.
+
+**D** (commit+push; run shared-service tests first — include_expired drift
+guard) → **R** (fetch, confirm) → **C** (md5-diff, copy only drifted runtime
+modules from D, preserve `skills/`+`*.duckdb`+`hybrid_memory_service.json`+`_mh_analysis.txt`,
+don't copy `tests/`/`eval`/utility scripts) → **kill stale memory_service
+processes** (they outlive app restarts) → **restart Hermes** → **md5 parity +
+service CreationDate fresh + pytest + memory_search smoke test**.

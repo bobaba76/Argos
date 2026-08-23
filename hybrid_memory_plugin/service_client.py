@@ -176,24 +176,26 @@ class SharedMemoryStore:
         self._rpc.user_id = self.user_id
 
     def search(
-        self,
-        query: str,
-        limit: int = 5,
-        exclude_categories: List[str] | None = None,
-        category_filter: str | None = None,
-        project_id: str | None = None,
-        as_of: str | None = None,
-        suppress_retrieval: bool = False,
-    ) -> List[MemoryRecord]:
-        values = self._rpc.call(
-            "store", "search", query=query, limit=limit,
-            exclude_categories=exclude_categories,
-            category_filter=category_filter,
-            project_id=project_id,
-            as_of=as_of,
-            suppress_retrieval=suppress_retrieval,
-        )
-        return [_record_from_dict(value) for value in (values or [])]
+            self,
+            query: str,
+            limit: int = 5,
+            exclude_categories: List[str] | None = None,
+            category_filter: str | None = None,
+            project_id: str | None = None,
+            as_of: str | None = None,
+            suppress_retrieval: bool = False,
+            include_expired: bool = False,
+        ) -> List[MemoryRecord]:
+            values = self._rpc.call(
+                "store", "search", query=query, limit=limit,
+                exclude_categories=exclude_categories,
+                category_filter=category_filter,
+                project_id=project_id,
+                as_of=as_of,
+                suppress_retrieval=suppress_retrieval,
+                include_expired=include_expired,
+            )
+            return [_record_from_dict(value) for value in (values or [])]
 
     def get_memories_by_ids(
         self,

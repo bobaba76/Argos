@@ -101,7 +101,7 @@ One honest note: Argos is developed and tested on the maintainer's own build of 
 
 ## License
 
-Argos is licensed under the **Business Source License 1.1** (BSL 1.1): free to read, modify, and self-host for personal and non-production use; production or commercial use requires a license from the author. It converts to **Apache 2.0** automatically on August 21, 2030. MIT-licensed components from the Hermes Agent base stay MIT. Full terms and the commercial-licensing contact path: [LICENSE](LICENSE).
+Argos is licensed under the **Business Source License 1.1** (BSL 1.1): free to read, modify, and self-host for personal and non-production use; production or commercial use requires a license from the author. It converts to **Apache 2.0** automatically on August 21, 2030. MIT-licensed components from the Hermes Agent base stay MIT. Full terms and the commercial-licensing contact path: [LICENSE.md](LICENSE.md).
 
 ## More docs
 

@@ -324,26 +324,30 @@ def _as_float(value: Any, default: float) -> float:
 def route_answerer(config: Dict[str, Any], user_message: str) -> Optional[Dict[str, str]]:
     """Return ``{"model": ..., "provider": ...}`` (provider optional) or None.
 
-    Called from ``_on_pre_llm_call``.  Returns the smart model for
-    temporal/multi-hop queries and the default model otherwise (so turns
-    self-correct back), or None when routing is disabled / not configured.
+    Called from ``_on_pre_llm_call``.  Returns the smart model ONLY for
+    genuine temporal/multi-hop queries above threshold; returns None for
+    everything else (casual chat, statements, below-threshold questions).
+
+    Regression fix 2026-08-23: older versions returned the DEFAULT model
+    for every non-smart message ("so turns self-correct back").  The core
+    honors any returned model via agent.switch_model(), so that made the
+    pre_llm_call hook force-switch EVERY chat/session to
+    router_default_model on every turn — stomping the user's explicitly
+    selected per-session model in the desktop UI (observed:
+    ox-alpha-free -> deepseek-v4-flash) and changing which model actually
+    answered the turn.  The hook must never override a session's own
+    model choice unless a genuine smart route fired.
     """
     try:
         if not _as_bool(config.get("router_enabled"), default=False):
             return None
         smart = str(config.get("router_smart_model") or "").strip()
-        default = str(config.get("router_default_model") or "").strip()
-        if not smart or not default:
-            logger.debug("router: enabled but missing smart/default model config")
+        if not smart:
+            logger.debug("router: enabled but missing smart model config")
             return None
         msg = user_message or ""
         if not _QUESTION_RE.search(msg):
-            pick = default
-            provider = str(config.get("router_default_provider") or "").strip()
-            result: Dict[str, str] = {"model": pick}
-            if provider:
-                result["provider"] = provider
-            return result
+            return None
         temporal = temporal_score(msg)
         multi_hop = multi_hop_score(msg)
         t_thresh = _as_float(config.get("router_temporal_threshold"), ROUTE_TEMPORAL_THRESHOLD)
@@ -352,8 +356,7 @@ def route_answerer(config: Dict[str, Any], user_message: str) -> Optional[Dict[s
             pick = smart
             provider = str(config.get("router_smart_provider") or "").strip()
         else:
-            pick = default
-            provider = str(config.get("router_default_provider") or "").strip()
+            return None
         result: Dict[str, str] = {"model": pick}
         if provider:
             result["provider"] = provider

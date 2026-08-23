@@ -3069,6 +3069,15 @@ class ArgosProvider(MemoryProvider):
 # keeping the cached system prompt byte-stable.  No core source patch needed.
 # ---------------------------------------------------------------------------
 
+# Idempotency guard for hook registration.  ``PluginManager.register_hook``
+# APPENDS to a list without dedup, and the desktop process re-runs plugin
+# ``register()`` for every chat session opened since app start — so Argos
+# accumulated one pre_llm_call callback per session, injecting N byte-identical
+# ambient blocks per turn (observed 2026-08-23: 7 copies of time/location/
+# weather on a single message; memory provider stayed ×1 because provider
+# registration is keyed/replace while hooks are append-only).
+_HOOKS_REGISTERED: set = set()
+
 def _build_timestamp_hint() -> str:
     """Render the per-turn local-time line, e.g. ``Current time: Friday 2026-07-31 19:55 SAST``.
 
@@ -3320,9 +3329,13 @@ def register(ctx) -> None:
     # Register the pre_llm_call hook for ambient context (time/location/
     # weather/file-activity).  Rides the native plugin_user_context injection
     # path — no core source patch needed.
+    # Guarded: skip if THIS PROCESS already registered it (desktop reloads the
+    # plugin per session; hooks are append-only, so an unguarded register
+    # duplicates every ambient line per session count).
     try:
-        if hasattr(ctx, "register_hook"):
+        if hasattr(ctx, "register_hook") and "pre_llm_call" not in _HOOKS_REGISTERED:
             ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+            _HOOKS_REGISTERED.add("pre_llm_call")
             logging.getLogger("argos").info(
                 "argos: registered pre_llm_call hook for ambient context"
             )

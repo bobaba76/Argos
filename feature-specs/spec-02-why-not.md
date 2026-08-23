@@ -59,7 +59,7 @@ Fail-soft: any exception inside explanation returns `{"verdict": "explanation_un
 ## 4. Implementation notes
 - Keep all explanation logic in `store.py` as a sibling of `_hybrid_search` (it reuses the private stage functions) — or behind the `retriever.py` protocol if cleaner; do not fork the SQL.
 - The provider branch is thin: validate args, call `explain_retrieval`, `json.dumps` the dict.
-- Also ship a **CLI wrapper** `hybrid_memory_plugin/why_not_cli.py` (mirror the style of the existing `review_pending.py` / `cleanup_memories.py` standalone scripts) so the feature can be exercised without the desktop app: `python why_not_cli.py --query "..." --target "..." --db <path>`.
+- Also ship a **CLI wrapper** `argos_plugin/why_not_cli.py` (mirror the style of the existing `review_pending.py` / `cleanup_memories.py` standalone scripts) so the feature can be exercised without the desktop app: `python why_not_cli.py --query "..." --target "..." --db <path>`.
 - Do not add config keys unless something genuinely needs tuning; `WHY_NOT_POOL_DEPTH = 200` as a module constant is enough.
 - Timestamps/format: match existing tool responses (JSON, `tool_error` for missing required args).
 

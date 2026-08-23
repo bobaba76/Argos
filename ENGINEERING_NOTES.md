@@ -9,7 +9,7 @@ Places this code lives:
 
 | Tag | Path / URL | Reality (measured) |
 |-----|-----------|--------------------|
-| A (dev fork) | `C:\Users\<user>\Documents\Github\Hermes\hybrid_memory_plugin` | Has `.git` at Hermes root (recheck why `git -C` silently failed). Plugin files are mostly **Aug 6–9 vintage** — the handoff's "A is where commits happen" no longer matches: recent commits (Aug 22–23) were made in the Argos repo itself. |
+| A (dev fork) | `C:\Users\<user>\Documents\Github\Hermes\argos_plugin` | Has `.git` at Hermes root (recheck why `git -C` silently failed). Plugin files are mostly **Aug 6–9 vintage** — the handoff's "A is where commits happen" no longer matches: recent commits (Aug 22–23) were made in the Argos repo itself. |
 | B (remote) | `github.com/bobaba76/Argos` (branch master) | Origin of the local Argos repo. |
 | B-local (dev, ACTIVE) | `C:\Users\<user>\Documents\Github\Argos` | **The actual dev repo now.** All Aug 22–23 commits live here. Ahead of origin by 1 (see below). |
 | C (live install) | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | Plain copy, no git. Mixed state: 12 files = current repo state (mtimes **Aug 23 16:30**), 17 files = Aug 6–9 vintage, 2 legacy test files present only here. |
@@ -43,7 +43,7 @@ Places this code lives:
 - SYNC_HANDOFF "Current known delta" (5 modules) is outdated: store.py, graph.py, query_expander.py, hermes_weather.py now match; the real delta is 17 modules (list above).
 
 ## Repo shape (stats)
-- `hybrid_memory_plugin/` ≈ 26.6k LOC Python, ~30 runtime modules + tests/ + eval/.
+- `argos_plugin/` ≈ 26.6k LOC Python, ~30 runtime modules + tests/ + eval/.
 - Recent commit stream (Aug 22–23): BSL license, 800-char cap comments, update_memory chain fix, config_schema UI/runtime default alignment, optional config_file, manifest removal from tree, evidence trail (Perseus review pt 2), egress gate + report (pt 6), approval-boundary invariant (pt 5), benchmark reproducibility appendix, P0 fixes, docs sync, dream on session-switch, P4.2 audit fixes, P4.2 distillation, ...
 - So a "Perseus review" recently drove fixes (P0 → pt2/pt5/pt6). Possibly more review points outstanding — check PerseusVault / review threads for remaining items.
 
@@ -170,7 +170,7 @@ the skill's `references/rpc-client-search-signature-drift.md`.
 - Committed `ee0cd85` (6 files: service_client, test_shared_service, __init__, MEMORY_SYSTEM, README, SYNC_HANDOFF). ENGINEERING_NOTES.md stays untracked.
 - **Full pytest suite: 390 passed in 577s (9m36s), ZERO failures** — includes the new regression test.
 - **Pushed to origin**: `44eca22..ee0cd85 master -> master` (license commit + fix set now on GitHub).
-- ⚠️ While working: `hybrid_memory_plugin/intent_router.py` became `M` (uncommitted) — the OTHER agent is editing it live. Do NOT touch/commit; it's in-progress work. (It was already synced to live earlier today from the committed state.)
+- ⚠️ While working: `argos_plugin/intent_router.py` became `M` (uncommitted) — the OTHER agent is editing it live. Do NOT touch/commit; it's in-progress work. (It was already synced to live earlier today from the committed state.)
 
 ## Still open / next session
 - [x] Full pytest suite green: **390 passed / 0 failed** (9m36s).

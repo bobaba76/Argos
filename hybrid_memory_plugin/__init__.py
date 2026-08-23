@@ -50,12 +50,10 @@ logger = logging.getLogger(__name__)
 _PREFETCH_WAIT_SECS = 3.0
 _DEFAULT_MAX_INJECTED = 20
 # Per-memory content cap in the auto-injection block. Without this, a few
-# long memories (3000+ chars) can blow the token budget at N=20. 200 chars
-# preserves the key fact while keeping the injection block compact.
-# Effective per-memory char cap in the injection block comes from config key
-# `inject_content_char_cap` (default 800). 200 truncated long facts on the
-# LongMemEval raw-turn corpus; 800 covers ~97% of the personal store while
-# keeping the block compact. 1200-1500 only pays off on raw-turn evals.
+# long memories (3000+ chars) can blow the token budget. 800 covers ~97% of
+# the personal store with no truncation; 1200-1500 only pays off on raw-turn
+# evals (e.g. LongMemEval). Effective value comes from config key
+# `inject_content_char_cap` (default 800).
 _DEFAULT_INJECT_CONTENT_CHAR_CAP = 800
 _INJECT_CONTENT_CHAR_CAP = _DEFAULT_INJECT_CONTENT_CHAR_CAP  # backward-compat alias
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
@@ -606,7 +604,7 @@ class HybridMemoryProvider(MemoryProvider):
             },
             {
                 "key": "inject_content_char_cap",
-                "description": "Per-memory max chars in the auto-injected Recalled-Memories block (200 truncated long facts; 800 covers ~97% of a personal store; higher only helps raw-turn evals)",
+                "description": "Per-memory max chars in the auto-injected Recalled-Memories block (800 covers ~97% of a personal store; raise only if long facts are being cut)",
                 "default": str(_DEFAULT_INJECT_CONTENT_CHAR_CAP),
                 "required": False,
             },

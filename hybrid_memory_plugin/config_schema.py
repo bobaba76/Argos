@@ -17,11 +17,21 @@ from plugins.memory.config_schema import (
     STORAGE_FLAT_JSON,
 )
 
+# `config_file` exists on the maintainer's fork but is NOT a field on stock
+# Hermes v0.20.5's ProviderConfigSchema. Passing it unconditionally crashes
+# schema load with TypeError on stock (Hermes swallows it → provider shows
+# with NO config panel). Only pass it when the running Hermes supports it, so
+# fresh installs on stock just work while the fork keeps the native path.
+_schema_kwargs: dict = {
+    "name": "hybrid_memory",
+    "label": "Argos (Local)",
+    "storage": STORAGE_FLAT_JSON,
+}
+if "config_file" in getattr(ProviderConfigSchema, "__dataclass_fields__", {}):
+    _schema_kwargs["config_file"] = "hybrid_memory.json"
+
 CONFIG_SCHEMA = ProviderConfigSchema(
-    name="hybrid_memory",
-    label="Argos (Local)",
-    storage=STORAGE_FLAT_JSON,
-    config_file="hybrid_memory.json",
+    **_schema_kwargs,
     fields=(
         ProviderField(
             key="local_embedding_model",

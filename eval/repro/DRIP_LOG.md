@@ -17,15 +17,22 @@ disaster-mode floor was the weakest link in an otherwise clean system.
 | # | Slice | Banked | Measured | Net | Miss recovery |
 |---|---|---|---|---|---|
 | A/B | 10 q, **miss-weighted** (7 misses + 3 passes), fresh phase-A through patched store | 3/10 | 7/10 | +4 | 4/7 |
-| Drip2 | 12 q, uniform random, seed 20260823 | 10/12 | 10/12 | ±0 | 1 miss drawn → 0/1 |
+| Drip2 | 12 q, uniform random, seed 20260823 | 10/12 | 10/12 | ±0 | 1 of 2 drawn |
 | Drip3 | 12 q, uniform random, seed 20260824 | 11/12 | 12/12 | +1 | 1/1 |
 | Drip4 | 20 q, uniform random, seed 20260825 (miss-heavy draw: 7) | 13/20 | 16/20 | +3 | 4/7 |
 | Drip5 | 20 q, uniform random, seed 20260826 | 16/20 | **18/20** | +2 | 2/4 |
+| Census | **final 59 q — completes the 133-question bank**, incl. ALL 3 unused misses | 56/59 | 55/59 | −1 | 0/3 |
 
-- Random-slice pooled accuracy: banked 50/64 (78.1%) → patched **56/64 (87.5%)**
-- All misses pooled: **12/21 recovered (57.1%)**
-- Pass regressions pooled: 2/54 pass-draws (3.7%) — both answerer-wording flips,
-  not retrieval losses (see autopsy below)
+## FINAL RESULT — full temporal bank, every question measured (no projection)
+
+**118/133 = 88.7%** (was 109/133 = 82.0% flat / 66.2% original protocol)
+
+- Misses recovered: 12 of 24 (50%); the 12 survivors are resistant reasoning
+  gaps, not retrieval failures — the patch's jurisdiction ends there.
+- Pass regressions: 3 flip-events across 109 pass-draws (~2.7%), all
+  answerer-paraphrase judge boundaries, retrieval exonerated each time.
+- Random-slice pooled accuracy: 78.1% → **87.5%** (n=64).
+- Projection made before any drip ran ("87–88%") — measured 88.7%.
 
 ## Interpretation (honest version)
 
@@ -62,10 +69,10 @@ disaster-mode floor was the weakest link in an otherwise clean system.
 
 ## Next installments
 
-Keep sampling uniformly from remaining pool (79−20 = 59 unused banked
-questions), exclude all used ids, new seed per run. Track: misses drawn,
-recoveries, pass-flips. The aggregate resolves toward citable precision
-around n≈40 random misses.
+**None needed — the census completed the bank.** All 133 temporal questions
+have now been measured under the patched store (see FINAL RESULT above).
+Any future re-verification should be a full-bank rerun or a targeted
+re-test of the 12 resistant misses.
 
 ## Drip5 postmortem (harness robustness lesson)
 

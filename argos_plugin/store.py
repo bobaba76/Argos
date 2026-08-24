@@ -570,6 +570,7 @@ class DuckDBMemoryStore:
         project_id: str | None = None,
         as_of: str | None = None,
         include_expired: bool = False,
+        include_closed: bool = False,
     ) -> List[MemoryRecord]:
         """BM25-lite text search. Returns filtered records ranked by BM25.
 
@@ -606,13 +607,19 @@ class DuckDBMemoryStore:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
         # Temporal filter: default to current (valid_to IS NULL),
-        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of))
+        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)).
+        # include_closed widens to closed versions too — used by the
+        # historical-query path so "where did I use to live" can see
+        # superseded facts. as_of takes precedence when both are set.
         if as_of:
             temporal_clause = (
                 "AND valid_from <= ? "
                 "AND (valid_to IS NULL OR valid_to > ?) "
             )
             temporal_params = [as_of, as_of]
+        elif include_closed:
+            temporal_clause = " "
+            temporal_params = []
         else:
             temporal_clause = "AND valid_to IS NULL "
             temporal_params = []
@@ -670,6 +677,7 @@ class DuckDBMemoryStore:
         project_id: str | None = None,
         as_of: str | None = None,
         include_expired: bool = False,
+        include_closed: bool = False,
     ) -> List[MemoryRecord]:
         """Vector similarity search. Returns filtered records ranked by cosine.
 
@@ -692,13 +700,16 @@ class DuckDBMemoryStore:
         vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
         params: List[Any] = [vec_text]
         # Temporal filter: default to current (valid_to IS NULL),
-        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of))
+        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)).
+        # include_closed widens to closed versions — historical-query path.
         if as_of:
             temporal_clause = (
                 "AND valid_from <= ? "
                 "AND (valid_to IS NULL OR valid_to > ?) "
             )
             params.extend([as_of, as_of])
+        elif include_closed:
+            temporal_clause = " "
         else:
             temporal_clause = "AND valid_to IS NULL "
         expiry_ref = as_of if as_of else self._now()
@@ -1190,6 +1201,7 @@ class DuckDBMemoryStore:
         as_of: str | None = None,
         suppress_retrieval: bool = False,
         include_expired: bool = False,
+        include_closed: bool = False,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with optional cross-encoder
         re-ranking, feedback, and recency.
@@ -1235,7 +1247,7 @@ class DuckDBMemoryStore:
         text_results: List[MemoryRecord] = self._text_search_raw(
             query, pool_size, excluded, category_filter,
             project_id=project_id, as_of=as_of,
-            include_expired=include_expired,
+            include_expired=include_expired, include_closed=include_closed,
         )
 
         if emb:
@@ -1244,6 +1256,7 @@ class DuckDBMemoryStore:
                     emb, pool_size, excluded, category_filter,
                     project_id=project_id, as_of=as_of,
                     include_expired=include_expired,
+                    include_closed=include_closed,
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):

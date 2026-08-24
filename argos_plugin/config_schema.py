@@ -517,6 +517,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Temporal",
         ),
         ProviderField(
+            key="history_at_current_time",
+            label="History at current time (temporal)",
+            kind=KIND_BOOL,
+            default="true",
+            description="On historical queries ('where did I use to live', 'what was my old job'), include superseded versions of memories in retrieval so past facts stay answerable.",
+            info="Ships ON. Fixes 'where did X use to Y' returning nothing: closed versions were filtered out entirely at current-time queries. Precision-first detector (question shape AND explicit past marker) gates the widened search; closed rows are labelled '(previously)' at injection so the model never reads them as current truth. as_of precedence preserved; ordinary queries unchanged.",
+            inline=True,
+            group="Temporal",
+        ),
+        ProviderField(
             key="expiry_enabled",
             label="Expiry enabled",
             kind=KIND_BOOL,

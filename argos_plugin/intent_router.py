@@ -306,6 +306,41 @@ def is_temporal_or_multihop(query: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Historical-time detection (#3: history at current time)
+# ---------------------------------------------------------------------------
+
+_HISTORY_PAST_RE = re.compile(
+    r"\b(use[d]?\s+to|used\s+to\s+(?:live|work|stay|drive|play)|"
+    r"previously|formerly|before\s+(?:the\s+)?(?:move|relocation)|"
+    r"(?:old|previous|former)\s+(?:address|house|flat|apartment|job|office|number)|"
+    r"where\s+(?:did|does)\s+\w+\s+(?:use|used)\s+to|"
+    r"what\s+(?:did|was)\s+\w+\s+(?:using|driving|playing|watching|reading)\s+before)",
+    re.IGNORECASE,
+)
+_HISTORY_TIME_RE = re.compile(
+    r"\bin\s+the\s+past\b|\bback\s+then\b|\b(at|in)\s+that\s+time\b|"
+    r"\bbefore\s+(?:that|this|the\s+update|the\s+change|we\s+moved)\b",
+    re.IGNORECASE,
+)
+
+
+def is_historical_query(query: str) -> bool:
+    """True when the query asks about a SUPERSEDED state of the world.
+
+    Precision-first (v3 philosophy): a match requires BOTH an explicit
+    past-state marker ("used to", "previously", "old address", "back
+    then") AND question shape, so ordinary current-state questions never
+    pay the widened-search cost.  This gates the include-closed-versions
+    retrieval path in ``_search_memories``.
+    """
+    if not query or not query.strip():
+        return False
+    if not _QUESTION_RE.search(query):
+        return False
+    return bool(_HISTORY_PAST_RE.search(query) or _HISTORY_TIME_RE.search(query))
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default

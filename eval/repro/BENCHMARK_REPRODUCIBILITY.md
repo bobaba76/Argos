@@ -19,7 +19,7 @@ document.
 | "99.6% of answer-bearing memories reach the top-96 candidates" | recall@96 = 0.996 | retrieval phase of the same 500-question run (phase-A cache, see §8) |
 | "Temporal questions: 82% correct (133 questions)" | 109/133 = 0.820 | 52/75 (`judged_temporal_flash_flat_75_gpt4o.jsonl`) + 57/58 (`judged_temporal_flash_flat_58_gpt4o.jsonl`) — same protocol both slices |
 | "a stronger answerer measured ~80+" | 43/55 = 0.782 | `judged_temporal_dsv4pro_55_gpt4o.jsonl` — 55-question temporal probe, directional (partial slice) |
-| "cross-system gap is directional, not lab-controlled" | Perseus 73.8 / Zep 63.8 / Mem0 49.0 | vendor-published numbers; see §8 caveats |
+| "cross-system gap is directional, not lab-controlled" | Perseus 73.8 / Zep 63.8 / Mem0 49.0 | vendor-published numbers; see §11 caveats |
 
 ## 2. Dataset
 
@@ -102,7 +102,7 @@ retrieval shipped (2026-08-21), in two sub-slices (75 + 58):
 
 "Date-anchored retrieval" = the time-expression re-ranking (+word-number
 resolution) applied before rendering, added 2026-08-21. The 58-question slice
-at 98.3% flat render is small-n but internally consistent (see caveats §8).
+at 98.3% flat render is small-n but internally consistent (see caveats §11).
 
 ## 6. Per-category scores — headline run (recomputed 2026-08-22)
 
@@ -174,7 +174,39 @@ python Evaluation/print_metrics.py judged_capexp_c1500_k96_gpt4o.jsonl data/long
   is a few dollars (the 70.4% run re-uses a single phase-A cache across all
   k-slices; re-answering any k costs only the LLM phase).
 
-## 9. Chain-unfold recall/precision (~93% / ~93%, 2026-08-20)
+## 9. Cost axes (Zep-style transparency, added 2026-08-24)
+
+Accuracy alone is half a claim. This section pins the **measured context
+size, latency, and item counts** for the headline configuration and its
+neighbors, all derived from the committed phase-A caches (the same artifacts
+behind §3/§8) with a fully deterministic counter:
+
+`context chars = Σ min(len(content), cap)` over items ranked by `sim`,
+capped at k, filtered at `similarity >= floor`. ÷4 ≈ tokens. The script is
+~30 lines; see `eval/repro/cost_axes.py`.
+
+| Configuration | Accuracy | Context tok/turn | Median items | Retrieval s/q |
+|---|---|---|---|---|
+| cap400 k96 no-floor | 63.0% | ~7,900 | — | 31.2 |
+| cap1500 k96 no-floor (**70.4% headline**) | 70.4% | ~20,900 | 96 | 33.4 |
+| cap1500 k96 +0.30 floor (**today's prod config**) | not re-judged | **~14,600** | 67 | 33.4 |
+
+Notes:
+- Token figures are **composed retrieval context** per turn (÷4 chars/tok),
+  measured over all 500 questions of the capexp cache — not API-bill tokens.
+  Answer+judge LLM costs are additional but small relative to context.
+- The +0.30 floor row is a *counterfactual* on the same cache: it shows what
+  today's production config would have injected on the headline run. The
+  never-blind fallback (top-8 unfiltered when the floor empties the window)
+  adds back ≤8 items on ~1.4% of turns (~7/500), so real production sits
+  marginally above the floored figure.
+- Retrieval latency is single-machine CPU ingest+retrieval wall-time from the
+  cache (`secs` field); scales with haystack size, not with cap/floor.
+- Zep reports 347–1,997 context tokens across its settings for 10.7 accuracy
+  points; Argos operates two orders of magnitude higher by design (it buys
+  recall@96 = 99.6% with context, then claws budget back with the floor).
+
+## 10. Chain-unfold recall/precision (~93% / ~93%, 2026-08-20)
 
 Separate harness (`eval_chain_unfold_clean.py`, maintainer's dev tree).
 Protocol: one-line synthetic facts seeded as version chains on **unsaturated**
@@ -185,7 +217,7 @@ classified RETRIEVAL-BURIED (not surfaced in top-20 → not a gate failure) vs
 GATE-BLOCKED (surfaced but didn't unfold → real failure). Measured 2026-08-20:
 recall ≈ 93%, precision ≈ 93%.
 
-## 10. Honest caveats (read before quoting)
+## 11. Honest caveats (read before quoting)
 
 1. **70.4% and 82% describe different protocols.** 70.4% = full 500 with
    flat render, no date anchor (temporal 47.4% inside it). 82% = the 133

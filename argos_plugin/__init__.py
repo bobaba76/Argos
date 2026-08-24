@@ -814,6 +814,12 @@ class ArgosProvider(MemoryProvider):
             if isinstance(da, str) else bool(da)
         )
 
+        hist = self._config.get("history_at_current_time", "true")
+        self._history_at_current_time = (
+            hist.lower() in ("true", "1", "yes")
+            if isinstance(hist, str) else bool(hist)
+        )
+
         auto = self._config.get("auto_extract", "true")
         self._auto_extract = (
             auto.lower() in ("true", "1", "yes") if isinstance(auto, str) else bool(auto)
@@ -1648,6 +1654,7 @@ class ArgosProvider(MemoryProvider):
         category_filter: str | None = None,
         project_id: str | None = None,
         include_expired: bool = False,
+        include_closed: bool = False,
     ) -> List[Any]:
         """Run hybrid search and apply a bounded graph-supported boost.
 
@@ -1671,6 +1678,7 @@ class ArgosProvider(MemoryProvider):
             project_id=effective_project or None,
             suppress_retrieval=True,
             include_expired=include_expired,
+            include_closed=include_closed,
         )
 
         # Query expansion: if the top hit's RAW similarity (pre-importance)
@@ -1958,7 +1966,24 @@ class ArgosProvider(MemoryProvider):
                 if confirmation:
                     sections.append(confirmation)
 
-                results = self._search_memories(query, limit=max_items)
+                # History-at-current-time (#3): on historical queries
+                # ("where did I use to live"), widen retrieval to closed
+                # versions so superseded facts are visible again.
+                try:
+                    try:
+                        from .intent_router import is_historical_query
+                    except ImportError:
+                        from intent_router import is_historical_query
+                    _include_closed = (
+                        getattr(self, "_history_at_current_time", False)
+                        and bool(query) and is_historical_query(query)
+                    )
+                except Exception:
+                    _include_closed = False
+                results = self._search_memories(
+                    query, limit=max_items,
+                    include_closed=_include_closed,
+                )
                 _floor = getattr(self, "_injection_min_score", 0.0)
                 if results and _floor > 0:
                     _kept = [
@@ -2019,7 +2044,13 @@ class ArgosProvider(MemoryProvider):
                         # when a capped preview looks relevant but incomplete.
                         mid = getattr(r, "memory_id", "") or ""
                         id_s = f" [id: {mid}]" if mid else ""
-                        lines.append(f"- {date_s}[{cat}] {content}{sim}{id_s}")
+                        # Closed version = superseded fact surfaced by a
+                        # historical query; label it so the model treats it
+                        # as past state, not current truth.
+                        hist_s = (
+                            " (previously)" if getattr(r, "valid_to", None) else ""
+                        )
+                        lines.append(f"- {date_s}[{cat}] {content}{sim}{id_s}{hist_s}")
                     sections.append("## Recalled Memories\n" + "\n".join(lines))
                 body = "\n\n".join(sections)
             except Exception as e:

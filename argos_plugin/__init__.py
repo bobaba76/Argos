@@ -3482,8 +3482,14 @@ def register(ctx) -> None:
                 _handle_revisit_command,
                 description="Surface a random older insight for re-engagement",
             )
+            ctx.register_command(
+                "neg",
+                _handle_neg_command,
+                description="Remember an explicit negative/exclusion claim (category 'negative', injected as [negative])",
+                args_hint="<claim>",
+            )
             logging.getLogger("argos").info(
-                "argos: registered /ilog and /revisit commands"
+                "argos: registered /ilog, /revisit and /neg commands"
             )
     except Exception as _e:
         logging.getLogger("argos").debug(
@@ -3549,6 +3555,39 @@ def _handle_ilog_command(raw_args: str) -> str:
             lines.append(f"   _tags: {tag_str}_")
         lines.append("")
     return "\n".join(lines)
+
+
+def _handle_neg_command(raw_args: str) -> str:
+    """Handle /neg — store an explicit negative (exclusion) claim.
+
+    Negative memories answer "is X ...?" questions with a grounded no:
+    they are injected with a [negative] label whenever the topic matches,
+    so the model treats them as ground-truth exclusions instead of
+    guessing from half-matching positive memories.
+
+    Usage:
+        /neg Alex does not drink coffee
+    """
+    claim = (raw_args or "").strip()
+    if not claim:
+        return (
+            "Usage: /neg <claim> — e.g. /neg Alex does not drink coffee. "
+            "Stored as category 'negative' and injected with a [negative] label."
+        )
+    store = _get_insight_store()
+    if store is None:
+        return "Memory store is not available. Make sure Hermes is running."
+    try:
+        rec = store.remember(category="negative", content=claim)
+    except Exception as e:
+        return f"Could not save negative memory: {e}"
+    finally:
+        store.close()
+    if rec is None:
+        return f"Saved (deduplicated or pending): /neg {claim}"
+    mid = getattr(rec, "memory_id", "") or ""
+    mid_s = f" [id: {mid}]" if mid else ""
+    return f"Saved as [negative] memory{mid_s}: {claim}"
 
 
 def _handle_revisit_command(raw_args: str) -> str:

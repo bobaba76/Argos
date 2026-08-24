@@ -65,7 +65,8 @@ VALID_CATEGORIES = frozenset({
     "relationship",
     "goal",
     "context_note",
-})
+        "negative",
+    })
 
 _DEFAULT_TTL_DAYS = {
     "context_note": 30,

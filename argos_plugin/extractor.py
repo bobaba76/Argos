@@ -235,8 +235,25 @@ _WORK_RE = re.compile(
 
 # "I prefer/like/love/hate/enjoy <something>" — preferences.
 _PREFERENCE_RE = re.compile(
-    r'\b(?:i\s+(?:prefer|like|love|hate|enjoy|can\'t\s+stand|don\'t\s+like)'
-    r'|i\'d\s+rather|i\'m\s+a\s+fan\s+of)\s+(.+?)(?:\.|$)',
+    r'\b(?:i\s+(?:prefer|like|love|hate|enjoy|dislike|can\'t\s+stand'
+    r'|don\'t\s+like|don\'t\s+enjoy)'
+    r'|i\'d\s+(?:rather|prefer)'
+    r'|i\'m\s+(?:a\s+fan\s+of|not\s+a\s+fan\s+of|into|keen\s+on))\s+(.+?)(?:\.|$)',
+    re.IGNORECASE,
+)
+
+# Assistant-side style directives: "always give me the short version",
+# "never use code comments", "don't call it that", "call me Mike",
+# "stop using jargon" — rules the user sets for how the assistant behaves.
+_ASSISTANT_DIRECTIVE_RE = re.compile(
+    r'\b(?:'
+    r'(?:always|never)\s+(?:give|say|use|respond|reply|write|speak|talk'
+    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]*'
+    r'|(?:do\s+not|don\'t)\s+(?:ever\s+|please\s+|just\s+|always\s+)?(?:give|say|use|respond|reply|write|speak|talk'
+    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]*'
+    r'|call\s+me\s+[^.!?]+'
+    r'|stop\s+(?:doing|being|using|saying)\b[^.!?]*'
+    r')',
     re.IGNORECASE,
 )
 
@@ -424,11 +441,27 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
     if m:
         pref = m.group(1).strip().rstrip('.')
         if len(pref) > 3:
+            matched = m.group(0).lower()
+            negated = any(k in matched for k in (" not ", "n't", "dislike", "hate", "can't stand"))
             return {
                 "category": "preference",
-                "content": f"User prefers: {pref}",
+                "content": f"User {'dislikes' if negated else 'prefers'}: {pref}",
                 "tags": ["preference"],
                 "payload": {"preference": pref},
+            }
+
+    # Assistant-side directive: "always give me the short version" /
+    # "never use jargon" / "call me Mike" — stored as preference with
+    # the assistant_side tag so preference-shaped queries surface it.
+    m = _ASSISTANT_DIRECTIVE_RE.search(sentence)
+    if m:
+        directive = m.group(0).strip().rstrip('.!?')
+        if len(directive) > 8:
+            return {
+                "category": "preference",
+                "content": f"User directive: {directive}",
+                "tags": ["preference", "assistant_side"],
+                "payload": {"preference": directive, "assistant_side": True},
             }
 
     # Habit: "I always test before deploying" / "I never push to main"
@@ -558,11 +591,19 @@ Extract facts that are:
 - Self-contained (make sense without the original conversation)
 - About the user or things in the user's life
 
+DO extract preferences and style directives — these are high value:
+- First-person likes/dislikes/wants ("I prefer window seats", "I hate meetings before 10")
+- Style/workflow directives aimed at the assistant ("always give me the short
+  version", "never use code comments", "call me Mike", "explain in plain English first")
+- Endorsements of assistant behavior ("I like it when you push back",
+  "don't be so formal with me")
+
 Do NOT extract:
 - Transient states ("I'm tired", "I'm busy right now")
 - Questions or requests
-- Opinions about the assistant
 - Greetings or chit-chat
+- First-person statements inside quoted or pasted third-party content —
+  only the user's own voice counts as the user's view
 
 Return a JSON array of objects with these keys:
 - "category": one of "personal_fact", "preference", "insight", "event", "relationship", "goal", "context_note"
@@ -583,6 +624,12 @@ Output: [{"category": "context_note", "content": "User's contact suggested morni
 
 User: "I've been deploying with Kubernetes lately, it's way better than Docker Swarm for our scale"
 Output: [{"category": "preference", "content": "User prefers Kubernetes over Docker Swarm for deployment at scale", "tags": ["devops", "kubernetes"]}, {"category": "personal_fact", "content": "User deploys with Kubernetes", "tags": ["devops", "kubernetes"]}]
+
+User: "Honestly I prefer short answers, and don't ever give me code without a plain-English explanation first"
+Output: [{"category": "preference", "content": "User prefers short answers", "tags": ["preference", "communication"]}, {"category": "preference", "content": "User directive: don't ever give code without a plain-English explanation first", "tags": ["preference", "assistant_side"]}]
+
+User: "I like it when you challenge my assumptions instead of just agreeing"
+Output: [{"category": "preference", "content": "User likes the assistant to challenge their assumptions rather than just agree", "tags": ["preference", "assistant_side"]}]
 
 User: "hey how are you"
 Output: []
@@ -677,6 +724,8 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
         if not isinstance(tags, list):
             tags = [str(tags)] if tags else []
         tags = [str(t).lower().strip() for t in tags if t][:5]
+        if category == "preference" and "preference" not in tags and len(tags) < 5:
+            tags.append("preference")
         try:
             confidence = max(0.0, min(1.0, float(fact.get("confidence", 0.45))))
         except (TypeError, ValueError):

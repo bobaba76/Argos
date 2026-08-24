@@ -53,7 +53,7 @@ class _FakeStore:
 def _make_provider(records, min_score):
     provider = _hmp.ArgosProvider()
     provider._store = _FakeStore()
-    provider._search_memories = lambda query, limit=96: list(records)
+    provider._search_memories = lambda query, limit=96, **kw: list(records)
     provider._injection_min_score = min_score
     provider._max_injected = 96
     return provider

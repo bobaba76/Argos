@@ -321,6 +321,22 @@ class DuckDBMemoryStore:
                     candidate_id       VARCHAR
                 )
             """)
+            # Deletion tombstones (2026-08-24): fingerprint of hard-deleted
+            # content so a later re-feed cannot silently resurrect it.
+            # Closes atlas deletion-canary step 6 (observational test
+            # test_deletion_step_5_6_refeed_resurrection in
+            # test_contradiction_matrix.py confirmed the resurrection).
+            # Reversible via purge_tombstone(); scoped per user_scope.
+            self.connection.execute("""
+                CREATE TABLE IF NOT EXISTS deletion_tombstones (
+                    content_hash   VARCHAR,
+                    category       VARCHAR,
+                    user_scope     VARCHAR,
+                    reason         VARCHAR DEFAULT 'user_delete',
+                    created_at     VARCHAR,
+                    PRIMARY KEY (content_hash, category, user_scope)
+                )
+            """)
             # Additive migration for databases created by earlier versions.
             columns = {
                 "status": "VARCHAR DEFAULT 'active'",
@@ -1427,6 +1443,16 @@ class DuckDBMemoryStore:
             logger.debug("Deduped memory: %s", content[:60])
             return None
 
+        # Deletion tombstone check: this exact fact was hard-deleted by the
+        # user; re-feeding the same content would silently resurrect it.
+        _ts = self.tombstone_check(content, category)
+        if _ts:
+            logger.info(
+                "Blocked re-creation of deleted memory (tombstone %s): %s",
+                _ts.get("created_at", ""), content[:60],
+            )
+            return None
+
         memory_id = f"mem-{uuid.uuid4().hex}"
         now = self._now()
         if not skip_auto_ttl and not record_payload.get("expires_at") and durability == "temporary":
@@ -2384,22 +2410,19 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             # Check existence first — DuckDB's execute() return value for
             # DELETE is not a reliable indicator of whether rows were deleted.
-            check = self.connection.execute(
-                """SELECT COUNT(*) FROM memory_records
-                   WHERE memory_id = ?
-                     AND (user_scope IS NULL OR user_scope = ?)""",
-                [memory_id, self.user_id],
-            ).fetchone()
-            if not check or check[0] == 0:
-                return False
-            # Chain position: is this the head (valid_to IS NULL)?
+            # Also fetch content/category so hard-deleted facts can be
+            # tombstoned (deletion must stay decisive against re-feeds).
             row = self.connection.execute(
-                """SELECT valid_to FROM memory_records
+                """SELECT content, category, valid_to FROM memory_records
                    WHERE memory_id = ?
                      AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
-            is_head = row is not None and row[0] is None
+            if not row:
+                return False
+            _del_content, _del_category = str(row[0] or ""), str(row[1] or "")
+            # Chain position: is this the head (valid_to IS NULL)?
+            is_head = row[2] is None
             now = self._now()
             if is_head:
                 # Promote the predecessor (the record superseded BY this
@@ -2417,6 +2440,10 @@ class DuckDBMemoryStore:
                            WHERE memory_id = ?""",
                         [now, pred[0]],
                     )
+                    # The deleted head's content is tombstoned too: deleting
+                    # the current version of a fact must survive re-feeds,
+                    # while the promoted predecessor keeps history intact.
+                    self._record_tombstone(_del_content, _del_category)
                     self.connection.execute(
                         "DELETE FROM memory_records WHERE memory_id = ?"
                         " AND (user_scope IS NULL OR user_scope = ?)",
@@ -2442,7 +2469,10 @@ class DuckDBMemoryStore:
                     [now, now, memory_id],
                 )
                 return {"deleted": True, "action": "quarantined"}
-            # Head with no predecessor: hard delete.
+            # Head with no predecessor: hard delete. Fingerprint the content
+            # first so a later re-feed (source re-ingest, extractor replay)
+            # cannot silently resurrect it — atlas deletion-canary step 6.
+            self._record_tombstone(_del_content, _del_category)
             self.connection.execute(
                 "DELETE FROM memory_records WHERE memory_id = ?"
                 " AND (user_scope IS NULL OR user_scope = ?)",
@@ -2454,6 +2484,68 @@ class DuckDBMemoryStore:
                 [memory_id, self.user_id],
             )
             return {"deleted": True, "action": "deleted"}
+
+    # -- deletion tombstones ---------------------------------------------------
+
+    @staticmethod
+    def _tombstone_hash(content: str) -> str:
+        """Fingerprint of deleted content: case/whitespace-insensitive."""
+        normalized = " ".join(str(content or "").lower().split())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def _record_tombstone(self, content: str, category: str,
+                          reason: str = "user_delete") -> None:
+        """Fingerprint hard-deleted content so re-feeding it is blocked.
+
+        MUST be called while holding self._lock (threading.Lock is not
+        reentrant; both call sites live inside delete_memory's locked
+        section). External tombstone writes go through delete_memory.
+        """
+        h = self._tombstone_hash(content)
+        if not h or not category:
+            return
+        assert self.connection is not None
+        self.connection.execute(
+            """INSERT OR REPLACE INTO deletion_tombstones
+               (content_hash, category, user_scope, reason, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [h, category, self.user_id, reason, self._now()],
+        )
+
+    def tombstone_check(self, content: str, category: str) -> dict | None:
+        """Return the tombstone row (as a dict) if this content was deleted."""
+        with self._lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                """SELECT reason, created_at FROM deletion_tombstones
+                   WHERE content_hash = ? AND category = ?
+                     AND user_scope = ?""",
+                [self._tombstone_hash(content), category, self.user_id],
+            ).fetchone()
+        if not row:
+            return None
+        return {"reason": row[0], "created_at": row[1]}
+
+    def purge_tombstone(self, content: str, category: str) -> bool:
+        """Explicitly allow a previously-deleted fact back into memory.
+
+        The user-facing escape hatch: 'delete' stays decisive until the
+        user says otherwise. Returns True if a tombstone was removed.
+        """
+        h = self._tombstone_hash(content)
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute(
+                """DELETE FROM deletion_tombstones
+                   WHERE content_hash = ? AND category = ? AND user_scope = ?""",
+                [h, category, self.user_id],
+            )
+            check = self.connection.execute(
+                """SELECT COUNT(*) FROM deletion_tombstones
+                   WHERE content_hash = ? AND category = ? AND user_scope = ?""",
+                [h, category, self.user_id],
+            ).fetchone()
+        return bool(check and check[0] == 0)
 
     # -- entity aliases -------------------------------------------------------
 
@@ -3299,6 +3391,78 @@ class DuckDBMemoryStore:
                 )
         except Exception as exc:
             logger.debug("set_state(%s) failed: %s", key, exc)
+
+    # -- distillation data access (P4.2) ---------------------------------------
+    # These encapsulate the SQL the distillation pass needs so it can run
+    # against either a direct DuckDBMemoryStore or a SharedMemoryStore proxy
+    # without reaching into _lock / connection / _fetch_records.
+
+    def count_eligible_since(self, since: str | None) -> int:
+        """Count active, non-superseded records created/updated since *since*.
+
+        If *since* is None (never run), counts all eligible records.
+        """
+        conditions = [
+            "COALESCE(status, 'active') = 'active'",
+            "valid_to IS NULL",
+            "(user_scope IS NULL OR user_scope = ?)",
+            "embedding IS NOT NULL",
+        ]
+        params: list[Any] = [self.user_id]
+        if since:
+            conditions.append("(created_at > ? OR updated_at > ?)")
+            params.extend([since, since])
+        sql = (
+            f"SELECT COUNT(*) FROM memory_records WHERE "
+            + " AND ".join(conditions)
+        )
+        try:
+            with self._lock:
+                assert self.connection is not None
+                row = self.connection.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def load_eligible_records(
+        self, since: str | None, limit: int,
+    ) -> List[MemoryRecord]:
+        """Load active, non-superseded records for distillation.
+
+        If *since* is provided, only records created/updated after it.
+        Falls back to most recent N if never run (since=None).
+        """
+        conditions = [
+            "COALESCE(status, 'active') = 'active'",
+            "valid_to IS NULL",
+            "(user_scope IS NULL OR user_scope = ?)",
+            "embedding IS NOT NULL",
+        ]
+        params: list[Any] = [self.user_id]
+        if since:
+            conditions.append("(created_at > ? OR updated_at > ?)")
+            params.extend([since, since])
+        sql = (
+            "SELECT * FROM memory_records WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY created_at DESC LIMIT ?"
+        )
+        params.append(limit)
+        return self._fetch_records(sql, params)
+
+    def load_high_signal_records(self, limit: int = 20) -> List[MemoryRecord]:
+        """Load records with feedback signals for the high-signal scan."""
+        sql = (
+            "SELECT * FROM memory_records WHERE "
+            "COALESCE(status, 'active') = 'active' "
+            "AND valid_to IS NULL "
+            "AND (user_scope IS NULL OR user_scope = ?) "
+            "AND embedding IS NOT NULL "
+            "AND (helpful_count > 0 OR dismissed_count > 0) "
+            "ORDER BY (helpful_count + dismissed_count) DESC, retrieval_count DESC "
+            "LIMIT ?"
+        )
+        return self._fetch_records(sql, [self.user_id, limit])
 
     # -- lifecycle ------------------------------------------------------------
 

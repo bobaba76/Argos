@@ -65,6 +65,14 @@ _TRIVIAL_QUERY_PATTERNS = (
     r"^\s*(?:ha\s*){2,}[!.]*\s*$",
 )
 _DEFAULT_INJECTION_MIN_SCORE = 0.0
+# Never-blind fallback (2026-08-24, measured): when the score floor filters
+# out EVERY candidate for a turn, inject the top few unfiltered results
+# instead of nothing. Closes the "fully-blinded question" failure mode found
+# by the atlas FN-rate probe (_probe_min_score_fn.py): 7/500 LongMemEval
+# questions had ALL their evidence below floor=0.30 (best near-miss sim
+# 0.297), while random drops at the same rate killed ~3.4x more evidence —
+# the floor is good, it just needs a guard against total suppression.
+_INJECTION_FALLBACK_COUNT = 8
 _INJECT_CONTENT_CHAR_CAP = _DEFAULT_INJECT_CONTENT_CHAR_CAP  # backward-compat alias
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _AUTO_EXTRACT_PAUSE_MARKER = "argos.auto_extract.paused"
@@ -627,7 +635,7 @@ class ArgosProvider(MemoryProvider):
             },
             {
                 "key": "injection_min_score",
-                "description": "Min similarity (0.0-1.0) for an item to be auto-injected; 0.0 disables the floor",
+                "description": "Min similarity (0.0-1.0) for an item to be auto-injected; 0.0 disables the floor; when the floor suppresses ALL candidates, the top few are injected anyway (never-blind fallback)",
                 "default": str(_DEFAULT_INJECTION_MIN_SCORE),
                 "required": False,
             },
@@ -1953,10 +1961,22 @@ class ArgosProvider(MemoryProvider):
                 results = self._search_memories(query, limit=max_items)
                 _floor = getattr(self, "_injection_min_score", 0.0)
                 if results and _floor > 0:
-                    results = [
+                    _kept = [
                         r for r in results
                         if float(getattr(r, "similarity", 0.0) or 0.0) >= _floor
                     ]
+                    if not _kept:
+                        # Never-blind fallback: the floor suppressed every
+                        # candidate. A turn whose evidence all sits below the
+                        # floor still deserves its best (weak) evidence rather
+                        # than silence — inject a few unfiltered top results.
+                        logger.info(
+                            "Injection floor %.2f suppressed all %d candidates; "
+                            "falling back to unfiltered top-%d",
+                            _floor, len(results), _INJECTION_FALLBACK_COUNT,
+                        )
+                        _kept = list(results[:_INJECTION_FALLBACK_COUNT])
+                    results = _kept
                 if results and getattr(self, "_chronological_injection", False):
                     # P2B: on temporal/multi-hop turns, re-sort the top-k by
                     # creation timestamp (oldest first) so the model reads a
@@ -2309,11 +2329,11 @@ class ArgosProvider(MemoryProvider):
                     dream_report.get("llm_calls", 0),
                 )
             elif dream_report.get("reason"):
-                logger.debug(
+                logger.warning(
                     "Distillation skipped: %s", dream_report["reason"],
                 )
         except Exception as e:
-            logger.debug("Distillation failed: %s", e)
+            logger.warning("Distillation failed: %s", e)
 
 
     # -- session switch ------------------------------------------------------

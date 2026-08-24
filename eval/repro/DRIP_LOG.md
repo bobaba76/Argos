@@ -94,3 +94,28 @@ follow-on quirks cost ~40 minutes before diagnosis:
    `af082822` dropped twice this way; a fresh-tiny-ack rerun answered 2/2.
 Rule of thumb: after ANY killed run, re-answer affected questions with a
 fresh ack rather than trusting partial outputs.
+
+
+## Drip #7 (24/8, cross-category, dual-process)
+
+First dual-GIL run (2x10q parallel processes, full power). Windows traps
+encountered & handled: desktop-restart SIGTERM killed wrappers but ORPHANED
+python children -> relaunch deadlocked on eval-home DuckDB lock (silent,
+no embedder-warm line). Fix: sweep orphans before relaunch. Resume-skip
+trap recurred: 4 pre-kill answers missing from final hyps -> fresh-ack
+sidecar rerun (hyp_drip7fix.jsonl), merged back.
+
+Result (gpt-4o judge): banked 16/20 -> PATCHED 18/20, ZERO regressions.
+- multi-session 5/7 -> 7/7 (both banked misses flipped)
+- single-session-assistant 3/5 -> 3/5 (both misses survive: answerer-
+  behavior class, matches Perseus gpt-4o dominance there 95.7%)
+- knowledge-update 4/4, single-user 3/3, single-pref 1/1: stable
+
+Cross-category campaign complete: temporal MEASURED 88.7% full-bank;
+knowledge-update +multi-session directionally UP; single-session-assistant
+= the residual weakness, answerer-bound not retrieval-bound.
+
+Perseus per-category (computed from THEIR qa_report.json, answerer
+gpt-4o): temporal 69.2, KU 76.9, MS 63.2, ssu 95.7, ssa 100, ssp 30.0,
+overall 73.6~73.8. Argos wins ALL THREE retrieval-heavy categories even
+on banked numbers; overall gap lives entirely in single-session family.

@@ -119,3 +119,30 @@ Perseus per-category (computed from THEIR qa_report.json, answerer
 gpt-4o): temporal 69.2, KU 76.9, MS 63.2, ssu 95.7, ssa 100, ssp 30.0,
 overall 73.6~73.8. Argos wins ALL THREE retrieval-heavy categories even
 on banked numbers; overall gap lives entirely in single-session family.
+
+## Answerer A/B (24/8): deepseek-v4-flash vs gpt-4o-2024-08-06 — paired n=17
+
+Design: same 17 questions (all 9 post-patch flash-fails + 8 stratified sentinels),
+same patched-store retrieval contexts (flash arm reuses tonight's answers; 4o arm
+ran fresh phase-A through the identical pipeline via LME_MODEL override), then ONE
+gpt-4o judge pass over both arms together.
+
+RESULT: FLASH 8/17 vs GPT-4O 7/17. 4o recovered 0/9 flash-fails; broke 1/8
+flash-passes. Flash-arm labels matched the independent re-judge 17/17.
+
+CONCLUSIONS:
+1. deepseek-v4-flash >= gpt-4o-2024-08-06 as Argos answerer. Competitor protocols
+   built on gpt-4o conferring an answering advantage: DEAD.
+2. Residual multi-session/SSA misses are NOT model-strength-bound. Forensics on the
+   two dual-arm SSA fails: eaca4986 (chord progression) = evidence ABSENT from
+   top-128 retrieval (single-letter note query; HYPOTHESIS: tokenizer/BM25 drops
+   1-char tokens - unverified, next probe). 58470ed2 (Borges quote) = evidence
+   PRESENT (11 kw hits) yet both models failed extraction -> extraction-bound.
+
+GOTCHAS (hard-won): aux client fallback chain IGNORES the requested model on
+transient errors (silent model swap; startup PAID-lane line = chain configured,
+not necessarily used - check per-row autoeval_label.model). Hypothesis files carry
+no contexts, but .phaseA.ack checkpoint files store the FULL 128-record snapshot.
+
+Artifacts: LongMemEval/data/lme_ab_answerer.json, hyp_ab_gpt4o{,.ack}.jsonl,
+hyp_ab_flash.jsonl (sidecar), judged_ab_answerer_gpt4o.jsonl.

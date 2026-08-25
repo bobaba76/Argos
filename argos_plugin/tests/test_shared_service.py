@@ -86,6 +86,57 @@ def test_shared_service_search_forwards_provider_kwargs(tmp_path):
             time.sleep(0.5)
 
 
+def test_shared_service_search_forwards_include_closed(tmp_path):
+    """Regression (25/8 incident): history-at-current-time threads include_closed
+    through _search_memories on EVERY prefetch. The proxy rejected it (TypeError)
+    and the service dispatch silently dropped it, so under storage_mode=
+    shared_service every live search failed fail-soft into EMPTY injections.
+    Locks the kwarg end-to-end: client signature -> wire -> dispatch -> store,
+    including that a closed (superseded) version actually comes back labelled."""
+    from service_client import SharedMemoryStore
+
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        encoding="utf-8",
+    )
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        v1 = store.remember(
+            category="personal_fact",
+            content="Alex lives in Johannesburg",
+        )
+        # Proxy convention: memory_id must be passed as a keyword.
+        v2 = store.update_memory(memory_id=v1.memory_id, content="Alex lives in Centurion")
+        assert v1 is not None and v2 is not None
+
+        # Default: closed version stays hidden.
+        current = store.search("where does Alex live", limit=10)
+        contents = [r.content for r in current]
+        assert "Alex lives in Centurion" in contents
+        assert all("Johannesburg" not in c for c in contents)
+
+        # Widened: both versions return; the closed row must carry valid_to
+        # set so the injection formatter can label it "(previously)".
+        widened = store.search(
+            "where does Alex live", limit=10,
+            category_filter=None, project_id=None,
+            suppress_retrieval=True, include_expired=False,
+            include_closed=True,
+        )
+        by_content = {r.content: r for r in widened}
+        assert "Alex lives in Johannesburg" in by_content, (
+            "closed version missing after RPC round trip"
+        )
+        assert "Alex lives in Centurion" in by_content
+        assert by_content["Alex lives in Johannesburg"].valid_to is not None
+        assert by_content["Alex lives in Centurion"].valid_to is None
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)
+
+
 def test_shared_graph_index_and_traverse_round_trip(tmp_path):
     """Priority 3 graph indexing/traversal must work through shared RPC."""
     from service_client import SharedGraphStore

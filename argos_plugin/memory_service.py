@@ -132,8 +132,9 @@ class MemoryService:
                     project_id=args.get("project_id"),
                     as_of=args.get("as_of"),
                     suppress_retrieval=bool(args.get("suppress_retrieval", False)),
-                    include_expired=bool(args.get("include_expired", False)),
-                )
+                                        include_expired=bool(args.get("include_expired", False)),
+                                        include_closed=bool(args.get("include_closed", False)),
+                                    )
             ]
         if method == "remember":
             return _record_to_dict(self.store.remember(**args))
@@ -234,6 +235,28 @@ class MemoryService:
             return self.store.list_aliases()
         if method == "aliases_for_canonical":
             return self.store.aliases_for_canonical(args.get("canonical_entity", ""))
+        # -- system state KV + distillation data access (P4.2) -----------------
+        if method == "get_state":
+            return self.store.get_state(args.get("key", ""))
+        if method == "set_state":
+            self.store.set_state(args.get("key", ""), args.get("value", ""))
+            return True
+        if method == "count_eligible_since":
+            return self.store.count_eligible_since(args.get("since"))
+        if method == "load_eligible_records":
+            return [
+                _record_to_dict(record)
+                for record in self.store.load_eligible_records(
+                    args.get("since"), int(args.get("limit", 100)),
+                )
+            ]
+        if method == "load_high_signal_records":
+            return [
+                _record_to_dict(record)
+                for record in self.store.load_high_signal_records(
+                    int(args.get("limit", 20)),
+                )
+            ]
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str) -> Any:

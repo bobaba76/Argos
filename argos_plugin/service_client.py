@@ -185,6 +185,7 @@ class SharedMemoryStore:
             as_of: str | None = None,
             suppress_retrieval: bool = False,
             include_expired: bool = False,
+            include_closed: bool = False,
         ) -> List[MemoryRecord]:
             values = self._rpc.call(
                 "store", "search", query=query, limit=limit,
@@ -194,6 +195,7 @@ class SharedMemoryStore:
                 as_of=as_of,
                 suppress_retrieval=suppress_retrieval,
                 include_expired=include_expired,
+                include_closed=include_closed,
             )
             return [_record_from_dict(value) for value in (values or [])]
 
@@ -277,6 +279,33 @@ class SharedMemoryStore:
 
     def save_candidate(self, **kwargs: Any) -> dict | None:
         return self._rpc.call("store", "save_candidate", **kwargs)
+
+    # -- system state KV + distillation data access (P4.2) --------------------
+    # These forward to the service so distillation can run against the proxy
+    # without reaching into _lock / connection / _fetch_records.
+
+    def get_state(self, key: str) -> str | None:
+        return self._rpc.call("store", "get_state", key=key)
+
+    def set_state(self, key: str, value: str) -> None:
+        self._rpc.call("store", "set_state", key=key, value=value)
+
+    def count_eligible_since(self, since: str | None) -> int:
+        return int(self._rpc.call("store", "count_eligible_since", since=since) or 0)
+
+    def load_eligible_records(
+        self, since: str | None, limit: int,
+    ) -> list:
+        values = self._rpc.call(
+            "store", "load_eligible_records", since=since, limit=limit,
+        ) or []
+        return [_record_from_dict(value) for value in values]
+
+    def load_high_signal_records(self, limit: int = 20) -> list:
+        values = self._rpc.call(
+            "store", "load_high_signal_records", limit=limit,
+        ) or []
+        return [_record_from_dict(value) for value in values]
 
     def list_candidates(self, **kwargs: Any) -> List[dict]:
         return self._rpc.call("store", "list_candidates", **kwargs) or []

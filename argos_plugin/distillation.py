@@ -74,25 +74,11 @@ def _count_eligible_since(store, since: Optional[str]) -> int:
     """Count active, non-superseded records created/updated since *since*.
 
     If *since* is None (never run), counts all eligible records.
+    Delegates to the store so this works against both a direct
+    DuckDBMemoryStore and a SharedMemoryStore proxy.
     """
-    conditions = [
-        "COALESCE(status, 'active') = 'active'",
-        "valid_to IS NULL",
-        "(user_scope IS NULL OR user_scope = ?)",
-        "embedding IS NOT NULL",
-    ]
-    params: list[Any] = [store.user_id]
-    if since:
-        conditions.append("(created_at > ? OR updated_at > ?)")
-        params.extend([since, since])
-    sql = (
-        f"SELECT COUNT(*) FROM memory_records WHERE "
-        + " AND ".join(conditions)
-    )
     try:
-        with store._lock:
-            row = store.connection.execute(sql, params).fetchone()
-        return int(row[0]) if row else 0
+        return store.count_eligible_since(since)
     except Exception:
         return 0
 
@@ -104,39 +90,25 @@ def _load_eligible_records(
 
     If *since* is provided, only records created/updated after it.
     Falls back to most recent N if never run (since=None).
+    Delegates to the store so this works against both a direct
+    DuckDBMemoryStore and a SharedMemoryStore proxy.
     """
-    conditions = [
-        "COALESCE(status, 'active') = 'active'",
-        "valid_to IS NULL",
-        "(user_scope IS NULL OR user_scope = ?)",
-        "embedding IS NOT NULL",
-    ]
-    params: list[Any] = [store.user_id]
-    if since:
-        conditions.append("(created_at > ? OR updated_at > ?)")
-        params.extend([since, since])
-    sql = (
-        "SELECT * FROM memory_records WHERE "
-        + " AND ".join(conditions)
-        + " ORDER BY created_at DESC LIMIT ?"
-    )
-    params.append(limit)
-    return store._fetch_records(sql, params)
+    try:
+        return store.load_eligible_records(since, limit)
+    except Exception:
+        return []
 
 
 def _load_high_signal_records(store, limit: int = 20) -> List[Any]:
-    """Load records with feedback signals for the high-signal scan."""
-    sql = (
-        "SELECT * FROM memory_records WHERE "
-        "COALESCE(status, 'active') = 'active' "
-        "AND valid_to IS NULL "
-        "AND (user_scope IS NULL OR user_scope = ?) "
-        "AND embedding IS NOT NULL "
-        "AND (helpful_count > 0 OR dismissed_count > 0) "
-        "ORDER BY (helpful_count + dismissed_count) DESC, retrieval_count DESC "
-        "LIMIT ?"
-    )
-    return store._fetch_records(sql, [store.user_id, limit])
+    """Load records with feedback signals for the high-signal scan.
+
+    Delegates to the store so this works against both a direct
+    DuckDBMemoryStore and a SharedMemoryStore proxy.
+    """
+    try:
+        return store.load_high_signal_records(limit)
+    except Exception:
+        return []
 
 
 # -- Cluster scan (seed-star greedy, deterministic, free) --------------------

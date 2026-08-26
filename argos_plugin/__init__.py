@@ -286,6 +286,48 @@ DELETE_SCHEMA = {
     },
 }
 
+TOMBSTONES_SCHEMA = {
+    "name": "memory_tombstones",
+    "description": (
+        "List deletion tombstones: fingerprints of hard-deleted memories that are "
+        "blocked from being re-created. Use when the user asks what was permanently "
+        "deleted, or to diagnose why saving a fact silently does nothing. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Max tombstones to return (default 200, cap 1000).",
+            },
+        },
+    },
+}
+
+PURGE_TOMBSTONE_SCHEMA = {
+    "name": "memory_tombstone_purge",
+    "description": (
+        "Escape hatch: lift a deletion tombstone so a previously hard-deleted fact "
+        "may be saved again. Requires the EXACT original content and its category "
+        "(matching is case/whitespace-normalized). Only do this on an explicit user "
+        "request to un-delete a specific fact."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "Exact original content of the deleted memory.",
+            },
+            "category": {
+                "type": "string",
+                "description": "Category the tombstone was recorded under (e.g. context_note).",
+            },
+        },
+        "required": ["content", "category"],
+    },
+}
+
 GRAPH_SEARCH_SCHEMA = {
     "name": "memory_graph_search",
     "description": (
@@ -2675,6 +2717,8 @@ class ArgosProvider(MemoryProvider):
             SAVE_SCHEMA,
             UPDATE_SCHEMA,
             DELETE_SCHEMA,
+            TOMBSTONES_SCHEMA,
+            PURGE_TOMBSTONE_SCHEMA,
             CANDIDATE_LIST_SCHEMA,
             CANDIDATE_REVIEW_SCHEMA,
             RESTORE_SCHEMA,
@@ -2842,6 +2886,30 @@ class ArgosProvider(MemoryProvider):
                         )
             action = result.get("action", "deleted") if isinstance(result, dict) else "deleted"
             return json.dumps({"status": action, "memory_id": memory_id, "result": result})
+
+        elif tool_name == "memory_tombstones":
+            try:
+                limit = max(1, min(int(args.get("limit", 200)), 1000))
+            except (ValueError, TypeError):
+                limit = 200
+            tombstones = self._store.list_tombstones(limit=limit)
+            return json.dumps({"count": len(tombstones), "tombstones": tombstones})
+
+        elif tool_name == "memory_tombstone_purge":
+            content = str(args.get("content", "")).strip()
+            category = str(args.get("category", "")).strip()
+            if not content or not category:
+                return tool_error("Missing required parameter: content and category")
+            purged = self._store.purge_tombstone(content=content, category=category)
+            if not purged:
+                return tool_error(
+                    "No matching tombstone found (content must match the original "
+                    "exactly, modulo case/whitespace)."
+                )
+            return json.dumps({
+                "status": "purged",
+                "detail": "Tombstone lifted — this fact may be saved again.",
+            })
 
         elif tool_name == "memory_candidate_list":
             status = args.get("status", "pending")

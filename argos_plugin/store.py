@@ -2561,6 +2561,33 @@ class DuckDBMemoryStore:
             ).fetchone()
         return bool(check and check[0] == 0)
 
+    def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Read-only census of deletion tombstones, newest first.
+
+        Visibility for the tombstone mechanism: shows what is blocked from
+        re-creation without exposing raw content (hash + metadata only).
+        """
+        limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT content_hash, category, user_scope, reason, created_at
+                   FROM deletion_tombstones
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                [limit],
+            ).fetchall()
+        return [
+            {
+                "content_hash": r[0],
+                "category": r[1],
+                "user_scope": r[2],
+                "reason": r[3],
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+
     # -- entity aliases -------------------------------------------------------
 
     def add_alias(self, alias: str, canonical_entity: str) -> None:

@@ -94,9 +94,18 @@ def _api_key() -> str:
     raise RuntimeError("OPENCODE_GO_API_KEY not found")
 
 
-def _call(messages: List[Dict[str, str]], max_tokens: int, key: str) -> Dict[str, Any]:
-    import urllib.request
+_HTTPX: Any = None  # module-level persistent client (one TLS handshake, not per call)
 
+
+def _client() -> Any:
+    global _HTTPX
+    if _HTTPX is None:
+        import httpx
+        _HTTPX = httpx.Client(timeout=httpx.Timeout(180.0, connect=15.0))
+    return _HTTPX
+
+
+def _call(messages: List[Dict[str, str]], max_tokens: int, key: str) -> Dict[str, Any]:
     body = {
         "model": DEFAULT_MODEL,
         "messages": messages,
@@ -111,10 +120,11 @@ def _call(messages: List[Dict[str, str]], max_tokens: int, key: str) -> Dict[str
     }
     last: Optional[Exception] = None
     for attempt in range(2):
-        req = urllib.request.Request(BASE_URL, data=json.dumps(body).encode(), headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                out = json.loads(resp.read().decode())
+            resp = _client().post(BASE_URL, json=body, headers=headers)
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            out = resp.json()
             return {
                 "text": out["choices"][0]["message"].get("content", "").strip(),
                 "usage": out.get("usage", {}),

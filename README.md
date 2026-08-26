@@ -68,9 +68,18 @@ Argos's headline measurements, each under a stated protocol:
   2026-08-21) improving that bucket further.
 - **Overall: 70.4% on LongMemEval_S** (500 questions, judged by gpt-4o,
   default answerer) — and head-to-head runs showed the *answerer*, not the
-  memory layer, is the bigger lever (a stronger answerer measured ~80+).
-  The benchmark runs on synthetic conversation data; real conversations are
-    messier and your results may differ.
+  memory layer, is the dominant lever (measured 2×2, below). The benchmark
+  runs on synthetic conversation data; real conversations are messier and
+  your results may differ.
+- **Answerer × distillation, measured (2×2, all 500 qids, same judge):**
+  gpt-4o 82.2% → 76.6% with the distill store; flash 48.0% → 86.6% with it.
+  The distill store is load-bearing for the flash answerer (+38.6 pts) and
+  mildly harmful for gpt-4o (−5.6 pts).
+- **Best current config: 89.8% (449/500) on LongMemEval_S** — grounding
+  prompt + distill store. Directly measured with the GLM-5.3-flash answerer
+  (26/8, ~US$1.9, gpt-4o judge); the flash-answerer equivalent is the same
+  449/500 as a zero-overlap composition (distill store on 338 qids +
+  grounding A/B on 162). Two independent full-bank measurements, one ruler.
 
   Every number above is independently re-measurable — dataset SHA-256, per-category
   denominators, model versions, prompts, exact commands, and the judged outputs

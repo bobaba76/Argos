@@ -20,7 +20,9 @@ snapshot records (regex-first, no LLM — deterministic and offline).
 Usage: python run_eval_provider.py <snapshot.duckdb> <eval_set.json> <out_dir>
 """
 import json
+import logging
 import math
+import os
 import shutil
 import sys
 import tempfile
@@ -118,6 +120,8 @@ def build_snapshot_graph(home: Path, use_llm: bool = False) -> int:
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from argos_plugin.graph import KuzuGraphStore
+    from argos_plugin.embeddings import LocalEmbedder, _resolve_embedding_model_path
+    from argos_plugin.store import DuckDBMemoryStore
 
     model = _resolve_embedding_model_path("bge-small-en-v1.5",
                                           hermes_home=str(home))
@@ -161,29 +165,28 @@ def run_arm(home: Path, eval_set: dict) -> dict:
     )
 
     results = []
-    totals = {"p5": [], "p10": [], "r5": [], "r10": [], "ndcg5": [],
-              "ndcg10": [], "mrr": []}
+    lim = int(eval_set.get("limit", 10))
+    ks = sorted({5, 10, lim})
+    totals: dict = {}
+    for k in ks:
+        totals[f"p{k}"] = []
+        totals[f"r{k}"] = []
+        totals[f"ndcg{k}"] = []
+    totals["mrr"] = []
     for q in eval_set["queries"]:
         hits = set(q["relevant"])
         ranked = [r.memory_id for r in provider._search_memories(
-            q["query"], limit=10)]
-        k5, k10 = ranked[:5], ranked[:10]
-        p5 = sum(1 for m in k5 if m in hits) / 5
-        p10 = sum(1 for m in k10 if m in hits) / 10
-        r5 = sum(1 for m in k5 if m in hits) / max(1, len(hits))
-        r10 = sum(1 for m in k10 if m in hits) / max(1, len(hits))
-        mrr = next((1 / (i + 1) for i, m in enumerate(ranked) if m in hits), 0.0)
-        row = {
-            "query": q["query"],
-            "n_relevant": len(hits),
-            "p5": round(p5, 4), "p10": round(p10, 4),
-            "r5": round(r5, 4), "r10": round(r10, 4),
-            "ndcg5": round(_ndcg(hits, ranked, 5), 4),
-            "ndcg10": round(_ndcg(hits, ranked, 10), 4),
-            "mrr": round(mrr, 4),
-            "top_hits": [m for m in k10 if m in hits],
-            "missed": sorted(hits - set(ranked)),
-        }
+            q["query"], limit=lim)]
+        row: dict = {"query": q["query"], "n_relevant": len(hits)}
+        for k in ks:
+            topk = ranked[:k]
+            row[f"p{k}"] = round(sum(1 for m in topk if m in hits) / k, 4)
+            row[f"r{k}"] = round(sum(1 for m in topk if m in hits) / max(1, len(hits)), 4)
+            row[f"ndcg{k}"] = round(_ndcg(hits, ranked, k), 4)
+        row["mrr"] = round(
+            next((1 / (i + 1) for i, m in enumerate(ranked) if m in hits), 0.0), 4)
+        row["top_hits"] = [m for m in ranked[:lim] if m in hits]
+        row["missed"] = sorted(hits - set(ranked))
         results.append(row)
         for key in totals:
             totals[key].append(row[key])
@@ -241,9 +244,13 @@ def main() -> int:
         llm_report = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
 
     eval_set = json.loads(eval_path.read_text(encoding="utf-8"))
+    if eval_set.get("reranker_top_n"):
+        ARMS["reranker_on"]["reranker_top_n"] = str(eval_set["reranker_top_n"])
     summary = {}
 
     for arm, cfg in ARMS.items():
+        if eval_set.get("arms") and arm not in eval_set["arms"]:
+            continue
         print(f"\n=== ARM: {arm} ===", flush=True)
         with tempfile.TemporaryDirectory(prefix=f"eval_{arm}_") as td:
             workdir = Path(td)

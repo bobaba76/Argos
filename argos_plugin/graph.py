@@ -469,6 +469,53 @@ def extract_graph_relations(
 _GRAPH_LLM_MIN_LENGTH = 60
 _GRAPH_LLM_TIMEOUT = 15.0
 
+
+def _extract_relations_watchdogged(
+    content: str,
+    category: str,
+    tags: Optional[List[str]],
+    *,
+    use_llm: bool = True,
+    timeout: float | None = None,
+) -> List[Dict[str, Any]]:
+    """extract_graph_relations_hybrid behind a hard watchdog.
+
+    The sync LLM relay has been observed to ignore its requested timeout
+    and block indefinitely on a black-holed socket (26 Aug 2026 incident:
+    one stuck call serialized the whole memory service behind it). The
+    watchdog bounds extraction wall-time; on breach we fall back to
+    regex-only relations so callers never hang.
+    """
+    if not use_llm:
+        return extract_graph_relations_hybrid(content, category, tags, use_llm=False)
+    if timeout is None:
+        timeout = max(_GRAPH_LLM_TIMEOUT * 2, 30.0)
+    box: Dict[str, Any] = {}
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            box["relations"] = extract_graph_relations_hybrid(
+                content, category, tags, use_llm=True
+            )
+        except BaseException as exc:  # must never escape into Event deadlock
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True, name="graph-llm-extract").start()
+    if not done.wait(timeout):
+        logger.warning(
+            "Graph LLM extraction exceeded %.0fs (relay likely hung); "
+            "falling back to regex-only relations.",
+            timeout,
+        )
+        return extract_graph_relations_hybrid(content, category, tags, use_llm=False)
+    if "error" in box:
+        logger.debug("Graph LLM extraction raised: %s", box["error"])
+        return []
+    return list(box.get("relations") or [])
+
 # Relations that carry no traversal/typing signal. Regex produces these
 # generically (mentions/related_to/context_about/insight_about/about_user/
 # working_toward/interested_in) — they connect everything to everything.
@@ -957,7 +1004,15 @@ class KuzuGraphStore:
             {"memory_id": str(memory_id), "category": category},
         )
 
-        relations = extract_graph_relations_hybrid(content, category, tags, use_llm=use_llm)
+        # Phase 1: relation extraction (may call the LLM), BEFORE any graph
+        # write. Still serialized by memory_service.dispatch's global lock,
+        # but watchdogged to ~30s worst case — a hung relay can no longer
+        # wedge the service indefinitely (26 Aug 2026 incident).
+        relations = _extract_relations_watchdogged(
+            content, category, tags, use_llm=use_llm
+        )
+
+        # Phase 2: apply (DB-only, fast).
         for relation in relations:
             attributes = dict(relation.get("attributes") or {})
             attributes["memory_id"] = str(memory_id)

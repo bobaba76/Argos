@@ -19,8 +19,59 @@ else:
     from store import MemoryRecord
 
 _START_LOCK_NAME = "hybrid_memory_service.starting"
+_START_LOCK_STALE_SECS = 90.0  # > _START_TIMEOUT; a healthy spawner unlinks well before this
 _DEFAULT_TIMEOUT = 30.0
 _START_TIMEOUT = 30.0
+
+
+def _pid_alive(pid: int) -> bool:
+    """Best-effort PID liveness check. Windows-safe (no os.kill signal 0)."""
+    if pid <= 0:
+        return False
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                return True  # query failed -> assume alive
+            finally:
+                kernel32.CloseHandle(handle)
+        import errno
+
+        os.kill(pid, 0)
+        return True
+    except OSError as exc:
+        return exc.errno != errno.ESRCH
+    except Exception:
+        return True  # cannot tell -> assume alive (conservative)
+
+
+def _start_lock_is_stale(lock_path: Path) -> bool:
+    """True when the lock holder is provably gone (dead PID) or ancient."""
+    try:
+        info = json.loads(lock_path.read_text(encoding="utf-8").strip() or "{}")
+        pid = int(info.get("pid", 0))
+        ts = float(info.get("ts", 0.0))
+    except (OSError, ValueError, TypeError):
+        try:
+            ts = lock_path.stat().st_mtime  # legacy/garbage lock: fall back to age
+        except OSError:
+            return False
+        pid = 0
+    if pid and _pid_alive(pid):
+        return False
+    return (time.time() - ts) > _START_LOCK_STALE_SECS
 
 
 class SharedMemoryServiceError(RuntimeError):
@@ -118,11 +169,31 @@ class _SharedRPC:
         lock_path = self.home / _START_LOCK_NAME
         owner = False
         try:
+            payload = json.dumps({"pid": os.getpid(), "ts": time.time()}).encode("utf-8")
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
             owner = True
         except FileExistsError:
-            pass
+            # A crashed spawner can leave the lock behind forever. Steal it when
+            # its holder is provably dead (or it predates any healthy start).
+            if _start_lock_is_stale(lock_path):
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    payload = json.dumps({"pid": os.getpid(), "ts": time.time()}).encode("utf-8")
+                    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    try:
+                        os.write(fd, payload)
+                    finally:
+                        os.close(fd)
+                    owner = True
+                except FileExistsError:
+                    pass  # another stealer won; just wait for health below
         if owner:
             try:
                 script = Path(__file__).with_name("memory_service.py")
@@ -341,6 +412,21 @@ class SharedMemoryStore:
         if value is False or value is None:
             return False
         return value
+
+    def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Read-only census of deletion tombstones (hash+metadata, newest first)."""
+        return list(self._rpc.call("store", "list_tombstones", limit=limit) or [])
+
+    def purge_tombstone(self, content: str, category: str) -> bool:
+        """Escape hatch: lift a deletion tombstone so the fact may be re-fed."""
+        return bool(
+            self._rpc.call(
+                "store",
+                "purge_tombstone",
+                content=content,
+                category=category,
+            )
+        )
 
     def cleanup_junk(self, return_ids: bool = False) -> int | dict:
         value = self._rpc.call("store", "cleanup_junk", return_ids=return_ids) or 0

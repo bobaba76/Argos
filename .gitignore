@@ -35,6 +35,18 @@ hybrid_memory_plugin/eval/probe_fp.py
 # Self-corpus eval outputs — carry personal memory content; never commit.
 eval_self_corpus_out.jsonl
 *_self_corpus_out.jsonl
+*.out.jsonl
+
+# Self-corpus regression gate — snapshots, gold sets, and gate scores carry
+# personal memory content; never commit. Only the gold freeze sha (recorded
+# in eval/gold/README.md) is committed.
+eval/snapshots/
+eval/gold/*
+!eval/gold/README.md
+# Personal-domain answerer bench outputs — personal content; never commit.
+eval/bench/
+gate_scores.json
+gate_baseline.json
 
 # Node/Electron artifacts
 node_modules/

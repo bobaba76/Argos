@@ -35,6 +35,33 @@ regression test (`tests/test_shared_service.py::test_shared_service_search_forwa
 has the matching `__init__.py` provider conventions — run pytest first.** When
 in doubt: `cd hybrid_memory_plugin && HF_HUB_OFFLINE=1 <venv-python> -m pytest tests/test_shared_service.py -q`.
 
+## GATE — self-corpus regression gate (any store/extractor/ranking change)
+
+**Any change to `store.py`, `extractor.py`, ranking, or retrieval config must
+pass the self-corpus regression gate before it syncs to live. FAIL blocks
+sync.** The gate runs the fixed (snapshot, gold set, seed 42, ladder 5,20,96)
+measurement against a frozen copy of the user's own store — LongMemEval is
+NOT this ruler (2026-08-20: bench tuning regressed real recall).
+
+```bash
+# 1. Stop Hermes/the memory service (exclusive DuckDB lock), then:
+python eval/snapshot_store.py take --db "%LOCALAPPDATA%\hermes\hybrid_memory.duckdb" \
+    --endpoint "%LOCALAPPDATA%\hermes\hybrid_memory_service.json"
+# 2. (once per frozen pair) build + review + freeze the gold set:
+python eval/build_gold.py --db eval/snapshots/<id>/hybrid_memory.duckdb
+#    ... review eval/gold/gold_v1.jsonl (approved/rejected), then:
+python eval/build_gold.py --db eval/snapshots/<id>/hybrid_memory.duckdb --freeze
+# 3. Run the gate (first run records the baseline):
+python eval/run_gate.py --snapshot eval/snapshots/<id> --gold eval/gold/gold_v1.jsonl \
+    --out gate_scores.json --compare eval/snapshots/<id>/gate_baseline.json
+```
+
+Verdict: PASS if no category recall@96 drops > 1pp, overall recall@96 drop
+≤ 0.5pp, MRR drop ≤ 0.01; else FAIL (exit 1) and the change must not sync.
+Run with the Hermes venv python, `HF_HUB_OFFLINE=1`, and a clean PYTHONPATH
+(`env -u PYTHONPATH`). Snapshots, gold sets, and gate outputs carry personal
+content — never commit them (gitignored).
+
 ## Step 1 — D: commit and push ("if the repo has been touched")
 
 ```bash

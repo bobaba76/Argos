@@ -184,3 +184,45 @@ the skill's `references/rpc-client-search-signature-drift.md`.
 
 ## Post-restart verification log
 - Restart #1 (17:09): service PID 49904 fresh (CreationDate 17:09:36) ✓, endpoint rewritten ✓, but in-app `memory_search` TypeError'd → app loaded plugin before the late copy of the two edited files. Fixed on disk (~17:21), awaiting restart #2.
+## Self-corpus regression gate (built 2026-08-26)
+
+The gate makes the real-store harness a versioned, snapshot-pinned regression
+gate so every store/extractor/ranking change is validated against the user's
+OWN corpus before it ships. LongMemEval is NOT this ruler (2026-08-20 lesson:
+bench tuning regressed real recall).
+
+- eval/snapshot_store.py — copies the live DuckDB to
+  eval/snapshots/<date>_<sha8>/ + sha256 manifest. REFUSES while the memory
+  service is running (exclusive DuckDB lock) — stop Hermes/the service first.
+  Keeps last 5 snapshots. Snapshots pin hybrid_memory.json too.
+- eval/build_gold.py — samples up to 1000 memories across categories (gold
+  v1 frozen: 995 approved / 5 rejected), one probe per memory, reviewable
+  JSONL in eval/gold/ (gitignored). Freeze = --freeze after the user
+  validates once; records sha256 + snapshot in gold_manifest.json; the sha
+  is committed in eval/gold/README.md only.
+- eval/run_gate.py — fixed (snapshot, gold, seed 42, ladder 5,20,96) run →
+  scores JSON (recall@5/20/96 + MRR, overall + per-category). --compare
+  verdict: PASS if no category recall@96 drops > 1pp, overall recall@96 drop
+  <= 0.5pp, MRR drop <= 0.01; else FAIL (exit 1). First run on a frozen pair
+  records gate_baseline.json beside the snapshot.
+- RULE: any store/extractor/ranking change → run the gate; FAIL blocks sync
+  to live (see SYNC_HANDOFF.md).
+- CAVEAT (validated 26/8): template probes share tokens with their targets →
+  recall@20 saturates (~99%+) — the gate is a STABILITY TRIPWIRE (MRR +
+  recall@96 + recency tie-flip), NOT a recall-quality ruler. k-descent
+  decisions use the real-query layer (diagnose_ranking + LME).
+- eval/weekly_recon.py — Monday 06:00 no-agent cron (wrapper in
+  HERMES_HOME/scripts/): service down → fresh snapshot + full gate vs
+  baseline (true drift sensor); service up → bit-stability rerun of the
+  frozen pair. Silent on PASS; `verdict:` line on failure; delivered to
+  telegram:63941908.
+
+Gotchas (each cost time before):
+- PYTHONPATH leak: run with env -u PYTHONPATH + Hermes venv python +
+  HF_HUB_OFFLINE=1 (embedder loads from local HF cache; a network HEAD-check
+  hangs for minutes).
+- Snapshot ONLY with the service stopped.
+- Never commit gold sets / --out JSONL / snapshots (personal content; repo is
+  public).
+- The gate runs against a temp copy of the snapshot (store init writes) — the
+  snapshot stays pristine.

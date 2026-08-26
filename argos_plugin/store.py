@@ -750,6 +750,44 @@ class DuckDBMemoryStore:
             out.append(r)
         return out
 
+    def find_semantic_duplicate(
+        self,
+        content: str,
+        min_similarity: float = 0.88,
+    ) -> MemoryRecord | None:
+        """Return the closest ACTIVE memory if it semantically covers *content*.
+
+        Extraction-time dedupe: embed the proposed fact and run a top-1
+        vector search against current memories (valid_to IS NULL, active,
+        non-expired, same user scope). Returns the top record (with
+        ``similarity`` set) when cosine >= *min_similarity*, else None.
+
+        Fail-soft: any embedder or search error returns None so dedupe can
+        never block memory capture. No LLM calls; local embedder only.
+        """
+        if not content or not content.strip():
+            return None
+        embedder = getattr(self, "embedder", None)
+        if embedder is None or not hasattr(embedder, "embed"):
+            return None
+        try:
+            emb = embedder.embed(content)
+        except Exception:
+            return None
+        if not emb:
+            return None
+        try:
+            hits = self._vector_search_raw(emb, limit=1, excluded=set())
+        except Exception:
+            return None
+        if not hits:
+            return None
+        top = hits[0]
+        sim = float(getattr(top, "similarity", 0.0) or 0.0)
+        if sim >= min_similarity:
+            return top
+        return None
+
     # -- ranking: RRF + feedback + recency -----------------------------------
 
     _PHRASE_STOPWORDS = frozenset(

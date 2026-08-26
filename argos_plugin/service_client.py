@@ -351,6 +351,17 @@ class SharedMemoryStore:
     def save_candidate(self, **kwargs: Any) -> dict | None:
         return self._rpc.call("store", "save_candidate", **kwargs)
 
+    def find_semantic_duplicate(
+        self, content: str, min_similarity: float = 0.88,
+    ) -> MemoryRecord | None:
+        """Return the closest active memory if it semantically covers *content*."""
+        return _record_from_dict(
+            self._rpc.call(
+                "store", "find_semantic_duplicate",
+                content=content, min_similarity=min_similarity,
+            )
+        )
+
     # -- system state KV + distillation data access (P4.2) --------------------
     # These forward to the service so distillation can run against the proxy
     # without reaching into _lock / connection / _fetch_records.

@@ -135,6 +135,15 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="extraction_dup_threshold",
+            label="Extraction dedupe threshold",
+            kind=KIND_TEXT,
+            default="0.88",
+            description="Minimum embedding cosine similarity for a proposed fact to be skipped as already covered by an active memory (0.0-1.0).",
+            info="Before a proposal is created, its content is embedded and compared (top-1) against active memories. Cosine >= this threshold means the fact is already in the cabinet, so no candidate is emitted. Set to 1.0 to disable semantic dedupe (exact-content dedupe still applies). Local embedder only; any embedder error fails soft to normal capture.",
+            group="Extraction",
+        ),
+        ProviderField(
             key="graph_aware_retrieval",
             label="Graph-aware retrieval",
             kind=KIND_BOOL,

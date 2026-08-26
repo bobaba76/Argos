@@ -7,7 +7,9 @@ prompts, per-category denominators, and the judged outputs themselves.
 
 **Verified 2026-08-22**: all numbers below were recomputed from the committed
 judged files with the official `print_metrics.py` during the writing of this
-document.
+document. **Extended 2026-08-26**: the answerer×distillation matrix (§12) and
+the grounding composite + GLM direct 449/500 arm (§13) were added, each wired
+into `verify_repro.sh`.
 
 ---
 
@@ -19,6 +21,8 @@ document.
 | "99.6% of answer-bearing memories reach the top-96 candidates" | recall@96 = 0.996 | retrieval phase of the same 500-question run (phase-A cache, see §8) |
 | "Temporal questions: 82% correct (133 questions)" | 109/133 = 0.820 | 52/75 (`judged_temporal_flash_flat_75_gpt4o.jsonl`) + 57/58 (`judged_temporal_flash_flat_58_gpt4o.jsonl`) — same protocol both slices |
 | "a stronger answerer measured ~80+" | 43/55 = 0.782 | `judged_temporal_dsv4pro_55_gpt4o.jsonl` — 55-question temporal probe, directional (partial slice) |
+| "Answerer × distillation, measured: gpt-4o 82.2% → 76.6% with the distill store; flash 48.0% → 86.6%" | 2×2 matrix | `judged_fullbank_v4_gpt4o_REAL.jsonl` (411/500), `judged_gpt4o500_v2.jsonl` (383/500), `judged_flash500_nodistill.jsonl` (240/500), `judged_full500_distill.jsonl` (433/500) — §12 |
+| "Best current config: 89.8% (449/500), grounding + distill" | 449/500 = 0.8980 | direct: `judged_glm500_final.jsonl` (GLM answerer); flash equivalent: `composite_449.py` composition over the matrix + grounding files — §13 |
 
 ## 2. Dataset
 
@@ -244,3 +248,73 @@ recall ≈ 93%, precision ≈ 93%.
    ships the small embedder.
 6. **Hindsight (91.4%) is excluded from cross-system comparisons** — different
    judging protocol and retrieval-depth regime.
+7. **The 89.8% headline is answerer-conditional.** It is *directly measured*
+   with the GLM-5.3-flash answerer (`judged_glm500_final.jsonl`); for the
+   production flash answerer it is a zero-overlap composition (distill store
+   on 338 qids + grounding A/B on 162), not an end-to-end flash run — §13.
+   Grounding was A/B'd on only 162 of 500 qids for flash; everything beyond
+   that on the flash side is composed, and the two full-bank numbers landing
+   on the same 449 is the corroboration, not a substitute for an end-to-end
+   flash run.
+8. **Matrix arms mix eras.** The gpt-4o no-distill arm is a "banked" baseline
+   (its judged file predates the other arms). All four are 500-qid,
+   same-judge, same test set, so the pairwise *deltas* are the claim — treat
+   the absolute percentages as era-specific.
+
+## 12. Answerer × distillation matrix (2×2, 2026-08-25)
+
+All four arms judged by **openai/gpt-4o-2024-11-20**, all on the **same 500
+unique qids** (identical test set), `temperature=0` judging. Files committed
+in this directory.
+
+| Answerer | Distill store OFF | Distill store ON | Δ |
+|---|---|---|---|
+| gpt-4o-2024-11-20 | 411/500 = 82.2% (`judged_fullbank_v4_gpt4o_REAL.jsonl`, banked) | 383/500 = 76.6% (`judged_gpt4o500_v2.jsonl`) | −5.6 pts |
+| deepseek-v4-flash | 240/500 = 48.0% (`judged_flash500_nodistill.jsonl`) | 433/500 = 86.6% (`judged_full500_distill.jsonl`) | +38.6 pts |
+
+The distill store is **answerer-interactive**: load-bearing for the flash
+answerer (+38.6 pts), mildly harmful for gpt-4o (−5.6 pts). Distillation
+ships enabled; a gpt-4o-class answerer should disable it. This supersedes
+the "stronger answerer ~80+" probe (§4) — the measured answerer effect is
+the matrix above. Judge neutrality was itself measured: judge swap ≤0.6pp,
+answerer swap −8.5pp (§4).
+
+## 13. Grounding (LME_GROUNDING=1) and the 449/500 headline (2026-08-25/26)
+
+Grounding = answerer prompt grounded in the retrieved evidence
+(`LME_GROUNDING=1`). Judge is **openai/gpt-4o-2024-11-20** on every row of
+every file in this section.
+
+**Flash composite (production answerer).** A composition with zero qid
+overlap (derivation: `eval/repro/composite_449.py`, wired into
+`verify_repro.sh`):
+
+| Component | Protocol | Correct |
+|---|---|---|
+| 338 qids | flash + distill store, no grounding (`judged_full500_distill.jsonl` minus the 162 A/B qids) | 308/338 |
+| 30 qids (preference) | flash + grounding (`judged_pref30_grounding.jsonl`) | 25/30 |
+| 132 qids (multi-session) | flash + grounding (`judged_multisession_grounding.jsonl`) | 116/132 |
+| **Composite** | — | **449/500 = 89.8%** |
+
+Grounding deltas on the A/B'd qids vs the banked no-grounding baselines
+(25/8 run ledger; the committed files carry the post-values):
+preference 17/30 → 25/30 (+8), multi-session 108/132 → 116/132 (+8).
+
+**GLM direct arm.** Same 500 qids (identical test set), grounding on all
+500, answerer `z-ai/glm-5.3-flash` — answerer stamped per-row in
+`hyp_glm500_v1.dedup.jsonl`; judged in `judged_glm500_final.jsonl`:
+**449/500 = 89.8%**, the direct full-bank measurement (26/8, ~US$1.9).
+
+Head-to-head on the same 162 grounded qids: flash 141 vs GLM 140 (net −1) —
+the flash composite landing on 449 is corroborated by the GLM direct run,
+and the answerer is not the ceiling (both answerers tie at 449 under the
+grounded protocol).
+
+**Fix trail (documented so 424 ≠ 449 never reads as drift):** the first GLM
+run produced ~34/500 garbage rows (batch truncation at `effort=max` left
+dangling rows that passed truthiness checks); 25 rows were re-answered in
+small batches (workspace-only `hyp_glm500_fix*.jsonl` fragments) and 35 rows
+re-judged (`judged_glm500_rejudge35.jsonl`, committed). `lme_phaseB` was
+hardened against the truncation mode. The earlier judged run
+(`judged_glm500_gpt4o.jsonl`, 424/500) was left in the workspace for audit
+and is superseded by `judged_glm500_final.jsonl`.

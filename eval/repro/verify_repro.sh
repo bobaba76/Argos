@@ -100,6 +100,43 @@ read -r C T <<<"$(count_correct "$J")"
 expected_cf "$C" 43 "$T" 55 && check "dsv4-pro probe 43/55" 1 "43/55" \
     || check "dsv4-pro probe 43/55" 0 "got $C/$T"
 
+# --- 4b. Answerer x distillation matrix (section 12) --------------------------
+# All four arms: 500 unique qids, judged by openai/gpt-4o-2024-11-20.
+for spec in \
+    "judged_gpt4o500_v2.jsonl 383 gpt-4o+distill" \
+    "judged_flash500_nodistill.jsonl 240 flash-no-distill" \
+    "judged_fullbank_v4_gpt4o_REAL.jsonl 411 gpt-4o-no-distill" \
+    "judged_full500_distill.jsonl 433 flash+distill"; do
+    set -- $spec
+    J="$REPRO_DIR/$1"
+    read -r C T <<<"$(count_correct "$J")"
+    expected_cf "$C" "$2" "$T" 500 && check "matrix $3 ($C/$T)" 1 "$2/500" \
+        || check "matrix $3 ($C/$T)" 0 "expected $2/500, got $C/$T"
+done
+
+# --- 4c. Grounding composite 449/500 (section 13) -----------------------------
+COMP="$( "$PY" "$(win "$REPRO_DIR/composite_449.py")" )"
+if [[ $? -eq 0 ]]; then
+    read -r C T <<<"$COMP"
+    if expected_cf "$C" 449 "$T" 500; then
+        check "grounding composite 449/500 ($C/$T)" 1 "308/338 + 25/30 + 116/132"
+    else
+        check "grounding composite 449/500 ($C/$T)" 0 "composite drifted: $C/$T"
+    fi
+else
+    check "grounding composite 449/500" 0 "composite_449.py failed: $COMP"
+fi
+
+# --- 4d. GLM direct 449/500 (section 13) --------------------------------------
+J="$REPRO_DIR/judged_glm500_final.jsonl"
+read -r C T <<<"$(count_correct "$J")"
+expected_cf "$C" 449 "$T" 500 && check "glm direct 449/500 ($C/$T)" 1 "449/500 == 0.8980" \
+    || check "glm direct 449/500 ($C/$T)" 0 "expected 449/500, got $C/$T"
+J="$REPRO_DIR/judged_glm500_rejudge35.jsonl"
+read -r C T <<<"$(count_correct "$J")"
+[[ "$T" -eq 35 ]] && check "glm rejudge35 sanity ($T rows)" 1 "35 re-judged rows tracked" \
+    || check "glm rejudge35 sanity ($T rows)" 0 "expected 35 rows, got $T"
+
 # --- 5. Cost axes (§9) -------------------------------------------------------
 CACHE="$ARTIFACTS/cache_capexp_k96.jsonl.phaseA.jsonl"
 if [[ -f "$CACHE" ]]; then

@@ -15,7 +15,7 @@ for the front-door overview see **[README.md](README.md)**.
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                  Provider Layer                          │
-│   (14 memory_* tools + pre_llm_call ambient hook +       │
+│   (16 memory_* tools + pre_llm_call ambient hook +       │
 │    insight-log skill + /ilog, /revisit commands)         │
 ├─────────────────────────────────────────────────────────┤
 │                  Retrieval Pipeline                      │
@@ -54,6 +54,8 @@ Fourteen agent-callable tools:
 | `memory_maintenance` | Preview (`dry_run=true`) or apply reversible quarantine of stale/duplicate memories. Never hard-deletes. |
 | `memory_why_not` | Diagnose why a memory missed retrieval: deterministic, free (no LLM), read-only. |
 | `memory_fetch_full` | Fetch the full stored text of a memory by ID when the injected preview was truncated. |
+| `memory_tombstones` | List deletion tombstones: fingerprints of hard-deleted memories that are blocked from being re-created. Use to answer "what was permanently deleted" or diagnose why saving a fact silently does nothing. Read-only. |
+| `memory_tombstone_purge` | Escape hatch: lift a deletion tombstone so a previously hard-deleted fact may be saved again. Requires the exact original content + category (matching is case/whitespace-normalized). Explicit user request only. |
 
 ## Core concepts
 

@@ -60,9 +60,9 @@ disaster-mode floor was the weakest link in an otherwise clean system.
 - `data/lme_temporal_{abl10,drip2,drip3,drip4}.json` (+ `_banked` sidecars)
 - `hyp_drip{2,3,4}.jsonl.phaseA.jsonl` — fresh retrieval through patched store
 - `judged_abl10_patched_gpt4o.jsonl`, `judged_drip{2,3,4}_gpt4o.jsonl`
-- Builders: `perseus-bench/_build_ablation_subset.py`, `_build_drip{2,3,4}.py`
-- Comparer: `perseus-bench/_compare_drip.py <sidecar> <judged> [label]`
-- Autopsy: `perseus-bench/_autopsy_fe651585.py`
+- Builders: `_build_ablation_subset.py`, `_build_drip{2,3,4}.py`
+- Comparer: `_compare_drip.py <sidecar> <judged> [label]`
+- Autopsy: `_autopsy_fe651585.py`
 
 ## Harness notes (post argos-rename)
 
@@ -108,17 +108,16 @@ sidecar rerun (hyp_drip7fix.jsonl), merged back.
 Result (gpt-4o judge): banked 16/20 -> PATCHED 18/20, ZERO regressions.
 - multi-session 5/7 -> 7/7 (both banked misses flipped)
 - single-session-assistant 3/5 -> 3/5 (both misses survive: answerer-
-  behavior class, matches Perseus gpt-4o dominance there 95.7%)
+  behavior class)
 - knowledge-update 4/4, single-user 3/3, single-pref 1/1: stable
 
 Cross-category campaign complete: temporal MEASURED 88.7% full-bank;
 knowledge-update +multi-session directionally UP; single-session-assistant
 = the residual weakness, answerer-bound not retrieval-bound.
 
-Perseus per-category (computed from THEIR qa_report.json, answerer
-gpt-4o): temporal 69.2, KU 76.9, MS 63.2, ssu 95.7, ssa 100, ssp 30.0,
-overall 73.6~73.8. Argos wins ALL THREE retrieval-heavy categories even
-on banked numbers; overall gap lives entirely in single-session family.
+Residual-gap note: Argos wins ALL THREE retrieval-heavy categories even
+on banked numbers; any overall cross-system gap lives entirely in the
+single-session family.
 
 ## Answerer A/B (24/8): deepseek-v4-flash vs gpt-4o-2024-08-06 — paired n=17
 

@@ -76,11 +76,6 @@ Argos's headline measurements, each under a stated protocol:
   denominators, model versions, prompts, exact commands, and the judged outputs
   themselves: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
 
-  - In the builder's own comparison against other open memory systems Argos
-  came in second, behind Perseus (73.8) and ahead of Zep (63.8) — but those
-  are vendor-published numbers under different protocols, so treat the
-  cross-system gap as directional, not lab-controlled.
-
 No claim here is "we beat vendor X." The numbers are there so you can judge
 for yourself, not so we can win an argument.
 

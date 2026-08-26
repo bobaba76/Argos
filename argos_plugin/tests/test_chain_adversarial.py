@@ -1,4 +1,4 @@
-"""Adversarial chain tests (Perseus review point 2 remainder).
+"""Adversarial chain tests.
 
 Attack-surface checks for the evolution-chain machinery: high-similarity
 supersession, updating a mid-chain member, restoring a quarantined

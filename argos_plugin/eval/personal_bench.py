@@ -61,8 +61,9 @@ _ATTRIBUTION = {
 
 ANSW_SYSTEM = (
     "You answer questions about facts stored in a personal memory system. "
-    "Use ONLY the provided memory notes. If the notes do not contain the "
-    "answer, reply exactly: NOT IN NOTES. Be concise."
+    "Use the memory notes to answer; when the notes support an answer, give "
+    "it in one short sentence. Only if NO note supports an answer, reply "
+    "exactly: NOT IN NOTES."
 )
 JUDGE_SYSTEM = (
     "You are a strict factual judge. Decide whether the ANSWER correctly "
@@ -72,9 +73,13 @@ JUDGE_SYSTEM = (
     "NOTES' as incorrect. Reply with exactly YES or NO."
 )
 PARA_SYSTEM = (
-    "Rewrite this search query as one natural, standalone question a person "
-    "might ask their personal assistant. Keep all names and ask about the "
-    "same thing. Output only the question, no preamble."
+    "Produce ONE natural, standalone question a person might ask their "
+    "personal assistant, such that the EXPECTED ANSWER is exactly the FACT "
+    "below. Derive the question from the FACT, not from the template query — "
+    "keep the fact's direction (never invert/negate it, never invent people "
+    "or entities), keep all names/numbers/specifics. If the FACT is about "
+    "the user, the question may ask about 'the user' or use second person. "
+    "Output only the question, no preamble."
 )
 
 
@@ -198,7 +203,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             q = line["query"]
             if args.paraphrase and line["memory_id"] not in existing:
                 pr = _call([{"role": "system", "content": PARA_SYSTEM},
-                            {"role": "user", "content": q}], 120, key)
+                            {"role": "user",
+                             "content": f"FACT: {line['content']}\n\n"
+                                        f"TEMPLATE QUERY (ignore unless it helps): {q}\n\n"
+                                        f"Question:"}], 160, key)
                 q = pr["text"] or q
             t0 = time.time()
             results = store.search(q, limit=args.k, suppress_retrieval=True)
@@ -213,11 +221,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          {"role": "user",
                           "content": f"GOLD FACT: {line['content']}\nQUESTION: {q}\n"
                                      f"ANSWER: {ans['text']}\n\nCorrect? (YES/NO)"}],
-                        8, key)
+                        24, key)
             correct = _yesno(jdg["text"])
             rec = {
                 "gold_id": line["memory_id"],
                 "category": line.get("category"),
+                "gold_content": line["content"],
                 "query": q,
                 "paraphrased": args.paraphrase and line["memory_id"] not in existing,
                 "gold_in_topk": hit,

@@ -532,6 +532,17 @@ FETCH_FULL_SCHEMA = {
 }
 
 
+def _flag(cfg: dict, key: str, default: str = "false") -> bool:
+    """Parse a string/bool config flag the way initialize() expects.
+
+    Accepts "true"/"1"/"yes" (case-insensitive) or a real bool; anything
+    else is False. Extracted so the temporal-lever flags are unit-testable
+    without constructing a full provider.
+    """
+    v = cfg.get(key, default)
+    return v.lower() in ("true", "1", "yes") if isinstance(v, str) else bool(v)
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -845,16 +856,10 @@ class ArgosProvider(MemoryProvider):
             self._injection_min_score = _DEFAULT_INJECTION_MIN_SCORE
 
         chrono = self._config.get("chronological_injection", "false")
-        self._chronological_injection = (
-            chrono.lower() in ("true", "1", "yes")
-            if isinstance(chrono, str) else bool(chrono)
-        )
+        self._chronological_injection = _flag(self._config, "chronological_injection", "false")
 
         da = self._config.get("date_anchor_rerank", "false")
-        self._date_anchor_rerank = (
-            da.lower() in ("true", "1", "yes")
-            if isinstance(da, str) else bool(da)
-        )
+        self._date_anchor_rerank = _flag(self._config, "date_anchor_rerank", "false")
 
         hist = self._config.get("history_at_current_time", "true")
         self._history_at_current_time = (
@@ -2062,8 +2067,19 @@ class ArgosProvider(MemoryProvider):
                         from .intent_router import is_temporal_or_multihop
                         if is_temporal_or_multihop(query):
                             def _ts_key(r):
+                                # created_at is an ISO-8601 string; lexicographic
+                                # order is only chronological when offsets are
+                                # uniform. Normalize to UTC epoch first so
+                                # mixed "Z"/"+14:00"/"-05:00" rows sort
+                                # correctly; unparseable rows keep raw ordering.
                                 ts = getattr(r, "created_at", None) or ""
-                                return ts
+                                try:
+                                    from datetime import datetime as _dt
+                                    return _dt.fromisoformat(
+                                        ts.replace("Z", "+00:00")
+                                    ).timestamp()
+                                except (ValueError, TypeError, AttributeError):
+                                    return ts
                             results = sorted(results, key=_ts_key)
                     except Exception:
                         pass  # P2B is best-effort; never break injection

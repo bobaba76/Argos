@@ -28,10 +28,15 @@ class _FakeSharedStore:
         pass
 
 
-def _stub_service_client(fake):
+def _stub_service_client(fake, monkeypatch):
     mod = types.ModuleType("service_client")
     mod.SharedMemoryStore = lambda *a, **k: fake
-    sys.modules["service_client"] = mod
+    # monkeypatch.setitem auto-restores after the test — the previous bare
+    # sys.modules assignment LEAKED the stub for the whole session, breaking
+    # test_shared_service.py when it ran later in the same suite (ghost
+    # 'service_client' module, "(unknown location)", fake missing every
+    # method the real class has).
+    monkeypatch.setitem(sys.modules, "service_client", mod)
 
 
 def test_category_registered():
@@ -48,16 +53,16 @@ def test_remember_round_trip(tmp_path):
     assert any(r.content == "Alex does not drink coffee" for r in hits)
 
 
-def test_neg_command_usage_message_when_empty():
-    _stub_service_client(_FakeSharedStore())
+def test_neg_command_usage_message_when_empty(monkeypatch):
+    _stub_service_client(_FakeSharedStore(), monkeypatch)
     # re-import so the lazy service_client import sees the stub
     out = argos_plugin._handle_neg_command("")
     assert "Usage: /neg" in out
 
 
-def test_neg_command_stores_claim():
+def test_neg_command_stores_claim(monkeypatch):
     fake = _FakeSharedStore()
-    _stub_service_client(fake)
+    _stub_service_client(fake, monkeypatch)
     out = argos_plugin._handle_neg_command("Alex does not drink coffee")
     assert "Saved as [negative] memory" in out
     assert "[id: neg-1]" in out

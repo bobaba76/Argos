@@ -9,9 +9,9 @@ Places this code lives:
 
 | Tag | Path / URL | Reality (measured) |
 |-----|-----------|--------------------|
-| A (dev fork) | `C:\Users\michael\Documents\Github\Hermes\argos_plugin` | Has `.git` at Hermes root (recheck why `git -C` silently failed). Plugin files are mostly **Aug 6–9 vintage** — the handoff's "A is where commits happen" no longer matches: recent commits (Aug 22–23) were made in the Argos repo itself. |
+| A (dev fork) | `<github-root>\Hermes\argos_plugin` | Has `.git` at Hermes root (recheck why `git -C` silently failed). Plugin files are mostly **Aug 6–9 vintage** — the handoff's "A is where commits happen" no longer matches: recent commits (Aug 22–23) were made in the Argos repo itself. |
 | B (remote) | `github.com/bobaba76/Argos` (branch master) | Origin of the local Argos repo. |
-| B-local (dev, ACTIVE) | `C:\Users\michael\Documents\Github\Argos` | **The actual dev repo now.** All Aug 22–23 commits live here. Ahead of origin by 1 (see below). |
+| B-local (dev, ACTIVE) | `<github-root>\Argos` | **The actual dev repo now.** All Aug 22–23 commits live here. Ahead of origin by 1 (see below). |
 | C (live install) | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | Plain copy, no git. Mixed state: 12 files = current repo state (mtimes **Aug 23 16:30**), 17 files = Aug 6–9 vintage, 2 legacy test files present only here. |
 
 ### Active sync happening during exploration
@@ -27,7 +27,7 @@ Places this code lives:
 
 ### Fork mystery resolved (17:00)
 - The fork IS a git repo at `b3afce7` (clean tree, only untracked `SYNC_HANDOFF.md`). Earlier `git -C` failure was the MSYS path-conversion quirk — native git needs `C:/...` paths, not `/c/...`.
-- `b3afce7..9772f71` (fork HEAD → origin/master): **33 files changed, +2336/−212** — one big sweep: egress gate (11 files), Perseus P0 fixes (10), benchmark appendix (9), evidence trail, config_schema fixes, 800-char comments. That's the whole story: **the fork is a stale checkout of the SAME history** (7 commits behind origin/master, 8 behind the Argos repo), NOT a divergent code line.
+- `b3afce7..9772f71` (fork HEAD → origin/master): **33 files changed, +2336/−212** — one big sweep: egress gate (11 files), external-review P0 fixes (10), benchmark appendix (9), evidence trail, config_schema fixes, 800-char comments. That's the whole story: **the fork is a stale checkout of the SAME history** (7 commits behind origin/master, 8 behind the Argos repo), NOT a divergent code line.
 - Live's 17 stale files == fork's b3afce7 versions (copied Aug 6–9, unchanged until the sweep). Today 16:30 someone copied the OTHER 12 from the repo line.
 - `git rev-list origin/master...HEAD` in fork = `0 0` — fork's local `origin/master` ref is stale (never fetched); don't trust it.
 
@@ -44,11 +44,11 @@ Places this code lives:
 
 ## Repo shape (stats)
 - `argos_plugin/` ≈ 26.6k LOC Python, ~30 runtime modules + tests/ + eval/.
-- Recent commit stream (Aug 22–23): BSL license, 800-char cap comments, update_memory chain fix, config_schema UI/runtime default alignment, optional config_file, manifest removal from tree, evidence trail (Perseus review pt 2), egress gate + report (pt 6), approval-boundary invariant (pt 5), benchmark reproducibility appendix, P0 fixes, docs sync, dream on session-switch, P4.2 audit fixes, P4.2 distillation, ...
-- So a "Perseus review" recently drove fixes (P0 → pt2/pt5/pt6). Possibly more review points outstanding — check PerseusVault / review threads for remaining items.
+- Recent commit stream (Aug 22–23): BSL license, 800-char cap comments, update_memory chain fix, config_schema UI/runtime default alignment, optional config_file, manifest removal from tree, evidence trail (external review pt 2), egress gate + report (pt 6), approval-boundary invariant (pt 5), benchmark reproducibility appendix, P0 fixes, docs sync, dream on session-switch, P4.2 audit fixes, P4.2 distillation, ...
+- An external review recently drove fixes (P0 → pt2/pt5/pt6). Possibly more review points outstanding.
 
 ## General docs read
-- README.md: 14 tools; honest-numbers section (93% chain-unfold; 99.6% answer-bearing recall to top-96; 82% temporal; 70.4% LongMemEval_S; 2nd behind Perseus in builder's own cross-system compare); "no native local-LLM yet" limitation; BSL 1.1.
+- README.md: 14 tools; honest-numbers section (93% chain-unfold; 99.6% answer-bearing recall to top-96; 82% temporal; 70.4% LongMemEval_S); "no native local-LLM yet" limitation; BSL 1.1.
 - MEMORY_SYSTEM.md: architecture (provider → retrieval pipeline → DuckDB + Kùzu), config reference, storage modes (shared_service RPC default vs direct), extraction pipeline, distillation gates, ambient context, prefetch.
 
 ## Next steps

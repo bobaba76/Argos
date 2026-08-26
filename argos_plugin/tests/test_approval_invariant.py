@@ -1,4 +1,4 @@
-"""Approval-boundary invariant tests (Perseus review point 4).
+"""Approval-boundary invariant tests.
 
 The storage layer must enforce that an unsupervised automatic review can
 never write the "approved" transition — that status is reserved for the

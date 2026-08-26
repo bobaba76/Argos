@@ -19,7 +19,6 @@ document.
 | "99.6% of answer-bearing memories reach the top-96 candidates" | recall@96 = 0.996 | retrieval phase of the same 500-question run (phase-A cache, see §8) |
 | "Temporal questions: 82% correct (133 questions)" | 109/133 = 0.820 | 52/75 (`judged_temporal_flash_flat_75_gpt4o.jsonl`) + 57/58 (`judged_temporal_flash_flat_58_gpt4o.jsonl`) — same protocol both slices |
 | "a stronger answerer measured ~80+" | 43/55 = 0.782 | `judged_temporal_dsv4pro_55_gpt4o.jsonl` — 55-question temporal probe, directional (partial slice) |
-| "cross-system gap is directional, not lab-controlled" | Perseus 73.8 / Zep 63.8 / Mem0 49.0 | vendor-published numbers; see §11 caveats |
 
 ## 2. Dataset
 
@@ -180,7 +179,7 @@ python Evaluation/print_metrics.py judged_capexp_c1500_k96_gpt4o.jsonl data/long
   is a few dollars (the 70.4% run re-uses a single phase-A cache across all
   k-slices; re-answering any k costs only the LLM phase).
 
-## 9. Cost axes (Zep-style transparency, added 2026-08-24)
+## 9. Cost axes (added 2026-08-24)
 
 Accuracy alone is half a claim. This section pins the **measured context
 size, latency, and item counts** for the headline configuration and its
@@ -208,9 +207,10 @@ Notes:
   marginally above the floored figure.
 - Retrieval latency is single-machine CPU ingest+retrieval wall-time from the
   cache (`secs` field); scales with haystack size, not with cap/floor.
-- Zep reports 347–1,997 context tokens across its settings for 10.7 accuracy
-  points; Argos operates two orders of magnitude higher by design (it buys
-  recall@96 = 99.6% with context, then claws budget back with the floor).
+- Some hosted memory vendors publish context budgets in the hundreds to low
+  thousands of tokens per turn; Argos operates two orders of magnitude higher
+  by design (it buys recall@96 = 99.6% with context, then claws budget back
+  with the floor).
 
 ## 10. Chain-unfold recall/precision (~93% / ~93%, 2026-08-20)
 

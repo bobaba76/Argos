@@ -6,11 +6,13 @@ version's topology (dev = the Hermes fork) is stale and must not be used.
 
 ## Topology (measured 2026-08-23)
 
+(`<github-root>` below = your local Github checkout folder.)
+
 | Tag | Path / URL | Type | Note |
 |-----|-----------|------|------|
-| **D (dev repo, canonical)** | `C:\Users\michael\Documents\Github\Argos` | full git repo | **All code changes and commits happen here.** origin = `github.com/bobaba76/Argos`. |
+| **D (dev repo, canonical)** | `<github-root>\Argos` | full git repo | **All code changes and commits happen here.** origin = `github.com/bobaba76/Argos`. |
 | **R (remote)** | `github.com/bobaba76/Argos` (branch `master`) | GitHub repo | Source of truth on GitHub. |
-| **F (fork, LEGACY)** | `C:\Users\michael\Documents\Github\Hermes` | git repo, stale | Old hermes-agent fork; **8 commits behind** D at last check (HEAD `b3afce7` vs D's `44eca22+`). Its `hybrid_memory_plugin/` files are old fork-era versions. **Never copy runtime modules from here. Do not commit here.** Keep only as reference. |
+| **F (fork, LEGACY)** | `<github-root>\Hermes` | git repo, stale | Old hermes-agent fork; **8 commits behind** D at last check (HEAD `b3afce7` vs D's `44eca22+`). Its `hybrid_memory_plugin/` files are old fork-era versions. **Never copy runtime modules from here. Do not commit here.** Keep only as reference. |
 | **C (live install)** | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | **NOT a git repo** | Plain file **copy** of D's `hybrid_memory_plugin/`. This is what the running Hermes app loads. Editing D alone does nothing live until you re-copy here and restart. |
 
 There is **no automatic link** from D/R to C. C is a copy-by-hand directory
@@ -36,7 +38,7 @@ in doubt: `cd hybrid_memory_plugin && HF_HUB_OFFLINE=1 <venv-python> -m pytest t
 ## Step 1 — D: commit and push ("if the repo has been touched")
 
 ```bash
-cd /c/Users/michael/Documents/Github/Argos
+cd <github-root>/Argos
 git status --short        # if empty, skip the commit below
 git add <your changed files>     # NEVER bare `git add -A` without reviewing
 git commit -m "..."
@@ -57,7 +59,7 @@ git fetch origin && git status -sb   # expect "## master...origin/master" with n
 C is NOT a git repo — file copy, not git pull:
 
 ```bash
-REPO="/c/Users/michael/Documents/Github/Argos/hybrid_memory_plugin"
+REPO="<github-root>/Argos/hybrid_memory_plugin"
 LIVE="$(cygpath -m "$LOCALAPPDATA")/hermes/plugins/hybrid_memory"   # forward slashes, no backslashes!
 ```
 

@@ -1,4 +1,4 @@
-"""Egress gate tests (Perseus review point 6).
+"""Egress gate tests.
 
 The egress gate refuses a plugin-owned LLM call when local_only is on, or
 when a conversation-derived payload carries PII identifiers; the caller

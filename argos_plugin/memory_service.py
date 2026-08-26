@@ -151,6 +151,13 @@ class MemoryService:
             ]
         if method == "save_candidate":
             return self.store.save_candidate(**args)
+        if method == "find_semantic_duplicate":
+            return _record_to_dict(
+                self.store.find_semantic_duplicate(
+                    content=args.get("content", ""),
+                    min_similarity=float(args.get("min_similarity", 0.88)),
+                )
+            )
         if method == "list_candidates":
             return self.store.list_candidates(**args)
         if method == "review_candidate":

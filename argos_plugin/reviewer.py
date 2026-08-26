@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -237,25 +238,31 @@ Use reject for obvious non-memory text. Use quarantine for malformed or suspicio
         },
         ensure_ascii=False,
     )
-    try:
-        response = call_llm(
-            task="memory_review",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=500,
-            timeout=15.0,
-            model=model or None,
-            provider=provider or None,
-        )
-        parsed = _parse_json_response(response)
-    except Exception as exc:
-        parsed = None
-        failure = str(exc)
-    else:
-        failure = ""
+    # Bounded retry: a transient connection error must not strand a proposal
+    # in limbo — retry once with a short backoff, then fail soft.
+    parsed = None
+    failure = ""
+    for attempt in range(2):
+        try:
+            response = call_llm(
+                task="memory_review",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.0,
+                max_tokens=500,
+                timeout=15.0,
+                model=model or None,
+                provider=provider or None,
+            )
+            parsed = _parse_json_response(response)
+            if parsed is not None:
+                break
+        except Exception as exc:
+            failure = str(exc)
+        if attempt == 0:
+            time.sleep(1.0)
 
     if not parsed:
         return {

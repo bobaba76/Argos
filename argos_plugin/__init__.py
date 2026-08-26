@@ -881,6 +881,15 @@ class ArgosProvider(MemoryProvider):
             auto_review.lower() in ("true", "1", "yes")
             if isinstance(auto_review, str) else bool(auto_review)
         )
+        # Extraction-time dedupe: proposals whose embedding cosine against an
+        # active memory clears this threshold are skipped entirely (no
+        # candidate emitted). 1.0 disables semantic dedupe.
+        try:
+            self._extraction_dup_threshold = max(
+                0.0, min(float(self._config.get("extraction_dup_threshold", 0.88)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._extraction_dup_threshold = 0.88
         # Stale-pending review sweep: re-review proposals stranded in
         # `pending` after a failed/rate-limited reviewer call, so a rate-limit
         # hiccup no longer condemns a proposal to sit unreviewed forever.
@@ -2286,7 +2295,27 @@ class ArgosProvider(MemoryProvider):
                     shadow_diff=self._extraction_shadow_diff,
                 )
                 proposed = 0
+                dup_threshold = getattr(self, "_extraction_dup_threshold", 0.88)
                 for fact in facts:
+                    # Pre-insert dedupe: skip proposals already covered by an
+                    # active memory (valid_to IS NULL). Fail-soft — any
+                    # embedder/search error inserts normally; dedupe must
+                    # never block memory capture.
+                    try:
+                        dup = self._store.find_semantic_duplicate(
+                            fact["content"], min_similarity=dup_threshold
+                        )
+                    except Exception:
+                        dup = None
+                    if dup is not None:
+                        logger.debug(
+                            "Skipping duplicate proposal %r — matches active "
+                            "memory %s (cosine=%.3f)",
+                            (fact.get("content") or "")[:80],
+                            getattr(dup, "memory_id", "?"),
+                            float(getattr(dup, "similarity", 0.0) or 0.0),
+                        )
+                        continue
                     payload = dict(fact.get("payload") or {})
                     candidate = self._store.save_candidate(
                         category=fact["category"],

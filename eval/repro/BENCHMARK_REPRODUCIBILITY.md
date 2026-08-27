@@ -241,10 +241,10 @@ recall ≈ 93%, precision ≈ 93%.
 > **reproduces on current code**: precision 92.9%, raw recall 92.9%, fair
 > recall 100% (arc 0.15 == arc 0.00 bit-identical); the single buried miss
 > (`gym`) is a retrieval artifact, not a gate failure. The original diagnostic
-> probes (PII-bearing) remain gitignored by rule. Note: the older crude harness
-> (`eval_chain_unfold.py`, raw recall over all positives incl. buried) reads
-> ~80/80 — that is the same feature under eval-artifact burden, **not** a
-> regression and not the headline figure.
+> probes (PII-bearing) remain gitignored by rule. Note: the earlier crude
+> harness (raw recall over all positives incl. buried, removed 27/8 as a
+> footgun) read ~80/80 — that was the same feature under eval-artifact burden,
+> **not** a regression and never the headline figure.
 
 ## 11. Honest caveats (read before quoting)
 

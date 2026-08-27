@@ -1,8 +1,10 @@
 # Chain-unfold: repro artifact (2026-08-27)
 
-Two harnesses exist, and they measure **different things**. This file documents
-both so nobody repeats the earlier misreading (reporting the crude harness as a
-regression when it is the same feature under a harsher metric).
+Two harnesses existed, measuring **different things**. This file documents the
+investigation so nobody repeats the earlier misreading (reporting the crude
+harness as a regression when it is the same feature under a harsher metric).
+**The crude harness was removed 2026-08-27** — the canonical one is the only
+chain-unfold eval in the repo; git history preserves the crude version.
 
 **Verdict up front: no regression.** The canonical headline — precision ≈ 93%,
 fair recall 100% on the 20/8 protocol — **reproduces exactly on current code**
@@ -49,7 +51,7 @@ IN BAND (prec >= 90 & fair recall >= 90): True
 - **The arc floor is inert for recall**: arc 0.15 == arc 0.00 exactly. The
   gate is a pure precision knob, as documented — it never blocks a real saga.
 
-## Crude eval (why it read lower) — `eval_chain_unfold.py`
+## Crude eval (why it read lower) — `eval_chain_unfold.py` (removed 27/8)
 
 The older, harsher harness (3 saturated chains — property/meds — plus real
 distractor memories; **raw recall over all positives; no RETRIEVAL-BURIED
@@ -61,8 +63,9 @@ not a regression signal:
   with real property memories), so it is RETRIEVAL-BURIED and counts as a raw
   miss. The clean protocol would classify it exactly that way and exclude it
   from fair recall.
-- Keep it if you want the "what does real dense-store recall look like, the
-  hard way" number; it is *not* the headline and never was.
+- Its one unique signal — raw recall on a dense store — is captured in this
+  file and in the 80/80 figure above; re-running it was what caused the 27/8
+  false "regression" scare, so it was deleted. Use the canonical harness.
 
 ## What changed vs 20/8? (nothing material)
 

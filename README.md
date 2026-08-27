@@ -33,7 +33,7 @@ And underneath all of this is a habit worth mentioning: every feature in Argos i
 
 ## The tools
 
-Argos exposes fourteen tools your agent can call directly:
+Argos exposes sixteen tools your agent can call directly:
 
 | Tool | What it's for |
 |---|---|
@@ -51,6 +51,8 @@ Argos exposes fourteen tools your agent can call directly:
 | `memory_maintenance` | Run cleanup and dedup passes |
 | `memory_why_not` | Explain why a memory didn't surface in retrieval |
 | `memory_fetch_full` | Fetch a memory's full untruncated text by ID |
+| `memory_tombstones` | List deletion tombstones — fingerprints of hard-deleted facts that are blocked from being re-created |
+| `memory_tombstone_purge` | Lift a deletion tombstone so a previously hard-deleted fact may be saved again (explicit request only) |
 
 ## The honest numbers
 
@@ -63,9 +65,10 @@ Argos's headline measurements, each under a stated protocol:
   Recall on this category moved via the intent matcher, not the thresholds.
 - **99.6% of answer-bearing memories reach the top-96 candidates.** Recall
   (delivery) isn't the weak point.
-- **Temporal questions: 82% correct** (133 questions, one uniform protocol),
-  with date-anchored retrieval (time-expression re-ranking, added
-  2026-08-21) improving that bucket further.
+- **Temporal questions: 88.7% correct** (118/133 — the full bank measured
+  under the 2026-08-23 text-leg hardening, one uniform protocol). Earlier
+  protocols: 82% with date-anchored retrieval (time-expression re-ranking,
+  added 2026-08-21), 66.2% originally.
 - **Overall: 70.4% on LongMemEval_S** (500 questions, judged by gpt-4o,
   default answerer) — and head-to-head runs showed the *answerer*, not the
   memory layer, is the dominant lever (measured 2×2, below). The benchmark
@@ -96,7 +99,7 @@ Be direct about this one: your memory data, embeddings, and graph all live local
 
 1. Copy the plugin folder to your Hermes plugins directory (on Windows: `%LOCALAPPDATA%\hermes\plugins\hybrid_memory`).
 2. Restart Hermes.
-3. Run `hermes tools` and confirm the fourteen `memory_*` tools show up.
+3. Run `hermes tools` and confirm the sixteen `memory_*` tools show up.
 4. Configure it in `hybrid_memory.json`, or through the settings UI under Memory -> Argos (Local).
 
 Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md).

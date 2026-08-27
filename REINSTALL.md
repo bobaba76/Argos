@@ -9,14 +9,15 @@ If you need to wipe and reinstall (corrupted DB, schema change, fresh start):
 2. **Back up your data** (optional but recommended):
    ```bash
    cp -r ~/.hermes/hybrid_memory.duckdb ~/.hermes/hybrid_memory.duckdb.bak
-   cp -r ~/.hermes/hybrid_memory_kuzu ~/.hermes/hybrid_memory_kuzu.bak
+   cp ~/.hermes/hybrid_memory_kuzu ~/.hermes/hybrid_memory_kuzu.bak
+   cp ~/.hermes/hybrid_memory_kuzu.wal ~/.hermes/hybrid_memory_kuzu.wal.bak 2>/dev/null || true
    ```
 
 3. **Delete the databases**:
    ```bash
    rm ~/.hermes/hybrid_memory.duckdb
    rm ~/.hermes/hybrid_memory.duckdb.wal
-   rm -rf ~/.hermes/hybrid_memory_kuzu/
+   rm -f ~/.hermes/hybrid_memory_kuzu ~/.hermes/hybrid_memory_kuzu.wal
    ```
 
 4. **Delete the config** (to get fresh defaults):
@@ -32,13 +33,13 @@ If you need to wipe and reinstall (corrupted DB, schema change, fresh start):
 
 2. **Copy the plugin**:
    ```bash
-   cp -r hybrid_memory_plugin/ ~/.hermes/plugins/hybrid_memory/
+   cp -r argos_plugin/ ~/.hermes/plugins/hybrid_memory/
    ```
 
 3. **Copy your data**:
    ```bash
    cp ~/.hermes/hybrid_memory.duckdb  <new-machine>:~/.hermes/
-   cp -r ~/.hermes/hybrid_memory_kuzu/ <new-machine>:~/.hermes/
+   cp ~/.hermes/hybrid_memory_kuzu* <new-machine>:~/.hermes/
    cp ~/.hermes/hybrid_memory.json     <new-machine>:~/.hermes/
    ```
 
@@ -51,7 +52,9 @@ If you need to wipe and reinstall (corrupted DB, schema change, fresh start):
 
 ## Rebuilding the graph
 
-If the Kuzu graph gets out of sync with the DuckDB store (e.g. after a manual DB edit):
+If the Kuzu graph gets out of sync with the DuckDB store (e.g. after a manual DB edit). Note: in
+current releases the graph is a **single file** named `hybrid_memory_kuzu` (plus a
+`hybrid_memory_kuzu.wal` while the service holds it), not a directory:
 
 ```bash
 python ~/.hermes/plugins/hybrid_memory/rebuild_graph.py --home ~/.hermes

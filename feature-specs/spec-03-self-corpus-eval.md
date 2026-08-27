@@ -1,5 +1,11 @@
 # Spec 3 — `eval_self_corpus.py`: regression-test retrieval on the real store
 
+> **Status: IMPLEMENTED — superseded in form.** Historical design record
+> (Aug 2026). The standalone script evolved into the snapshot/gold/gate
+> toolchain (`snapshot_store` / `build_gold` / `run_gate` / `weekly_recon` /
+> `personal_bench`) — see SYNC_HANDOFF.md and the benchmark runbook.
+
+
 ## 1. Why this exists
 Argos is benchmarked on LongMemEval — a 500-question lab corpus of large synthetic documents (turns up to ~76k chars). The user's **real store is short-fact-dense** (median memory ~120 chars). Tuning against the benchmark can silently regress real-world recall, and the reverse: a benchmark win can be meaningless for the real store. We need a **free, deterministic, repeatable** way to score retrieval against the user's own memories and catch regressions before they matter.
 

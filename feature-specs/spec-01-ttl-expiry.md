@@ -1,5 +1,10 @@
 # Spec 1 — TTL expiry tiers ("best-before dates" on memories)
 
+> **Status: IMPLEMENTED.** Historical design record (Aug 2026). TTL expiry
+> tiers, `include_expired`, and the `as_of` fix are shipped; the feature is
+> invisible when off (byte-identical behavior).
+
+
 ## 1. Why this exists
 Some memories are only true for a while ("tenant moves out at the end of June", "promo runs until Friday", "project X is blocked this week"). Today those facts sit in the store forever and surface in retrieval long after they stopped being true, cluttering search results and occasionally making the agent answer with stale facts.
 

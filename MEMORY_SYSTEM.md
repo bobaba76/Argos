@@ -36,7 +36,7 @@ for the front-door overview see **[README.md](README.md)**.
 
 ## Tools
 
-Fourteen agent-callable tools:
+Sixteen agent-callable tools:
 
 | Tool | Purpose |
 |------|---------|

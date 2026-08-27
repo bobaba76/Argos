@@ -23,14 +23,12 @@ __pycache__/
 venv/
 env/
 
-# Diagnostic chain-unfold eval/probe files — carry personally-identifying
-# example content (names, medication) for the recall investigation.
-# NEVER commit these to a public repo; the analysis is done.
-argos_plugin/eval/eval_chain_unfold*.py
-argos_plugin/eval/probe_chain_miss.py
-argos_plugin/eval/probe_cosines.py
-argos_plugin/eval/probe_deep_search.py
-argos_plugin/eval/probe_fp.py
+# Diagnostic chain-unfold PROBE files — carry personally-identifying example
+# content (names, medication) for the recall investigation. NEVER commit
+# these to a public repo; the analysis is done. The SANITIZED repro harness
+# (eval_chain_unfold.py) IS committed and safe.
+argos_plugin/eval/probe_*.py
+argos_plugin/eval/eval_chain_unfold_priv.py
 
 # Self-corpus eval outputs — carry personal memory content; never commit.
 eval_self_corpus_out.jsonl

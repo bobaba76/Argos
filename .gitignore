@@ -7,7 +7,7 @@ data/
 *_kuzu/
 *.pid
 *.log
-hybrid_memory_plugin/_mh_analysis.txt
+argos_plugin/_mh_analysis.txt
 hybrid_memory_service.json
 hybrid_memory_service.starting
 hybrid_memory.auto_extract.paused
@@ -26,11 +26,11 @@ env/
 # Diagnostic chain-unfold eval/probe files — carry personally-identifying
 # example content (names, medication) for the recall investigation.
 # NEVER commit these to a public repo; the analysis is done.
-hybrid_memory_plugin/eval/eval_chain_unfold*.py
-hybrid_memory_plugin/eval/probe_chain_miss.py
-hybrid_memory_plugin/eval/probe_cosines.py
-hybrid_memory_plugin/eval/probe_deep_search.py
-hybrid_memory_plugin/eval/probe_fp.py
+argos_plugin/eval/eval_chain_unfold*.py
+argos_plugin/eval/probe_chain_miss.py
+argos_plugin/eval/probe_cosines.py
+argos_plugin/eval/probe_deep_search.py
+argos_plugin/eval/probe_fp.py
 
 # Self-corpus eval outputs — carry personal memory content; never commit.
 eval_self_corpus_out.jsonl
@@ -40,10 +40,14 @@ eval_self_corpus_out.jsonl
 # Self-corpus regression gate — snapshots, gold sets, and gate scores carry
 # personal memory content; never commit. Only the gold freeze sha (recorded
 # in eval/gold/README.md) is committed.
+argos_plugin/eval/snapshots/
 eval/snapshots/
+argos_plugin/eval/gold/*
+!argos_plugin/eval/gold/README.md
 eval/gold/*
 !eval/gold/README.md
 # Personal-domain answerer bench outputs — personal content; never commit.
+argos_plugin/eval/bench/
 eval/bench/
 gate_scores.json
 gate_baseline.json

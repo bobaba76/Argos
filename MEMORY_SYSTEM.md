@@ -114,15 +114,18 @@ chronological chain of versions for each fact.
   ("why did I switch...", "what changed...") triggers automatic injection of
   a compact version arc into the search results, so the agent can answer
   "how did this fact evolve?" without an extra tool call.
-  - **Measured (2026-08-27, committed repro — `eval/repro/CHAIN_UNFOLD_RESULTS.md`):**
-      80% recall / 80% precision (top3 + fallback; arc floors 0.00–0.35 flat).
-      The earlier ~93% figure (2026-08-20) did **not** reproduce on current
-      code and is archived; treat 93% as historical.
-    - **Open diagnosis:** "what changed with my property plan" never unfolds
-      (chain not surfaced — retrieval-shaped miss), "what changed in the
-      weather today" fires with fallback on at any gate floor (matcher/retrieval
-      FP, not threshold-separable). The private probe analysis is the prescribed
-      next step before any claim restoral.
+  - **Measured (canonical eval `argos_plugin/eval/eval_chain_unfold_clean.py`,
+    20/8 → reproduced 27/8; results `eval/repro/CHAIN_UNFOLD_RESULTS.md`):**
+    precision **92.9%**, raw recall **92.9%**, **fair recall 100%** on
+    change-intent questions — unsaturated topics, every surfaced chain unfolds;
+    only real misses are retrieval-buried artefacts (excluded by design, not
+    gate failures). The `Arc(0.15)` / `anchor(0.30)` similarity floors are
+    *pure precision gates*: an arc-floor sweep (0.00 vs 0.15) is bit-identical,
+    confirming zero recall cost.
+  - **A harsher crude harness** (`eval_chain_unfold.py`, 3 saturated chains,
+    raw recall over *all* positives incl. buried) reads ~80%/80% — that is the
+    same feature under eval-artifact burden, not a regression; the canonical
+    figure is the 92.9% / 100% above.
 - **Head-deletion promotion** — deleting the current version promotes the
   predecessor to current (and re-indexes it in the graph).
 

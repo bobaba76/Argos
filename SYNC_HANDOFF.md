@@ -4,7 +4,7 @@ Three places hold this code. Only a manual step connects them. Do all three
 so they stop disagreeing. **This file was rewritten 2026-08-23** — the old
 version's topology (dev = the Hermes fork) is stale and must not be used.
 
-## Topology (measured 2026-08-23)
+## Topology (measured 2026-08-27)
 
 (`<github-root>` below = your local Github checkout folder.)
 
@@ -12,8 +12,8 @@ version's topology (dev = the Hermes fork) is stale and must not be used.
 |-----|-----------|------|------|
 | **D (dev repo, canonical)** | `<github-root>\Argos` | full git repo | **All code changes and commits happen here.** origin = `github.com/bobaba76/Argos`. |
 | **R (remote)** | `github.com/bobaba76/Argos` (branch `master`) | GitHub repo | Source of truth on GitHub. |
-| **F (fork, LEGACY)** | `<github-root>\Hermes` | git repo, stale | Old hermes-agent fork; **8 commits behind** D at last check (HEAD `b3afce7` vs D's `44eca22+`). Its `hybrid_memory_plugin/` files are old fork-era versions. **Never copy runtime modules from here. Do not commit here.** Keep only as reference. |
-| **C (live install)** | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | **NOT a git repo** | Plain file **copy** of D's `hybrid_memory_plugin/`. This is what the running Hermes app loads. Editing D alone does nothing live until you re-copy here and restart. |
+| **F (fork, LEGACY)** | `<github-root>\Hermes` | git repo, stale | Old hermes-agent fork; **42 commits behind** D as of 2026-08-27 (HEAD `b3afce7`, unchanged since 2026-08-23). Its `argos_plugin/` files are old fork-era versions. **Never copy runtime modules from here. Do not commit here.** Keep only as reference. |
+| **C (live install)** | `%LOCALAPPDATA%\hermes\plugins\hybrid_memory` | **NOT a git repo** | Plain file **copy** of D's `argos_plugin/`. This is what the running Hermes app loads. Editing D alone does nothing live until you re-copy here and restart. |
 
 There is **no automatic link** from D/R to C. C is a copy-by-hand directory
 (no `.git`). Build in D → push to R → copy to C → restart Hermes.
@@ -33,7 +33,7 @@ regression test (`tests/test_shared_service.py::test_shared_service_search_forwa
 
 **Rule: never copy `service_client.py` into live unless the repo state also
 has the matching `__init__.py` provider conventions — run pytest first.** When
-in doubt: `cd hybrid_memory_plugin && HF_HUB_OFFLINE=1 <venv-python> -m pytest tests/test_shared_service.py -q`.
+in doubt: `cd argos_plugin && HF_HUB_OFFLINE=1 <venv-python> -m pytest tests/test_shared_service.py -q`.
 
 ## GATE — self-corpus regression gate (any store/extractor/ranking change)
 
@@ -72,8 +72,9 @@ git commit -m "..."
 git push origin master
 ```
 
-Local `ENGINEERING_NOTES.md` (exploration log) is intentionally **untracked** —
-never commit it (it's a working note, not a product doc).
+The exploration log from Aug 2026 is archived at `docs/archive/ENGINEERING_NOTES.md`
+(historical record — do not revive it as a live doc; current state lives in
+this file, MEMORY_SYSTEM.md, and the benchmark runbook).
 
 ## Step 2 — R: confirm it's current
 
@@ -86,7 +87,7 @@ git fetch origin && git status -sb   # expect "## master...origin/master" with n
 C is NOT a git repo — file copy, not git pull:
 
 ```bash
-REPO="<github-root>/Argos/hybrid_memory_plugin"
+REPO="<github-root>/Argos/argos_plugin"
 LIVE="$(cygpath -m "$LOCALAPPDATA")/hermes/plugins/hybrid_memory"   # forward slashes, no backslashes!
 ```
 

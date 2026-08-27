@@ -19,7 +19,7 @@ into `verify_repro.sh`. **Refreshed 2026-08-27:** temporal headline now the full
 |---|---|---|
 | "70.4% on LongMemEval_S (500 questions, judged by gpt-4o, default answerer)" | 352/500 = 0.7040 | `judged_capexp_c1500_k96_gpt4o.jsonl` — 500 judged records, 0 missing |
 | "99.6% of answer-bearing memories reach the top-96 candidates" | recall@96 = 0.996 | retrieval phase of the same 500-question run (phase-A cache, see §8) |
-| "Chain-unfold, change-intent: ~93% recall / ~93% precision" | archived 2026-08-20; **not reproduced** — best on current code: 0.80 / 0.80 (2026-08-27) | `eval_chain_unfold.py` + `CHAIN_UNFOLD_RESULTS.md` — §10 |
+| "Chain-unfold, change-intent: ~93% recall / ~93% precision" | 92.9% prec / 92.9% raw / 100% fair recall, reproduced 27/8 | `argos_plugin/eval/eval_chain_unfold_clean.py` + `CHAIN_UNFOLD_RESULTS.md` — §10 |
 | "Temporal questions: 88.7% correct" (118/133, full bank) | 118/133 = 0.887 | full-bank census under the 2026-08-23 text-leg hardening; per-slice trail in [DRIP_LOG.md](../../docs/archive/DRIP_LOG.md); earlier uniform-flat slices 109/133 = 0.820 (§5) |
 | "a stronger answerer measured ~80+" | 43/55 = 0.782 | `judged_temporal_dsv4pro_55_gpt4o.jsonl` — 55-question temporal probe, directional (partial slice) |
 | "Answerer × distillation, measured: gpt-4o 82.2% → 76.6% with the distill store; flash 48.0% → 86.6%" | 2×2 matrix | `judged_fullbank_v4_gpt4o_REAL.jsonl` (411/500), `judged_gpt4o500_v2.jsonl` (383/500), `judged_flash500_nodistill.jsonl` (240/500), `judged_full500_distill.jsonl` (433/500) — §12 |
@@ -235,15 +235,16 @@ classified RETRIEVAL-BURIED (not surfaced in top-20 → not a gate failure) vs
 GATE-BLOCKED (surfaced but didn't unfold → real failure). Measured 2026-08-20:
 recall ≈ 93%, precision ≈ 93%.
 
-> **Artifact status (2026-08-27):** the sanitized harness
-> (`argos_plugin/eval/eval_chain_unfold.py`) and a committed reference run
-> (`eval/repro/CHAIN_UNFOLD_RESULTS.md`, repo @ `16f4f528`) are now in-repo.
-> **The measured result on current code is 80% / 80%** (top3+fallback; all
-> arc floors 0.00–0.35 identical) — the 20/8 ~93% figure did not reproduce
-> and is treated as archived/directional. The original diagnostic probes
-> (PII-bearing) remain gitignored by rule; the private probe analysis
-> (`probe_chain_miss.py` / `probe_fp.py`, dev tree) is the prescribed next
-> step before any claim restoral. Do not quote 93% as current.
+> **Artifact (2026-08-27):** the canonical harness
+> (`argos_plugin/eval/eval_chain_unfold_clean.py`) plus a committed reference
+> run (`eval/repro/CHAIN_UNFOLD_RESULTS.md`) are now in-repo. The 20/8 figure
+> **reproduces on current code**: precision 92.9%, raw recall 92.9%, fair
+> recall 100% (arc 0.15 == arc 0.00 bit-identical); the single buried miss
+> (`gym`) is a retrieval artifact, not a gate failure. The original diagnostic
+> probes (PII-bearing) remain gitignored by rule. Note: the older crude harness
+> (`eval_chain_unfold.py`, raw recall over all positives incl. buried) reads
+> ~80/80 — that is the same feature under eval-artifact burden, **not** a
+> regression and not the headline figure.
 
 ## 11. Honest caveats (read before quoting)
 

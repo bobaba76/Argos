@@ -1,5 +1,10 @@
 # Argos Engineering Notes — exploration log
 
+> **ARCHIVED 2026-08-27** — historical exploration log (Aug 2026). Live
+> facts now live in SYNC_HANDOFF.md, MEMORY_SYSTEM.md, and the benchmark
+> runbook; kept for the record — do not treat as current.
+
+
 > Started 2026-08-23 (session: chief code engineer familiarization).
 > Log everything seen + things worth investigating. Append as we go.
 

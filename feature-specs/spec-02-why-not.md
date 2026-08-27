@@ -1,5 +1,9 @@
 # Spec 2 — `memory_why_not`: "why didn't you remember X?"
 
+> **Status: IMPLEMENTED.** Historical design record (Aug 2026).
+> `memory_why_not` ships as a provider tool plus `why_not_cli.py`.
+
+
 ## 1. Why this exists
 When the agent fails to recall something the user is sure it knows ("I told you about the power bill!"), the user currently has no way to interrogate the failure. They want to ask **why** a specific memory did not surface and get a deterministic, honest answer about which stage of the retrieval pipeline dropped it — not a guess.
 

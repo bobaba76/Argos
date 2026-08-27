@@ -9,7 +9,7 @@ prompts, per-category denominators, and the judged outputs themselves.
 judged files with the official `print_metrics.py` during the writing of this
 document. **Extended 2026-08-26**: the answerer×distillation matrix (§12) and
 the grounding composite + GLM direct 449/500 arm (§13) were added, each wired
-into `verify_repro.sh`.
+into `verify_repro.sh`. **Refreshed 2026-08-27:** temporal headline now the full-bank 88.7% census (§5).
 
 ---
 
@@ -19,7 +19,8 @@ into `verify_repro.sh`.
 |---|---|---|
 | "70.4% on LongMemEval_S (500 questions, judged by gpt-4o, default answerer)" | 352/500 = 0.7040 | `judged_capexp_c1500_k96_gpt4o.jsonl` — 500 judged records, 0 missing |
 | "99.6% of answer-bearing memories reach the top-96 candidates" | recall@96 = 0.996 | retrieval phase of the same 500-question run (phase-A cache, see §8) |
-| "Temporal questions: 82% correct (133 questions)" | 109/133 = 0.820 | 52/75 (`judged_temporal_flash_flat_75_gpt4o.jsonl`) + 57/58 (`judged_temporal_flash_flat_58_gpt4o.jsonl`) — same protocol both slices |
+| "Chain-unfold, change-intent: ~93% recall / ~93% precision" | ~0.93 / ~0.93 | protocol in §10; harness NOT in-repo (maintainer dev tree) — see §10 artifact note |
+| "Temporal questions: 88.7% correct" (118/133, full bank) | 118/133 = 0.887 | full-bank census under the 2026-08-23 text-leg hardening; per-slice trail in [DRIP_LOG.md](../../docs/archive/DRIP_LOG.md); earlier uniform-flat slices 109/133 = 0.820 (§5) |
 | "a stronger answerer measured ~80+" | 43/55 = 0.782 | `judged_temporal_dsv4pro_55_gpt4o.jsonl` — 55-question temporal probe, directional (partial slice) |
 | "Answerer × distillation, measured: gpt-4o 82.2% → 76.6% with the distill store; flash 48.0% → 86.6%" | 2×2 matrix | `judged_fullbank_v4_gpt4o_REAL.jsonl` (411/500), `judged_gpt4o500_v2.jsonl` (383/500), `judged_flash500_nodistill.jsonl` (240/500), `judged_full500_distill.jsonl` (433/500) — §12 |
 | "Best current config: 89.8% (449/500), grounding + distill" | 449/500 = 0.8980 | direct: `judged_glm500_final.jsonl` (GLM answerer); flash equivalent: `composite_449.py` composition over the matrix + grounding files — §13 |
@@ -89,23 +90,30 @@ Judge neutrality was measured directly (cross-judge matrix, k=48): swapping
 the judge moved results ≤0.6pp; swapping the answerer moved them −8.5pp. The
 answerer, not the judge or the memory layer, is the dominant lever.
 
-## 5. Temporal protocol (82.0%, 2026-08-21)
+## 5. Temporal protocol (88.7% full bank — census 2026-08-23)
 
-The 133 temporal-reasoning questions were re-measured after date-anchored
-retrieval shipped (2026-08-21), in two sub-slices (75 + 58):
+The 133 temporal-reasoning questions are **fully measured** — every question,
+no projection — under the BM25-lite text-leg hardening of 2026-08-23:
+**118/133 = 88.7%** (was 109/133 = 82.0% uniform flat / 66.2% original
+protocol). Miss recovery 12/24 (50%); the 12 survivors are answerer-reasoning
+gaps, not retrieval failures (autopsied in the drip log). The step-by-step
+verification trail lives in [docs/archive/DRIP_LOG.md](../../docs/archive/DRIP_LOG.md).
+
+Protocol history (same 133-question bank, flash answerer, gpt-4o judge):
 
 | Slice | Protocol | Correct | Accuracy |
 |---|---|---|---|
-| 75 questions, flat render | flash answerer, gpt-4o judge | 52/75 | 69.3% |
-| 58 questions, flat render | flash answerer, gpt-4o judge | 57/58 | 98.3% |
+| 75 questions, flat render | pre-hardening | 52/75 | 69.3% |
+| 58 questions, flat render | pre-hardening | 57/58 | 98.3% |
 | **Combined (uniform flat)** | — | **109/133** | **82.0%** |
-| 75 questions, date-anchor prompt | flash answerer, gpt-4o judge | 54/75 | 72.0% |
-| 75 questions, chronological render | flash answerer, gpt-4o judge | 50/75 | 66.7% |
-| 58 questions, chronological-asc render | flash answerer, gpt-4o judge | 55/58 | 94.8% |
+| 75 questions, date-anchor prompt | 21/8 protocol | 54/75 | 72.0% |
+| 58 questions, chronological-asc render | 21/8 protocol | 55/58 | 94.8% |
+| **Full bank, hardened store (census)** | 23/8 protocol | **118/133** | **88.7%** |
 
 "Date-anchored retrieval" = the time-expression re-ranking (+word-number
-resolution) applied before rendering, added 2026-08-21. The 58-question slice
-at 98.3% flat render is small-n but internally consistent (see caveats §11).
+resolution) applied before rendering, added 2026-08-21; the census then ran
+the whole bank through the hardened text leg. The 58-question slices are
+small-n but internally consistent (see caveats §11).
 
 ## 6. Per-category scores — headline run (recomputed 2026-08-22)
 
@@ -227,13 +235,19 @@ classified RETRIEVAL-BURIED (not surfaced in top-20 → not a gate failure) vs
 GATE-BLOCKED (surfaced but didn't unfold → real failure). Measured 2026-08-20:
 recall ≈ 93%, precision ≈ 93%.
 
+> **Artifact gap (noted 2026-08-27):** the chain-unfold harness
+> (`eval_chain_unfold_clean.py`) is **not checked into this repo** — it lives
+> in the maintainer's dev tree, and probe files are gitignored by rule. The
+> ~93% figure is protocol-documented here but not artifact-reproducible from
+> this checkout; treat it as directional.
+
 ## 11. Honest caveats (read before quoting)
 
-1. **70.4% and 82% describe different protocols.** 70.4% = full 500 with
-   flat render, no date anchor (temporal 47.4% inside it). 82% = the 133
-   temporal questions re-measured under date-anchored retrieval. Quoting them
-   side by side is correct per the README's framing ("improving that bucket
-   further") but they are not one run.
+1. **70.4% and 88.7% describe different protocols.** 70.4% = full 500 with
+   flat render, no date anchor (temporal 47.4% inside it). 88.7% = the 133
+   temporal questions re-measured under date-anchored retrieval + the 23/8
+   text-leg hardening (full-bank census). Quoting them side by side is
+   correct per the README's framing but they are not one run.
 2. **Cross-system numbers are vendor-published** under their own protocols
    (their exact k, judge versions, and prompts are not fully public). We match
    the model tier (gpt-4o-class both sides) and official judge prompts; the

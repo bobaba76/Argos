@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Chain-unfold eval: does auto-injection fire correctly, at what cost?
 
+**Superseded as the headline harness by `eval_chain_unfold_clean.py`**
+(unsaturated topics, fair recall == recall over surfaced positives). This
+older harness measures the SAME feature under the HARSHER metric — raw recall
+over ALL positives including retrieval-buried chains on saturated topics,
+which the clean protocol classifies as eval artifacts. Reading it as a
+regression vs the clean figure is a known trap (see
+eval/repro/CHAIN_UNFOLD_RESULTS.md). Keep for the dense-store stress view;
+prefer the clean harness for the headline number.
+
 Method:
 - Temp home + temp DuckDB store (never touches live data).
 - Seed 3 real chains via update_memory (v1 -> v2):

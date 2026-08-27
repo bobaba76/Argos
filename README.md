@@ -1,115 +1,69 @@
 # Argos
 
-Persistent memory for AI agents, running on your own machine.
+Persistent memory for AI agents, on your own machine. A Hermes plugin: hybrid vector + graph store with local embeddings.
 
-## What Argos is
+## Capabilities
 
-Argos is a plugin for Hermes Agent that gives your agent a real memory. Instead of forgetting everything the moment a conversation ends, it keeps track of who you are, what you care about, and what you've told it before, and brings that back up when it's relevant. It's named after the hundred-eyed watchman from Greek myth who never slept and never missed a thing. Under the hood it combines a vector store, a knowledge graph, and local embeddings, but you don't need to know any of that to use it. You just talk to your agent, and it starts remembering.
+- **Facts persist across sessions.** Tell it once, ask weeks later.
+- **Changes are versioned, not erased.** Updating a fact chains a new version onto the old one. Ask "what changed?" and get the history.
+- **Semantic search.** Vector + keyword fusion (RRF) finds memories by meaning, not just exact words.
+- **Relationship graph.** A Kùzu graph of entities, relations, and aliases powers multi-hop queries ("who works with my sister?").
+- **Ambient context.** Time, location, weather, and recent file activity inject every turn via a `pre_llm_call` hook.
+- **Insight capture.** "I just realised…" moments are logged verbatim. Browse with `/ilog`, resurface with `/revisit`, store exclusions with `/neg <claim>`.
+- **Gated distillation.** Once a day, cost-capped, Argos proposes distilled patterns from accumulated records. Nothing lands in memory without your approval.
+- **Reversible cleanup.** Stale or duplicate memories are quarantined, not deleted. Restore if needed.
 
-## What it does for you
+## Trust model
 
-- **Remembers facts across sessions.** Tell it once that you're allergic to shellfish or that your team ships on Fridays, and it doesn't need you to say it again. Ask "what do you know about my work schedule?" three weeks later and it'll still know.
-- **Tracks how things change over time.** If your job title changes or your address moves, Argos doesn't erase the old fact, it versions it. Ask "what changed about my role this year?" and it can walk you through the history instead of just giving you the latest snapshot.
-- **Finds things by meaning, not just keywords.** Ask "what did we agree about the budget in March?" and it searches by intent, fuses that with keyword matches, and surfaces the memory even if you never used the word "budget" when you first mentioned it.
-- **Understands relationships between things it remembers.** Ask "who works with my sister?" and it can traverse a graph of people, places, and concepts instead of just doing flat text lookup.
-- **Knows the context of right now.** It's aware of the current time in your timezone, roughly where you are, the weather, and files you've recently touched, so it can answer things like "should I bring an umbrella later?" without you spelling out where "later" and "here" mean.
-- **Catches your own realizations.** When you say something like "I just realized I've been avoiding this project because I'm scared of the scope," it logs that as an insight and can bring it back up later if the topic resurfaces. You can browse them with `/ilog` or pull one back into the conversation with `/revisit`. Use `/neg <claim>` to store an explicit exclusion (e.g. `/neg I do not drink coffee`) — injected with a [negative] label so the model answers grounded nos instead of guessing.
-- **Learns from its own feedback over time.** Once a day, gated and cost-capped, Argos looks over what it has remembered — and what you've marked helpful or dismissed — and *proposes* distilled patterns: insights, contradictions, and guardrails ("this project keeps slipping whenever X happens"). Nothing it proposes lands in memory without your approval; it all passes through the same suggestion tray you already approve.
-- **Cleans up after itself, reversibly.** Old or duplicate memories get quarantined rather than deleted, and you can restore them if it turns out you needed them after all.
+Nothing becomes a memory silently. Every turn is mined for facts (regex first, LLM fallback), but the output is a *proposal* — pending until you approve it. Updates chain versions instead of overwriting. Cleanup quarantines instead of deleting. Distillation proposes but never writes. Every feature is gated by a measurement in the eval harness; ideas that didn't help were turned off.
 
-## How it earns trust
+## Tools
 
-Memory systems fail when they either forget things that matter or remember things you never agreed to. Argos is built around not doing either.
+Sixteen `memory_*` tools, grouped:
 
-Nothing becomes a memory silently. Every conversation turn gets mined for durable facts, first with regex, then with an LLM fallback if needed, but what comes out of that is a *proposal*, not a stored memory. An auxiliary review step quarantines obvious junk automatically, and everything else sits pending until you explicitly approve it. Argos never puts words in your mouth and calls them memories.
+| Group | Tools |
+|-------|-------|
+| Store & search | `memory_search`, `memory_save`, `memory_fetch_full` |
+| Version chains | `memory_update`, `memory_delete`, `memory_chain` |
+| Graph | `memory_graph_search`, `memory_graph_query` |
+| Review & restore | `memory_candidate_list`, `memory_candidate_review`, `memory_restore` |
+| Feedback & maintenance | `memory_feedback`, `memory_maintenance` |
+| Diagnostics | `memory_why_not`, `memory_tombstones`, `memory_tombstone_purge` |
 
-Updating a fact never destroys the old version. When something changes, Argos chains a new version onto the old one instead of overwriting it. You can look at the arc, compare versions, or just ask "what changed?" and get a compact history injected automatically. Your past self doesn't get erased just because your present self said something different.
+## Numbers
 
-Cleanup is reversible too. Maintenance can quarantine stale or duplicate memories, but quarantine isn't deletion. If the cleanup was wrong, you restore it and move on.
+| Metric | Result | Protocol |
+|--------|--------|----------|
+| LongMemEval_S (best config) | 89.8% (449/500) | GLM-5.3-flash answerer, gpt-4o judge |
+| LongMemEval_S (baseline) | 70.4% (352/500) | gpt-4o judge, default answerer |
+| Chain-unfold (change-intent) | 93% recall / 93% precision | canonical eval harness |
+| Temporal questions | 88.7% (118/133) | full-bank, text-leg hardening |
+| Recall@96 | 99.6% | answer-bearing memories reaching top-96 |
 
-The distillation pass ("the dream") follows the same rule one level up. It can suggest patterns the store never stated outright, but it can only *propose*: its output lands in the same suggestion tray your extracted memories pass through, and nothing becomes active memory until you approve it. It doesn't edit, merge, or delete anything on its own — ever.
+Protocols, dataset SHA-256, per-category denominators, model versions, prompts, exact commands, and judged outputs: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
 
-And underneath all of this is a habit worth mentioning: every feature in Argos is gated by an actual measurement in the eval harness. Several ideas that sounded good on paper, plain chronological ordering, a stronger graph boost, wider context injection, got turned off because the numbers said they didn't help. That's not a failure, it's the point. Features earn their place with evidence, not intuition.
+## What it can't do
 
-## The tools
-
-Argos exposes sixteen tools your agent can call directly:
-
-| Tool | What it's for |
-|---|---|
-| `memory_search` | Hybrid vector + keyword search |
-| `memory_save` | Store a new memory |
-| `memory_update` | Version an existing memory |
-| `memory_delete` | Delete a memory; the previous version takes its place |
-| `memory_chain` | Walk a memory's version history (arc, versions, diff) |
-| `memory_graph_search` | Search the relationship graph |
-| `memory_graph_query` | Run a direct graph traversal |
-| `memory_candidate_list` | See pending extraction proposals |
-| `memory_candidate_review` | Approve or reject a proposal |
-| `memory_restore` | Bring a quarantined memory back |
-| `memory_feedback` | Tag a memory helpful, dismissed, or incorrect |
-| `memory_maintenance` | Run cleanup and dedup passes |
-| `memory_why_not` | Explain why a memory didn't surface in retrieval |
-| `memory_fetch_full` | Fetch a memory's full untruncated text by ID |
-| `memory_tombstones` | List deletion tombstones — fingerprints of hard-deleted facts that are blocked from being re-created |
-| `memory_tombstone_purge` | Lift a deletion tombstone so a previously hard-deleted fact may be saved again (explicit request only) |
-
-## The honest numbers
-
-Argos's headline measurements, each under a stated protocol:
-
-- **Chain-unfold, change-intent questions: ~93% recall / ~93% precision**
-  (2026-08-20, its own eval harness). The residual false positives sit just
-  inside the true-positive similarity band — one sits at 0.548 — so ~93%
-  precision is a *diagnosed ceiling*: no cosine threshold separates them.
-  Recall on this category moved via the intent matcher, not the thresholds.
-- **99.6% of answer-bearing memories reach the top-96 candidates.** Recall
-  (delivery) isn't the weak point.
-- **Temporal questions: 88.7% correct** (118/133 — the full bank measured
-  under the 2026-08-23 text-leg hardening, one uniform protocol). Earlier
-  protocols: 82% with date-anchored retrieval (time-expression re-ranking,
-  added 2026-08-21), 66.2% originally.
-- **Overall: 70.4% on LongMemEval_S** (500 questions, judged by gpt-4o,
-  default answerer) — and head-to-head runs showed the *answerer*, not the
-  memory layer, is the dominant lever (measured 2×2, below). The benchmark
-  runs on synthetic conversation data; real conversations are messier and
-  your results may differ.
-- **Answerer × distillation, measured (2×2, all 500 qids, same judge):**
-  gpt-4o 82.2% → 76.6% with the distill store; flash 48.0% → 86.6% with it.
-  The distill store is load-bearing for the flash answerer (+38.6 pts) and
-  mildly harmful for gpt-4o (−5.6 pts).
-- **Best current config: 89.8% (449/500) on LongMemEval_S** — grounding
-  prompt + distill store. Directly measured with the GLM-5.3-flash answerer
-  (26/8, ~US$1.9, gpt-4o judge); the flash-answerer equivalent is the same
-  449/500 as a zero-overlap composition (distill store on 338 qids +
-  grounding A/B on 162). Two independent full-bank measurements, one ruler.
-
-  Every number above is independently re-measurable — dataset SHA-256, per-category
-  denominators, model versions, prompts, exact commands, and the judged outputs
-  themselves: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
-
-No claim here is "we beat vendor X." The numbers are there so you can judge
-for yourself, not so we can win an argument.
-
-## What it can't do yet
-
-Be direct about this one: your memory data, embeddings, and graph all live locally, as flat files on your machine, and never go to a hosted memory vendor. But the LLM calls Argos makes for fact extraction, review, and the optional distillation pass currently go through whatever cloud model you've configured in Hermes. There's no native local-LLM support yet. If you want a fully offline setup, you're not there today, only the embedding step is offline right now.
+Memory data, embeddings, and graph live locally as flat files — no hosted vendor. LLM calls for extraction, review, and distillation go through your configured cloud model; no native local-LLM support yet. Only embeddings are offline.
 
 ## Quick start
 
-1. Copy the plugin folder to your Hermes plugins directory (on Windows: `%LOCALAPPDATA%\hermes\plugins\hybrid_memory`).
+1. Copy `argos_plugin/` to your Hermes plugins directory (`%LOCALAPPDATA%\hermes\plugins\hybrid_memory` on Windows).
 2. Restart Hermes.
-3. Run `hermes tools` and confirm the sixteen `memory_*` tools show up.
-4. Configure it in `hybrid_memory.json`, or through the settings UI under Memory -> Argos (Local).
+3. Run `hermes tools` — confirm the 16 `memory_*` tools appear.
+4. Configure in `hybrid_memory.json` or the settings UI (Memory → Argos).
 
 Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md).
 
-One honest note: Argos is developed and tested on the maintainer's own build of Hermes. It only uses stock Hermes plugin APIs (the memory provider, the pre-call hook, the user-context injection path), so it's expected to work on a plain install, but a plain upstream build hasn't been through the test suite yet. If you hit something on a stock build, an issue is the fastest way to get it fixed.
+Argos is developed and tested on the maintainer's build of Hermes. It uses only stock plugin APIs (memory provider, pre-call hook, user-context injection), so it should work on a plain install, but a stock upstream build hasn't been through the test suite yet.
 
 ## License
 
-Argos is licensed under the **Business Source License 1.1** (BSL 1.1): free to read, modify, and self-host for personal and non-production use; production or commercial use requires a license from the author. It converts to **Apache 2.0** automatically on August 21, 2030. MIT-licensed components from the Hermes Agent base stay MIT. Full terms and the commercial-licensing contact path: [LICENSE.md](LICENSE.md).
+Business Source License 1.1 (BSL 1.1): free for personal and non-production use; production or commercial use requires a license. Converts to Apache 2.0 on August 21, 2030. Full terms: [LICENSE.md](LICENSE.md).
 
 ## More docs
 
-Settings and every configuration option live in [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md), not in this file. For how the memory system actually works under the hood, see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md). If something breaks or you need to migrate, see [REINSTALL.md](REINSTALL.md). Tests live under `argos_plugin`, run them with `python -m pytest tests/ -v`.
+- [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) — every setting, default, and description
+- [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md) — how the system works under the hood
+- [REINSTALL.md](REINSTALL.md) — reinstall, migration, graph rebuild
+- Tests: `python -m pytest tests/ -v` (run from `argos_plugin/`)

@@ -2,50 +2,32 @@
 
 ## Prerequisites
 
-- **Python 3.11+**
-- **Hermes** (the agent framework this plugin extends)
-- **pip** packages installed automatically by the plugin system:
-  - `duckdb` — vector + text search storage
-  - `kuzu` — relationship graph database
-  - `sentence-transformers` — local embedding model (BGE-small-en-v1.5)
-- *(Optional)* `BAAI/bge-reranker-base` — cross-encoder reranker, downloaded
-  on first use only if `reranker_enabled=true` (~420MB).
+- Python 3.11+
+- Hermes (the agent framework this plugin extends)
+- pip packages auto-installed on first load: `duckdb`, `kuzu`, `sentence-transformers`
+- Optional: `BAAI/bge-reranker-base` (~420MB, downloaded on first use if `reranker_enabled=true`)
 
 ## Installation
 
 ### Option A: Automatic (via Hermes plugin system)
 
-1. Place the `argos_plugin/` directory in your Hermes plugins folder:
+1. Place `argos_plugin/` in your Hermes plugins folder:
    ```
-   ~/.hermes/plugins/hybrid_memory/        (Linux/macOS)
-   %LOCALAPPDATA%\hermes\plugins\hybrid_memory\  (Windows)
+   ~/.hermes/plugins/hybrid_memory/            (Linux/macOS)
+   %LOCALAPPDATA%\hermes\plugins\hybrid_memory\ (Windows)
    ```
-
-2. Restart Hermes. The plugin auto-installs its pip dependencies on first load.
-
-3. Verify the plugin loaded:
-   ```
-   hermes tools
-   ```
-   You should see all sixteen `memory_*` tools: `memory_search`,
-      `memory_save`, `memory_update`, `memory_delete`, `memory_chain`,
-      `memory_graph_search`, `memory_graph_query`, `memory_candidate_list`,
-      `memory_candidate_review`, `memory_restore`, `memory_feedback`,
-      `memory_maintenance`, `memory_why_not`, `memory_fetch_full`,
-      `memory_tombstones`, and `memory_tombstone_purge`.
+2. Restart Hermes. Pip dependencies install on first load.
+3. Verify: `hermes tools` — you should see the 16 `memory_*` tools.
 
 ### Option B: Manual pip install
 
-If auto-install fails, install dependencies manually:
 ```bash
 pip install duckdb kuzu sentence-transformers
 ```
 
 ## Configuration
 
-The config file lives in the Hermes home directory as `hybrid_memory.json`
-(`~/.hermes/hybrid_memory.json` on Linux/macOS; `%LOCALAPPDATA%\hermes\hybrid_memory.json`
-on Windows — created on first run with defaults). A representative subset:
+Settings live in `hybrid_memory.json` in the Hermes home directory (`~/.hermes/` on Linux/macOS, `%LOCALAPPDATA%\hermes\` on Windows). Created on first run with defaults. Representative subset:
 
 ```json
 {
@@ -72,53 +54,31 @@ on Windows — created on first run with defaults). A representative subset:
 }
 ```
 
-A few settings have different display defaults in the desktop UI schema than
-in the runtime defaults above: `max_injected_items` (UI `8` vs runtime `20`),
-`graph_retrieval_boost` (UI `0.05` vs runtime `0.0`), and `chain_unfold`
-(UI `off` vs runtime `auto`). Your saved `hybrid_memory.json` wins either way.
-
-See `CONFIG_REFERENCE.md` for the full settings tables and a description of
-every option.
+The settings UI reads the same `hybrid_memory.json` the service uses — what you see is what's live. Full settings reference: [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md).
 
 ## Storage modes
 
-- **`shared_service`** (recommended) — a standalone RPC service holds the database; multiple Hermes processes (CLI + gateway + desktop) share one canonical store safely.
-- **`direct`** — the plugin opens the DuckDB file directly. Single-process only; use for debugging.
+- **`shared_service`** (recommended) — a standalone RPC service owns the database; multiple Hermes processes (CLI + gateway + desktop) share one store safely.
+- **`direct`** — the plugin opens the DuckDB file directly. Single-process only; for debugging.
 
 ## Embedding model
 
-The plugin uses `BGE-small-en-v1.5` by default, loaded locally (no API calls, no cloud). The model is cached at `~/.hermes/models/bge-small-en-v1.5/`. If the model is unavailable, the system gracefully falls back to text-only search.
+BGE-small-en-v1.5, loaded locally (no API calls, no cloud). Cached at `~/.hermes/models/bge-small-en-v1.5/`. Falls back to text-only search if the model is unavailable.
 
 ## Verifying it works
 
-1. Save a memory:
-   ```
-   hermes -m "Remember: I use Vim as my primary editor"
-   ```
+`hermes tools` confirms the plugin loaded (16 `memory_*` tools listed). To test save/search/graph-query, start a chat and ask the agent to use the tools — that's the only runtime path. Examples:
 
-2. Search for it:
-   ```
-   hermes -m "What editor do I use?"
-   ```
-   The system should retrieve the memory via vector similarity.
+- "Remember that I use Vim as my primary editor" — triggers `memory_save`.
+- "What editor do I use?" — triggers `memory_search`.
+- "Show me the graph around Vim" — triggers `memory_graph_query`.
 
-3. Check the graph:
-   ```
-   hermes tools memory_graph_query --entity "Vim"
-   ```
-   Should show the entity node and its relationships.
+Ambient context (time/location/weather/file-activity) injects automatically every turn via a `pre_llm_call` hook. Set `location` in `~/.hermes/config.yaml` (or `HERMES_LOCATION`) for location/weather hints.
 
-4. Ambient context (time/location/weather/file-activity) is injected
-   automatically every turn via a `pre_llm_call` hook — no setup needed
-   beyond setting `location` in `~/.hermes/config.yaml` (or
-   `HERMES_LOCATION`) if you want the location/weather hints.
-
-5. Insight log: share a realization in chat ("I just realised…") and it's
-   captured as an `insight`-category memory. Browse with `/ilog` or surface
-   a random older one with `/revisit`.
+Insight log: share a realization in chat ("I just realised…") and it's captured as an `insight`-category memory. Browse with `/ilog` or surface a random older one with `/revisit`.
 
 ## Troubleshooting
 
-- **"Kuzu graph unavailable"** — the graph database failed to initialize. Check write permissions on `~/.hermes/hybrid_memory_kuzu/`.
-- **Embedding model not found** — ensure `sentence-transformers` is installed and the model cached. The system will fall back to text search if embeddings are unavailable.
-- **DuckDB writer lock** — another process has the DB open in direct mode. Switch to `shared_service` mode.
+- **"Kuzu graph unavailable"** — graph database failed to initialize. Check write permissions on `~/.hermes/hybrid_memory_kuzu`.
+- **Embedding model not found** — ensure `sentence-transformers` is installed and the model is cached. Falls back to text search if embeddings are unavailable.
+- **DuckDB writer lock** — another process has the DB open in direct mode. Switch to `shared_service`.

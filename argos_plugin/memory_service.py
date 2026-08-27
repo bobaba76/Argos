@@ -341,6 +341,11 @@ class MemoryService:
             if self.server is not None:
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             return {"status": "shutting_down"}
+        if request.get("method") == "backup":
+            # Service-coordinated backup: the service is the sole DB writer,
+            # so CHECKPOINT + EXPORT is safe and cross-platform.  No
+            # component/method split — this is a top-level service command.
+            return self._backup(request.get("args") or {})
 
         component = request.get("component")
         method = request.get("method")
@@ -355,6 +360,31 @@ class MemoryService:
             if component == "store":
                 return self._call_store(method, args, user_id)
             return self._call_graph(method, args, user_id)
+
+    def _backup(self, args: dict) -> Any:
+        """Service-coordinated backup via EXPORT DATABASE (FORMAT PARQUET)."""
+        if __package__:
+            from .backup import backup_store, list_snapshots
+        else:
+            from backup import backup_store, list_snapshots
+        # Resolve dst_root from config or default to <home>/backups/memory.
+        config = _load_config(self.home)
+        backup_cfg = config.get("backup", {}) if isinstance(config.get("backup"), dict) else {}
+        dst_root = str(backup_cfg.get("dst_root", str(self.home / "backups" / "memory")))
+        retention = int(backup_cfg.get("retention_snapshots", 6))
+        # If args override (CLI can pass these), use them.
+        dst_root = str(args.get("dst_root", dst_root))
+        retention = int(args.get("retention_snapshots", retention))
+        if args.get("list"):
+            return {"snapshots": list_snapshots(dst_root)}
+        with self.lock:
+            manifest = backup_store(
+                self.store.connection,
+                dst_root,
+                retention_snapshots=retention,
+                source_db_path=self.store.db_path,
+            )
+        return manifest
 
     def close(self) -> None:
         with self.lock:

@@ -232,6 +232,22 @@ class _SharedRPC:
     def stop_service(self) -> Any:
         return self._request({"method": "shutdown"})
 
+    def backup(self, dst_root: str | None = None, retention: int | None = None) -> Any:
+        """Trigger a service-coordinated backup. Returns the manifest dict."""
+        args: Dict[str, Any] = {}
+        if dst_root is not None:
+            args["dst_root"] = dst_root
+        if retention is not None:
+            args["retention_snapshots"] = retention
+        return self._request({"method": "backup", "args": args})
+
+    def list_backups(self, dst_root: str | None = None) -> Any:
+        """List available snapshots in the backup destination."""
+        args: Dict[str, Any] = {"list": True}
+        if dst_root is not None:
+            args["dst_root"] = dst_root
+        return self._request({"method": "backup", "args": args})
+
 
 class SharedMemoryStore:
     """DuckDBMemoryStore-compatible client backed by the shared service."""

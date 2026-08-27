@@ -15,7 +15,7 @@
 
 ### Option A: Automatic (via Hermes plugin system)
 
-1. Place the `hybrid_memory_plugin/` directory in your Hermes plugins folder:
+1. Place the `argos_plugin/` directory in your Hermes plugins folder:
    ```
    ~/.hermes/plugins/hybrid_memory/        (Linux/macOS)
    %LOCALAPPDATA%\hermes\plugins\hybrid_memory\  (Windows)
@@ -27,11 +27,12 @@
    ```
    hermes tools
    ```
-   You should see all fourteen `memory_*` tools: `memory_search`,
+   You should see all sixteen `memory_*` tools: `memory_search`,
       `memory_save`, `memory_update`, `memory_delete`, `memory_chain`,
       `memory_graph_search`, `memory_graph_query`, `memory_candidate_list`,
       `memory_candidate_review`, `memory_restore`, `memory_feedback`,
-      `memory_maintenance`, `memory_why_not`, and `memory_fetch_full`.
+      `memory_maintenance`, `memory_why_not`, `memory_fetch_full`,
+      `memory_tombstones`, and `memory_tombstone_purge`.
 
 ### Option B: Manual pip install
 
@@ -42,7 +43,9 @@ pip install duckdb kuzu sentence-transformers
 
 ## Configuration
 
-The config file lives at `~/.hermes/hybrid_memory.json` (created on first run with defaults). A representative subset:
+The config file lives in the Hermes home directory as `hybrid_memory.json`
+(`~/.hermes/hybrid_memory.json` on Linux/macOS; `%LOCALAPPDATA%\hermes\hybrid_memory.json`
+on Windows — created on first run with defaults). A representative subset:
 
 ```json
 {
@@ -74,8 +77,8 @@ in the runtime defaults above: `max_injected_items` (UI `8` vs runtime `20`),
 `graph_retrieval_boost` (UI `0.05` vs runtime `0.0`), and `chain_unfold`
 (UI `off` vs runtime `auto`). Your saved `hybrid_memory.json` wins either way.
 
-See `MEMORY_SYSTEM.md` for the full config table and a description of every
-setting.
+See `CONFIG_REFERENCE.md` for the full settings tables and a description of
+every option.
 
 ## Storage modes
 

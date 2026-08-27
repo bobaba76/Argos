@@ -2235,6 +2235,32 @@ class ArgosProvider(MemoryProvider):
                 "pending_user_confirmation": "pending_user_confirmation",
             }
             final_status = decision_map.get(decision, "pending_user_confirmation")
+
+            # Value-supersession (issue #4): if the candidate was flagged with
+            # a value conflict at save time, downgrade to pending_user_confirmation
+            # regardless of the LLM's decision — a human must confirm that the
+            # new value supersedes the old one.  Pass supersedes_memory_id so
+            # the confirmation chains the supersession automatically.
+            supersedes_memory_id: str | None = None
+            candidate_payload = candidate.get("payload") or {}
+            if isinstance(candidate_payload, str):
+                try:
+                    candidate_payload = json.loads(candidate_payload)
+                except (json.JSONDecodeError, TypeError):
+                    candidate_payload = {}
+            value_sup = candidate_payload.get("value_supersession")
+            if value_sup and isinstance(value_sup, dict):
+                supersedes_memory_id = value_sup.get("supersedes_memory_id")
+                if final_status == "reviewed_approved":
+                    final_status = "pending_user_confirmation"
+                    review["reason"] = (
+                        "Value-supersession detected: new value "
+                        f"{value_sup.get('new_value', '?')} conflicts with "
+                        f"existing value {value_sup.get('old_value', '?')}. "
+                        "Confirmation required to supersede the old fact. "
+                        + (review.get("reason", "") or "")
+                    ).strip()
+
             result = self._store.review_candidate(
                 evidence_retention=getattr(self, "_evidence_retention", "full"),
                 candidate_id=candidate["candidate_id"],
@@ -2245,6 +2271,7 @@ class ArgosProvider(MemoryProvider):
                 durability=review.get("durability"),
                 scope=review.get("scope"),
                 review_source="auto_review",
+                supersedes_memory_id=supersedes_memory_id,
             )
             # Spec 1: deterministic expiry suggestion on approval. The
             # suggestion is logged but NOT auto-applied — the user confirms

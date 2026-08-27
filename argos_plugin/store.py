@@ -26,6 +26,11 @@ try:
     from .retriever import DuckDBRetriever
 except ImportError:  # store.py imported as a top-level module (tests)
     from retriever import DuckDBRetriever
+
+try:
+    from .value_extractor import extract_values, values_conflict
+except ImportError:  # store.py imported as a top-level module (tests)
+    from value_extractor import extract_values, values_conflict
 import time
 import uuid
 from collections import deque
@@ -1611,6 +1616,82 @@ class DuckDBMemoryStore:
         )
         return fetched[0] if fetched else None
 
+    # -- value-supersession (stale-number detection) -------------------------
+
+    def _find_conflicting_active_value(
+        self,
+        content: str,
+        category: str,
+    ) -> Optional[tuple[str, str, str, str]]:
+        """Find an active memory whose value conflicts with *content*.
+
+        Extracts numeric values from *content* and checks active records in
+        the same category for the same subject with a different value.
+        Zero LLM — pure regex + token-overlap matching.
+
+        Returns ``(old_memory_id, old_content, new_value, old_value)`` for the
+        first conflict found, or None if no conflict.
+        """
+        new_values = extract_values(content)
+        if not new_values:
+            return None
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT memory_id, content FROM memory_records
+                   WHERE category = ? AND valid_to IS NULL
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND COALESCE(status, 'active') = 'active'""",
+                [category, self.user_id],
+            ).fetchall()
+        for old_id, old_content in rows:
+            if old_content == content:
+                continue  # same text — dedup handles this
+            old_values = extract_values(old_content)
+            if not old_values:
+                continue
+            conflict = values_conflict(new_values, old_values)
+            if conflict:
+                new_v, old_v = conflict
+                return (old_id, old_content, new_v.value, old_v.value)
+        return None
+
+    def _mark_superseded(
+        self,
+        memory_id: str,
+        reason: str,
+        superseded_by: str | None = None,
+    ) -> bool:
+        """Mark a memory as superseded (set valid_to).
+
+        This is the storage-level supersession — it sets ``valid_to = now``
+        and optionally ``superseded_by``.  The old record is preserved for
+        history queries.  Returns True if the record was found and updated.
+        """
+        now = self._now()
+        with self._lock:
+            assert self.connection is not None
+            check = self.connection.execute(
+                """SELECT 1 FROM memory_records
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND valid_to IS NULL""",
+                [memory_id, self.user_id],
+            ).fetchone()
+            if not check:
+                return False
+            self.connection.execute(
+                """UPDATE memory_records
+                   SET valid_to = ?, superseded_by = ?, updated_at = ?
+                   WHERE memory_id = ?""",
+                [now, superseded_by, now, memory_id],
+            )
+        logger.info(
+            "Value-supersession: %s superseded (%s) by %s",
+            memory_id, reason, superseded_by or "N/A",
+        )
+        return True
+
     # -- candidate/proposal queue ---------------------------------------------
 
     @staticmethod
@@ -1709,6 +1790,22 @@ class DuckDBMemoryStore:
         candidate_payload.setdefault("source", source)
         if external:
             candidate_payload["external_source"] = True
+        # Value-supersession detection (issue #4): check if this candidate's
+        # numeric value conflicts with an existing active fact.  If so, record
+        # the conflict in the payload so the reviewer can surface it as a
+        # supersession proposal.  Zero LLM — pure regex + token-overlap.
+        try:
+            conflict = self._find_conflicting_active_value(content, category)
+            if conflict:
+                old_id, old_content, new_val, old_val = conflict
+                candidate_payload["value_supersession"] = {
+                    "supersedes_memory_id": old_id,
+                    "old_content": old_content[:200],
+                    "new_value": new_val,
+                    "old_value": old_val,
+                }
+        except Exception as exc:
+            logger.debug("Value-supersession check failed: %s", exc)
         try:
             normalized_confidence = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):

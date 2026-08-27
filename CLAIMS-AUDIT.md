@@ -61,19 +61,18 @@ headline is answerer-conditional (GLM direct / flash composed).
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
 | Test suite | ✓ | 26 test modules in `argos_plugin/tests/` (gate 21, egress, adversarial chains, contradiction matrix, shared-service RPC). |
-| No personal data in public repo | ✓ verified | only the gold freeze sha is committed (`eval/gold/README.md`). |
+| Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
 
 ## 3. Claims flagged — measured internally, no public artifact yet
 
-These are real measurements made on the maintainer's production setup.
-They are **internal** — not quotable as public claims until they have a
+These measurements are not part of the public claim set until they have a
 committed, re-runnable artifact:
 
 | Claim | Status | What's missing |
 |---|---|---|
-| Personal self-corpus gate + personal bench | internal | operates on the maintainer's live store; results recorded in the weekly recon skill, not public |
+| Self-corpus gate + personal bench | internal | maintained for the weekly recon |
 
 ---
 

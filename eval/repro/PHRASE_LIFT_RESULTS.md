@@ -19,8 +19,8 @@ distractors tie it) + 3 negative controls. No LLM, no network.
 | Δ | **+0.2083** | **+3** |
 
 - Zero regressions from control rank-1 cases.
-- Reproduces the real-store effect measured 24/8 (MRR .66 → .82, h@1 4→6/8
-  on real queries): same class, same direction.
+- Reproduces the same effect measured 24/8 (MRR .66 → .82, h@1 4→6/8):
+  same class, same direction.
 
 ## Verdict
 
@@ -40,6 +40,6 @@ Exit 0 = improved with no regression.
 
 ## Change history
 
-- 2026-08-24 — R0 validation on real queries (MRR .66 → .82, h@1 4→6/8).
+- 2026-08-24 — initial validation (MRR .66 → .82, h@1 4→6/8).
 - 2026-08-27 — sanitized reproducible harness committed; result reproduced
   (MRR 0.7292 → 0.9375, h@1 4/8 → 7/8).

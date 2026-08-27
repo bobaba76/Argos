@@ -9,8 +9,8 @@ class of query where the gold memory shares the exact phrase (e.g. "who is
 the sales director" -> "...Raymond is the Sales Director...") but was ranked
 low because unigram token overlap tied it with merely-similar content.
 
-The R0 validation (24/8) measured MRR .66 -> .82, h@1 4/8 -> 6/8 on eight
-real queries; this file is the sanitized, re-runnable equivalent:
+The initial validation (24/8) measured MRR .66 -> .82, h@1 4/8 -> 6/8 on
+eight queries; this file is the sanitized, re-runnable equivalent:
 deterministic synthetic facts (no real names/employers/locations), each
 case built so the gold memory shares the verbatim phrase while 3-4 similar
 distractors tie it on token overlap — the exact failure mode the lift
@@ -20,7 +20,7 @@ Protocol:
 - Fresh temp store per run (local embeddings, bge-small-en-v1.5, offline).
 - Run 1: alpha=0.0 (control). Run 2: alpha=0.25 (production).
 - Metric: h@1 (rank of gold memory == 1) and MRR over the same query set.
-- No LLM, no network, no personal data. Deterministic.
+- No LLM, no network. Deterministic.
 
 Run: env -u PYTHONPATH HF_HUB_OFFLINE=1 <hermes-venv-python>
      argos_plugin/eval/eval_phrase_lift_clean.py

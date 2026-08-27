@@ -2,7 +2,7 @@
 
 Deterministic ranking A/B: **baseline (no cross-encoder) vs reranker_on**
 (`bge-reranker-base`, `reranker_top_n=50`, CE blend 0.8/0.2) on a 300-query
-stratified sample (seed 42) of the maintainer's real-store queries, evaluated
+stratified sample (seed 42), evaluated
 with `argos_plugin/eval/run_eval_provider.py` against the frozen snapshot
 `20260826_170626_224920_4d612e0f`.
 
@@ -20,9 +20,7 @@ with `argos_plugin/eval/run_eval_provider.py` against the frozen snapshot
 | nDCG@5 | 0.9174 | 0.9432 | +0.0258 |
 | P@5 | 0.1913 | 0.1927 | +0.0014 |
 
-Full per-query rows, the eval-set builder, and the smoke eval live in
-`argos_plugin/eval/bench/rerank_ab/` (untracked). The committed artifact is
-the aggregate summary and this protocol.
+The committed artifact is the aggregate summary and this protocol.
 
 ## Verdict
 

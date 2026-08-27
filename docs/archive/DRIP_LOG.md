@@ -1,5 +1,11 @@
 # Text-leg hardening — drip-feed verification log
 
+> **ARCHIVED 2026-08-27** — completed verification log for the BM25-lite
+> text-leg hardening. Its final result (temporal 118/133 = 88.7%) is the
+> current headline in eval/repro/BENCHMARK_REPRODUCIBILITY.md §5. Historical
+> record.
+
+
 **Change under test:** BM25-lite `_text_search_raw` (regex tokenizer +
 IGNORECASE, 8 tokens minus stopwords, idf × tf-saturation × length-norm,
 LIMIT 2000) replacing first-4-token ILIKE overlap scoring.

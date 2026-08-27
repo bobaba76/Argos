@@ -26,7 +26,7 @@ shows its own display defaults in a couple of cases — those are footnoted.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `local_embedding_model` | `BAAI/bge-small-en-v1.5` | Sentence-transformers model (~130MB, offline). Falls back to text search if it fails to load. |
-| `reranker_enabled` | `false` | Cross-encoder re-ranking of top candidates (~300ms/query on CPU). Experimental — evaluate before relying on it. |
+| `reranker_enabled` | `false` | Cross-encoder re-ranking of top candidates. Measured ~8s/query on CPU (26/8 A/B, dev box) — needs CUDA torch to be production-viable. Experimental — evaluate before relying on it. |
 | `reranker_model` | `BAAI/bge-reranker-base` | HuggingFace reranker model (~420MB, downloaded on first use). |
 | `reranker_top_n` | `10` | Number of top candidates to re-rank (5–100). |
 

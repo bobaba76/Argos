@@ -33,6 +33,8 @@ and exact commands: [`eval/repro/BENCHMARK_REPRODUCIBILITY.md`](eval/repro/BENCH
 | Chain-unfold (change-intent) | 93% recall / 93% precision | `CHAIN_UNFOLD_RESULTS.md` + canonical harness `argos_plugin/eval/eval_chain_unfold_clean.py` | ✓ (27/8 reproduced: 92.9/92.9/100 fair) |
 | Temporal questions | 88.7% (118/133) | full-bank census under 23/8 text-leg hardening (repro §5); earlier slices `judged_temporal_flash_*.jsonl` | ✓ |
 | Recall@96 | 99.6% | retrieval phase of the 500-question capexp run (repro §1/§8) | ✓ |
+| Phrase-lift (exact-phrase ranking) | α=0.25: MRR .7292 → .9375, h@1 4/8 → 7/8, zero regressions | `PHRASE_LIFT_RESULTS.md` + harness `argos_plugin/eval/eval_phrase_lift_clean.py` | ✓ (27/8 reproduced) |
+| Reranker A/B | MRR +3.1pp (0.9058→0.9372), nDCG@20 +2.5pp, R@20 +0.3pp (300-strat seed 42) | `RERANKER_AB.md` + committed aggregate `reranker_ab_summary.json` | ✓ (aggregate) |
 
 **Caveats that travel with the numbers** (full list: repro §11): 70.4% and
 88.7% are different protocols, not one run; cross-system numbers are
@@ -59,24 +61,19 @@ headline is answerer-conditional (GLM direct / flash composed).
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
 | Test suite | ✓ | 26 test modules in `argos_plugin/tests/` (gate 21, egress, adversarial chains, contradiction matrix, shared-service RPC). |
-| No personal data in public repo | ✓ verified | gold JSONL, snapshots, bench outputs, gate baselines gitignored by rule; only gold freeze sha committed (`eval/gold/README.md`). |
+| No personal data in public repo | ✓ verified | only the gold freeze sha is committed (`eval/gold/README.md`). |
 
 ---
 
-## 3. Claims flagged — measured but not yet public evidence
+## 3. Claims flagged — measured internally, no public artifact yet
 
-These are real measurements that are **not yet committed as re-runnable
-artifacts**, so they are *not* quotable as public claims until they are:
+These are real measurements made on the maintainer's production setup.
+They are **internal** — not quotable as public claims until they have a
+committed, re-runnable artifact:
 
 | Claim | Status | What's missing |
 |---|---|---|
-| Phrase/proximity lift (α = 0.25) — MRR .66 → .82, h@1 4→6/8, zero regressions (measured 24/8) | measured, kept in maintainer notes | committed eval set + judged/frozen artifact + gate row |
-| Reranker A/B (26/8, 300-strat seed 42): MRR +3.1pp (0.906→0.937), ndcg20 +2.5pp, recall@20 +0.3pp | measured, kept in maintainer notes | committed eval set + artifact; verdict is *ranking* lever, not recall lever (k-descent stays locked); CPU-only torch ~8s/q blocks prod ship until CUDA-torch |
-| Personal self-corpus gate + personal bench | intentionally **private** | gold/snapshots/baselines hold personal memory content — gitignored by design; never public evidence |
-
-Rule of thumb for this section: if it landed in memory or a session log but
-not in `eval/repro/`, it is a **finding**, not a **claim** — and cannot be
-quoted as a public number until it has an artifact.
+| Personal self-corpus gate + personal bench | internal | operates on the maintainer's live store; results recorded in the weekly recon skill, not public |
 
 ---
 
@@ -95,3 +92,8 @@ quoted as a public number until it has an artifact.
   22/8 reproducibility work). Flagged the uncommitted measurements (§3) and
   the aspirational trust-model sentence (§4) so the honest-evidence boundary
   is explicit.
+- **2026-08-27 (same day)** — phrase-lift and reranker A/B graduated from
+  findings (§3) to measured claims (§1): phrase-lift gained a sanitized
+  re-runnable harness (`eval_phrase_lift_clean.py`) with the result
+  reproduced (MRR .7292 → .9375); the reranker A/B aggregate summary was
+  committed (`reranker_ab_summary.json`).

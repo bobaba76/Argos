@@ -65,6 +65,37 @@ _TRIVIAL_QUERY_PATTERNS = (
     r"^\s*(?:ha\s*){2,}[!.]*\s*$",
 )
 _DEFAULT_INJECTION_MIN_SCORE = 0.0
+
+# Freshness markers (2026-08-27, anti-staleness): recalled memories whose
+# CONTENT carries an explicit date anchor ("26/8", "PR #96224",
+# "August 27, 2026", "last week") get a compact as-of marker built from the
+# record's own update timestamp. Append-only; only date-bearing rows; no
+# ranking/retrieval change. Config key: freshness_markers (default true).
+_DATE_ANCHOR_RE = re.compile(
+    r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"   # 26/8, 26/8/2026, 08-27
+    r"|\b\d{4}-\d{2}-\d{2}\b"                   # ISO-8601
+    r"|\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+    r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|"
+    r"Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b"  # August 27, 2026
+    r"|\b(?:yesterday|today|last\s+(?:week|month|year)|"
+    r"\d+\s+(?:day|week|month|year)s?\s+ago)\b"  # relative anchors
+    r"|\bPR\s*#\d+\b"                            # PR/reference numbers
+)
+
+def _freshness_marker_for(content: str, as_of: str) -> str:
+    """Return a compact as-of marker when content carries a date anchor.
+
+    Marker is '<as of YYYY-MM-DD>' (angle brackets) — visually distinct
+    from the bracketed metadata prefixes on the same line.
+    """
+    if not content or not as_of:
+        return ""
+    try:
+        if _DATE_ANCHOR_RE.search(content):
+            return f"\u27e8as of {as_of[:10]}\u27e9"
+    except (TypeError, ValueError):
+        pass
+    return ""
 # Never-blind fallback (2026-08-24, measured): when the score floor filters
 # out EVERY candidate for a turn, inject the top few unfiltered results
 # instead of nothing. Closes the "fully-blinded question" failure mode found
@@ -95,6 +126,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "storage_mode": "shared_service",
         "max_injected_items": str(_DEFAULT_MAX_INJECTED),
         "inject_content_char_cap": str(_DEFAULT_INJECT_CONTENT_CHAR_CAP),
+        "freshness_markers": "true",
         "local_embedding_model": _DEFAULT_MODEL,
         "auto_extract": "true",
         "llm_fallback": "true",
@@ -839,6 +871,14 @@ class ArgosProvider(MemoryProvider):
             self._inject_cap = int(self._config.get("inject_content_char_cap", _DEFAULT_INJECT_CONTENT_CHAR_CAP))
         except (ValueError, TypeError):
             self._inject_cap = _DEFAULT_INJECT_CONTENT_CHAR_CAP
+
+        # Freshness markers (Tier-2 anti-staleness, default ON): append an
+        # as-of marker to injected memories whose content carries a date
+        # anchor. Append-only text; ranking and retrieval untouched.
+        fgate = self._config.get("freshness_markers", "true")
+        self._freshness_markers = (
+            fgate.lower() in ("true", "1", "yes") if isinstance(fgate, str) else bool(fgate)
+        )
 
         # Injection gates (default OFF — benchmark parity; enable per config):
         # skip_retrieval_on_trivial: no heavy retrieval when the turn is a
@@ -2127,7 +2167,18 @@ class ArgosProvider(MemoryProvider):
                         hist_s = (
                             " (previously)" if getattr(r, "valid_to", None) else ""
                         )
-                        lines.append(f"- {date_s}[{cat}] {content}{sim}{id_s}{hist_s}")
+                        # Freshness marker (Tier-2 anti-staleness): when the
+                        # content carries an explicit date anchor, append a
+                        # compact as-of marker from the record's own update
+                        # time so a stale anchor is never read as current.
+                        fr_s = ""
+                        if getattr(self, "_freshness_markers", False):
+                            try:
+                                _asof = getattr(r, "updated_at", None) or (r.created_at or "")
+                                fr_s = _freshness_marker_for(content, _asof or "")
+                            except Exception:
+                                fr_s = ""
+                        lines.append(f"- {date_s}[{cat}] {content}{fr_s}{sim}{id_s}{hist_s}")
                     sections.append("## Recalled Memories\n" + "\n".join(lines))
                 body = "\n\n".join(sections)
             except Exception as e:

@@ -1609,7 +1609,7 @@ class ArgosProvider(MemoryProvider):
         retrieval counters — only the separate _chain_unfolded_stats
         counter is updated.
 
-        Gate (measured 2026-08-13, eval_chain_unfold.py): the original
+        Gate (measured 2026-08-13, early chain-unfold eval): the original
         top-3-any-chain gate fired on unrelated queries (weather query ->
         Chain A arc) and injected wrong arcs (Query X -> Chain Y arc).
         Tightened to: TOP-1 result only, raw_similarity >= 0.30 floor

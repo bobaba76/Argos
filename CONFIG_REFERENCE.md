@@ -117,3 +117,23 @@ shows its own display defaults in a couple of cases — those are footnoted.
 > ³ The desktop UI schema shows `off` ("ships OFF"); the runtime default
 > is `auto`. The `memory_chain` tool is always available on-demand
 > regardless of this setting.
+### Retrieval injection & routing (live knobs, 26/8)
+
+Newer knobs read from `hybrid_memory.json`. A few are not surfaced in the
+settings UI yet — edit the JSON directly. "Live (26/8)" = the maintainer's
+production config; code defaults from `_load_config()` / `intent_router.py`.
+
+| Setting | Code default | Live (26/8) | Description |
+|---------|-------------|-------------|-------------|
+| `max_injected_items` | `20` ¹ | `96` | Max memories auto-injected as context per turn (cap, not quota). |
+| `injection_min_score` | `0.0` | `0.30` | Relevance floor for injected items — dynamic-k below the floor. |
+| `skip_retrieval_on_trivial` | `false` | `true` | Skip retrieval for trivial/filler turns — cost lever. |
+| `inject_content_char_cap` | `800` | `800` | Per-item char cap in injected context. |
+| `phrase_lift_alpha` | `0.0` | `0.25` | Exact-phrase lift strength in ranking (validated 24/8: MRR .66→.82, zero regressions). |
+| `phrase_lift_pool` | `200` | `200` | Candidate pool scanned for phrase lift. |
+| `chronological_injection` | `false` | `true` | Chronological re-sort of injected items. |
+| `date_anchor_rerank` | `false` | `true` | Date-expression re-ranking (temporal retrieval, 21/8). |
+| `router_enabled` | `false` | `true` | Answerer routing: temporal/multi-hop queries go to the smart model. |
+| `router_subcall_enabled` | `false` | `true` | One trimmed sub-call injects a dated-memory hint before routing (fail-soft). |
+| `router_default_model` / `router_default_provider` | — | `deepseek-v4-flash` / `opencode-go` | Cheap default answerer. |
+| `router_smart_model` / `router_smart_provider` | — | `z-ai/glm-5.3-flash` / `openrouter` | Smart answerer for routed queries (shipped 26/8). |

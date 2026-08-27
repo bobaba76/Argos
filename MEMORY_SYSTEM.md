@@ -122,10 +122,6 @@ chronological chain of versions for each fact.
     gate failures). The `Arc(0.15)` / `anchor(0.30)` similarity floors are
     *pure precision gates*: an arc-floor sweep (0.00 vs 0.15) is bit-identical,
     confirming zero recall cost.
-  - **A harsher crude harness** (`eval_chain_unfold.py`, 3 saturated chains,
-    raw recall over *all* positives incl. buried) reads ~80%/80% — that is the
-    same feature under eval-artifact burden, not a regression; the canonical
-    figure is the 92.9% / 100% above.
 - **Head-deletion promotion** — deleting the current version promotes the
   predecessor to current (and re-indexes it in the graph).
 

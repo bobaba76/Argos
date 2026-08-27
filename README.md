@@ -42,6 +42,8 @@ Sixteen `memory_*` tools, grouped:
 
 Protocols, dataset SHA-256, per-category denominators, model versions, prompts, exact commands, and judged outputs: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
 
+Every claim above — and every capability statement in this README — is audited against source and committed artifacts in [CLAIMS-AUDIT.md](CLAIMS-AUDIT.md). Measured numbers are re-derived by `./eval/repro/verify_repro.sh` (fails on drift).
+
 ## What it can't do
 
 Memory data, embeddings, and graph live locally as flat files — no hosted vendor. LLM calls for extraction, review, and distillation go through your configured cloud model; no native local-LLM support yet. Only embeddings are offline.

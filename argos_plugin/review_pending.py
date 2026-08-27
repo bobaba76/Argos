@@ -8,15 +8,18 @@ approvals become ``reviewed_approved`` and still require explicit promotion.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 if __package__:
     from .reviewer import review_candidate_with_llm
+    from .reviewer import set_external_policy
     from .service_client import SharedMemoryStore
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from reviewer import review_candidate_with_llm
+    from reviewer import set_external_policy
     from service_client import SharedMemoryStore
 
 
@@ -28,7 +31,23 @@ _DECISION_MAP = {
 }
 
 
+def _sync_policy_from_config(home: Path) -> None:
+    """Mirror the hybrid_memory.json external-source policy into the reviewer."""
+    enabled = False
+    cfg_path = home / "hybrid_memory.json"
+    try:
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            enabled = str(cfg.get("external_sources_require_confirmation", "false")).lower() in (
+                "true", "1", "yes"
+            )
+    except Exception:
+        pass
+    set_external_policy(enabled)
+
+
 def review_pending(home: Path, limit: int) -> dict[str, int]:
+    _sync_policy_from_config(home)
     store = SharedMemoryStore(home, user_id="default_user", embedder=None)
     counts: dict[str, int] = {}
     try:

@@ -20,6 +20,18 @@ _SENSITIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# External-source write policy (config-driven, set by the provider/service).
+# When True, candidates tagged external_source never auto-activate: they go
+# straight to pending_user_confirmation, even when the LLM reviewer would
+# have approved. Default OFF — personal installs keep today's behavior.
+_EXTERNAL_REQUIRE_CONFIRMATION = False
+
+
+def set_external_policy(enabled: bool) -> None:
+    """Set the external-source confirmation policy (from hybrid_memory.json)."""
+    global _EXTERNAL_REQUIRE_CONFIRMATION
+    _EXTERNAL_REQUIRE_CONFIRMATION = bool(enabled)
+
 # Spec 1 — deterministic expiry suggestion. No LLM; pure regex + category map.
 # Returns an ISO-8601 UTC string (the suggested expires_at) or None.
 #
@@ -182,6 +194,42 @@ def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", pro
             "review_model": "egress_gate",
         }
 
+    # External-source gate (inbound security). Content tagged as coming from
+    # an external/untrusted channel (email, web, import) is handled
+    # deterministically, with NO LLM call:
+    #   1. the evidence is scanned for injection/poisoning patterns — any
+    #      hit routes the proposal to pending_user_confirmation (the scanner
+    #      is a gate, not a judge: blocked means "route to a human").
+    #   2. when external_sources_require_confirmation is on, ALL external
+    #      candidates await a human, even scan-clean ones.
+    if isinstance(payload, dict) and payload.get("external_source"):
+        try:
+            if __package__:
+                from .inbound_security import scan_inbound_text
+            else:
+                from inbound_security import scan_inbound_text
+        except Exception:
+            scan_result = None
+        else:
+            scan_result = scan_inbound_text(
+                evidence or str(candidate.get("content") or "")
+            )
+        if scan_result is not None and scan_result.blocked:
+            return {
+                "decision": "pending_user_confirmation",
+                "confidence": 0.99,
+                "reason": "Inbound security scan blocked: "
+                          + scan_result.summary(),
+                "review_model": "inbound_security_gate",
+            }
+        if _EXTERNAL_REQUIRE_CONFIRMATION:
+            return {
+                "decision": "pending_user_confirmation",
+                "confidence": 0.99,
+                "reason": "External-source memory requires human confirmation "
+                          "(external_sources_require_confirmation).",
+                "review_model": "external_source_gate",
+            }
 
     try:
         from agent.auxiliary_client import call_llm

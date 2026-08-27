@@ -12,6 +12,7 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 | `database_filename` | `hybrid_memory.duckdb` | DuckDB filename (in HERMES_HOME). |
 | `graph_dirname` | `hybrid_memory_kuzu` | Kùzu graph file base name (in HERMES_HOME). A single file, not a directory; a `.wal` sibling exists while the service holds the graph. |
 | `local_only` | `false` | Egress gate: restrict plugin-owned LLM calls (extraction, review, distillation, router sub-calls) to local-only models. |
+| `external_sources_require_confirmation` | `false` | Memory-safety gate: candidates tagged `external_source` (email/web/import) can never auto-activate — the reviewer short-circuits to `pending_user_confirmation` (no LLM call) and the store's `auto_review` transition is downgraded at the storage boundary. A human confirmation or a `manual`/`tool` review is required. Inbound scanning of external evidence runs regardless and always routes blocked content to pending. |
 
 ## Embeddings
 

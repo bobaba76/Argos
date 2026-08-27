@@ -48,7 +48,7 @@ import duckdb  # noqa: E402
 # ---------------------------------------------------------------------------
 
 DEFAULT_LIMIT = 100
-MAX_LIMIT = 500
+MAX_LIMIT = 5000
 DEFAULT_SEED = 42
 DEFAULT_LADDER = "5,20,96"
 DEFAULT_OUT = "eval_self_corpus_out.jsonl"

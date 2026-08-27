@@ -277,6 +277,15 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Retrieval",
         ),
         ProviderField(
+            key="external_sources_require_confirmation",
+            label="External sources require confirmation",
+            kind=KIND_BOOL,
+            default="false",
+            description="Memory from external/untrusted channels (email, web, imports) stays pending until a human confirms.",
+            info="When enabled, candidates tagged external_source can NEVER auto-activate: the reviewer short-circuits to pending_user_confirmation even when its LLM review would have approved, and the storage boundary blocks auto_review activation. Inbound security scanning of external evidence runs regardless — scan-blocked content always routes to pending for a human. Off by default: personal installs that never tag external sources see no behavior change.",
+            group="Security",
+        ),
+        ProviderField(
             key="context_aware_retrieval",
             label="Context-aware retrieval",
             kind=KIND_BOOL,

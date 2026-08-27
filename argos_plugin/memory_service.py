@@ -110,6 +110,10 @@ class MemoryService:
             )
         except (TypeError, ValueError):
             self.store._phrase_lift_pool = 200
+        # External-source write policy (parity with the provider config).
+        self.store.external_sources_require_confirmation = str(
+            config.get("external_sources_require_confirmation", "false")
+        ).lower() in ("true", "1", "yes")
         try:
             self.graph = KuzuGraphStore(home / graph_name, user_id="default_user")
         except Exception as exc:

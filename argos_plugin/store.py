@@ -57,6 +57,55 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# --- prompt-injection / hidden-content hardening (2026-08-27) ---------------
+# Stored memory is later replayed verbatim into prompts (auto-injection and
+# memory_search results). Content that mimics instructions must not enter the
+# store silently. These are heuristic regexes — deliberately conservative:
+# a false positive lands in quarantine (recoverable), never in the active
+# store, and never makes an LLM call.
+_HIDDEN_CHARS_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+_FORMAT_SPACES_RE = re.compile(r"[\u2000-\u200a\u202f\u205f]")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+# (compiled pattern, human label). First match wins; the label is stored in
+# quarantine_reason / raised in ValueError messages for audit. All patterns
+# are case-insensitive — payloads arrive in any casing.
+def _ci(pattern: str) -> re.Pattern:
+    return re.compile(pattern, re.IGNORECASE)
+
+_INJECTION_PATTERNS: List[tuple] = [
+    (_ci(r"ignore\s+((all|the|any)\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|messages?|commands?|rules)"), "instruction_override"),
+    (_ci(r"disregard\s+(the\s+)?(previous|prior|above|earlier)"), "disregard_previous"),
+    (_ci(r"do\s+not\s+(tell|reveal|show|mention|say)\s+(the\s+)?(user|them|him|her)"), "conceal_from_user"),
+    (_ci(r"reveal\s+(your\s+)?(system\s+prompt|internal\s+instructions?|instructions?)"), "prompt_reveal"),
+    (_ci(r"you\s+are\s+(now\s+)?(an?|no\s+longer)\b"), "identity_shift"),
+    (_ci(r"repeat\s+(after\s+me|the\s+following)"), "repeat_after_me"),
+    (_ci(r"\[system\s+note\s*:"), "fence_spoof"),
+    (_ci(r"\bjailbreak\b"), "jailbreak_ref"),
+    (_ci(r"\bDAN\b\s+(mode|activated|is)\b"), "dan_mode"),
+    (_ci(r"(forget|erase|wipe)\s+(everything|all)\s+(you\s+(know|learned)|your\s+(memories?|instructions?))"), "memory_wipe"),
+]
+
+
+def sanitize_content(content: str) -> tuple:
+    """Normalize content for storage and sniff for instruction-like text.
+
+    Returns ``(cleaned_text, matched_label_or_None)``. Cleaning removes
+    zero-width/format/control characters used to hide text from humans
+    (white-on-white PDF footers, invisible CJK joiners, BOMs). A non-None
+    label means callers must refuse (direct saves/updates) or quarantine
+    (proposals) — never store the text as active memory.
+    """
+    if not content:
+        return content, None
+    clean = _HIDDEN_CHARS_RE.sub("", content)
+    clean = _FORMAT_SPACES_RE.sub(" ", clean)
+    clean = _CONTROL_CHARS_RE.sub("", clean)
+    for pattern, label in _INJECTION_PATTERNS:
+        if pattern.search(clean):
+            return clean, label
+    return clean, None
+
 VALID_CATEGORIES = frozenset({
     "personal_fact",
     "preference",
@@ -224,6 +273,12 @@ class DuckDBMemoryStore:
         self.expiry_enabled: bool = False
         self.ttl_days: Dict[str, int] = dict(_DEFAULT_TTL_DAYS)
         self.expiry_default_days: int = 90
+        # External-source write policy (set from config by the provider and
+        # the shared service). When True, candidates tagged external_source
+        # can never auto-activate: the storage boundary downgrades auto_review
+        # approvals to pending_user_confirmation. Default OFF (personal
+        # installs keep exactly today's behavior).
+        self.external_sources_require_confirmation: bool = False
 
     # -- connection management ------------------------------------------------
 
@@ -295,7 +350,9 @@ class DuckDBMemoryStore:
                     evidence_role     VARCHAR DEFAULT 'user_turn',
                     source_timestamp   VARCHAR,
                     review_confidence  DOUBLE,
-                    review_model       VARCHAR
+                    review_model       VARCHAR,
+                    quarantine_reason  VARCHAR,
+                    quarantined_at     VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS entity_aliases (
                     alias              VARCHAR,
@@ -364,6 +421,8 @@ class DuckDBMemoryStore:
                 "source_timestamp": "VARCHAR",
                 "review_confidence": "DOUBLE",
                 "review_model": "VARCHAR",
+                "quarantine_reason": "VARCHAR",
+                "quarantined_at": "VARCHAR",
             }
             for name, definition in columns.items():
                 try:
@@ -1463,6 +1522,12 @@ class DuckDBMemoryStore:
         """
         if not content or not content.strip():
             return None
+        content, _inj = sanitize_content(content)
+        if _inj:
+            raise ValueError(
+                f"Content blocked: stored text matches an instruction-injection "
+                f"pattern ({_inj}). Refusing to write."
+            )
         if category not in VALID_CATEGORIES:
             logger.warning("Unknown category '%s', defaulting to context_note", category)
             category = "context_note"
@@ -1565,6 +1630,7 @@ class DuckDBMemoryStore:
             durability, scope, project_id, session_id, status, created_at,
             updated_at, reviewed_at, review_reason, evidence_text, evidence_role,
             source_timestamp, review_confidence, review_model,
+            quarantine_reason, quarantined_at,
         ) = row
         return {
             "candidate_id": candidate_id,
@@ -1588,6 +1654,8 @@ class DuckDBMemoryStore:
             "source_timestamp": source_timestamp,
             "review_confidence": review_confidence,
             "review_model": review_model,
+            "quarantine_reason": quarantine_reason,
+            "quarantined_at": quarantined_at,
         }
 
     def save_candidate(
@@ -1607,10 +1675,16 @@ class DuckDBMemoryStore:
         evidence_role: str = "user_turn",
         source_timestamp: str | None = None,
         dedup: bool = True,
+        external: bool = False,
     ) -> dict | None:
         """Store a pending proposal without making it retrievable memory."""
         if not content or not content.strip():
             return None
+        content, _inj = sanitize_content(content)
+        if not content or not content.strip():
+            return None
+        candidate_status = "quarantined" if _inj else "pending"
+        quarantine_reason = f"injection_pattern: {_inj}" if _inj else None
         if category not in VALID_CATEGORIES:
             category = "context_note"
         if dedup:
@@ -1633,6 +1707,8 @@ class DuckDBMemoryStore:
         candidate_payload = dict(payload or {})
         candidate_payload.setdefault("user_scope", self.user_id)
         candidate_payload.setdefault("source", source)
+        if external:
+            candidate_payload["external_source"] = True
         try:
             normalized_confidence = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):
@@ -1644,15 +1720,16 @@ class DuckDBMemoryStore:
                   (candidate_id, category, content, tags, payload, source,
                    confidence, durability, scope, project_id, session_id,
                    user_scope, status, created_at, updated_at, evidence_text,
-                   evidence_role, source_timestamp)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+                   evidence_role, source_timestamp, quarantine_reason, quarantined_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     candidate_id, category, content.strip(), tags or [],
                     json.dumps(candidate_payload), source, normalized_confidence,
                     durability or "durable", scope or "profile", project_id,
                     session_id or "", candidate_payload.get("user_scope"),
-                    now, now, evidence_text,
+                    candidate_status, now, now, evidence_text,
                     evidence_role or "user_turn", source_timestamp,
+                    quarantine_reason, (now if _inj else None),
                 ],
             )
         return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
@@ -1674,7 +1751,7 @@ class DuckDBMemoryStore:
         elif status:
             conditions.append("status = ?")
             params.append(status)
-        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model FROM memory_candidates"
+        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model, quarantine_reason, quarantined_at FROM memory_candidates"
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
@@ -1735,6 +1812,33 @@ class DuckDBMemoryStore:
         candidate = candidates[0]
         if candidate["status"] not in {"pending", "reviewed_approved", "pending_user_confirmation"}:
             return {"candidate": candidate, "memory": None}
+        # Stored-prompt-injection guard: a pending candidate whose content
+        # mimics instructions (written before the injection scan shipped, or
+        # via a bypass) can never be approved — refuse loudly instead.
+        if decision in {"approved", "reviewed_approved"}:
+            _, _inj = sanitize_content(candidate["content"])
+            if _inj:
+                raise ValueError(
+                    f"approval refused: candidate content matches an "
+                    f"instruction-injection pattern ({_inj})"
+                )
+        # Storage-boundary external-source invariant: when the policy is on,
+        # an unsupervised auto-review can never activate external-source
+        # memory — the decision is downgraded to pending_user_confirmation.
+        # The agent-facing confirmation tool (review_source="tool") and
+        # manual callers may still approve it.
+        if (
+            review_source == "auto_review"
+            and decision in {"approved", "reviewed_approved"}
+            and getattr(self, "external_sources_require_confirmation", False)
+            and isinstance(candidate.get("payload"), dict)
+            and candidate["payload"].get("external_source")
+        ):
+            decision = "pending_user_confirmation"
+            reason = (
+                "Storage boundary: external-source memory cannot auto-activate "
+                "(external_sources_require_confirmation). " + reason
+            ).strip()
         now = self._now()
         memory = None
         final_status = decision
@@ -2145,6 +2249,13 @@ class DuckDBMemoryStore:
         If no content/tags/payload changes are provided, returns the existing
         record unchanged.
         """
+        if content is not None:
+            content, _inj = sanitize_content(content)
+            if _inj:
+                raise ValueError(
+                    f"Content blocked: updated text matches an instruction-injection "
+                    f"pattern ({_inj}). Refusing to write."
+                )
         existing = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE memory_id = ?

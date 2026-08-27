@@ -42,7 +42,7 @@ from .confirmation import build_confirmation_block
 from .extractor import extract_from_turn
 from .routing import resolve_storage_names
 from .service_client import SharedGraphStore, SharedMemoryStore
-from .reviewer import review_candidate_with_llm, suggest_expiry
+from .reviewer import review_candidate_with_llm, set_external_policy, suggest_expiry
 from .query_expander import QueryExpander
 from .distillation import run_distillation
 
@@ -148,6 +148,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "distillation_max_calls": "10",
         # Egress (review point 6)
         "local_only": "false",
+        "external_sources_require_confirmation": "false",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -1257,6 +1258,12 @@ class ArgosProvider(MemoryProvider):
                 self._reranker_model, hermes_home=home
             )
 
+        # External-source write policy: config flag → reviewer gate + storage.
+        self._external_require_confirmation = _flag(
+            self._config, "external_sources_require_confirmation", "false"
+        )
+        set_external_policy(self._external_require_confirmation)
+
         if use_shared_service:
             # One local service owns the canonical DuckDB/Kùzu files. The
             # provider process never opens those files directly in this mode.
@@ -1280,6 +1287,9 @@ class ArgosProvider(MemoryProvider):
             # Exact-phrase lift: pass alpha + pool into the store's ranking.
             self._store._phrase_lift_alpha = self._phrase_lift_alpha
             self._store._phrase_lift_pool = self._phrase_lift_pool
+            self._store.external_sources_require_confirmation = (
+                self._external_require_confirmation
+            )
             try:
                 graph_path = home / graph_dirname
                 self._graph = KuzuGraphStore(graph_path, user_id=self._user_id)
@@ -2851,7 +2861,10 @@ class ArgosProvider(MemoryProvider):
                     save_kwargs["durability"] = args["durability"]
                 if "expires_at" in args:
                     save_kwargs["expires_at"] = args["expires_at"]
-            rec = self._store.remember(**save_kwargs)
+            try:
+                rec = self._store.remember(**save_kwargs)
+            except ValueError as exc:
+                return tool_error(str(exc))
             if rec is None:
                 return json.dumps({"status": "deduplicated", "message": "Similar memory already exists"})
             # Index every memory category; entity links are additive and
@@ -2881,7 +2894,10 @@ class ArgosProvider(MemoryProvider):
             # caller explicitly provided it (None = clear/revive, str = set).
             if getattr(self, "_expiry_enabled", False) and "expires_at" in args:
                 update_kwargs["expires_at"] = args["expires_at"]
-            rec = self._store.update_memory(**update_kwargs)
+            try:
+                rec = self._store.update_memory(**update_kwargs)
+            except ValueError as exc:
+                return tool_error(str(exc))
             if rec is None:
                 return tool_error(f"Memory not found: {memory_id}")
             if getattr(self, "_graph", None):

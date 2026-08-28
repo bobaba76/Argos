@@ -1,0 +1,16 @@
+
+# Source files stay LF regardless of checkout platform. Windows CRLF
+# checkouts break exact-text patch matching and turn every edit into
+# pure line-ending churn in diffs.
+*.py        text eol=lf
+*.js        text eol=lf
+*.ts        text eol=lf
+*.jsx       text eol=lf
+*.tsx       text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf

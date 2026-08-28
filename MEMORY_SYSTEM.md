@@ -77,7 +77,7 @@ When a memory is updated, the old version is superseded (not deleted). The store
 - **`memory_chain` tool** — retrieves the full version arc for any memory ID (modes: `arc`, `versions`, `diff`).
 - **Chain annotation** — search results carry a `chain` field indicating whether a memory has version history.
 - **Chain-unfold** — when `chain_unfold=auto`, a change-intent query ("why did I switch...", "what changed...") triggers automatic injection of a compact version arc into the search results. Only runs in the `memory_search` tool path.
-- **Head-deletion promotion** — deleting the current version promotes the predecessor to current (and re-indexes it in the graph).
+- **Head-deletion promotion** — deleting the current version promotes the predecessor to current (and re-indexes it in the graph). If there is no predecessor (single-version record), the record is hard-deleted and its content is tombstoned against re-creation. Non-head (middle) versions are quarantined, not deleted, to preserve the causal arc.
 - **History-at-current-time** (`history_at_current_time=true`) — widens retrieval to superseded versions on historical queries; injected with a "(previously)" label.
 
 ### Date-anchored retrieval
@@ -106,12 +106,12 @@ Proposals are never active memory until reviewed. The agent can also save explic
 
 ### Maintenance and quarantine
 
-- **`memory_maintenance`** — previews (`dry_run=true`, default) or applies reversible quarantine of stale temporary memories and low-quality duplicates. Never hard-deletes.
+- **`memory_maintenance`** — previews (`dry_run=true`, default) or applies reversible quarantine of stale temporary memories and low-quality duplicates. Never hard-deletes. (This scopes to maintenance only; `memory_delete` is a separate tool — see version chains above.)
 - **`consolidation_enabled`** — runs the same maintenance automatically at session end.
 - **`memory_restore`** — brings a quarantined memory back to active retrieval (and re-indexes it in the graph).
 - **`memory_feedback`** with `incorrect` — detaches the memory from the graph.
 - **Junk-entity purge** — at session end, the graph purges orphaned junk entities.
-- **Semantic merge** — `consolidate()`'s duplicate leg uses embedding-similarity merging: records within a high similarity threshold of an existing active record are consolidated (newest wins, older version chained or appended deterministically). Reversible, never hard-deletes.
+- **Semantic merge** — `consolidate()`'s duplicate leg uses embedding-similarity merging: records within a high similarity threshold of an existing active record are consolidated (newest wins, older version chained or appended deterministically). Reversible, never hard-deletes. (Scopes to consolidation only; `memory_delete` can hard-delete single-version records — see version chains.)
 
 ### Expiry / TTL
 

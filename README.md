@@ -11,11 +11,11 @@ Persistent memory for AI agents, on your own machine. A Hermes plugin: hybrid ve
 - **Ambient context.** Time, location, weather, and recent file activity inject every turn via a `pre_llm_call` hook.
 - **Insight capture.** "I just realised…" moments are logged verbatim. Browse with `/ilog`, resurface with `/revisit`, store exclusions with `/neg <claim>`.
 - **Gated distillation.** Once a day, cost-capped, Argos proposes distilled patterns from accumulated records. Nothing lands in memory without your approval.
-- **Reversible cleanup.** Stale or duplicate memories are quarantined, not deleted. Restore if needed.
+- **Reversible cleanup.** Maintenance and consolidation quarantine stale or duplicate memories, not delete them. Explicit deletion (`memory_delete`) is chain-aware: multi-version records promote the predecessor or quarantine the middle version; single-version records are hard-deleted and tombstoned against re-creation.
 
 ## Trust model
 
-Nothing becomes a memory silently. Every turn is mined for facts (regex first, LLM fallback), but the output is a *proposal* — pending until you approve it. Updates chain versions instead of overwriting. Cleanup quarantines instead of deleting. Distillation proposes but never writes. Every feature is gated by a measurement in the eval harness; ideas that didn't help were turned off.
+Nothing becomes a memory silently. Every turn is mined for facts (regex first, LLM fallback), but the output is a *proposal* — pending until you approve it. The agent can also save explicitly via `memory_save`, which writes directly to active memory (an intentional action, not passive ingestion). Updates chain versions instead of overwriting. Cleanup quarantines instead of deleting; explicit `memory_delete` on a single-version record hard-deletes and tombstones it (re-creation blocked until the tombstone is purged). Distillation proposes but never writes. Every feature is gated by a measurement in the eval harness; ideas that didn't help were turned off.
 
 ## Tools
 

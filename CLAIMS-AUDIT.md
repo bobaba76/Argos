@@ -1,6 +1,6 @@
 # Claims Audit — Argos
 
-**Date:** 2026-08-27 · **Audited:** README.md and docs vs `src/` and committed eval
+**Date:** 2026-08-28 · **Audited:** README.md and docs vs `src/` and committed eval
 artifacts on `master` · **Branch HEAD:** `7d14697`
 
 This file is the living index of every claim Argos makes. The rule: **anything
@@ -56,7 +56,8 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Ambient context injects per turn | ✓ | `pre_llm_call` hook; `tests/test_ambient_*` (weather/location/file activity). |
 | Insight capture + `/ilog`, `/revisit`, `/neg` | ✓ | insight-log tool; negative-memory exclusions tested (`test_negative_memory.py`). |
 | Gated distillation — cost-capped, proposes only | ✓ | `test_distillation.py`; nothing lands without approval (approval invariant, `test_approval_invariant.py`). |
-| Reversible cleanup — quarantine, not delete | ✓ | tombstones + `memory_restore`; `test_deletion_tombstones.py`, `test_ttl_expiry.py`. |
+| Trust model — "nothing becomes a memory silently" | ✓ (scoped) | Auto-extraction → proposal queue (pending until reviewed). `memory_save` is the explicit exception: writes directly to active memory, bypassing the proposal queue (intentional agent action, not passive ingestion). `MEMORY_SYSTEM.md` documents the exception. |
+| Reversible cleanup — quarantine, not delete | ✓ (scoped) | `memory_maintenance` / `consolidate()` quarantine only, never hard-delete. `memory_delete` is chain-aware: head-with-predecessor promotes + hard-deletes the row; non-head quarantines; **single-version hard-deletes + tombstones** (re-creation blocked until `memory_tombstone_purge`). `test_deletion_tombstones.py`, `test_ttl_expiry.py`. |
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
@@ -96,3 +97,9 @@ committed, re-runnable artifact:
   re-runnable harness (`eval_phrase_lift_clean.py`) with the result
   reproduced (MRR .7292 → .9375); the reranker A/B aggregate summary was
   committed (`reranker_ab_summary.json`).
+- **2026-08-28** — scoped two trust-model claims that were overstated (issues #12, #13):
+  the "nothing becomes a memory silently" claim now notes the `memory_save` explicit-save
+  exception; the "reversible cleanup — quarantine, not delete" claim now distinguishes
+  maintenance/consolidation (quarantine only) from `memory_delete` (chain-aware: promote,
+  quarantine, or hard-delete + tombstone for single-version records). Added a structural
+  claim row for the trust-model paragraph. No code behavior changed.

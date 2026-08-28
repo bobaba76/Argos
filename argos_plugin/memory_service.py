@@ -177,6 +177,15 @@ class MemoryService:
             return self.store.restore_memory(**args)
         if method == "record_feedback":
             return self.store.record_feedback(**args)
+        if method == "mark_superseded":
+            # Live-admin supersession (e.g. retroactive chains after a new
+            # benchmark supersedes an old one).  Sets valid_to; the read side
+            # excludes the record automatically.
+            return self.store._mark_superseded(
+                memory_id=args.get("memory_id", ""),
+                reason=args.get("reason", ""),
+                superseded_by=args.get("superseded_by"),
+            )
         if method == "delete_memory":
             return self.store.delete_memory(**args)
         # -- deletion tombstones (read-only visibility + escape hatch) ---------

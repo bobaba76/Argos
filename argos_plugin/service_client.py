@@ -423,6 +423,22 @@ class SharedMemoryStore:
             candidate_id=candidate_id, limit=limit,
         ) or []
 
+    def mark_superseded(
+        self, memory_id: str, reason: str = "",
+        superseded_by: str | None = None,
+    ) -> bool:
+        """Live admin: supersede a memory (sets valid_to; read side excludes it).
+
+        Route for one-off/retroactive chains — the candidate-review path uses
+        the same store method internally.
+        """
+        return bool(
+            self._rpc.call(
+                "store", "mark_superseded",
+                memory_id=memory_id, reason=reason, superseded_by=superseded_by,
+            )
+        )
+
     def quarantine_memory(self, **kwargs: Any) -> bool:
         return bool(self._rpc.call("store", "quarantine_memory", **kwargs))
 

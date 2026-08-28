@@ -1621,13 +1621,21 @@ class DuckDBMemoryStore:
     def _find_conflicting_active_value(
         self,
         content: str,
-        category: str,
+        _category: str,
     ) -> Optional[tuple[str, str, str, str]]:
         """Find an active memory whose value conflicts with *content*.
 
-        Extracts numeric values from *content* and checks active records in
-        the same category for the same subject with a different value.
+        Extracts numeric values from *content* and checks ACTIVE records in
+        ANY category for the same subject with a different value.  The scan
+        is deliberately cross-category: stale-number pairs like an ``insight``
+        headline and a ``context_note`` carry the same subject under different
+        categories (the original 82.2%/89.8% incident).  False positives are
+        cheap — a conflict only downgrades the candidate to
+        ``pending_user_confirmation``, never auto-activates anything.
         Zero LLM — pure regex + token-overlap matching.
+
+        ``_category`` is kept for call-site compatibility but intentionally
+        unused (dedup/embedding layers still respect category scoping).
 
         Returns ``(old_memory_id, old_content, new_value, old_value)`` for the
         first conflict found, or None if no conflict.
@@ -1639,10 +1647,10 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT memory_id, content FROM memory_records
-                   WHERE category = ? AND valid_to IS NULL
+                   WHERE valid_to IS NULL
                      AND (user_scope IS NULL OR user_scope = ?)
                      AND COALESCE(status, 'active') = 'active'""",
-                [category, self.user_id],
+                [self.user_id],
             ).fetchall()
         for old_id, old_content in rows:
             if old_content == content:

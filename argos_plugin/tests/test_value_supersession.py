@@ -213,6 +213,28 @@ class TestStoreSupersession:
         finally:
             store.close()
 
+    def test_find_conflicting_cross_category(self, tmp_path):
+        """Stale value detected even when the two facts live in different categories."""
+        store = self._make_store(tmp_path)
+        try:
+            store.remember(
+                category="context_note",
+                content="LongMemEval benchmark score is 82.2%",
+                dedup=False,
+            )
+            # Same subject, different value, DIFFERENT category (the original
+            # incident shape: insight headline vs context_note).
+            conflict = store._find_conflicting_active_value(
+                "LongMemEval benchmark score is 89.8%",
+                "insight",
+            )
+            assert conflict is not None
+            old_id, old_content, new_val, old_val = conflict
+            assert old_val == "82.2"
+            assert new_val == "89.8"
+        finally:
+            store.close()
+
     def test_find_conflicting_no_conflict_same_value(self, tmp_path):
         """Same subject + same value → no conflict (idempotent)."""
         store = self._make_store(tmp_path)

@@ -82,6 +82,8 @@ committed, re-runnable artifact:
 | Statement | Why it's not a claim yet |
 |---|---|
 | README Trust model: "Every feature is gated by a measurement in the eval harness" | Aspirational. Feature *areas* are tested, but not every shipped knob has a committed before/after measurement. The measured subset is §1; everything else is structural verification (§2). Treat the sentence as engineering intent, not an audited fact. |
+| MEMORY_SYSTEM.md:102 + CONFIG_REFERENCE.md:79-82 + UI label "Stale-pending sweep": "periodically re-reviews proposals pending too long" | **Configured-but-unimplemented.** Four keys (`stale_review_sweep_enabled`, `stale_review_interval_min`, `stale_review_min_age_min`, `stale_review_max_batch`) are declared in `config_schema.py`, documented as a live feature, and parsed in `__init__.py:942-964` into `self._stale_review_*` attributes — and never read again. No scheduler, timer, cron, or hook consumes them. `review_pending.py` is the manual CLI that would be the sweep's engine (default limit 25 matches `stale_review_max_batch`), but nothing schedules it. `git log --all -S '_stale_review'` shows no consumer was ever added. The docs overstate a shipped feature; either implement the sweep or mark this section aspirational. |
+| MEMORY_SYSTEM.md:103 + CONFIG_REFERENCE.md:83: "Role-word learning (role_alias_llm_fallback=true) — when an unknown word appears in 'my X is Name', the LLM is asked if X is a person-role; learned words persist to role_words" | **Implemented for alias minting, not for fact categorization.** The feature works end-to-end in `__init__.py` (`_extract_role_aliases` + `_llm_classify_role_word` + `_persist_learned_role_word`), and the docs accurately describe the mechanism. The gap: `extractor.py` has a separate 12-word hardcoded role lexicon that decides fact *category* (relationship vs personal_fact), while `graph.py` has a 46+ word seed list that decides *alias minting*. LLM learning only feeds the second set. A learned word like "doula" instantly fixes alias retrieval and persists, but the underlying fact is still stored as `personal_fact` forever — extractor.py never consults learned words. Category wrong, alias right; the system papers over the categorization gap at the alias layer. |
 
 ---
 
@@ -103,3 +105,11 @@ committed, re-runnable artifact:
   maintenance/consolidation (quarantine only) from `memory_delete` (chain-aware: promote,
   quarantine, or hard-delete + tombstone for single-version records). Added a structural
   claim row for the trust-model paragraph. No code behavior changed.
+- **2026-08-28 (deep review)** — added two aspirational entries to §4:
+  (a) the stale-review sweep is configured-but-unimplemented (four parsed keys never
+  consumed; `review_pending.py` is the orphaned manual engine; docs describe it as live);
+  (b) role-word LLM learning works for alias minting but not for fact categorization
+  (two hardcoded lexicons that never converge — extractor.py's 12-word list vs graph.py's
+  46+ word seed set). Filed issues #23 (inbound security fail-open on import error,
+  `reviewer.py:206-212`) and #24 (egress gate returns True for unknown kind,
+  `egress.py:225-227`) — both are fail-closed fixes. No code behavior changed.

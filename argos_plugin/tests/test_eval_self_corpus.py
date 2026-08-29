@@ -288,23 +288,33 @@ class TestResumeAndBaseline:
         assert esc._completed_ids(out) == set()
 
     def test_verdict_pass(self):
-        current = {"overall": {"recall@20": 0.92}}
-        baseline = {"overall": {"recall@20": 0.90}}
+        # Updated for #21: verdict now uses shared thresholds (recall@max-k,
+        # MRR, category). Use a full scores dict with a ladder.
+        current = {"ladder": [5, 20, 96], "overall": {"recall@96": 0.92, "mrr": 0.60},
+                   "by_category": {"personal_fact": {"recall@96": 0.92, "mrr": 0.60}}}
+        baseline = {"ladder": [5, 20, 96], "overall": {"recall@96": 0.90, "mrr": 0.60},
+                    "by_category": {"personal_fact": {"recall@96": 0.90, "mrr": 0.60}}}
         v = esc._verdict(current, baseline)
         assert v.startswith("PASS")
 
     def test_verdict_fail(self):
-        current = {"overall": {"recall@20": 0.85}}
-        baseline = {"overall": {"recall@20": 0.92}}
+        # Updated for #21: a 7pp drop in recall@96 exceeds the 0.5pp
+        # overall threshold → FAIL.
+        current = {"ladder": [5, 20, 96], "overall": {"recall@96": 0.85, "mrr": 0.60},
+                   "by_category": {"personal_fact": {"recall@96": 0.85, "mrr": 0.60}}}
+        baseline = {"ladder": [5, 20, 96], "overall": {"recall@96": 0.92, "mrr": 0.60},
+                    "by_category": {"personal_fact": {"recall@96": 0.92, "mrr": 0.60}}}
         v = esc._verdict(current, baseline)
         assert v.startswith("FAIL")
-        assert "-7.0pp" in v or "-7.00" in v
 
     def test_verdict_borderline_pass(self):
-        current = {"overall": {"recall@20": 0.895}}
-        baseline = {"overall": {"recall@20": 0.92}}
+        # Updated for #21: a 0.4pp drop in recall@96 is within the 0.5pp
+        # overall threshold → PASS.
+        current = {"ladder": [5, 20, 96], "overall": {"recall@96": 0.896, "mrr": 0.60},
+                   "by_category": {"personal_fact": {"recall@96": 0.896, "mrr": 0.60}}}
+        baseline = {"ladder": [5, 20, 96], "overall": {"recall@96": 0.90, "mrr": 0.60},
+                    "by_category": {"personal_fact": {"recall@96": 0.90, "mrr": 0.60}}}
         v = esc._verdict(current, baseline)
-        # -2.5pp → within 3pp threshold → PASS
         assert v.startswith("PASS")
 
 

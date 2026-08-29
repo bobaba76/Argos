@@ -27,11 +27,14 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import logging
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_ROOT) not in sys.path:
@@ -42,17 +45,21 @@ if str(_EVAL_DIR) not in sys.path:
 
 import eval_self_corpus as esc  # noqa: E402
 import build_gold  # noqa: E402
+import verdict as _verdict_mod  # noqa: E402
 
 DEFAULT_LADDER = "5,20,96"
 DEFAULT_EMBEDDER = "BAAI/bge-small-en-v1.5"
 DEFAULT_SEED = 42
 MIN_APPROVED = 50
 DEFAULT_OUT = "gate_scores.json"
+DEFAULT_PROBE_TIMEOUT = 30  # seconds per probe; 0 = no timeout
 
-# Verdict thresholds (per the regression-gate spec).
-CATEGORY_RECALL_PP = 1.0    # no category recall@max-k drops > 1pp
-OVERALL_RECALL_PP = 0.5     # overall recall@max-k drop <= 0.5pp
-OVERALL_MRR = 0.01          # overall MRR drop <= 0.01
+# Verdict thresholds — delegated to the shared verdict module (#21).
+# These constants are re-exported for backward compatibility; the single
+# source of truth is eval/verdict.py.
+CATEGORY_RECALL_PP = _verdict_mod.CATEGORY_RECALL_PP
+OVERALL_RECALL_PP = _verdict_mod.OVERALL_RECALL_PP
+OVERALL_MRR = _verdict_mod.OVERALL_MRR
 
 
 def _mrr(rank: Optional[int]) -> float:
@@ -82,6 +89,49 @@ def score_probe(
             rank = i + 1
             break
     return {"per_window": per_window, "rank": rank}
+
+
+def _score_probe_with_timeout(
+    store: Any,
+    gold_line: Dict[str, Any],
+    ladder: List[int],
+    timeout: float,
+) -> Dict[str, Any]:
+    """Run score_probe with a per-probe timeout (#21).
+
+    If the probe doesn't complete within *timeout* seconds, returns a
+    degenerate result (all misses, no rank) so one hung embedder/query
+    can't stall the gate indefinitely.
+    """
+    if timeout <= 0:
+        return score_probe(store, gold_line, ladder)
+    import threading
+    result_box: List[Any] = []
+    def _worker():
+        try:
+            result_box.append(score_probe(store, gold_line, ladder))
+        except Exception as exc:
+            result_box.append(exc)
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        # Timed out — return a degenerate miss.
+        logger.warning(
+            "Probe timed out after %.1fs (query=%r, memory_id=%s)",
+            timeout, gold_line.get("query", "")[:60], gold_line.get("memory_id", "?"),
+        )
+        return {
+            "per_window": {str(k): False for k in ladder},
+            "rank": None,
+            "_timeout": True,
+        }
+    if result_box and isinstance(result_box[0], Exception):
+        raise result_box[0]
+    if result_box:
+        return result_box[0]
+    # Thread died without producing a result.
+    return {"per_window": {str(k): False for k in ladder}, "rank": None}
 
 
 def _summarize(probe_results: List[Dict[str, Any]], ladder: List[int]) -> Dict[str, float]:
@@ -130,39 +180,10 @@ def compute_scores(
 def gate_verdict(current: Dict[str, Any], baseline: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """Compare current scores vs baseline; return (pass, failure reasons).
 
-    PASS if: no category recall@max-k drops > 1pp, overall recall@max-k
-    drop <= 0.5pp, and overall MRR drop <= 0.01.  Only regressions fail
-    the gate — improvements never do.
+    Delegates to the shared verdict module (#21) so run_gate and
+    eval_self_corpus --baseline agree on all PASS/FAIL cases.
     """
-    ladder = current.get("ladder") or baseline.get("ladder") or [5, 20, 96]
-    max_k = max(ladder)
-    rk = f"recall@{max_k}"
-    failures: List[str] = []
-    base_cats = baseline.get("by_category", {})
-    cur_cats = current.get("by_category", {})
-    for cat, bm in base_cats.items():
-        cm = cur_cats.get(cat, {})
-        drop = bm.get(rk, 0.0) - cm.get(rk, 0.0)
-        if drop > CATEGORY_RECALL_PP / 100.0:
-            failures.append(
-                f"category {cat}: {rk} {cm.get(rk, 0.0)*100:.1f}% vs baseline "
-                f"{bm.get(rk, 0.0)*100:.1f}% ({drop*100:+.1f}pp)"
-            )
-    bo = baseline.get("overall", {})
-    co = current.get("overall", {})
-    drop_r = bo.get(rk, 0.0) - co.get(rk, 0.0)
-    if drop_r > OVERALL_RECALL_PP / 100.0:
-        failures.append(
-            f"overall {rk}: {co.get(rk, 0.0)*100:.1f}% vs baseline "
-            f"{bo.get(rk, 0.0)*100:.1f}% ({drop_r*100:+.1f}pp)"
-        )
-    drop_m = bo.get("mrr", 0.0) - co.get("mrr", 0.0)
-    if drop_m > OVERALL_MRR:
-        failures.append(
-            f"overall MRR: {co.get('mrr', 0.0):.4f} vs baseline "
-            f"{bo.get('mrr', 0.0):.4f} ({drop_m:+.4f})"
-        )
-    return (not failures, failures)
+    return _verdict_mod.gate_verdict(current, baseline)
 
 
 def run_gate(
@@ -174,6 +195,7 @@ def run_gate(
     embedder_model: str = DEFAULT_EMBEDDER,
     user_id: str = "default_user",
     seed: int = DEFAULT_SEED,
+    probe_timeout: float = DEFAULT_PROBE_TIMEOUT,
 ) -> int:
     """Run the gate; return 0 PASS / 1 FAIL / 2 error."""
     ladder = ladder or [5, 20, 96]
@@ -232,7 +254,10 @@ def run_gate(
         store = DuckDBMemoryStore(copy, user_id=user_id, embedder=embedder)
         try:
             cfg_hash = esc._config_hash(db_path, embedder_model or "none")
-            probe_results = [score_probe(store, line, ladder) for line in gold_lines]
+            probe_results = [
+                _score_probe_with_timeout(store, line, ladder, probe_timeout)
+                for line in gold_lines
+            ]
         finally:
             store.close()
     finally:
@@ -294,6 +319,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--embedder-model", default=DEFAULT_EMBEDDER, help=f"Embedder (default '{DEFAULT_EMBEDDER}'); empty = text search only.")
     parser.add_argument("--threads", type=int, default=4, help="Accepted for CLI parity; keep modest (default 4).")
     parser.add_argument("--user-id", default="default_user")
+    parser.add_argument("--probe-timeout", type=float, default=DEFAULT_PROBE_TIMEOUT,
+                        help=f"Per-probe timeout in seconds (default {DEFAULT_PROBE_TIMEOUT}; 0 = no timeout).")
     args = parser.parse_args(argv)
 
     try:
@@ -305,6 +332,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         Path(args.snapshot), Path(args.gold), Path(args.out),
         compare_path=compare, ladder=ladder,
         embedder_model=args.embedder_model, user_id=args.user_id, seed=args.seed,
+        probe_timeout=args.probe_timeout,
     )
 
 

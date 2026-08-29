@@ -135,11 +135,28 @@ def _seed_star_cluster(
     components used in P4.1's tighter 0.88 dedup).
     """
     if np is None or len(records) < 2:
+        if np is None and len(records) >= 2:
+            # Silent numpy fallback (#33 finding 2): clustering returns all
+            # singletons and no cluster LLM calls are made, but the high-signal
+            # scan may still run — a silent partial-degradation mode. Log it
+            # so it's distinguishable from a healthy "nothing to cluster" run.
+            logger.warning(
+                "numpy unavailable — clustering disabled, returning %d singletons. "
+                "Install numpy for distillation clustering.", len(records),
+            )
         return [[r] for r in records]
 
     # Sort by created_at descending (newest first = seed priority).
+    # Coerce None to epoch 0 (#33 finding 3): `created_at or ""` makes
+    # records with missing timestamps sort as empty strings, which in
+    # reverse-chronological order lands them last (treated as oldest),
+    # deprioritizing records with missing timestamps even when they're
+    # new. Using a minimal sentinel ("0000-01-01T00:00:00Z") ensures
+    # missing-timestamp records sort as oldest intentionally, not by
+    # accident from string comparison semantics.
+    _EPOCH_SENTINEL = "0000-01-01T00:00:00Z"
     sorted_records = sorted(
-        records, key=lambda r: r.created_at or "", reverse=True,
+        records, key=lambda r: r.created_at or _EPOCH_SENTINEL, reverse=True,
     )
 
     # Build embedding matrix for all records.
@@ -528,7 +545,12 @@ def run_distillation(
             (r.content or "")[:200] for r in cluster
         )[:2000]
         source_ids = [r.memory_id for r in cluster]
-        cluster_project_id = cluster[0].project_id if cluster else None
+        # Use _majority_project_id instead of cluster[0].project_id (#33
+        # finding 1): a mixed-project cluster can mis-tag the proposal
+        # with the first record's project. _majority_project_id returns
+        # None for mixed-project clusters (global proposal) and the
+        # unanimous project id otherwise.
+        cluster_project_id = _majority_project_id(cluster) if cluster else None
 
         # Emit insights.
         for item in parsed.get("insights", []):

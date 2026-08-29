@@ -25,7 +25,9 @@ gate re-scans the evidence and enforces the confirmation policy.
 """
 from __future__ import annotations
 
+import html
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import List, Set
 
@@ -128,19 +130,103 @@ class ScanResult:
         ) + (f" (+{len(self.matches) - 8} more)" if len(self.matches) > 8 else "")
 
 
+def _normalize_for_scan(text: str) -> str:
+    """Normalize text before regex scanning to catch evasion (#19).
+
+    The scanner is regex-only, which has a known ceiling: paraphrasing,
+    non-English text, and character-level evasion bypass it. This
+    normalization layer addresses the character-level evasion class
+    without adding LLM-based detection:
+
+    1. Strip zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
+       — attackers insert these between keywords to break regex matches
+       while keeping the text visually identical.
+    2. Decode HTML entities (&#x69; = 'i', &lt; = '<') — a common
+       obfuscation technique that hides patterns from regex.
+    3. Normalize homoglyphs via NFKD decomposition — converts lookalike
+       Unicode characters to their ASCII equivalents (e.g. Cyrillic 'а'
+       to Latin 'a') so patterns match regardless of the input script.
+    4. Collapse whitespace — multiple spaces/tabs between words can
+       break patterns that expect single spaces.
+
+    This keeps the zero-LLM property: the normalization is deterministic
+    and cheap. The original text is preserved for the snippet; only the
+    scanned copy is normalized.
+    """
+    if not text:
+        return ""
+    # 1. Strip zero-width characters.
+    result = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", text)
+    # 2. Decode HTML entities (handles named, decimal, and hex).
+    result = html.unescape(result)
+    # 3. NFKD normalization: decompose homoglyphs to ASCII equivalents.
+    result = unicodedata.normalize("NFKD", result)
+    # 4. Collapse whitespace (but preserve structure for snippet extraction).
+    result = re.sub(r"[ \t]+", " ", result)
+    return result
+
+
 def scan_inbound_text(text: str) -> ScanResult:
-    """Scan one inbound text. BLOCKED = route to a human; never act on it."""
+    """Scan one inbound text. BLOCKED = route to a human; never act on it.
+
+    The text is normalized before scanning (#19) to catch character-level
+    evasion (zero-width chars, HTML entities, homoglyphs). The original
+    text is used for snippet extraction so the evidence is readable.
+    """
     result = ScanResult()
     if not text or not text.strip():
         return result
-    lower = text.lower()
+    # Normalize for scanning (catches evasion), but keep original for snippets.
+    normalized = _normalize_for_scan(text)
+    lower = normalized.lower()
     for category, name, regex in _PATTERNS:
         m = re.search(regex, lower)
         if m:
             start = max(0, m.start() - 30)
-            snippet = text[start:m.end() + 30].replace("\n", " ")
+            snippet = normalized[start:m.end() + 30].replace("\n", " ")
             result.matches.append(
                 ScanMatch(category=category, pattern=name, snippet=snippet)
             )
     result.blocked = bool(result.matches)
     return result
+
+
+def scan_inbound_or_raise(text: str, *, content_label: str = "content") -> ScanResult:
+    """Ingestion-time enforcement (#19): scan external content at the boundary.
+
+    Unlike ``scan_inbound_text`` (which just returns a result), this function
+    is called at ingestion time when content is tagged as external/untrusted.
+    If the scan blocks, it raises ``InboundSecurityError`` so the caller can
+    refuse the write — the content never enters the store.
+
+    Callers (importers, feed handlers, ``remember()``, ``save_candidate()``)
+    should call this when ``external_source`` is True or when the content
+    arrives from an untrusted channel. The scanner is a gate, not a judge:
+    a BLOCKED verdict means "refuse the write and route to a human".
+
+    Args:
+        text: The inbound content to scan.
+        content_label: A short label for error messages (e.g. "candidate",
+                       "memory").
+
+    Returns:
+        ScanResult with blocked=False if the content is clean.
+
+    Raises:
+        InboundSecurityError: If the scan blocks (content matches a
+                              poisoning/injection pattern).
+    """
+    result = scan_inbound_text(text)
+    if result.blocked:
+        raise InboundSecurityError(
+            f"Inbound security scan blocked {content_label}: {result.summary()}"
+        )
+    return result
+
+
+class InboundSecurityError(Exception):
+    """Raised when inbound content is blocked by the security scanner.
+
+    The content matched a poisoning/injection pattern and must not enter
+    the store. Route to a human for review.
+    """

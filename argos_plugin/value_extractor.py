@@ -196,3 +196,68 @@ def values_conflict(
             # Same subject, different value — conflict
             return (new_v, old_v)
     return None
+
+
+# --- transition-verb gate (#36) -------------------------------------------
+# Only transition statements should close a standing fact. A plain restatement
+# ("I use X") must not invalidate a legacy value — the user may hold several
+# things at once. The transition gate checks whether the new content carries
+# an explicit transition signal before treating a value conflict as a true
+# supersession candidate.
+
+# Transition verbs and phrases that signal a change of state.
+# Matched case-insensitively on the full content text.
+_TRANSITION_VERBS = re.compile(
+    r"\b(?:"
+    r"switched\s+to|switch\s+to|"
+    r"changed\s+to|change\s+to|"
+    r"moved\s+to|move\s+to|"
+    r"replaced|replace(?:d)?\s+(?:with|by|to)?|"
+    r"stopped\s+(?:using|doing|taking|going|working)|"
+    r"started\s+(?:using|doing|taking|going|working)|"
+    r"now\s+(?:use|uses|using|live|lives|living|work|works|working|drive|drives|take|takes)|"
+    r"no\s+longer\s+(?:use|uses|using|live|lives|work|works|drive|drives|take|takes)|"
+    r"used\s+to\s+(?:use|live|work|drive|take)|"
+    r"upgraded\s+to|upgrade\s+to|"
+    r"downgraded\s+to|downgrade\s+to|"
+    r"switched\s+from|switch\s+from|"
+    r"changed\s+from|change\s+from|"
+    r"moved\s+from|move\s+from"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Negation of transition — "didn't switch", "hasn't changed", "still uses".
+# If the content negates a transition, it's a corroboration, not a change.
+_TRANSITION_NEGATION = re.compile(
+    r"\b(?:"
+    r"didn['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"hasn['\u2019]?t\s+(?:switched|changed|moved|replaced|stopped|started)|"
+    r"haven['\u2019]?t\s+(?:switched|changed|moved|replaced|stopped|started)|"
+    r"don['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"doesn['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"still\s+(?:use|uses|using|live|lives|work|works|drive|drives|take|takes|have|has)|"
+    r"never\s+(?:switched|changed|moved|replaced|stopped|started)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_transition_statement(text: str) -> bool:
+    """Check if *text* carries an explicit transition signal (#36).
+
+    A transition statement is one that signals a change of state —
+    "switched to", "changed to", "stopped using", "now uses", etc.
+    A plain restatement ("I use 449 rows") is NOT a transition.
+
+    Negated transitions ("didn't switch", "still uses") are treated as
+    corroboration, not transition.
+
+    Returns True if the text contains a non-negated transition verb.
+    """
+    if not text or not text.strip():
+        return False
+    # If the text negates a transition, it's not a transition.
+    if _TRANSITION_NEGATION.search(text):
+        return False
+    return bool(_TRANSITION_VERBS.search(text))

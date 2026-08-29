@@ -1309,6 +1309,221 @@ class KuzuGraphStore:
         ordered = sorted(scores, key=lambda mid: (-scores[mid], mid))
         return ordered[:max(1, min(int(limit), 500))]
 
+    # -- Personalized PageRank diffusion (issue #37) -------------------------
+
+    def ppr_memory_ids(
+        self,
+        query: str,
+        limit: int = 100,
+        damping: float = 0.5,
+        dense_prior: float = 0.05,
+        max_iterations: int = 20,
+        convergence_threshold: float = 1e-4,
+    ) -> List[str]:
+        """Personalized PageRank diffusion from query-grounded seed entities.
+
+        Unlike ``traversal_memory_ids`` (bounded BFS over typed relations),
+        PPR diffuses relevance through ALL edges (typed + generic, but
+        generic edges carry less weight because they connect everything).
+        The diffusion naturally decays with distance, so multi-hop
+        associations surface without a fixed depth cutoff.
+
+        Parameters:
+            query: the user query; entity terms are extracted and grounded
+                to graph nodes as seeds.
+            limit: max memory IDs to return.
+            damping: PageRank damping factor (~0.5 keeps relevance near
+                the seeds; higher values drift further).
+            dense_prior: a uniform prior added to every node so the walk
+                doesn't collapse to a single seed on sparse graphs (~0.05).
+            max_iterations: power-iteration cap.
+            convergence_threshold: L1-norm convergence threshold.
+
+        Seed weighting (issue #37 spec):
+            Seeds are weighted by an IDF-like penalty: entities that appear
+            in many memories (hubs) get lower seed weight, so the diffusion
+            doesn't favor well-connected but irrelevant entities. The weight
+            is ``1.0 / max(1, len(memory_ids))`` per seed entity.
+
+        Edge cases:
+            If no seeds can be grounded, returns [] (degrades to dense
+            retrieval — the caller's vector/text search handles the query).
+
+        Returns:
+            Memory IDs ordered by PPR score (desc).
+        """
+        stop_words = _GRAPH_STOP_ENTITIES | {
+            "about", "and", "are", "does", "from", "have", "into", "more",
+            "that", "the", "this", "what", "when", "where", "which", "with",
+            "who", "how", "why", "did", "was", "were", "been", "for", "our",
+        }
+        terms = []
+        seen_terms = set()
+        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", str(query or "").lower()):
+            if term in stop_words or term in seen_terms:
+                continue
+            seen_terms.add(term)
+            terms.append(term)
+            if len(terms) >= 8:
+                break
+        if not terms:
+            return []
+
+        # Ground: find seed entities for each query term.
+        # Exclude the "user" hub node — in a personal memory graph
+        # EVERYTHING touches user, so seeding it drowns out specific entities.
+        seeds: Dict[str, float] = {}
+        for term in terms:
+            try:
+                for edge in self.search_graph(term, limit=20):
+                    for endpoint in (edge.get("source"), edge.get("target")):
+                        eid = str(endpoint)
+                        if eid == "user" or eid.startswith("memory:"):
+                            continue
+                        if eid in seeds:
+                            continue
+                        # IDF-like penalty: entities linked to many memories
+                        # get lower seed weight. This prevents hubs from
+                        # dominating the diffusion.
+                        attrs = edge.get("attributes") or {}
+                        mem_ids = attrs.get("memory_ids", [])
+                        if not isinstance(mem_ids, list):
+                            mem_ids = [mem_ids] if mem_ids else []
+                        evidence_count = max(1, len(mem_ids))
+                        seeds[eid] = 1.0 / evidence_count
+            except Exception:
+                continue
+        if not seeds:
+            return []
+
+        # Build the adjacency structure for the subgraph reachable from
+        # seeds within a bounded neighborhood. We load edges for the seeds
+        # and their neighbors (2 hops), which is sufficient for PPR on a
+        # ~1k-node graph.
+        # Adjacency: {node_id: [(neighbor_id, edge_weight), ...]}
+        # Edge weight: typed relations get 1.0, generic relations get 0.3
+        # (they connect everything, so they carry less signal).
+        adjacency: Dict[str, List[tuple]] = {}
+        all_nodes: set = set()
+
+        def _add_edge(src: str, tgt: str, rel: str) -> None:
+            weight = 1.0 if rel in _GRAPH_TYPED_RELATIONS else 0.3
+            adjacency.setdefault(src, []).append((tgt, weight))
+            adjacency.setdefault(tgt, []).append((src, weight))  # undirected
+            all_nodes.add(src)
+            all_nodes.add(tgt)
+
+        # Hop 1: edges touching seeds.
+        seed_list = list(seeds.keys())
+        hop1_edges = self._query_edges_for_nodes(seed_list)
+        for edge in hop1_edges:
+            src = str(edge.get("source", ""))
+            tgt = str(edge.get("target", ""))
+            rel = str(edge.get("relation", ""))
+            # Skip memory: nodes in the graph structure — they're leaf
+            # endpoints, not traversal nodes. Their memory IDs are collected
+            # separately below.
+            if src.startswith("memory:") or tgt.startswith("memory:"):
+                continue
+            _add_edge(src, tgt, rel)
+
+        # Hop 2: edges touching hop-1 neighbors.
+        hop1_neighbors = [n for n in all_nodes if n not in seeds]
+        if hop1_neighbors:
+            hop2_edges = self._query_edges_for_nodes(hop1_neighbors[:50])
+            for edge in hop2_edges:
+                src = str(edge.get("source", ""))
+                tgt = str(edge.get("target", ""))
+                rel = str(edge.get("relation", ""))
+                if src.startswith("memory:") or tgt.startswith("memory:"):
+                    continue
+                _add_edge(src, tgt, rel)
+
+        if not all_nodes:
+            return []
+
+        # Build the seed vector (personalized teleport distribution).
+        # Normalize seed weights, then add the dense prior.
+        total_seed_weight = sum(seeds.values())
+        n_nodes = len(all_nodes)
+        seed_vec = {}
+        for node in all_nodes:
+            if node in seeds:
+                seed_vec[node] = (seeds[node] / total_seed_weight) * (1.0 - dense_prior)
+            else:
+                seed_vec[node] = 0.0
+        # Add dense prior: uniform distribution over all nodes.
+        prior_per_node = dense_prior / n_nodes
+        for node in all_nodes:
+            seed_vec[node] += prior_per_node
+
+        # Normalize seed vector to sum to 1.
+        total = sum(seed_vec.values())
+        if total > 0:
+            for node in seed_vec:
+                seed_vec[node] /= total
+
+        # Power iteration for PageRank.
+        # PR(node) = (1 - damping) * seed_vec[node] +
+        #            damping * sum(PR(neighbor) * weight / out_degree(neighbor))
+        pr = dict(seed_vec)  # Initialize with seed vector.
+        out_degree: Dict[str, float] = {}
+        for node, neighbors in adjacency.items():
+            out_degree[node] = sum(w for _, w in neighbors) or 1.0
+        # Nodes with no edges get out_degree 1.0 (self-loop, standard PR).
+        for node in all_nodes:
+            if node not in out_degree:
+                out_degree[node] = 1.0
+
+        for _ in range(max_iterations):
+            new_pr: Dict[str, float] = {}
+            for node in all_nodes:
+                # Teleport component.
+                new_pr[node] = (1.0 - damping) * seed_vec.get(node, 0.0)
+            # Diffusion component.
+            for node, neighbors in adjacency.items():
+                if not neighbors:
+                    continue
+                share = damping * pr.get(node, 0.0) / out_degree[node]
+                for neighbor, weight in neighbors:
+                    new_pr[neighbor] = new_pr.get(neighbor, 0.0) + share * weight
+            # Check convergence (L1 norm).
+            diff = sum(abs(new_pr.get(n, 0.0) - pr.get(n, 0.0)) for n in all_nodes)
+            pr = new_pr
+            if diff < convergence_threshold:
+                break
+
+        # Collect memory IDs from the highest-PPR nodes.
+        # Walk the top nodes' edges and extract memory_ids from attributes.
+        top_nodes = sorted(pr, key=lambda n: -pr.get(n, 0.0))[:max(20, limit)]
+        # Also include seed nodes' direct memory evidence.
+        scores: Dict[str, float] = {}
+        for node in top_nodes:
+            node_score = pr.get(node, 0.0)
+            if node_score <= 0:
+                continue
+            try:
+                edges = self._query_edges_for_nodes([node])
+            except Exception:
+                continue
+            for edge in edges:
+                attrs = edge.get("attributes") or {}
+                mem_ids = attrs.get("memory_ids", [])
+                if not isinstance(mem_ids, list):
+                    mem_ids = [mem_ids] if mem_ids else []
+                for mid in mem_ids:
+                    if mid:
+                        scores[str(mid)] = scores.get(str(mid), 0.0) + node_score
+                # memory: nodes carry explicit memory evidence.
+                for endpoint in (edge.get("source"), edge.get("target")):
+                    if str(endpoint).startswith("memory:"):
+                        mid = str(endpoint)[len("memory:"):]
+                        if mid:
+                            scores[mid] = scores.get(mid, 0.0) + node_score
+
+        ordered = sorted(scores, key=lambda mid: (-scores[mid], mid))
+        return ordered[:max(1, min(int(limit), 500))]
+
     def query_graph(self, entity_id: str) -> List[Dict[str, Any]]:
         """Find visible edges touching an entity id (bidirectional).
 

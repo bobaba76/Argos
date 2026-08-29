@@ -75,15 +75,22 @@ class _Tenant:
         home: Path,
         embedder,
         reranker,
+        default_scope: str | None = None,
     ) -> None:
         self.name = name
         self.config = config
         db_name = str(config.get("database_filename", "hybrid_memory.duckdb"))
         graph_name = str(config.get("graph_dirname", "hybrid_memory_kuzu"))
+        # Default scope for direct (non-RPC) calls like the startup hygiene
+        # sweep. The DEFAULT tenant keeps the historical "default_user" so
+        # the sweep still sees entities written by default clients — a
+        # scope change here silently disabled the sweep (#49 review).
+        self.default_scope = default_scope or "default_user"
         # The tenant name is the store's default scope; every request
         # re-scopes per user_id anyway (defense in depth).
         self.store = DuckDBMemoryStore(
-            home / db_name, user_id=name, embedder=embedder, reranker=reranker,
+            home / db_name, user_id=self.default_scope,
+            embedder=embedder, reranker=reranker,
         )
         try:
             self.store._reranker_top_n = max(
@@ -107,15 +114,8 @@ class _Tenant:
         self.store.external_sources_require_confirmation = str(
             config.get("external_sources_require_confirmation", "true")
         ).lower() in ("true", "1", "yes")
-        # Injection caps (per-tenant overlay; Phase 2 policy surface).
         try:
-            self.store._max_injected = max(
-                0, min(int(config.get("max_injected_items", 12)), 50)
-            )
-        except (TypeError, ValueError):
-            self.store._max_injected = 12
-        try:
-            self.graph = KuzuGraphStore(home / graph_name, user_id=name)
+            self.graph = KuzuGraphStore(home / graph_name, user_id=self.default_scope)
         except Exception as exc:
             logger.warning(
                 "Kùzu unavailable for tenant %r: %s", name, exc,
@@ -159,7 +159,13 @@ def _parse_tenants(config: dict, home: Path, embedder, reranker) -> dict:
         merged["graph_dirname"] = entry.get(
             "graph_dirname", config.get("graph_dirname", "hybrid_memory_kuzu")
         )
-        tenants[name] = _Tenant(name, merged, home, embedder, reranker)
+        # Default tenant keeps the historical "default_user" scope (#49
+        # review): the startup hygiene sweep and any direct store/graph
+        # calls must see the data default clients write.
+        default_scope = "default_user" if name == "default" else name
+        tenants[name] = _Tenant(
+            name, merged, home, embedder, reranker, default_scope=default_scope,
+        )
     return tenants
 
 

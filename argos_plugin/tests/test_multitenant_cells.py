@@ -46,6 +46,25 @@ def _write_config(tmp_path: Path, config: dict) -> None:
     )
 
 
+def _stop_service(store) -> None:
+    """Stop the shared service and WAIT for its endpoint to disappear.
+
+    A fixed sleep after stop_service() is a flake source: the next test's
+    service boot can race a still-dying previous service. Waiting for the
+    endpoint file to go away (bounded, 5s) makes teardown deterministic.
+    """
+    try:
+        store._rpc.stop_service()
+    except Exception:
+        pass
+    endpoint = store.home / "hybrid_memory_service.json"
+    for _ in range(50):
+        if not endpoint.exists():
+            return
+        time.sleep(0.1)
+    time.sleep(0.5)  # last resort; endpoint may be stale-but-dead
+
+
 class TestTwoTenantIsolation:
     """Each tenant sees only its own data across every retrieval surface."""
 
@@ -57,10 +76,7 @@ class TestTwoTenantIsolation:
         try:
             yield a, b, tmp_path
         finally:
-            try:
-                a._rpc.stop_service()
-            finally:
-                time.sleep(0.5)
+            _stop_service(a)
 
     def test_text_search_isolation(self, stores):
         a, b, _ = stores
@@ -153,10 +169,7 @@ class TestSingleTenantBackwardCompat:
             assert rec is not None
             assert store.search("single tenant", limit=5)
         finally:
-            try:
-                store._rpc.stop_service()
-            finally:
-                time.sleep(0.5)
+            _stop_service(store)
 
     def test_tenant_config_overlay_applied(self, tmp_path):
         """Per-tenant config overlay (phrase_lift_alpha) must reach the store."""
@@ -168,6 +181,35 @@ class TestSingleTenantBackwardCompat:
             assert svc._tenants["brandon-bot"].store._phrase_lift_alpha == 0.25
             # Default tenant keeps the global default.
             assert svc._tenants["default"].store._phrase_lift_alpha == 0.0
+        finally:
+            svc.close()
+
+    def test_default_tenant_keeps_historical_scope(self, tmp_path):
+        """The default tenant's store/graph default scope must stay
+        'default_user' (#49 review): the startup hygiene sweep and direct
+        calls must still see data written by default clients."""
+        _write_config(tmp_path, _TWO_TENANT_CONFIG)
+        import memory_service
+        svc = memory_service.MemoryService(tmp_path)
+        try:
+            assert svc._tenants["default"].store.user_id == "default_user"
+            assert svc._tenants["default"].default_scope == "default_user"
+            # Named tenants scope to their own name.
+            assert svc._tenants["brandon-bot"].store.user_id == "brandon-bot"
+        finally:
+            svc.close()
+
+    def test_single_tenant_keeps_default_scope(self, tmp_path):
+        """No tenants key: the single default tenant uses 'default_user' —
+        exact old behavior, so the sweep sees historical data."""
+        (tmp_path / "hybrid_memory.json").write_text(
+            json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+            encoding="utf-8",
+        )
+        import memory_service
+        svc = memory_service.MemoryService(tmp_path)
+        try:
+            assert svc._tenants["default"].store.user_id == "default_user"
         finally:
             svc.close()
 
@@ -189,7 +231,4 @@ class TestPerTenantBackup:
                 "backup must write a snapshot under dst_root"
             )
         finally:
-            try:
-                store._rpc.stop_service()
-            finally:
-                time.sleep(0.5)
+            _stop_service(store)

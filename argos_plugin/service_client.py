@@ -199,6 +199,10 @@ class _SharedRPC:
                     if b"\n" in chunk:
                         break
             response = json.loads(b"".join(chunks).splitlines()[0].decode("utf-8"))
+        except ConnectionRefusedError:
+            # Propagate so the retry loop in _request can handle it (#20):
+            # the request never reached the server, so retrying is safe.
+            raise
         except (OSError, ValueError, IndexError) as exc:
             raise SharedMemoryServiceError(
                 f"shared memory service request failed: {exc}",

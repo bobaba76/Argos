@@ -1165,6 +1165,14 @@ class DuckDBMemoryStore:
     # With k=20, rank 1 → 0.0476 and rank 10 → 0.0323 (spread ~0.015).
     # The wider spread lets relevance survive the importance adjustment.
 
+    # Rank-1 survival guard (#38): if a single arm ranks an item #1 by a
+    # clear margin, the fused top-k must still contain it. The guard
+    # promotes any arm rank-1 item that was pushed below top-k by RRF.
+    # "Clear margin" = the arm rank-1 score is > _RANK1_MARGIN_RATIO times
+    # the arm rank-2 score (default 1.5x -- a meaningful gap).
+    _RANK1_GUARD_TOP_K = 3
+    _RANK1_MARGIN_RATIO = 1.5
+
     @classmethod
     def _rrf_fuse(
         cls,
@@ -1173,11 +1181,25 @@ class DuckDBMemoryStore:
     ) -> List[MemoryRecord]:
         """Fuse vector and text rankings via Reciprocal Rank Fusion.
 
-        RRF score(d) = sum over lists: 1 / (k + rank_in_list)
-        A document appearing at rank 1 in both lists scores higher than
-        one appearing at rank 1 in only one list.  The fused score is
-        stored in ``similarity`` so callers see a single relevance number.
+        Includes the rank-1 survival guard (#38): if a single arm ranks
+        an item #1 by a clear margin, the fused top-k must still contain
+        it — RRF can suppress a strong semantic rank-1 when the other
+        arms disagree.
         """
+        # Capture original arm scores BEFORE fusion overwrites similarity.
+        # The guard needs the original arm-level scores to detect a clear
+        # margin between rank-1 and rank-2.
+        arm_rank1_info: list[tuple[str, float, float]] = []  # (id, r1_score, r2_score)
+        for arm in (vector_results, text_results):
+            if len(arm) >= 2:
+                r1 = arm[0]
+                r2 = arm[1]
+                arm_rank1_info.append((
+                    r1.memory_id,
+                    float(getattr(r1, "similarity", 0.0) or 0.0),
+                    float(getattr(r2, "similarity", 0.0) or 0.0),
+                ))
+
         scores: Dict[str, float] = {}
         records_by_id: Dict[str, MemoryRecord] = {}
 
@@ -1201,6 +1223,71 @@ class DuckDBMemoryStore:
 
         fused = list(records_by_id.values())
         fused.sort(key=lambda r: r.similarity, reverse=True)
+
+        # Rank-1 survival guard (#38): if a single arm ranks an item #1
+        # by a clear margin, the fused top-k must still contain it. RRF
+        # can suppress a strong semantic rank-1 when the other arms
+        # disagree — this guard promotes it back into the top-k.
+        fused = cls._rank1_survival_guard(fused, arm_rank1_info)
+        return fused
+
+    @classmethod
+    def _rank1_survival_guard(
+        cls,
+        fused: List[MemoryRecord],
+        arm_rank1_info: list[tuple[str, float, float]],
+    ) -> List[MemoryRecord]:
+        """Ensure each arm clear rank-1 survives in the fused top-k.
+
+        For each arm, if the rank-1 item has a score > _RANK1_MARGIN_RATIO
+        times the rank-2 score, and it was pushed below _RANK1_GUARD_TOP_K
+        in the fused ranking, promote it into the top-k.
+
+        Args:
+            fused: The RRF-fused ranking (sorted by similarity desc).
+            arm_rank1_info: List of (memory_id, rank1_score, rank2_score)
+                captured BEFORE fusion overwrote the similarity scores.
+        """
+        if not fused:
+            return fused
+        top_k_ids = {r.memory_id for r in fused[:cls._RANK1_GUARD_TOP_K]}
+        # Collect all promotions first, then apply them. This prevents
+        # one promotion from pushing another arm rank-1 out of top-k.
+        to_promote: list[str] = []
+        for r1_id, s1, s2 in arm_rank1_info:
+            # Check for a clear margin: rank-1 score >> rank-2 score.
+            if s2 > 0 and s1 < s2 * cls._RANK1_MARGIN_RATIO:
+                continue
+            if s2 == 0 and s1 == 0:
+                continue
+            # If rank-1 is already in the fused top-k, no promotion needed.
+            if r1_id in top_k_ids:
+                continue
+            to_promote.append(r1_id)
+
+        if not to_promote:
+            return fused
+
+        # Remove promoted items from their current positions, then insert
+        # them all at the top-k boundary. This ensures they all end up in
+        # the top-k without displacing each other.
+        promoted_records: list[MemoryRecord] = []
+        for r1_id in to_promote:
+            for i, r in enumerate(fused):
+                if r.memory_id == r1_id:
+                    promoted_records.append(fused.pop(i))
+                    logger.debug(
+                        "Rank-1 survival guard: promoting %s (arm rank-1)",
+                        r1_id,
+                    )
+                    break
+        # Insert promoted records at the top-k boundary, in order.
+        insert_pos = cls._RANK1_GUARD_TOP_K - len(promoted_records)
+        if insert_pos < 0:
+            insert_pos = 0
+        for record in promoted_records:
+            fused.insert(insert_pos, record)
+            insert_pos += 1
         return fused
 
     @staticmethod

@@ -191,47 +191,53 @@ class TestStoreSupersession:
         return store
 
     def test_find_conflicting_active_value_detects_stale(self, tmp_path):
-        """New fact with different percentage for same subject → conflict found."""
+        """New fact with different percentage for same subject → conflict found.
+
+        Updated for #36: transition-verb gate requires a transition statement
+        to trigger a value conflict. Plain restatements are corroboration.
+        """
         store = self._make_store(tmp_path)
         try:
-            # Old fact: 82.2%
+            # Old fact: salary $449
             store.remember(
                 category="context_note",
-                content="LongMemEval benchmark score is 82.2%",
+                content="my salary at acme corp is $449 per week",
                 dedup=False,
             )
-            # New fact: 89.8% — same subject, different value
+            # New fact: salary $500 — same subject, different value, transition verb
             conflict = store._find_conflicting_active_value(
-                "LongMemEval benchmark score is 89.8%",
+                "my salary at acme corp switched to $500 per week",
                 "context_note",
             )
             assert conflict is not None
             old_id, old_content, new_val, old_val = conflict
-            assert old_val == "82.2"
-            assert new_val == "89.8"
-            assert "82.2" in old_content
+            assert old_val == "449"
+            assert new_val == "500"
+            assert "449" in old_content
         finally:
             store.close()
 
     def test_find_conflicting_cross_category(self, tmp_path):
-        """Stale value detected even when the two facts live in different categories."""
+        """Stale value detected even when the two facts live in different categories.
+
+        Updated for #36: transition-verb gate requires a transition statement.
+        """
         store = self._make_store(tmp_path)
         try:
             store.remember(
                 category="context_note",
-                content="LongMemEval benchmark score is 82.2%",
+                content="my salary at acme corp is $449 per week",
                 dedup=False,
             )
-            # Same subject, different value, DIFFERENT category (the original
-            # incident shape: insight headline vs context_note).
+            # Same subject, different value, DIFFERENT category, with transition verb
             conflict = store._find_conflicting_active_value(
-                "LongMemEval benchmark score is 89.8%",
+                "my salary at acme corp switched to $500 per week",
                 "insight",
             )
             assert conflict is not None
             old_id, old_content, new_val, old_val = conflict
-            assert old_val == "82.2"
-            assert new_val == "89.8"
+            assert old_val == "449"
+            assert new_val == "500"
         finally:
             store.close()
 
@@ -345,19 +351,22 @@ class TestSaveCandidateWithSupersession:
         return store
 
     def test_candidate_records_supersession_conflict(self, tmp_path):
-        """Candidate with a conflicting value records the conflict in payload."""
+        """Candidate with a conflicting value records the conflict in payload.
+
+        Updated for #36: transition-verb gate requires a transition statement.
+        """
         store = self._make_store(tmp_path)
         try:
             # Existing active fact with old value
             store.remember(
                 category="context_note",
-                content="LongMemEval benchmark score is 82.2%",
+                content="my salary at acme corp is $449 per week",
                 dedup=False,
             )
-            # New candidate with new value
+            # New candidate with new value — transition verb required (#36)
             candidate = store.save_candidate(
                 category="context_note",
-                content="LongMemEval benchmark score is 89.8%",
+                content="my salary at acme corp switched to $500 per week",
                 source="llm_extraction",
             )
             assert candidate is not None
@@ -367,8 +376,8 @@ class TestSaveCandidateWithSupersession:
                 payload = json.loads(payload)
             assert "value_supersession" in payload
             vs = payload["value_supersession"]
-            assert vs["new_value"] == "89.8"
-            assert vs["old_value"] == "82.2"
+            assert vs["new_value"] == "500"
+            assert vs["old_value"] == "449"
             assert vs["supersedes_memory_id"]
         finally:
             store.close()
@@ -429,19 +438,22 @@ class TestEndToEndSupersession:
             store.close()
 
     def test_supersession_via_review_candidate(self, tmp_path):
-        """Full flow: save_candidate → review with supersedes_memory_id → old excluded."""
+        """Full flow: save_candidate → review with supersedes_memory_id → old excluded.
+
+        Updated for #36: transition-verb gate requires a transition statement.
+        """
         store = self._make_store(tmp_path)
         try:
             # Old fact
             old = store.remember(
                 category="context_note",
-                content="LongMemEval benchmark score is 82.2%",
+                content="my salary at acme corp is $449 per week",
                 dedup=False,
             )
-            # New candidate with conflicting value
+            # New candidate with conflicting value — transition verb required (#36)
             candidate = store.save_candidate(
                 category="context_note",
-                content="LongMemEval benchmark score is 89.8%",
+                content="my salary at acme corp switched to $500 per week",
                 source="llm_extraction",
             )
             assert candidate is not None
@@ -473,9 +485,9 @@ class TestEndToEndSupersession:
             new_mem_id = result["memory"]["memory_id"]
             assert fetched[0].superseded_by == new_mem_id
             # Search should only return the new record
-            results = store.search("LongMemEval benchmark score", limit=10)
+            results = store.search("salary at acme corp", limit=10)
             contents = [r.content for r in results]
-            assert not any("82.2" in c for c in contents), \
+            assert not any("449" in c for c in contents), \
                 "Old superseded record should not appear in retrieval"
         finally:
             store.close()

@@ -19,6 +19,7 @@ the plan, not the shipped behavior.
 | `P4.3-live-backup.md` | True backup (cross-platform, no downtime) | **IMPLEMENTED** via `EXPORT DATABASE (FORMAT PARQUET)` — supersedes the VSS design (`argos_plugin/backup.py`, commit `91a492c`). VSS retained as a forensic alternative. |
 | `P5.1-memory-lifecycle.md` | Memory lifecycle: archival tier, forgetting, long-horizon rollups | **DRAFT** — board issue pending |
 | `P5.2-deploy-tooling.md` | One-command repo→live plugin deploy | **DRAFT** — board issue pending |
+| `spec-04-trust-model.md` | Trust-model cluster (provenance taint, grounding, one-way ladder, quote verify) | **IMPLEMENTED** (batch-2: #43, #40, #39, #35) |
 
 Line numbers and repo paths inside the specs date from their writing time
 (pre-`argos_plugin` rename, pre-`shared_service` RPC) — historical, not current.

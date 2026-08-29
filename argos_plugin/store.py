@@ -133,6 +133,154 @@ _DEFAULT_TTL_DAYS = {
 _NOT_PROVIDED = object()
 
 
+# --- trust-model: provenance taint, grounding, rejection ledger (batch-2) ----
+# Three record-level metadata fields that gate what a memory may do or become.
+# Designed together (one schema pass) per the trust-model cluster consolidation
+# (issues #43, #40, #39). Issue #35 (quote verification) feeds #40's grounding.
+
+# Provenance origin (#43): binary label, fail-closed to the stricter class.
+# Unknown/corrupt values parse to "external" so a missing or tampered label can
+# never widen a memory's blast radius. Sanitization/redaction does NOT alter it.
+PROVENANCE_INTERNAL = "internal"
+PROVENANCE_EXTERNAL = "external"
+_VALID_PROVENANCE = frozenset({PROVENANCE_INTERNAL, PROVENANCE_EXTERNAL})
+
+
+def normalize_provenance(value: Any) -> str:
+    """Fail-closed provenance parser. Unknown/corrupt -> external (stricter)."""
+    v = str(value or "").strip().lower()
+    if v == PROVENANCE_INTERNAL:
+        return PROVENANCE_INTERNAL
+    # Everything else (external, "", None, garbage) fails closed to external.
+    return PROVENANCE_EXTERNAL
+
+
+# Grounding (#40): how a record was obtained; caps how trusted it can become.
+# Ladder (low -> high): speculative < inferred < extracted < observed.
+# Promotion/confirmation may raise a record's class but never above what its
+# grounding allows; recall counts are NOT verification and never raise class.
+GROUNDING_SPECULATIVE = "speculative"   # hypothesis, unverified
+GROUNDING_INFERRED = "inferred"         # model- or distill-derived
+GROUNDING_EXTRACTED = "extracted"       # parsed/extracted from a user turn
+GROUNDING_OBSERVED = "observed"         # direct user statement
+_GROUNDING_ORDER = {
+    GROUNDING_SPECULATIVE: 0,
+    GROUNDING_INFERRED: 1,
+    GROUNDING_EXTRACTED: 2,
+    GROUNDING_OBSERVED: 3,
+}
+_VALID_GROUNDING = frozenset(_GROUNDING_ORDER)
+
+
+def normalize_grounding(value: Any) -> str:
+    """Fail-closed grounding parser. Unknown/corrupt -> speculative (strictest)."""
+    v = str(value or "").strip().lower()
+    if v in _GROUNDING_ORDER:
+        return v
+    return GROUNDING_SPECULATIVE
+
+
+def grounding_rank(value: Any) -> int:
+    return _GROUNDING_ORDER.get(normalize_grounding(value), 0)
+
+
+# Trust-class ceiling per grounding (#40). A record may be promoted up to its
+# ceiling but never past it via recall or auto-review. User confirmation raises
+# the grounding (lifts the ceiling); recall counts do not.
+# Status ladder (low -> high): quarantined/rejected < pending_user_confirmation
+#   < reviewed_approved < approved.
+_TRUST_CLASS_ORDER = {
+    "quarantined": 0,
+    "rejected": 0,
+    "pending_user_confirmation": 1,
+    "reviewed_approved": 2,
+    "approved": 3,
+}
+_GROUNDING_CEILING = {
+    GROUNDING_SPECULATIVE: "pending_user_confirmation",
+    GROUNDING_INFERRED: "reviewed_approved",
+    GROUNDING_EXTRACTED: "approved",
+    GROUNDING_OBSERVED: "approved",
+}
+
+
+def trust_class_rank(status: Any) -> int:
+    return _TRUST_CLASS_ORDER.get(str(status or "").strip().lower(), 0)
+
+
+def grounding_allows_status(grounding: Any, status: Any) -> bool:
+    """True if *grounding* permits reaching *status* (the ceiling check)."""
+    ceiling = _GROUNDING_CEILING.get(
+        normalize_grounding(grounding), "pending_user_confirmation"
+    )
+    return trust_class_rank(status) <= trust_class_rank(ceiling)
+
+
+def default_grounding_for_write(*, source: str = "", external: bool = False,
+                                explicit_grounding: Any = None) -> str:
+    """Default grounding per write path (#40).
+
+    - direct user statement (source=explicit, not external) -> observed
+    - parsed/extracted (source=llm_extraction)              -> extracted
+    - distill/model-derived (source=distillation)           -> inferred
+    - external-origin ingest                                -> inferred
+    - anything else                                         -> speculative
+    An explicit grounding from the caller always wins (after normalization).
+    """
+    if explicit_grounding is not None:
+        return normalize_grounding(explicit_grounding)
+    src = str(source or "").strip().lower()
+    if external:
+        return GROUNDING_INFERRED
+    if src in {"explicit", "user", "manual"}:
+        return GROUNDING_OBSERVED
+    if src in {"llm_extraction", "extraction"}:
+        return GROUNDING_EXTRACTED
+    if src in {"distillation", "distill"}:
+        return GROUNDING_INFERRED
+    return GROUNDING_SPECULATIVE
+
+
+# Rejection ledger (#39): one-way trust ladder. A rejected value's identity
+# (subject, predicate, scope) is recorded; no approval path may resurrect it
+# without a NEW record passing the same gates. Keyed by (subject, predicate,
+# scope) so paraphrased re-assertions of the same claim slot are also blocked.
+def rejection_key(candidate: dict) -> tuple:
+    """Derive a (subject, predicate, scope) identity from a candidate/record.
+
+    subject:   the entity the fact is about (a named person from payload, else
+               "user" for self-referential facts).
+    predicate: category + the specific claim slot (attribute / fact_type /
+               relation / preference / ...) so "user/age" and "user/location"
+               are distinct slots.
+    scope:     user_scope (defaults to default_user).
+    """
+    if not isinstance(candidate, dict):
+        return ("", "", "default_user")
+    payload = candidate.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    category = str(candidate.get("category", "") or "").strip().lower()
+    subject = (
+        str(payload.get("name") or "").strip().lower()
+        or str(payload.get("workplace") or "").strip().lower()
+        or "user"
+    )
+    slot = (
+        str(payload.get("attribute") or "").strip().lower()
+        or str(payload.get("fact_type") or "").strip().lower()
+        or str(payload.get("relation") or "").strip().lower()
+        or str(payload.get("preference") or "").strip().lower()
+        or str(payload.get("goal") or "").strip().lower()
+        or str(payload.get("insight") or "").strip().lower()
+        or str(payload.get("event") or "").strip().lower()
+    )
+    predicate = f"{category}:{slot}" if slot else category
+    scope = str(
+        candidate.get("user_scope") or payload.get("user_scope") or "default_user"
+    ).strip().lower()
+    return (subject, predicate, scope)
+
+
 class MemoryRecord:
     """In-memory representation of a stored memory row."""
 
@@ -145,6 +293,7 @@ class MemoryRecord:
         "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
         "quarantine_reason", "quarantined_at",
         "valid_from", "valid_to", "superseded_by",
+        "provenance_origin", "grounding",
     )
 
     def __init__(
@@ -176,6 +325,8 @@ class MemoryRecord:
         valid_from: str | None = None,
         valid_to: str | None = None,
         superseded_by: str | None = None,
+        provenance_origin: str = PROVENANCE_INTERNAL,
+        grounding: str = GROUNDING_OBSERVED,
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -211,6 +362,11 @@ class MemoryRecord:
         self.valid_from = valid_from
         self.valid_to = valid_to
         self.superseded_by = superseded_by
+        # Trust-model (batch-2): provenance taint (#43) and grounding (#40).
+        # Both fail-closed at parse time; see normalize_provenance /
+        # normalize_grounding. Sanitization never alters provenance_origin.
+        self.provenance_origin = normalize_provenance(provenance_origin)
+        self.grounding = normalize_grounding(grounding)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -239,6 +395,8 @@ class MemoryRecord:
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
             "superseded_by": self.superseded_by,
+            "provenance_origin": self.provenance_origin,
+            "grounding": self.grounding,
         }
 
 
@@ -335,7 +493,9 @@ class DuckDBMemoryStore:
                     quarantined_at     VARCHAR,
                     valid_from         VARCHAR,
                     valid_to           VARCHAR,
-                    superseded_by      VARCHAR
+                    superseded_by      VARCHAR,
+                    provenance_origin  VARCHAR DEFAULT 'internal',
+                    grounding          VARCHAR DEFAULT 'observed'
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -360,7 +520,9 @@ class DuckDBMemoryStore:
                     review_confidence  DOUBLE,
                     review_model       VARCHAR,
                     quarantine_reason  VARCHAR,
-                    quarantined_at     VARCHAR
+                    quarantined_at     VARCHAR,
+                    provenance_origin  VARCHAR DEFAULT 'internal',
+                    grounding          VARCHAR DEFAULT 'extracted'
                 );
                 CREATE TABLE IF NOT EXISTS entity_aliases (
                     alias              VARCHAR,
@@ -403,6 +565,23 @@ class DuckDBMemoryStore:
                     PRIMARY KEY (content_hash, category, user_scope)
                 )
             """)
+            # Rejection ledger (#39, batch-2): one-way trust ladder. Records the
+            # (subject, predicate, scope) identity of a REJECTED value so no
+            # approval path (auto-review, user confirmation, restore) may
+            # resurrect it without a NEW record passing the same gates. Distinct
+            # from deletion_tombstones (which key on exact content hash): this
+            # keys on the claim slot, so paraphrased re-assertions are blocked.
+            # Reversible via purge_rejection().
+            self.connection.execute("""
+                CREATE TABLE IF NOT EXISTS rejection_ledger (
+                    subject       VARCHAR,
+                    predicate     VARCHAR,
+                    user_scope    VARCHAR,
+                    reason        VARCHAR DEFAULT 'review_rejected',
+                    created_at    VARCHAR,
+                    PRIMARY KEY (subject, predicate, user_scope)
+                )
+            """)
             # Additive migration for databases created by earlier versions.
             columns = {
                 "status": "VARCHAR DEFAULT 'active'",
@@ -421,6 +600,8 @@ class DuckDBMemoryStore:
                 "valid_from": "VARCHAR",
                 "valid_to": "VARCHAR",
                 "superseded_by": "VARCHAR",
+                "provenance_origin": "VARCHAR DEFAULT 'internal'",
+                "grounding": "VARCHAR DEFAULT 'observed'",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",
@@ -431,6 +612,8 @@ class DuckDBMemoryStore:
                 "review_model": "VARCHAR",
                 "quarantine_reason": "VARCHAR",
                 "quarantined_at": "VARCHAR",
+                "provenance_origin": "VARCHAR DEFAULT 'internal'",
+                "grounding": "VARCHAR DEFAULT 'extracted'",
             }
             for name, definition in columns.items():
                 try:
@@ -524,6 +707,73 @@ class DuckDBMemoryStore:
                 """)
             except Exception as exc:
                 logger.warning("candidate user_scope backfill failed: %s", exc)
+
+            # Provenance-origin backfill (#43): derive the taint label from the
+            # payload's external_source flag for pre-existing records. Fails
+            # closed — anything not clearly internal becomes external.
+            try:
+                self.connection.execute("""
+                    UPDATE memory_records
+                    SET provenance_origin = CASE
+                        WHEN provenance_origin IN ('internal', 'external')
+                            THEN provenance_origin
+                        WHEN json_extract_string(payload, '$.external_source') = 'true'
+                             OR json_extract_string(payload, '$.external_source') = '1'
+                            THEN 'external'
+                        ELSE 'internal'
+                    END
+                """)
+            except Exception as exc:
+                logger.warning("provenance_origin backfill failed: %s", exc)
+            try:
+                self.connection.execute("""
+                    UPDATE memory_candidates
+                    SET provenance_origin = CASE
+                        WHEN provenance_origin IN ('internal', 'external')
+                            THEN provenance_origin
+                        WHEN json_extract_string(payload, '$.external_source') = 'true'
+                             OR json_extract_string(payload, '$.external_source') = '1'
+                            THEN 'external'
+                        ELSE 'internal'
+                    END
+                """)
+            except Exception as exc:
+                logger.warning("candidate provenance_origin backfill failed: %s", exc)
+
+            # Grounding backfill (#40): derive from the write-path source for
+            # pre-existing records. Distill-derived and external-origin records
+            # ground as inferred; llm_extraction as extracted; explicit/user as
+            # observed. Anything unresolved stays speculative (strictest).
+            try:
+                self.connection.execute("""
+                    UPDATE memory_records
+                    SET grounding = CASE
+                        WHEN grounding IN ('speculative','inferred','extracted','observed')
+                            THEN grounding
+                        WHEN source IN ('explicit', 'user', 'manual') THEN 'observed'
+                        WHEN source IN ('llm_extraction', 'extraction') THEN 'extracted'
+                        WHEN source IN ('distillation', 'distill') THEN 'inferred'
+                        WHEN provenance_origin = 'external' THEN 'inferred'
+                        ELSE 'speculative'
+                    END
+                """)
+            except Exception as exc:
+                logger.warning("grounding backfill failed: %s", exc)
+            try:
+                self.connection.execute("""
+                    UPDATE memory_candidates
+                    SET grounding = CASE
+                        WHEN grounding IN ('speculative','inferred','extracted','observed')
+                            THEN grounding
+                        WHEN source IN ('explicit', 'user', 'manual') THEN 'observed'
+                        WHEN source IN ('llm_extraction', 'extraction') THEN 'extracted'
+                        WHEN source IN ('distillation', 'distill') THEN 'inferred'
+                        WHEN provenance_origin = 'external' THEN 'inferred'
+                        ELSE 'extracted'
+                    END
+                """)
+            except Exception as exc:
+                logger.warning("candidate grounding backfill failed: %s", exc)
             # Composite index: scope → status → validity.
             try:
                 self.connection.execute("""
@@ -602,6 +852,8 @@ class DuckDBMemoryStore:
             valid_from=row.get("valid_from"),
             valid_to=row.get("valid_to"),
             superseded_by=row.get("superseded_by"),
+            provenance_origin=row.get("provenance_origin", PROVENANCE_INTERNAL),
+            grounding=row.get("grounding", GROUNDING_OBSERVED),
         )
 
     def _fetch_records(
@@ -1551,6 +1803,8 @@ class DuckDBMemoryStore:
         project_id: str | None = None,
         status: str = "active",
         expires_at: Any = _NOT_PROVIDED,
+        provenance_origin: Any = None,
+        grounding: Any = None,
     ) -> MemoryRecord | None:
         """Insert a memory record. Returns None if deduped away.
 
@@ -1558,6 +1812,13 @@ class DuckDBMemoryStore:
         - ``_NOT_PROVIDED`` (default): auto-TTL logic applies (current behavior).
         - ``None``: explicitly no expiry (skip auto-TTL, store NULL).
         - ISO-8601 string: set to that value (explicit wins over TTL map).
+
+        Trust-model (batch-2):
+        - *provenance_origin* (#43): internal/external taint. When None, derived
+          from the payload's external_source flag. Fail-closed to external.
+        - *grounding* (#40): observed/extracted/inferred/speculative. When None,
+          derived from the write path (source / external). Fail-closed to
+          speculative. Sanitization never alters either label.
         """
         if not content or not content.strip():
             return None
@@ -1574,6 +1835,20 @@ class DuckDBMemoryStore:
         record_payload = dict(payload or {})
         record_payload.setdefault("user_scope", self.user_id)
         source = str(source or record_payload.get("source") or "explicit")
+        # Provenance taint (#43): per-record, fail-closed. An explicit label
+        # wins; otherwise derive from the payload's external_source flag.
+        is_external = bool(record_payload.get("external_source")) or (
+            str(record_payload.get("provenance_origin") or "").strip().lower()
+            == PROVENANCE_EXTERNAL
+        )
+        if provenance_origin is not None:
+            prov = normalize_provenance(provenance_origin)
+        else:
+            prov = PROVENANCE_EXTERNAL if is_external else PROVENANCE_INTERNAL
+        # Grounding (#40): default per write path; explicit wins.
+        ground = default_grounding_for_write(
+            source=source, external=is_external, explicit_grounding=grounding
+        )
         durability = str(
             durability or (
                 "temporary" if category in {"context_note", "event", "goal"} else "durable"
@@ -1609,6 +1884,18 @@ class DuckDBMemoryStore:
             )
             return None
 
+        # Rejection-ledger check (#39): a previously-rejected claim slot may not
+        # be re-created directly. Re-assertion must come back through the
+        # proposal queue (save_candidate) so the gates re-apply. Keyed by
+        # (subject, predicate, scope) so paraphrased re-assertions are blocked.
+        _rj = self.rejection_check(category, record_payload)
+        if _rj:
+            logger.info(
+                "Blocked re-creation of rejected claim (ledger %s): %s",
+                _rj.get("created_at", ""), content[:60],
+            )
+            return None
+
         memory_id = f"mem-{uuid.uuid4().hex}"
         now = self._now()
         if not skip_auto_ttl and not record_payload.get("expires_at") and durability == "temporary":
@@ -1631,8 +1918,8 @@ class DuckDBMemoryStore:
                 (memory_id, category, content, tags, payload, created_at, updated_at,
                  expires_at, embedding, status, source, confidence, durability, scope,
                  project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
-                 valid_from)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?)
+                 valid_from, provenance_origin, grounding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
         """
         with self._lock:
             assert self.connection is not None
@@ -1644,6 +1931,7 @@ class DuckDBMemoryStore:
                 status, source, confidence, durability, scope, project_id,
                 record_payload.get("user_scope"),
                 now,  # valid_from = creation time
+                prov, ground,
             ])
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
@@ -1753,7 +2041,7 @@ class DuckDBMemoryStore:
             durability, scope, project_id, session_id, status, created_at,
             updated_at, reviewed_at, review_reason, evidence_text, evidence_role,
             source_timestamp, review_confidence, review_model,
-            quarantine_reason, quarantined_at,
+            quarantine_reason, quarantined_at, provenance_origin, grounding,
         ) = row
         return {
             "candidate_id": candidate_id,
@@ -1779,6 +2067,8 @@ class DuckDBMemoryStore:
             "review_model": review_model,
             "quarantine_reason": quarantine_reason,
             "quarantined_at": quarantined_at,
+            "provenance_origin": normalize_provenance(provenance_origin),
+            "grounding": normalize_grounding(grounding),
         }
 
     def save_candidate(
@@ -1799,8 +2089,15 @@ class DuckDBMemoryStore:
         source_timestamp: str | None = None,
         dedup: bool = True,
         external: bool = False,
+        provenance_origin: Any = None,
+        grounding: Any = None,
     ) -> dict | None:
-        """Store a pending proposal without making it retrievable memory."""
+        """Store a pending proposal without making it retrievable memory.
+
+        Trust-model (batch-2): *provenance_origin* (#43) and *grounding* (#40)
+        are derived from the write path when not passed explicitly, and carried
+        onto the approved memory when the candidate is activated.
+        """
         if not content or not content.strip():
             return None
         content, _inj = sanitize_content(content)
@@ -1833,6 +2130,16 @@ class DuckDBMemoryStore:
                     _ts.get("created_at", ""), content[:60],
                 )
                 return None
+            # Rejection-ledger check (#39): a previously-rejected claim slot may
+            # not re-enter the proposal queue. The one-way ladder refuses
+            # resurrection at the gate so the reviewer never sees it again.
+            _rj = self.rejection_check(category, payload or {})
+            if _rj:
+                logger.info(
+                    "Blocked re-proposal of rejected claim (ledger %s): %s",
+                    _rj.get("created_at", ""), content[:60],
+                )
+                return None
 
         candidate_id = f"cand-{uuid.uuid4().hex}"
         now = self._now()
@@ -1843,6 +2150,22 @@ class DuckDBMemoryStore:
         candidate_payload.setdefault("source", source)
         if external:
             candidate_payload["external_source"] = True
+        # Trust-model defaults (batch-2): provenance taint + grounding.
+        # An explicit kwarg wins; otherwise a payload override (e.g. the #35
+        # quote-verification downgrade writing payload.grounding=inferred) is
+        # honored; otherwise the value is derived from the write path.
+        is_external = external or bool(candidate_payload.get("external_source"))
+        if provenance_origin is not None:
+            prov = normalize_provenance(provenance_origin)
+        elif candidate_payload.get("provenance_origin"):
+            prov = normalize_provenance(candidate_payload.get("provenance_origin"))
+        else:
+            prov = PROVENANCE_EXTERNAL if is_external else PROVENANCE_INTERNAL
+        payload_grounding = candidate_payload.get("grounding")
+        ground = default_grounding_for_write(
+            source=source, external=is_external,
+            explicit_grounding=(grounding if grounding is not None else payload_grounding),
+        )
         # Value-supersession detection (issue #4): check if this candidate's
         # numeric value conflicts with an existing active fact.  If so, record
         # the conflict in the payload so the reviewer can surface it as a
@@ -1870,8 +2193,9 @@ class DuckDBMemoryStore:
                   (candidate_id, category, content, tags, payload, source,
                    confidence, durability, scope, project_id, session_id,
                    user_scope, status, created_at, updated_at, evidence_text,
-                   evidence_role, source_timestamp, quarantine_reason, quarantined_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   evidence_role, source_timestamp, quarantine_reason, quarantined_at,
+                   provenance_origin, grounding)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     candidate_id, category, content.strip(), tags or [],
                     json.dumps(candidate_payload), source, normalized_confidence,
@@ -1880,6 +2204,7 @@ class DuckDBMemoryStore:
                     candidate_status, now, now, evidence_text,
                     evidence_role or "user_turn", source_timestamp,
                     quarantine_reason, (now if _inj else None),
+                    prov, ground,
                 ],
             )
         return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
@@ -1901,7 +2226,7 @@ class DuckDBMemoryStore:
         elif status:
             conditions.append("status = ?")
             params.append(status)
-        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model, quarantine_reason, quarantined_at FROM memory_candidates"
+        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model, quarantine_reason, quarantined_at, provenance_origin, grounding FROM memory_candidates"
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
@@ -1972,23 +2297,57 @@ class DuckDBMemoryStore:
                     f"approval refused: candidate content matches an "
                     f"instruction-injection pattern ({_inj})"
                 )
-        # Storage-boundary external-source invariant: when the policy is on,
-        # an unsupervised auto-review can never activate external-source
-        # memory — the decision is downgraded to pending_user_confirmation.
-        # The agent-facing confirmation tool (review_source="tool") and
-        # manual callers may still approve it.
+        # Storage-boundary external-source invariant (#43, structural): when
+        # the policy is on, an unsupervised auto-review can never activate
+        # external-origin memory — the decision is downgraded to
+        # pending_user_confirmation. This mirrors the payload.external_source
+        # check but keys on the permanent provenance_origin column, which
+        # survives payload stripping/sanitization (the taint is not laundered).
+        # The agent-facing confirmation tool (review_source="tool") and manual
+        # callers may still approve it.
+        candidate_provenance = candidate.get("provenance_origin", PROVENANCE_INTERNAL)
+        is_external_origin = (
+            candidate_provenance == PROVENANCE_EXTERNAL
+            or (isinstance(candidate.get("payload"), dict)
+                and candidate["payload"].get("external_source"))
+        )
         if (
             review_source == "auto_review"
             and decision in {"approved", "reviewed_approved"}
             and getattr(self, "external_sources_require_confirmation", True)
-            and isinstance(candidate.get("payload"), dict)
-            and candidate["payload"].get("external_source")
+            and is_external_origin
         ):
             decision = "pending_user_confirmation"
             reason = (
-                "Storage boundary: external-source memory cannot auto-activate "
+                "Storage boundary: external-origin memory cannot auto-activate "
                 "(external_sources_require_confirmation). " + reason
             ).strip()
+        # Grounding ceiling (#40): promotion may not raise a record past what
+        # its grounding allows. User confirmation (tool/manual) LIFTS the
+        # grounding to the minimum required for the requested class (the
+        # ceiling moves with grounding, not with use); auto-review is capped
+        # and downgrades to the ceiling instead. Recall counts are never
+        # verification — they cannot reach this path.
+        candidate_grounding = candidate.get("grounding", GROUNDING_SPECULATIVE)
+        user_confirmed = review_source in {"tool", "manual"}
+        if decision in {"approved", "reviewed_approved"}:
+            if not grounding_allows_status(candidate_grounding, decision):
+                if user_confirmed:
+                    # User confirmation lifts the grounding (and the ceiling).
+                    candidate_grounding = (
+                        GROUNDING_EXTRACTED if decision == "approved"
+                        else GROUNDING_INFERRED
+                    )
+                else:
+                    ceiling = _GROUNDING_CEILING.get(
+                        normalize_grounding(candidate_grounding),
+                        "pending_user_confirmation",
+                    )
+                    decision = ceiling
+                    reason = (
+                        f"Grounding ceiling ({candidate.get('grounding')} "
+                        f"-> {ceiling}). " + reason
+                    ).strip()
         now = self._now()
         memory = None
         final_status = decision
@@ -2006,6 +2365,8 @@ class DuckDBMemoryStore:
                 durability=selected_durability,
                 scope=selected_scope,
                 project_id=candidate["project_id"],
+                provenance_origin=candidate_provenance,
+                grounding=candidate_grounding,
             )
             # Pass explicit expires_at through to remember() (Spec 1).
             if expires_at is not _NOT_PROVIDED:
@@ -2053,6 +2414,16 @@ class DuckDBMemoryStore:
                         review_model or "", durability, scope, candidate_id,
                     ],
                 )
+
+                # Rejection ledger (#39): record the rejected claim slot so no
+                # approval path may resurrect it without a NEW record passing
+                # the gates. One-way trust ladder — approve never launders.
+                if final_status == "rejected":
+                    self.record_rejection(
+                        candidate["category"],
+                        candidate.get("payload"),
+                        reason=(reason or "review_rejected")[:200],
+                    )
 
                 # Wave 2: carry candidate evidence into memory_evidence so every
                 # approved memory keeps provenance ("why does Hermes believe
@@ -2897,6 +3268,97 @@ class DuckDBMemoryStore:
             {
                 "content_hash": r[0],
                 "category": r[1],
+                "user_scope": r[2],
+                "reason": r[3],
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+
+    # -- rejection ledger (one-way trust ladder, #39) -------------------------
+
+    def rejection_check(self, category: str, payload: Dict[str, Any] | None) -> dict | None:
+        """Return the ledger row (as a dict) if this claim slot was rejected.
+
+        Keyed by (subject, predicate, scope) — the claim slot, not the exact
+        value — so paraphrased re-assertions of a rejected fact are also
+        blocked. ``payload`` is the candidate/record payload (or None).
+        """
+        key = rejection_key({"category": category, "payload": payload or {},
+                             "user_scope": self.user_id})
+        if not key[0] or not key[1]:
+            return None
+        with self._lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                """SELECT reason, created_at FROM rejection_ledger
+                   WHERE subject = ? AND predicate = ? AND user_scope = ?""",
+                [key[0], key[1], key[2]],
+            ).fetchone()
+        if not row:
+            return None
+        return {"reason": row[0], "created_at": row[1]}
+
+    def record_rejection(self, category: str, payload: Dict[str, Any] | None,
+                         reason: str = "review_rejected") -> None:
+        """Fingerprint a rejected claim slot so it cannot be resurrected (#39).
+
+        MUST be called while holding self._lock (call sites live inside the
+        locked review section). External rejection writes go through
+        review_candidate.
+        """
+        key = rejection_key({"category": category, "payload": payload or {},
+                             "user_scope": self.user_id})
+        if not key[0] or not key[1]:
+            return
+        assert self.connection is not None
+        self.connection.execute(
+            """INSERT OR REPLACE INTO rejection_ledger
+               (subject, predicate, user_scope, reason, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            [key[0], key[1], key[2], reason, self._now()],
+        )
+
+    def purge_rejection(self, category: str, payload: Dict[str, Any] | None) -> bool:
+        """Explicitly allow a previously-rejected claim slot back in (#39).
+
+        The escape hatch: rejection stays decisive until the user says
+        otherwise. Returns True if a ledger entry was removed.
+        """
+        key = rejection_key({"category": category, "payload": payload or {},
+                             "user_scope": self.user_id})
+        if not key[0] or not key[1]:
+            return False
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute(
+                """DELETE FROM rejection_ledger
+                   WHERE subject = ? AND predicate = ? AND user_scope = ?""",
+                [key[0], key[1], key[2]],
+            )
+            check = self.connection.execute(
+                """SELECT COUNT(*) FROM rejection_ledger
+                   WHERE subject = ? AND predicate = ? AND user_scope = ?""",
+                [key[0], key[1], key[2]],
+            ).fetchone()
+        return bool(check and check[0] == 0)
+
+    def list_rejections(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Read-only census of the rejection ledger, newest first (#39)."""
+        limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT subject, predicate, user_scope, reason, created_at
+                   FROM rejection_ledger
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                [limit],
+            ).fetchall()
+        return [
+            {
+                "subject": r[0],
+                "predicate": r[1],
                 "user_scope": r[2],
                 "reason": r[3],
                 "created_at": r[4],

@@ -42,6 +42,96 @@ _LLM_MIN_CONTENT_LENGTH = 60
 _LLM_TIMEOUT = 15.0
 
 
+# --- quote verification (#35, batch-2) ---------------------------------------
+# The verbatim/quote label is LLM-claimed; nothing checked that the quote
+# actually appears in the source conversation. This deterministic check greps
+# the claimed quote against the source transcript; on miss, the item is
+# downgraded from verbatim to inferred (landing on #40's grounding field) and
+# the failure is logged with a countable counter surfaced in review. Cheap,
+# zero LLM. Normalization: whitespace/case-insensitive substring match with a
+# small tolerance for near-misses (punctuation/whitespace differences).
+_QUOTE_MISSES = 0  # module-level counter; read via get_quote_verification_stats()
+
+
+def get_quote_verification_stats() -> Dict[str, int]:
+    """Counters for the quote-verification gate (surfaced in review)."""
+    return {"quote_verification_misses": _QUOTE_MISSES}
+
+
+def _reset_quote_verification_stats() -> None:
+    """Test hook: reset the miss counter."""
+    global _QUOTE_MISSES
+    _QUOTE_MISSES = 0
+
+
+def _normalize_for_quote_match(text: str) -> str:
+    """Normalize text for quote matching: lowercase, collapse whitespace,
+    strip common quote marks and surrounding punctuation."""
+    if not text:
+        return ""
+    # Strip the quote characters an LLM might wrap a verbatim quote in, plus
+    # all punctuation that varies between transcript and claim (trailing ! vs .,
+    # commas, etc.). Keep alphanumerics and spaces only.
+    stripped = re.sub(r"[`\"‘’“”«»„‟'']", " ", str(text))
+    stripped = re.sub(r"[^\w\s]", " ", stripped, flags=re.UNICODE)
+    stripped = re.sub(r"\s+", " ", stripped).strip().lower()
+    return stripped
+
+
+def verify_quote_against_source(quote: str, source_text: str,
+                                *, min_quote_len: int = 8) -> bool:
+    """Return True if *quote* can be found in *source_text*.
+
+    Whitespace/case-insensitive substring match. A near-miss tolerance handles
+    minor punctuation/whitespace divergence: the normalized quote must be a
+    contiguous substring of the normalized source. Quotes shorter than
+    *min_quote_len* characters (after normalization) are treated as found —
+    a tiny fragment is not a meaningful verbatim claim to falsify.
+    """
+    q = _normalize_for_quote_match(quote)
+    s = _normalize_for_quote_match(source_text)
+    if not q or not s:
+        return False
+    if len(q) < min_quote_len:
+        return True
+    return q in s
+
+
+def apply_quote_verification(fact: Dict[str, Any], source_text: str) -> Dict[str, Any]:
+    """Verify a fact's claimed verbatim quote against the source (#35).
+
+    If the fact carries a ``verbatim_quote`` (LLM-claimed direct quote) and it
+    cannot be found in *source_text*, the fact is downgraded: its grounding
+    drops to ``inferred`` (the structural home from #40) and the miss is
+    counted. Facts without a verbatim_quote are untouched. Mutates and returns
+    *fact*; never raises.
+    """
+    global _QUOTE_MISSES
+    try:
+        quote = fact.get("verbatim_quote") if isinstance(fact, dict) else None
+        if not quote:
+            return fact
+        payload = fact.setdefault("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+            fact["payload"] = payload
+        if verify_quote_against_source(str(quote), source_text or ""):
+            payload["quote_verified"] = True
+        else:
+            payload["quote_verified"] = False
+            # Downgrade verbatim -> inferred (lands on #40's grounding field).
+            payload["grounding"] = "inferred"
+            _QUOTE_MISSES += 1
+            logger.info(
+                "Quote verification miss: claimed verbatim quote not found in "
+                "source; downgraded to inferred. fact=%r",
+                (fact.get("content") or "")[:80],
+            )
+    except Exception as exc:
+        logger.debug("Quote verification failed (fail-soft): %s", exc)
+    return fact
+
+
 # ---------------------------------------------------------------------------
 # Junk filter — prevents low-quality memories from being stored
 # ---------------------------------------------------------------------------
@@ -640,6 +730,10 @@ Return a JSON array of objects with these keys:
 - "confidence": number from 0 to 1
 - "durability": "permanent", "durable", or "temporary"
 - "scope": "profile", "project", or "session"
+- "verbatim_quote": OPTIONAL — the exact substring of the user's message that
+  this fact is a direct quote of. Include this ONLY when the content is a
+  word-for-word quote of the user; omit it for paraphrased or inferred facts.
+  The quote MUST appear verbatim in the user's message or it will be rejected.
 
 If there are no durable facts, return an empty array: []
 
@@ -764,7 +858,8 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
         scope = str(fact.get("scope", "profile")).lower()
         if scope not in {"profile", "project", "session"}:
             scope = "profile"
-        result.append({
+        payload: Dict[str, Any] = {"source": "llm_extraction"}
+        out_fact = {
             "category": category,
             "content": content,
             "tags": tags,
@@ -772,8 +867,17 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
             "confidence": confidence,
             "durability": durability,
             "scope": scope,
-            "payload": {"source": "llm_extraction"},
-        })
+            "payload": payload,
+        }
+        # Carry an LLM-claimed verbatim quote through for verification (#35).
+        vq = fact.get("verbatim_quote")
+        if isinstance(vq, str) and vq.strip():
+            out_fact["verbatim_quote"] = vq.strip()
+        # Verify the claimed quote against the source transcript before
+        # labelling the memory verbatim. On miss, downgrade to inferred (#40
+        # grounding field) and count the failure for review (#35).
+        apply_quote_verification(out_fact, user_content)
+        result.append(out_fact)
 
     return result
 

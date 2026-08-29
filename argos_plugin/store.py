@@ -3949,6 +3949,8 @@ class DuckDBMemoryStore:
 
         Visibility for the tombstone mechanism: shows what is blocked from
         re-creation without exposing raw content (hash + metadata only).
+        Scope-filtered (user_scope = current scope) so one tenant never
+        sees another tenant's tombstones (#49 isolation surface).
         """
         limit = max(1, min(int(limit), 1000))
         with self._lock:
@@ -3956,9 +3958,10 @@ class DuckDBMemoryStore:
             rows = self.connection.execute(
                 """SELECT content_hash, category, user_scope, reason, created_at
                    FROM deletion_tombstones
+                   WHERE (user_scope IS NULL OR user_scope = ?)
                    ORDER BY created_at DESC
                    LIMIT ?""",
-                [limit],
+                [self.user_id, limit],
             ).fetchall()
         return [
             {

@@ -2612,6 +2612,16 @@ class ArgosProvider(MemoryProvider):
                         )
                         continue
                     payload = dict(fact.get("payload") or {})
+                    # Project-scoped proposals (#47): thread the session's
+                    # project_id into candidates at extraction time. The
+                    # candidates table already has the column — this is the
+                    # plumbing that populates it. When the fact carries its
+                    # own project_id (e.g. from explicit extraction), that
+                    # wins; otherwise the session's current project scope
+                    # is used. Global/unsessioned sessions stay None.
+                    fact_project_id = fact.get("project_id")
+                    if not fact_project_id:
+                        fact_project_id = getattr(self, "_current_project_id", None) or None
                     candidate = self._store.save_candidate(
                         category=fact["category"],
                         content=fact["content"],
@@ -2621,7 +2631,7 @@ class ArgosProvider(MemoryProvider):
                         confidence=fact.get("confidence", 0.45),
                         durability=fact.get("durability", "durable"),
                         scope=fact.get("scope", "profile"),
-                        project_id=fact.get("project_id"),
+                        project_id=fact_project_id,
                         session_id=session_id,
                         evidence_text=user_content,
                         evidence_role="user_turn",

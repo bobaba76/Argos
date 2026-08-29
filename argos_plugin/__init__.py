@@ -668,6 +668,13 @@ class ArgosProvider(MemoryProvider):
         self._graph_traversal_enabled: bool = False
         self._graph_traversal_depth: int = 2
         self._graph_traversal_boost: float = 0.0
+        # Personalized PageRank diffusion (issue #37): eval-first graph
+        # retrieval arm. PPR replaces traversal with diffusion — seed the
+        # graph with query-entity weights, diffuse via power iteration.
+        # Disabled by default; enable via config for A/B evaluation.
+        self._graph_ppr_enabled: bool = False
+        self._graph_ppr_damping: float = 0.5
+        self._graph_ppr_boost: float = 0.0
         self._consolidation_enabled: bool = False
         self._consolidation_min_age_days: int = 30
         self._consolidation_max_actions: int = 25
@@ -1066,6 +1073,24 @@ class ArgosProvider(MemoryProvider):
             )
         except (TypeError, ValueError):
             self._graph_traversal_boost = 0.0
+        # PPR config (issue #37).
+        graph_ppr = self._config.get("graph_ppr_enabled", "false")
+        self._graph_ppr_enabled = (
+            graph_ppr.lower() in ("true", "1", "yes")
+            if isinstance(graph_ppr, str) else bool(graph_ppr)
+        )
+        try:
+            self._graph_ppr_damping = max(
+                0.0, min(float(self._config.get("graph_ppr_damping", 0.5)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._graph_ppr_damping = 0.5
+        try:
+            self._graph_ppr_boost = max(
+                0.0, min(float(self._config.get("graph_ppr_boost", 0.0)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self._graph_ppr_boost = 0.0
         try:
             self._alias_expansion_boost = max(
                 0.0, min(float(self._config.get("alias_expansion_boost", 0.7)), 1.0)
@@ -1981,6 +2006,28 @@ class ArgosProvider(MemoryProvider):
                                 seen.add(tid)
                 except Exception:
                     traversal_ids = []
+            # PPR-based candidates (issue #37): Personalized PageRank
+            # diffusion from query-grounded seed entities. Replaces
+            # traversal with diffusion — surfaces multi-hop associations
+            # without a fixed depth cutoff. Disabled unless
+            # graph_ppr_enabled (config) — eval-first A/B gate.
+            ppr_ids: list[str] = []
+            if self._graph_ppr_enabled:
+                try:
+                    ppr_ids = self._graph.ppr_memory_ids(
+                        effective_query,
+                        limit=max(10, candidate_limit),
+                        damping=self._graph_ppr_damping,
+                    )
+                    logger.debug("ppr: %d candidate ids for %r", len(ppr_ids), effective_query[:40])
+                    if ppr_ids:
+                        seen = set(graph_ids)
+                        for pid in ppr_ids:
+                            if pid not in seen:
+                                graph_ids.append(pid)
+                                seen.add(pid)
+                except Exception:
+                    ppr_ids = []
             # Also query the graph for each canonical entity from aliases
             for canonical in alias_expansions:
                 try:
@@ -2028,8 +2075,14 @@ class ArgosProvider(MemoryProvider):
                 injectable_ids = set(alias_expanded_ids) if alias_expanded_ids else set()
                 if self._graph_traversal_enabled:
                     injectable_ids.update(traversal_ids)
+                if self._graph_ppr_enabled:
+                    injectable_ids.update(ppr_ids)
+                    logger.debug("graph injectable ids: %d (traversal=%d, ppr=%d, alias=%d)",
+                                 len(injectable_ids), len(traversal_ids),
+                                 len(ppr_ids), len(alias_expanded_ids))
+                elif self._graph_traversal_enabled:
                     logger.debug("graph injectable ids: %d (traversal=%d, alias=%d)",
-                                                     len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
+                                 len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
                 if self._graph_inject_candidates:
                     injectable_ids.update(graph_ids)
                 if injectable_ids:
@@ -2072,6 +2125,7 @@ class ArgosProvider(MemoryProvider):
                 graph_count = max(len(graph_ids), 1)
                 alias_id_set = set(alias_expanded_ids)
                 traversal_id_set = set(traversal_ids)
+                ppr_id_set = set(ppr_ids)
                 for record in results:
                     # Alias-expanded candidates: alias expansion is a
                     # definitive identity mapping (e.g. "my role" =
@@ -2096,6 +2150,16 @@ class ArgosProvider(MemoryProvider):
                             and record.memory_id in traversal_id_set):
                         record.similarity = max(
                             record.similarity, self._graph_traversal_boost
+                        )
+                        continue
+                    # PPR candidates (issue #37): memory reached by PageRank
+                    # diffusion from query-grounded seed entities. Same
+                    # relational-evidence rationale as traversal — floor
+                    # lifts it above the cutoff.
+                    if (self._graph_ppr_enabled
+                            and record.memory_id in ppr_id_set):
+                        record.similarity = max(
+                            record.similarity, self._graph_ppr_boost
                         )
                         continue
                     rank = graph_rank.get(record.memory_id)

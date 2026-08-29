@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -22,6 +23,11 @@ _START_LOCK_NAME = "hybrid_memory_service.starting"
 _START_LOCK_STALE_SECS = 90.0  # > _START_TIMEOUT; a healthy spawner unlinks well before this
 _DEFAULT_TIMEOUT = 30.0
 _START_TIMEOUT = 30.0
+# Retry-once policy (#20): only ConnectionRefusedError at connect time is
+# retried — the request never reached the server, so retrying is safe for
+# ANY method (no duplicate-write risk). Timeouts are NOT retried (the
+# server may have processed the request).
+_RETRY_BACKOFF_S = 0.5
 
 
 def _pid_alive(pid: int) -> bool:
@@ -75,7 +81,17 @@ def _start_lock_is_stale(lock_path: Path) -> bool:
 
 
 class SharedMemoryServiceError(RuntimeError):
-    pass
+    """RPC failure carrying the server-reported error class (#20).
+
+    The server now returns ``error_class`` + a short traceback in the
+    error envelope; this exception surfaces the class so clients can
+    distinguish failure kinds (e.g. ValueError vs OSError) instead of
+    pattern-matching on message text.
+    """
+
+    def __init__(self, message: str, error_class: str | None = None) -> None:
+        super().__init__(message)
+        self.error_class = error_class or "SharedMemoryServiceError"
 
 
 def _read_endpoint(home: Path) -> dict | None:
@@ -124,10 +140,44 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
 class _SharedRPC:
     def __init__(self, home: str | Path, user_id: str = "default_user") -> None:
         self.home = Path(home)
-        self.user_id = user_id or "default_user"
+        self._default_user_id = user_id or "default_user"
+        # user_id is thread-local (#20): set_user_scope from one thread
+        # must not change the scope stamped on another thread's requests.
+        self._scope = threading.local()
         self._ensure_service()
 
+    @property
+    def user_id(self) -> str:
+        return getattr(self._scope, "user_id", self._default_user_id)
+
+    @user_id.setter
+    def user_id(self, value: str) -> None:
+        self._scope.user_id = value or "default_user"
+
     def _request(self, request: dict, timeout: float = _DEFAULT_TIMEOUT) -> Any:
+        """Send one request; retry once on connection-refused (#20).
+
+        ConnectionRefusedError at connect time means the request never
+        reached the server (e.g. the service is mid-restart), so a retry
+        is safe for ANY method — no duplicate-write risk. The endpoint
+        file is re-read on retry because a restart may have bound a new
+        port. Timeouts and other OSErrors are NOT retried: the request
+        may have been processed.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self._request_once(request, timeout)
+            except ConnectionRefusedError as exc:
+                if attempt >= 2:
+                    raise SharedMemoryServiceError(
+                        f"shared memory service refused connection: {exc}",
+                        error_class="ConnectionRefusedError",
+                    ) from exc
+                time.sleep(_RETRY_BACKOFF_S)
+
+    def _request_once(self, request: dict, timeout: float) -> Any:
         endpoint = _read_endpoint(self.home)
         if endpoint is None:
             raise SharedMemoryServiceError("shared memory service endpoint is unavailable")
@@ -149,10 +199,21 @@ class _SharedRPC:
                     if b"\n" in chunk:
                         break
             response = json.loads(b"".join(chunks).splitlines()[0].decode("utf-8"))
+        except ConnectionRefusedError:
+            # Propagate so the retry loop in _request can handle it (#20):
+            # the request never reached the server, so retrying is safe.
+            raise
         except (OSError, ValueError, IndexError) as exc:
-            raise SharedMemoryServiceError(f"shared memory service request failed: {exc}") from exc
+            raise SharedMemoryServiceError(
+                f"shared memory service request failed: {exc}",
+                error_class=type(exc).__name__,
+            ) from exc
         if not response.get("ok"):
-            raise SharedMemoryServiceError(str(response.get("error", "service error")))
+            # Error envelope (#20): surface the server's error class.
+            raise SharedMemoryServiceError(
+                str(response.get("error", "service error")),
+                error_class=str(response.get("error_class") or "ServiceError"),
+            )
         return response.get("result")
 
     def _healthy(self) -> bool:
@@ -255,12 +316,30 @@ class SharedMemoryStore:
     def __init__(self, home: str | Path, user_id: str = "default_user", embedder=None) -> None:
         self.home = Path(home)
         self.db_path = self.home / "hybrid_memory.duckdb"
-        self.user_id = user_id or "default_user"
-        self._rpc = _SharedRPC(self.home, self.user_id)
+        self._default_user_id = user_id or "default_user"
+        # Thread-local scope (#20): see set_user_scope.
+        self._scope = threading.local()
+        self._rpc = _SharedRPC(self.home, self._default_user_id)
+
+    @property
+    def user_id(self) -> str:
+        return getattr(self._scope, "user_id", self._default_user_id)
+
+    @user_id.setter
+    def user_id(self, value: str | None) -> None:
+        self._scope.user_id = value or "default_user"
 
     def set_user_scope(self, user_id: str | None) -> None:
-        self.user_id = user_id or "default_user"
-        self._rpc.user_id = self.user_id
+        """Set the scope for the CURRENT thread only (#20).
+
+        Previously this mutated shared instance state, so concurrent calls
+        from threads with different scopes raced: thread A's
+        set_user_scope("alice") could be observed by thread B's next
+        request. Now each thread carries its own scope; the server still
+        re-scopes the store per request under its lock (defense in depth).
+        """
+        self.user_id = user_id
+        self._rpc.user_id = user_id
 
     def search(
             self,
@@ -535,12 +614,22 @@ class SharedGraphStore:
 
     def __init__(self, home: str | Path, user_id: str = "default_user") -> None:
         self.home = Path(home)
-        self.user_id = user_id or "default_user"
-        self._rpc = _SharedRPC(self.home, self.user_id)
+        self._default_user_id = user_id or "default_user"
+        self._scope = threading.local()  # thread-local scope (#20)
+        self._rpc = _SharedRPC(self.home, self._default_user_id)
+
+    @property
+    def user_id(self) -> str:
+        return getattr(self._scope, "user_id", self._default_user_id)
+
+    @user_id.setter
+    def user_id(self, value: str | None) -> None:
+        self._scope.user_id = value or "default_user"
 
     def set_user_scope(self, user_id: str | None) -> None:
-        self.user_id = user_id or "default_user"
-        self._rpc.user_id = self.user_id
+        """Set the scope for the CURRENT thread only (#20, see SharedMemoryStore)."""
+        self.user_id = user_id
+        self._rpc.user_id = user_id
 
     def search_graph(self, term: str, limit: int = 100) -> List[dict]:
         return self._rpc.call("graph", "search_graph", term=term, limit=limit) or []

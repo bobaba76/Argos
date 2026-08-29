@@ -1165,19 +1165,31 @@ class DuckDBMemoryStore:
     # With k=20, rank 1 → 0.0476 and rank 10 → 0.0323 (spread ~0.015).
     # The wider spread lets relevance survive the importance adjustment.
 
+    # Rank-1 survival guard (#38): if a single arm ranks an item #1 by a
+    # clear margin, the fused top-k must still contain it. RRF can bury a
+    # strong semantic rank-1 that lacks support in the other arm.
+    # "Clear margin" = rank-1 score >= _RANK1_MARGIN_RATIO x rank-2 score.
+    _RANK1_GUARD_TOP_K = 3
+    _RANK1_MARGIN_RATIO = 1.5
+
     @classmethod
     def _rrf_fuse(
         cls,
         vector_results: List[MemoryRecord],
         text_results: List[MemoryRecord],
+        *,
+        enable_rank1_guard: bool = True,
     ) -> List[MemoryRecord]:
         """Fuse vector and text rankings via Reciprocal Rank Fusion.
 
-        RRF score(d) = sum over lists: 1 / (k + rank_in_list)
-        A document appearing at rank 1 in both lists scores higher than
-        one appearing at rank 1 in only one list.  The fused score is
-        stored in ``similarity`` so callers see a single relevance number.
+        Includes the rank-1 survival guard (#38): an arm rank-1 with a
+        clear margin over its own rank-2 must appear in the fused top-k
+        even when the other arm ranks it poorly. ``enable_rank1_guard``
+        is the fusion-policy knob — eval/probe_rank1_loss.py turns it
+        off to measure the raw failure the guard fixes.
         """
+        guard_ids = cls._rank1_guard_ids(vector_results, text_results)
+
         scores: Dict[str, float] = {}
         records_by_id: Dict[str, MemoryRecord] = {}
 
@@ -1201,7 +1213,57 @@ class DuckDBMemoryStore:
 
         fused = list(records_by_id.values())
         fused.sort(key=lambda r: r.similarity, reverse=True)
+        if enable_rank1_guard:
+            fused = cls._ensure_rank1_guards(fused, guard_ids)
         return fused
+
+    @staticmethod
+    def _rank1_guard_ids(
+        vector_results: List[MemoryRecord],
+        text_results: List[MemoryRecord],
+    ) -> List[str]:
+        """Memory ids that are a clear rank-1 in their arm (#38).
+
+        An arm's rank-1 is "clear" when its score is at least
+        _RANK1_MARGIN_RATIO x the arm's rank-2 score (and rank-2 has a
+        positive score). Must be called BEFORE fusion overwrites
+        ``similarity`` with the fused score — callers that fuse the same
+        arm records twice (e.g. the probe) must pass fresh copies to the
+        second call.
+        """
+        ids: List[str] = []
+        for arm in (vector_results, text_results):
+            if len(arm) < 2:
+                continue
+            s1 = float(getattr(arm[0], "similarity", 0.0) or 0.0)
+            s2 = float(getattr(arm[1], "similarity", 0.0) or 0.0)
+            if s1 > 0.0 and (s2 <= 0.0 or s1 >= s2 * DuckDBMemoryStore._RANK1_MARGIN_RATIO):
+                ids.append(arm[0].memory_id)
+        return ids
+
+    @classmethod
+    def _ensure_rank1_guards(
+        cls,
+        fused: List[MemoryRecord],
+        guard_ids: List[str],
+    ) -> List[MemoryRecord]:
+        """Pull clear arm rank-1s that RRF dropped below top-k back in (#38).
+
+        No-op when every guard is already in the fused top-k — the common
+        case where the arms agree. When a guard is missing (RRF buried it),
+        the guards move to the front in fused order: the arm that ranked
+        them #1 by a clear margin wins the tie.
+        """
+        if not guard_ids or not fused:
+            return fused
+        k = cls._RANK1_GUARD_TOP_K
+        guard_set = set(guard_ids)
+        inside_ids = {r.memory_id for r in fused[:k]}
+        if all(g in inside_ids for g in guard_set):
+            return fused
+        head = [r for r in fused if r.memory_id in guard_set]
+        tail = [r for r in fused if r.memory_id not in guard_set]
+        return head + tail
 
     @staticmethod
     def _parse_timestamp(ts: str | None) -> datetime | None:

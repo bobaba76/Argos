@@ -1894,6 +1894,34 @@ class DuckDBMemoryStore:
             str(record_payload.get("provenance_origin") or "").strip().lower()
             == PROVENANCE_EXTERNAL
         )
+        # Ingestion-time inbound security scan (#19): when content arrives
+        # from an external/untrusted channel, scan it at the boundary before
+        # it enters the store. The scanner catches injection, suppression,
+        # and mutation patterns that sanitize_content's instruction-injection
+        # check doesn't cover. Blocked content is refused (raises ValueError)
+        # so it never becomes retrievable memory.
+        if is_external:
+            try:
+                if __package__:
+                    from .inbound_security import scan_inbound_text
+                else:
+                    from inbound_security import scan_inbound_text
+                _scan = scan_inbound_text(content)
+                if _scan.blocked:
+                    raise ValueError(
+                        f"Content blocked by inbound security scan: "
+                        f"{_scan.summary()}. External-origin content "
+                        f"matching poisoning/injection patterns is refused."
+                    )
+            except ImportError:
+                logger.warning(
+                    "Inbound security scanner unavailable for external memory "
+                    "— refusing write as fail-closed"
+                )
+                raise ValueError(
+                    "Inbound security scanner unavailable; external-origin "
+                    "memory cannot be written without the security gate."
+                )
         if provenance_origin is not None:
             prov = normalize_provenance(provenance_origin)
         else:
@@ -2167,6 +2195,35 @@ class DuckDBMemoryStore:
             return None
         candidate_status = "quarantined" if _inj else "pending"
         quarantine_reason = f"injection_pattern: {_inj}" if _inj else None
+        # Ingestion-time inbound security scan (#19): when content arrives
+        # from an external/untrusted channel, scan it at the boundary before
+        # it enters the candidate queue. The scanner catches injection,
+        # suppression, and mutation patterns that sanitize_content's
+        # instruction-injection check doesn't cover. Blocked content is
+        # quarantined (not silently dropped) so a human can review it.
+        if external or bool((payload or {}).get("external_source")):
+            try:
+                if __package__:
+                    from .inbound_security import scan_inbound_text
+                else:
+                    from inbound_security import scan_inbound_text
+                _scan = scan_inbound_text(content)
+                if _scan.blocked:
+                    candidate_status = "quarantined"
+                    quarantine_reason = (
+                        f"inbound_security: {_scan.summary()}"
+                    )
+                    logger.warning(
+                        "Inbound security scan blocked external candidate: %s",
+                        _scan.summary(),
+                    )
+            except ImportError:
+                logger.warning(
+                    "Inbound security scanner unavailable for external candidate "
+                    "— quarantining as fail-closed"
+                )
+                candidate_status = "quarantined"
+                quarantine_reason = "inbound_security_scanner_unavailable"
         if category not in VALID_CATEGORIES:
             category = "context_note"
         if dedup:

@@ -109,6 +109,39 @@ class TestRetryOnce:
         assert result == {"status": "ok"}
         assert calls["n"] == 2
 
+    def test_retry_real_path_connect_refused(self, tmp_path, monkeypatch):
+        """REAL _request_once path (only socket.create_connection stubbed):
+        a refused connect is retried once, then surfaces error_class
+        ConnectionRefusedError. Review fix: _request_once previously
+        converted ConnectionRefusedError (an OSError subclass) into
+        SharedMemoryServiceError inside its except clause, so the retry
+        loop never fired in production — the wholesale _request_once
+        monkeypatch above missed it."""
+        import socket
+        import threading
+
+        rpc = service_client._SharedRPC.__new__(service_client._SharedRPC)
+        rpc.home = tmp_path
+        rpc._default_user_id = "default_user"
+        rpc._scope = threading.local()
+        (tmp_path / "hybrid_memory_service.json").write_text(json.dumps({
+            "host": "127.0.0.1", "port": 1, "token": "x",
+        }), encoding="utf-8")
+
+        attempts = {"n": 0}
+
+        def refuse(*args, **kwargs):
+            attempts["n"] += 1
+            raise ConnectionRefusedError("connection refused (simulated)")
+
+        monkeypatch.setattr(socket, "create_connection", refuse)
+        with pytest.raises(service_client.SharedMemoryServiceError) as excinfo:
+            rpc._request({"method": "health"}, timeout=1.0)
+        assert excinfo.value.error_class == "ConnectionRefusedError"
+        assert attempts["n"] == 2, (
+            f"expected 2 connect attempts (1 + retry), got {attempts['n']}"
+        )
+
     def test_retry_real_path_dead_port(self, tmp_path, monkeypatch):
         """REAL _request_once path (only socket.create_connection stubbed):
         a refused connect is retried once, then surfaces error_class

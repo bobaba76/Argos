@@ -36,8 +36,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
+_EVAL_DIR = Path(__file__).resolve().parent
+if str(_EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVAL_DIR))
 
 import duckdb  # noqa: E402
+import verdict as _verdict_mod  # noqa: E402 — shared threshold source (#21)
 
 # Lazy imports of store/embedder/date_anchor — done in main() so --help
 # is fast and doesn't require the full plugin stack.
@@ -623,12 +627,13 @@ def _load_baseline(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _verdict(current: Dict[str, Any], baseline: Dict[str, Any]) -> str:
-    cur_r20 = current.get("overall", {}).get("recall@20", 0.0)
-    base_r20 = baseline.get("overall", {}).get("recall@20", 0.0)
-    delta_pp = (cur_r20 - base_r20) * 100.0
-    if delta_pp < -3.0:
-        return f"FAIL recall@20={cur_r20*100:.1f}% (baseline {base_r20*100:.1f}%, {delta_pp:+.1f}pp)"
-    return f"PASS recall@20={cur_r20*100:.1f}% (baseline {base_r20*100:.1f}%)"
+    """Delegates to the shared verdict module (#21).
+
+    Both run_gate and eval_self_corpus --baseline now use the same
+    thresholds: category recall@max-k > 1pp, overall recall@max-k > 0.5pp,
+    overall MRR > 0.01.  The old 3pp recall@20-only verdict is deprecated.
+    """
+    return _verdict_mod.verdict_string(current, baseline)
 
 
 # ---------------------------------------------------------------------------

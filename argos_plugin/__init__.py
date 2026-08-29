@@ -113,6 +113,50 @@ _AUTO_EXTRACT_PAUSE_MARKER = "argos.auto_extract.paused"
 # Config
 # ---------------------------------------------------------------------------
 
+# Config cache for the hot path (pre_llm_call calls _load_config() every
+# turn — issue #29). Invalidated by mtime when the JSON file changes.
+_config_cache: dict | None = None
+_config_cache_mtime: float = 0.0
+_config_cache_path: str = ""
+
+
+def _load_config_cached() -> dict | None:
+    """Return cached config if the file hasn't changed, else None."""
+    global _config_cache, _config_cache_mtime, _config_cache_path
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+    config_path = home / "hybrid_memory.json"
+    path_str = str(config_path)
+    try:
+        mtime = config_path.stat().st_mtime if config_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    if _config_cache is not None and path_str == _config_cache_path and mtime == _config_cache_mtime:
+        return _config_cache
+    return None
+
+
+def _store_config_cache(cfg: dict) -> None:
+    """Store config in the cache after a fresh load."""
+    global _config_cache, _config_cache_mtime, _config_cache_path
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+    config_path = home / "hybrid_memory.json"
+    try:
+        mtime = config_path.stat().st_mtime if config_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    _config_cache = cfg
+    _config_cache_mtime = mtime
+    _config_cache_path = str(config_path)
+
+
 def _load_config(hermes_home: str | None = None) -> dict:
     """Load config from $HERMES_HOME/hybrid_memory.json.
 
@@ -120,6 +164,14 @@ def _load_config(hermes_home: str | None = None) -> dict:
     falling back to get_hermes_home() only when not provided. This ensures
     the config file and databases resolve to the same directory.
     """
+    # Config cache with mtime-based invalidation (issue #29: pre_llm_call
+    # was re-reading the JSON file on every turn). When hermes_home is not
+    # provided (the hot path from pre_llm_call), use the cached copy if the
+    # file hasn't changed.
+    if hermes_home is None:
+        cached = _load_config_cached()
+        if cached is not None:
+            return cached
     config = {
         "database_filename": "hybrid_memory.duckdb",
         "graph_dirname": "hybrid_memory_kuzu",
@@ -180,7 +232,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "distillation_max_calls": "10",
         # Egress (review point 6)
         "local_only": "false",
-        "external_sources_require_confirmation": "false",
+        "external_sources_require_confirmation": "true",
     }
     if hermes_home:
         home = Path(hermes_home)
@@ -199,6 +251,9 @@ def _load_config(hermes_home: str | None = None) -> dict:
                            if v is not None and v != ""})
         except Exception:
             pass
+    # Cache the result for the hot path (issue #29).
+    if hermes_home is None:
+        _store_config_cache(config)
     return config
 
 
@@ -580,6 +635,14 @@ def _flag(cfg: dict, key: str, default: str = "false") -> bool:
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
+# Module-level user_id for module-level helpers (_get_insight_store, etc.)
+# that can't access the provider instance. Set during provider initialize.
+_active_user_id: str = "default_user"
+
+# Cached import of route_answerer (issue #29: was re-importing every turn).
+_route_answerer_fn = None
+
+
 class ArgosProvider(MemoryProvider):
     """Three-tier local memory: DuckDB (vector) + Kuzu (graph) + local embeddings."""
 
@@ -843,6 +906,8 @@ class ArgosProvider(MemoryProvider):
         self._platform = kwargs.get("platform", "cli")
         self._agent_context = kwargs.get("agent_context", "primary")
         self._user_id = kwargs.get("user_id") or "default_user"
+        global _active_user_id
+        _active_user_id = self._user_id
         self._current_project_id = str(kwargs.get("project_id") or "").strip()
 
         self._config = _load_config(self._hermes_home)
@@ -1134,10 +1199,8 @@ class ArgosProvider(MemoryProvider):
             if isinstance(expiry_suggest, str) else bool(expiry_suggest)
         )
         # Push expiry config to the store so remember() uses the right TTL map.
-        if self._store is not None:
-            self._store.expiry_enabled = self._expiry_enabled
-            self._store.ttl_days = dict(self._expiry_ttl_days)
-            self._store.expiry_default_days = self._expiry_default_days
+        # (Moved after store creation — issue #29: these blocks were dead code
+        # when run before the store exists during initialize.)
         # Distillation config (P4.2)
         distillation_enabled = self._config.get("distillation_enabled", "false")
         self._distillation_enabled = (
@@ -1200,13 +1263,7 @@ class ArgosProvider(MemoryProvider):
         self._scale_warn_records = int(
             self._config.get("scale_warn_records", 5000)
         )
-        if self._store is not None:
-            try:
-                self._store.set_scale_thresholds(
-                    self._scale_warn_latency_ms, self._scale_warn_records
-                )
-            except Exception:
-                pass
+        # (Scale threshold push moved after store creation — issue #29.)
 
         # Entity aliases: load from config (JSON mapping) into the store.
         aliases_json = str(self._config.get("entity_aliases", "")).strip()
@@ -1233,8 +1290,16 @@ class ArgosProvider(MemoryProvider):
                     extra = json.loads(role_words_cfg)
                 else:
                     extra = [w.strip() for w in role_words_cfg.split(",")]
-                from graph import _set_role_words_override
+                from graph import _set_role_words_override, _get_role_words
                 _set_role_words_override(set(extra))
+                # Converge the extractor's role-word set with the graph's
+                # (issue #14: extractor had a private 14-word list that
+                # learning never updated).
+                try:
+                    from extractor import set_role_words
+                    set_role_words(_get_role_words())
+                except Exception:
+                    pass
                 logger.debug("Loaded %d role words from config", len(extra))
             except Exception as exc:
                 logger.warning("Failed to parse role_words config: %s", exc)
@@ -1289,7 +1354,10 @@ class ArgosProvider(MemoryProvider):
         ).lower() in {"1", "true", "yes", "on"}
 
         # Reranker (lazy — model loads on first rerank call).
-        if self._reranker_enabled:
+        # In shared-service mode, the reranker runs inside the service
+        # process (which reads the same config), so skip the local
+        # construction — it would be wasted work (issue #29 item 2).
+        if self._reranker_enabled and not use_shared_service:
             try:
                 from .embeddings import CrossEncoderReranker
             except ImportError:
@@ -1300,7 +1368,7 @@ class ArgosProvider(MemoryProvider):
 
         # External-source write policy: config flag → reviewer gate + storage.
         self._external_require_confirmation = _flag(
-            self._config, "external_sources_require_confirmation", "false"
+            self._config, "external_sources_require_confirmation", "true"
         )
         set_external_policy(self._external_require_confirmation)
 
@@ -1336,6 +1404,22 @@ class ArgosProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("Kuzu graph unavailable, continuing without it: %s", e)
                 self._graph = None
+
+        # Push expiry config and scale thresholds to the store now that it
+        # exists (issue #29: these blocks were dead code when run before the
+        # store was created during initialize).
+        try:
+            self._store.expiry_enabled = self._expiry_enabled
+            self._store.ttl_days = dict(self._expiry_ttl_days)
+            self._store.expiry_default_days = self._expiry_default_days
+        except Exception:
+            pass
+        try:
+            self._store.set_scale_thresholds(
+                self._scale_warn_latency_ms, self._scale_warn_records
+            )
+        except Exception:
+            pass
 
         self._initialized = True
         logger.info(
@@ -2190,7 +2274,13 @@ class ArgosProvider(MemoryProvider):
 
         t = threading.Thread(target=_run, daemon=True, name="hybrid-prefetch")
         with self._prefetch_lock:
+            # Join the previous prefetch thread before overwriting the handle
+            # (issue #30: was replaced without join, leaving a stale thread
+            # that could complete and write state for an old query).
+            old = self._prefetch_thread
             self._prefetch_thread = t
+        if old and old.is_alive() and old is not t:
+            old.join(timeout=0.1)  # brief — don't block the new turn
         t.start()
 
     def _consume_prefetch_result(self, query: str) -> str | None:
@@ -2377,12 +2467,16 @@ class ArgosProvider(MemoryProvider):
             try:
                 item = self._sync_queue.get(timeout=10.0)
             except queue.Empty:
-                # Idle for 10s; check if we should exit.
+                # Idle for 10s; check if we should exit. Re-check under the
+                # lock to avoid the idle-exit race (issue #30: a put could
+                # arrive between the get-timeout and the empty() check).
                 with self._sync_lock:
-                    if self._sync_queue.empty():
+                    try:
+                        item = self._sync_queue.get_nowait()
+                    except queue.Empty:
                         self._sync_worker_started = False
                         return
-                continue
+                # Got an item during the race window — process it below.
             if item is None:
                 # Sentinel to stop the worker.
                 self._sync_queue.task_done()
@@ -2708,6 +2802,14 @@ class ArgosProvider(MemoryProvider):
                     # Self-extending: add to in-memory set + persist to config
                     _add_learned_role_word(role_word)
                     known_words = _get_role_words()  # refresh for next iteration
+                    # Also update the extractor's role-word set so future
+                    # "my X is Name" extractions categorize as relationship
+                    # (issue #14: extractor and graph lexicons converge).
+                    try:
+                        from extractor import set_role_words
+                        set_role_words(known_words)
+                    except Exception:
+                        pass
                     self._persist_learned_role_word(role_word)
                     alias = f"my {role_word}"
                     store.add_alias(alias, name)
@@ -3552,10 +3654,14 @@ def _on_pre_llm_call(**kwargs) -> dict:
     # (question + a handful of dated memories) and injects the short answer
     # back as a hint — staying on the cheap Flash answerer throughout.
     try:
-        from .intent_router import route_answerer
+        # Cache the import (issue #29: was re-importing every turn).
+        global _route_answerer_fn
+        if _route_answerer_fn is None:
+            from .intent_router import route_answerer as _ra
+            _route_answerer_fn = _ra
         _cfg = _load_config()
         _q = (kwargs.get("user_message") or "").strip()
-        _route = route_answerer(_cfg, _q)
+        _route = _route_answerer_fn(_cfg, _q)
         if _route:
             _smart = str(_cfg.get("router_smart_model") or "").strip()
             _subcall_on = _as_flag(cfg_value=_cfg.get("router_subcall_enabled"))
@@ -3717,7 +3823,7 @@ def _get_insight_store():
             home = Path(get_hermes_home())
         except Exception:
             home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-        return SharedMemoryStore(home, user_id="default_user")
+        return SharedMemoryStore(home, user_id=_active_user_id)
     except Exception:
         return None
 

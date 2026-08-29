@@ -60,6 +60,13 @@ def test_gate_allows_plain_text():
     assert gate("query_expansion", PLAIN, cfg) is True
 
 
+def test_gate_fails_closed_on_unknown_kind():
+    """An unknown kind must be refused (fail-closed), not allowed."""
+    cfg = {}
+    assert gate("nonexistent_kind", PLAIN, cfg) is False
+    assert gate("", PLAIN, cfg) is False
+
+
 def test_contains_sensitive_labels_identifiers():
     assert contains_sensitive("mail a@b.co.za today") == "email address"
     assert contains_sensitive("phone 0831234567") == "South African phone number"

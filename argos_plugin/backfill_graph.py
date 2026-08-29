@@ -154,6 +154,7 @@ def main() -> int:
             continue
 
         try:
+            is_last = (i + 1) == len(records) or (i + 1) % batch_size == 0
             graph.index_memory(
                 memory_id=memory_id,
                 category=category,
@@ -161,6 +162,7 @@ def main() -> int:
                 tags=tags,
                 created_at=created_at,
                 use_llm=use_llm,
+                flush=is_last,  # Batch flush: only flush at batch boundaries
             )
             indexed += 1
         except Exception as e:

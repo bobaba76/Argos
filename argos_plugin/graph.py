@@ -972,6 +972,7 @@ class KuzuGraphStore:
         tags: List[str] | None = None,
         created_at: str | None = None,
         use_llm: bool = True,
+        flush: bool = True,
     ) -> int:
         """Index one memory and its extracted entities in the graph.
 
@@ -982,6 +983,11 @@ class KuzuGraphStore:
         Extraction is regex-first, LLM-supplemented when regex finds few
         relations and the content is substantial. All entities pass through
         the stop-word / validity gate before reaching the graph.
+
+        When *flush* is False, the Kùzu connection is not flushed after this
+        write — bulk callers (backfill, import) should pass flush=False and
+        call _flush() once at the end to avoid a per-write reopen cost
+        (issue #31).
         """
         if not memory_id or not content:
             return 0
@@ -1034,7 +1040,8 @@ class KuzuGraphStore:
                 relation["target_type"],
                 {"memory_id": str(memory_id), "category": category},
             )
-        self._flush()
+        if flush:
+            self._flush()
         return len(relations)
 
     def remove_memory(self, memory_id: str) -> bool:
@@ -1045,13 +1052,33 @@ class KuzuGraphStore:
         memory_node = self._internal_id(f"memory:{memory_id}")
         changed = False
         with self._shared_conn_lock:
+            # Targeted query for edges where the memory_node is a direct
+            # endpoint (about_user, mentions) — O(degree) instead of O(edges).
+            # Then scan remaining edges for memory_id in the JSON attributes
+            # (entity-to-entity edges that carry evidence). The full scan is
+            # still needed because memory_id lives in a JSON blob (issue #11),
+            # but the targeted query handles the common case efficiently.
             result = self.conn.execute(
                 """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-                   RETURN a.id, r.relation_type, b.id, r.attributes"""
+                   WHERE a.id = $memory_node OR b.id = $memory_node
+                   RETURN a.id, r.relation_type, b.id, r.attributes""",
+                parameters={"memory_node": memory_node},
             )
-            edges = []
+            direct_edges = []
             while result.has_next():
-                edges.append(result.get_next())
+                direct_edges.append(result.get_next())
+            # Full scan for edges that reference the memory_id in their
+            # attributes but don't directly involve the memory_node.
+            result = self.conn.execute(
+                """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+                   WHERE a.id <> $memory_node AND b.id <> $memory_node
+                   RETURN a.id, r.relation_type, b.id, r.attributes""",
+                parameters={"memory_node": memory_node},
+            )
+            other_edges = []
+            while result.has_next():
+                other_edges.append(result.get_next())
+            edges = direct_edges + other_edges
             for source, relation, target, raw_attrs in edges:
                 try:
                     attrs = json.loads(raw_attrs) if raw_attrs else {}
@@ -1223,11 +1250,12 @@ class KuzuGraphStore:
             return []
         if require_specific_seed:
             non_concept = sum(1 for t in seed_types.values() if t != "concept")
-            if non_concept < 2:
-                # Broad query: only generic-concept seeds or a single weak
-                # non-concept hit (relationships, preferences, goals...).
+            if non_concept < 1:
+                # Broad query: only generic-concept seeds, no specific entity.
                 # Traversal output would be hub-adjacent noise — the boost
-                # floor regresses precision on these.
+                # floor regresses precision on these. A single grounded
+                # non-concept seed (e.g. "tell me about Alex") is enough to
+                # traverse (issue #31: docstring says 1, code required 2).
                 return []
 
         # BFS over meaningful relations only, hop-weighted. Meaningful =
@@ -1320,6 +1348,16 @@ class KuzuGraphStore:
         query is O(matching edges), not O(all edges). The quarantine
         visibility guard remains in Python because it inspects a JSON
         attribute field that Kuzu cannot filter natively.
+
+        Architecture note (issue #11): Kùzu is deliberately used as a
+        derived re-ranker / adjacency store at current personal-store scale
+        (~1k nodes). Entity and relation attributes live in a single opaque
+        JSON ``attributes STRING`` column; property predicates cannot be
+        expressed in Cypher because every key is inside one string. Hot
+        paths that would benefit from native Cypher filtering (visibility,
+        scope, role-word) are candidates for migration to dedicated columns
+        when scale demands it. This is a deliberate design choice (option A
+        in issue #11), not an oversight.
         """
         term_lower = str(term or "").lower().strip()
         if not term_lower:
@@ -1372,20 +1410,24 @@ class KuzuGraphStore:
         if not node_ids:
             return []
         node_ids = [self._internal_id(node_id) for node_id in node_ids]
-        # Kuzu doesn't support parameterized IN-lists reliably across
-        # versions, so we build the list literal safely.
-        safe_ids = [str(n).replace("'", "\\'") for n in node_ids]
-        id_list = "[" + ", ".join(f"'{n}'" for n in safe_ids) + "]"
+        # Parameterized IN-list: node ids are passed as query parameters,
+        # never interpolated into the Cypher string (injection-safe).
+        params = {}
+        placeholders = []
+        for i, nid in enumerate(node_ids):
+            params[f"id{i}"] = str(nid)
+            placeholders.append(f"$id{i}")
+        ph_list = ", ".join(placeholders)
         query = f"""
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        WHERE a.id IN {id_list} OR b.id IN {id_list}
+        WHERE a.id IN [{ph_list}] OR b.id IN [{ph_list}]
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
                b.attributes AS target_attrs, r.attributes AS relation_attrs
         """
         with self._shared_conn_lock:
-            results = self.conn.execute(query)
+            results = self.conn.execute(query, parameters=params)
         edges: List[Dict[str, Any]] = []
         while results.has_next():
             row = results.get_next()

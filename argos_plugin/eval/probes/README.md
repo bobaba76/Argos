@@ -71,7 +71,7 @@ Run: `python eval/probes/probe_poisoning.py` (free) / `python eval/probes/probe_
 
 ## Policy config
 
-`external_sources_require_confirmation` (hybrid_memory.json, default `false`):
+`external_sources_require_confirmation` (hybrid_memory.json, default `true`):
 when ON, any candidate tagged `external_source` can never auto-activate. When
 OFF, external candidates still get scanned at review — blocked evidence always
 routes to `pending_user_confirmation`. Untagged (personal) candidates are

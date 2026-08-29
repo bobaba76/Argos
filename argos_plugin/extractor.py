@@ -319,9 +319,10 @@ _ONGOING_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "I have/own/use/take X" — generic attribute extraction.
+# "I have/own X" — possession attribute (scoped to have/own only so it
+# doesn't shadow _HAVE_USE_RE for "I use/take X" — issue #32).
 _ATTRIBUTE_RE = re.compile(
-    r'\b(?:i\s+(?:have|own|use|take)\s+)'
+    r'\b(?:i\s+(?:have|own)\s+)'
     r'(.+?)(?:[.,;]|$)',
     re.IGNORECASE,
 )
@@ -332,6 +333,32 @@ _NOT_A_NAME = frozenset({
     "this", "that", "it", "there", "here", "what", "who", "where",
     "today", "tomorrow", "yesterday", "now", "then",
 })
+
+# Base relationship role words for the "My X is Y" gate. Extended at runtime
+# by set_role_words() with the graph's learned/configured role words so the
+# extractor and graph converge on one lexicon (issue #14).
+_BASE_ROLE_WORDS = frozenset({
+    "wife", "husband", "partner", "boyfriend", "girlfriend",
+    "boss", "advisor", "doctor", "teacher", "mentor",
+    "friend", "colleague", "manager", "supervisor",
+})
+_extra_role_words: set[str] = set()
+
+
+def set_role_words(words: set[str] | frozenset[str] | None) -> None:
+    """Update the extractor's role-word set from the graph's learned words.
+
+    Called by the provider during initialize() so the extractor and graph
+    converge on one lexicon (issue #14: previously the extractor had a
+    private 14-word list that learning never updated).
+    """
+    global _extra_role_words
+    _extra_role_words = {w.lower().strip() for w in (words or set()) if w}
+
+
+def _all_role_words() -> frozenset[str]:
+    """Return the complete role-word set (base + learned)."""
+    return _BASE_ROLE_WORDS | _extra_role_words
 
 
 def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
@@ -420,9 +447,10 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
         value = m.group(2).strip().rstrip('.')
         if len(attr) > 2 and len(value) > 2:
             # If it looks like a relationship ("my role is Entity-B"), tag it.
-            if attr in ("wife", "husband", "partner", "boyfriend", "girlfriend",
-                        "boss", "advisor", "doctor", "teacher", "mentor",
-                        "friend", "colleague", "manager", "supervisor"):
+            # Uses the dynamic role-word set (base + graph-learned words) so
+            # a learned word like "doula" or "housemate" correctly categorizes
+            # as a relationship (issue #14).
+            if attr in _all_role_words():
                 return {
                     "category": "relationship",
                     "content": f"User's {attr} is {value}",

@@ -158,7 +158,12 @@ class LocalEmbedder:
 
     def __init__(self, model_name: str = _DEFAULT_MODEL,
                  hermes_home: Optional[Path] = None) -> None:
-        self._model_name = model_name
+        # Coerce None to the default (issue #45): a None model_name crashed
+        # deferredly inside _query_instruction_for -> model_name.lower(),
+        # silently emptying all retrieval. Treat None as "use the default"
+        # so a caller that passes None (e.g. an unset CLI flag) gets a
+        # working embedder, not a crash-at-query-time trap.
+        self._model_name = model_name or _DEFAULT_MODEL
         self._hermes_home = hermes_home
         self._loaded = False
         self._load_failed = False

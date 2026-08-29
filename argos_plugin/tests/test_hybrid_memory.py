@@ -91,6 +91,31 @@ class TestEmbeddings:
 
         assert "bge-small-en-v1.5" in _DEFAULT_MODEL
 
+    def test_none_model_name_coerces_to_default(self):
+        """LocalEmbedder(model_name=None) must not crash (issue #45).
+
+        A None model_name used to crash deferredly inside
+        _query_instruction_for -> model_name.lower(), silently emptying
+        all retrieval. It must coerce to the default instead.
+        """
+        from embeddings import LocalEmbedder, _DEFAULT_MODEL
+
+        emb = LocalEmbedder(model_name=None)
+        assert emb._model_name == _DEFAULT_MODEL
+        # _prepare_text must not raise on the query path:
+        result = emb._prepare_text("test query", is_query=True)
+        assert isinstance(result, str)
+
+    def test_embed_query_with_none_model_does_not_raise(self):
+        """embed(is_query=True) must not raise even with a None-origin
+        model (issue #45): the None is coerced to the default at init,
+        so the query-instruction path never sees a None model_name."""
+        from embeddings import LocalEmbedder
+
+        emb = LocalEmbedder(model_name=None)
+        result = emb.embed("test query", is_query=True)
+        assert isinstance(result, list)
+
 
 class TestDuckDBStore:
     def test_init_and_save(self, tmp_path):
@@ -226,6 +251,40 @@ class TestDuckDBStore:
 
         results = store.search("Sam", limit=5)
         assert len(results) >= 1
+        store.close()
+
+    def test_broken_embedder_falls_back_to_text_search(self, tmp_path):
+        """A broken embedder must fall back to text-only search, not return
+        [] (issue #45). _hybrid_search wraps the query-embed call in
+        try/except, mirroring the existing _vector_search_raw guard, so
+        an embedder crash degrades to text-only retrieval with a warning
+        instead of silently emptying all results.
+        """
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
+        store.remember(category="personal_fact", content="User takes FocusTool for example condition")
+        store.remember(category="relationship", content="Sam is the user's wife")
+
+        # Inject a broken embedder whose embed() always raises.
+        class _BrokenEmbedder:
+            def embed(self, text, *, is_query=False):
+                raise RuntimeError("simulated embedder failure")
+            def embed_batch(self, texts, *, is_query=False):
+                raise RuntimeError("simulated embedder failure")
+            @property
+            def is_available(self):
+                return False
+            @property
+            def dimension(self):
+                return None
+
+        store.embedder = _BrokenEmbedder()
+
+        # Search must NOT raise and must return text-leg results.
+        results = store.search("FocusTool", limit=5)
+        assert len(results) >= 1, "Broken embedder should fall back to text-only, not return []"
+        assert any("FocusTool" in r.content for r in results)
         store.close()
 
     def test_dedup(self, tmp_path):

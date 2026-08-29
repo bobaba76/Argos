@@ -33,12 +33,12 @@ _DECISION_MAP = {
 
 def _sync_policy_from_config(home: Path) -> None:
     """Mirror the hybrid_memory.json external-source policy into the reviewer."""
-    enabled = False
+    enabled = True
     cfg_path = home / "hybrid_memory.json"
     try:
         if cfg_path.exists():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            enabled = str(cfg.get("external_sources_require_confirmation", "false")).lower() in (
+            enabled = str(cfg.get("external_sources_require_confirmation", "true")).lower() in (
                 "true", "1", "yes"
             )
     except Exception:

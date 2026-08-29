@@ -120,6 +120,32 @@ def test_reviewer_untagged_candidate_unaffected_by_policy(tmp_path, monkeypatch)
         set_external_policy(False)
 
 
+def test_reviewer_fails_closed_when_scanner_unavailable(tmp_path, monkeypatch):
+    """When the inbound_security module cannot be imported, an external-source
+    candidate must fail closed (pending_user_confirmation), not bypass the
+    scanner to reach the LLM."""
+    _stub_agent(monkeypatch)  # any LLM reach fails the test
+    set_external_policy(False)
+    try:
+        # Sabotage the import so inbound_security cannot be loaded.
+        import sys
+        original = sys.modules.pop("inbound_security", None)
+        sys.modules["argos.inbound_security"] = None  # type: ignore
+        monkeypatch.setitem(sys.modules, "inbound_security", None)
+
+        store = _make_store(tmp_path)
+        cand = _add_candidate(store, external=True)
+        res = review_candidate_with_llm(cand)
+        assert res["decision"] == "pending_user_confirmation"
+        assert res["review_model"] == "inbound_security_unavailable"
+    finally:
+        set_external_policy(False)
+        sys.modules.pop("inbound_security", None)
+        sys.modules.pop("argos.inbound_security", None)
+        if original is not None:
+            sys.modules["inbound_security"] = original
+
+
 # ---------------------------------------------------------- storage boundary
 
 def test_storage_boundary_auto_review_cannot_activate_external(tmp_path):

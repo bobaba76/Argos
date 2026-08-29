@@ -23,8 +23,9 @@ _SENSITIVE_RE = re.compile(
 # External-source write policy (config-driven, set by the provider/service).
 # When True, candidates tagged external_source never auto-activate: they go
 # straight to pending_user_confirmation, even when the LLM reviewer would
-# have approved. Default OFF — personal installs keep today's behavior.
-_EXTERNAL_REQUIRE_CONFIRMATION = False
+# have approved. Default ON — out-of-the-box installs enforce the
+# human-confirmation boundary for external/untrusted sources.
+_EXTERNAL_REQUIRE_CONFIRMATION = True
 
 
 def set_external_policy(enabled: bool) -> None:
@@ -209,7 +210,14 @@ def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", pro
             else:
                 from inbound_security import scan_inbound_text
         except Exception:
-            scan_result = None
+            # Fail closed: if the scanner cannot be loaded, route to a human
+            # rather than proceeding without the security gate.
+            return {
+                "decision": "pending_user_confirmation",
+                "confidence": 0.99,
+                "reason": "Inbound security scanner unavailable; external-source memory requires human confirmation.",
+                "review_model": "inbound_security_unavailable",
+            }
         else:
             scan_result = scan_inbound_text(
                 evidence or str(candidate.get("content") or "")

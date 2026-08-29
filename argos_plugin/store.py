@@ -257,7 +257,7 @@ class DuckDBMemoryStore:
         self.user_id = (user_id or "default_user").strip()
         self.embedder = embedder
         self.reranker = reranker
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.connection: Optional[duckdb.DuckDBPyConnection] = None
         self._connect()
         self._init_db()
@@ -281,9 +281,12 @@ class DuckDBMemoryStore:
         # External-source write policy (set from config by the provider and
         # the shared service). When True, candidates tagged external_source
         # can never auto-activate: the storage boundary downgrades auto_review
-        # approvals to pending_user_confirmation. Default OFF (personal
-        # installs keep exactly today's behavior).
-        self.external_sources_require_confirmation: bool = False
+        # approvals to pending_user_confirmation. Default ON (out-of-the-box
+        # installs enforce the human-confirmation boundary).
+        self.external_sources_require_confirmation: bool = True
+        # Alias cache: avoids a full-table scan on every search query
+        # (issue #27). Invalidated on add_alias / remove_alias.
+        self._alias_cache: dict[str, list[tuple[str, str]]] | None = None
 
     # -- connection management ------------------------------------------------
 
@@ -689,22 +692,33 @@ class DuckDBMemoryStore:
             temporal_clause = "AND valid_to IS NULL "
             temporal_params = []
 
+        # Push category_filter and excluded into SQL so the LIMIT 2000
+        # candidate pool is pre-filtered (issue #27: Python-side filtering
+        # after the fetch starves narrow queries with wrong-category rows).
+        category_clause = ""
+        category_params: list = []
+        if category_filter:
+            category_clause = " AND category = ?"
+            category_params.append(category_filter)
+        if excluded:
+            excluded_placeholders = ", ".join(["?" for _ in excluded])
+            category_clause += f" AND LOWER(category) NOT IN ({excluded_placeholders})"
+            category_params.extend(e.lower() for e in excluded)
         sql = (
             "SELECT * FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
             f"{temporal_clause} "
             "AND (user_scope IS NULL OR user_scope = ?) "
             f"{expiry_clause}"
-            f"{project_clause} AND ("
+            f"{project_clause}"
+            f"{category_clause} AND ("
             f"{conditions}) LIMIT 2000"
         )
-        results = self._fetch_records(sql, [*temporal_params, *params, *patterns])
+        results = self._fetch_records(
+            sql, [*temporal_params, *params, *category_params, *patterns]
+        )
         out: List[MemoryRecord] = []
         for r in results:
-            if excluded and r.category.lower() in excluded:
-                continue
-            if category_filter and r.category != category_filter:
-                continue
             if not self._matches_scope(r.payload):
                 continue
             if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
@@ -787,6 +801,15 @@ class DuckDBMemoryStore:
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
+        # Push category_filter and excluded into SQL (issue #27).
+        category_clause = ""
+        if category_filter:
+            category_clause = " AND category = ?"
+            params.append(category_filter)
+        if excluded:
+            excluded_placeholders = ", ".join(["?" for _ in excluded])
+            category_clause += f" AND LOWER(category) NOT IN ({excluded_placeholders})"
+            params.extend(e.lower() for e in excluded)
         params.append(limit * 4)
         sql = (
             f"SELECT *, list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) AS sim "
@@ -796,17 +819,14 @@ class DuckDBMemoryStore:
             "  AND embedding IS NOT NULL "
             "  AND (user_scope IS NULL OR user_scope = ?) "
             f"{expiry_clause}"
-            f"{project_clause} "
+            f"{project_clause}"
+            f"{category_clause} "
             "ORDER BY sim DESC "
             "LIMIT ?"
         )
         results = self._fetch_records(sql, params, sim_col="sim")
         out: List[MemoryRecord] = []
         for r in results:
-            if excluded and r.category.lower() in excluded:
-                continue
-            if category_filter and r.category != category_filter:
-                continue
             if not self._matches_scope(r.payload):
                 continue
             if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
@@ -1332,7 +1352,21 @@ class DuckDBMemoryStore:
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
         if self.embedder and hasattr(self.embedder, "embed"):
-            emb = self.embedder.embed(query, is_query=True)
+            try:
+                emb = self.embedder.embed(query, is_query=True)
+            except Exception as exc:
+                # Query-embed failure must NOT take down the whole search
+                # (issue #45): a broken embedder (None model, load failure,
+                # .lower() crash) used to propagate here and empty every
+                # retrieval silently, because fail-soft callers swallowed
+                # the exception and saw "no relevant memories". Fall back
+                # to text-only retrieval — degraded but honest — and log
+                # a warning so the failure is visible.
+                logger.warning(
+                    "Query embedding failed — falling back to text-only "
+                    "search: %s", exc,
+                )
+                emb = []
 
         # Retrieve more candidates than requested so the reranker has a
         # larger pool to work with. If no reranker, just use limit.
@@ -1788,6 +1822,17 @@ class DuckDBMemoryStore:
                 ).fetchone()
             if existing:
                 return None
+            # Tombstone check (issue #46): a hard-deleted fact must not
+            # re-enter the proposal queue. Same fingerprint as remember()'s
+            # tombstone_check, applied at proposal time so the reviewer
+            # never sees a resurrected fact.
+            _ts = self.tombstone_check(content, category)
+            if _ts:
+                logger.info(
+                    "Blocked re-proposal of deleted fact (tombstone %s): %s",
+                    _ts.get("created_at", ""), content[:60],
+                )
+                return None
 
         candidate_id = f"cand-{uuid.uuid4().hex}"
         now = self._now()
@@ -1935,7 +1980,7 @@ class DuckDBMemoryStore:
         if (
             review_source == "auto_review"
             and decision in {"approved", "reviewed_approved"}
-            and getattr(self, "external_sources_require_confirmation", False)
+            and getattr(self, "external_sources_require_confirmation", True)
             and isinstance(candidate.get("payload"), dict)
             and candidate["payload"].get("external_source")
         ):
@@ -1965,85 +2010,93 @@ class DuckDBMemoryStore:
             # Pass explicit expires_at through to remember() (Spec 1).
             if expires_at is not _NOT_PROVIDED:
                 remember_kwargs["expires_at"] = expires_at
-            memory = self.remember(**remember_kwargs)
-            if memory is None:
-                final_status = "deduplicated"
-            elif supersedes_memory_id:
-                # Chain the new memory behind the named current record.
-                # Same supersession semantics as update_memory, but the new
-                # version's content comes from the candidate, not the old
-                # record. Scope-checked: cannot supersede another user's
-                # memory.
-                with self._lock:
-                    assert self.connection is not None
-                    check = self.connection.execute(
-                        """SELECT 1 FROM memory_records
-                           WHERE memory_id = ?
-                             AND (user_scope IS NULL OR user_scope = ?)
-                             AND valid_to IS NULL""",
-                        [supersedes_memory_id, self.user_id],
-                    ).fetchone()
-                    if check:
-                        self.connection.execute(
-                            """UPDATE memory_records
-                               SET valid_to = ?, superseded_by = ?, updated_at = ?
-                               WHERE memory_id = ?""",
-                            [now, memory.memory_id, now, supersedes_memory_id],
-                        )
-                        superseded_ok = True
+        # Wrap the entire review path (remember + supersede + candidate-status
+        # + evidence) in one transaction so a crash between steps cannot leave
+        # the chain forked or the candidate status inconsistent (issue #9).
         with self._lock:
             assert self.connection is not None
-            self.connection.execute(
-                """UPDATE memory_candidates
-                   SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?,
-                       review_confidence = ?, review_model = ?,
-                       durability = COALESCE(?, durability), scope = COALESCE(?, scope)
-                   WHERE candidate_id = ?""",
-                [
-                    final_status, now, now, reason or "", review_confidence,
-                    review_model or "", durability, scope, candidate_id,
-                ],
-            )
-
-            # Wave 2: carry candidate evidence into memory_evidence so every
-            # approved memory keeps provenance ("why does Hermes believe
-            # this, and from exactly which user statement?").
-            # Retention modes: full | hash | none.
-            if memory is not None and evidence_retention != "none":
-                evidence_text = candidate.get("evidence_text") or ""
-                if evidence_retention == "hash" and evidence_text:
-                    evidence_text = hashlib.sha256(
-                        evidence_text.encode("utf-8")
-                    ).hexdigest()
-                payload = candidate.get("payload") or {}
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                if decision in {"approved", "reviewed_approved"}:
+                    memory = self.remember(**remember_kwargs)
+                    if memory is None:
+                        final_status = "deduplicated"
+                    elif supersedes_memory_id:
+                        # Chain the new memory behind the named current record.
+                        # Same supersession semantics as update_memory, but the
+                        # new version's content comes from the candidate, not
+                        # the old record. Scope-checked: cannot supersede
+                        # another user's memory.
+                        check = self.connection.execute(
+                            """SELECT 1 FROM memory_records
+                               WHERE memory_id = ?
+                                 AND (user_scope IS NULL OR user_scope = ?)
+                                 AND valid_to IS NULL""",
+                            [supersedes_memory_id, self.user_id],
+                        ).fetchone()
+                        if check:
+                            self.connection.execute(
+                                """UPDATE memory_records
+                                   SET valid_to = ?, superseded_by = ?, updated_at = ?
+                                   WHERE memory_id = ?""",
+                                [now, memory.memory_id, now, supersedes_memory_id],
+                            )
+                            superseded_ok = True
                 self.connection.execute(
-                    """INSERT INTO memory_evidence
-                       (memory_id, user_scope, source_session_id, source_timestamp,
-                        evidence_role, evidence_text, extraction_method,
-                        reviewer_decision, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT (memory_id) DO NOTHING""",
+                    """UPDATE memory_candidates
+                       SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?,
+                           review_confidence = ?, review_model = ?,
+                           durability = COALESCE(?, durability), scope = COALESCE(?, scope)
+                       WHERE candidate_id = ?""",
                     [
-                        memory.memory_id,
-                        (
-                            payload.get("user_scope")
-                            if isinstance(payload, dict) else None
-                        ) or self.user_id,
-                        (
-                            payload.get("source_session_id")
-                            if isinstance(payload, dict) else None
-                        ) or candidate.get("session_id") or "",
-                        candidate.get("source_timestamp") or now,
-                        candidate.get("evidence_role") or "",
-                        evidence_text,
-                        (
-                            payload.get("extraction_method", "")
-                            if isinstance(payload, dict) else ""
-                        ),
-                        final_status,
-                        now,
+                        final_status, now, now, reason or "", review_confidence,
+                        review_model or "", durability, scope, candidate_id,
                     ],
                 )
+
+                # Wave 2: carry candidate evidence into memory_evidence so every
+                # approved memory keeps provenance ("why does Hermes believe
+                # this, and from exactly which user statement?").
+                # Retention modes: full | hash | none.
+                if memory is not None and evidence_retention != "none":
+                    evidence_text = candidate.get("evidence_text") or ""
+                    if evidence_retention == "hash" and evidence_text:
+                        evidence_text = hashlib.sha256(
+                            evidence_text.encode("utf-8")
+                        ).hexdigest()
+                    payload = candidate.get("payload") or {}
+                    self.connection.execute(
+                        """INSERT INTO memory_evidence
+                           (memory_id, user_scope, source_session_id, source_timestamp,
+                            evidence_role, evidence_text, extraction_method,
+                            reviewer_decision, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT (memory_id) DO NOTHING""",
+                        [
+                            memory.memory_id,
+                            (
+                                payload.get("user_scope")
+                                if isinstance(payload, dict) else None
+                            ) or self.user_id,
+                            (
+                                payload.get("source_session_id")
+                                if isinstance(payload, dict) else None
+                            ) or candidate.get("session_id") or "",
+                            candidate.get("source_timestamp") or now,
+                            candidate.get("evidence_role") or "",
+                            evidence_text,
+                            (
+                                payload.get("extraction_method", "")
+                                if isinstance(payload, dict) else ""
+                            ),
+                            final_status,
+                            now,
+                        ],
+                    )
+                self.connection.execute("COMMIT")
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
         result = {
             "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
             "memory": memory.to_dict() if memory else None,
@@ -2431,50 +2484,59 @@ class DuckDBMemoryStore:
 
         with self._lock:
             assert self.connection is not None
-            # 1. Create the new version, carrying feedback counters forward
-            #    from the superseded record so importance evidence survives
-            #    edits. A memory with 10 helpful votes keeps them after a
-            #    content fix. retrieval_count also carries forward because the
-            #    new version represents the same fact the user has been
-            #    retrieving.
-            self.connection.execute(
-                """INSERT INTO memory_records
-                   (memory_id, category, content, tags, payload, created_at, updated_at,
-                    expires_at, embedding, status, source, confidence, durability, scope,
-                    project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
-                    valid_from, valid_to, superseded_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
-                [new_id, rec.category, new_content, new_tags,
-                 json.dumps(new_payload), now, now,
-                 effective_expires,
-                 new_emb if new_emb else None,
-                 rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
-                 rec.project_id,
-                 rec.payload.get("user_scope"),
-                 rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
-                 now],
-            )
-            # 2. Supersede the old version
-            self.connection.execute(
-                """UPDATE memory_records
-                   SET valid_to = ?, superseded_by = ?, updated_at = ?
-                   WHERE memory_id = ?""",
-                [now, new_id, now, memory_id],
-            )
-            # 3. Carry the evidence trail forward. memory_evidence is keyed
-            #    by memory_id, so the new version would otherwise orphan the
-            #    provenance row (review point 2: provenance after updates).
-            self.connection.execute(
-                """INSERT INTO memory_evidence
-                   (memory_id, user_scope, source_session_id, source_timestamp,
-                    evidence_role, evidence_text, extraction_method,
-                    reviewer_decision, created_at, candidate_id)
-                   SELECT ?, user_scope, source_session_id, source_timestamp,
-                          evidence_role, evidence_text, extraction_method,
-                          reviewer_decision, created_at, candidate_id
-                   FROM memory_evidence WHERE memory_id = ?""",
-                [new_id, memory_id],
-            )
+            # Wrap the version-chain write in an explicit transaction so a
+            # crash between steps cannot leave two current versions or
+            # orphan the evidence trail (issue #9).
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                # 1. Create the new version, carrying feedback counters forward
+                #    from the superseded record so importance evidence survives
+                #    edits. A memory with 10 helpful votes keeps them after a
+                #    content fix. retrieval_count also carries forward because the
+                #    new version represents the same fact the user has been
+                #    retrieving.
+                self.connection.execute(
+                    """INSERT INTO memory_records
+                       (memory_id, category, content, tags, payload, created_at, updated_at,
+                        expires_at, embedding, status, source, confidence, durability, scope,
+                        project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
+                        valid_from, valid_to, superseded_by)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                    [new_id, rec.category, new_content, new_tags,
+                     json.dumps(new_payload), now, now,
+                     effective_expires,
+                     new_emb if new_emb else None,
+                     rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
+                     rec.project_id,
+                     rec.payload.get("user_scope"),
+                     rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
+                     now],
+                )
+                # 2. Supersede the old version
+                self.connection.execute(
+                    """UPDATE memory_records
+                       SET valid_to = ?, superseded_by = ?, updated_at = ?
+                       WHERE memory_id = ?""",
+                    [now, new_id, now, memory_id],
+                )
+                # 3. Carry the evidence trail forward. memory_evidence is keyed
+                #    by memory_id, so the new version would otherwise orphan the
+                #    provenance row (review point 2: provenance after updates).
+                self.connection.execute(
+                    """INSERT INTO memory_evidence
+                       (memory_id, user_scope, source_session_id, source_timestamp,
+                        evidence_role, evidence_text, extraction_method,
+                        reviewer_decision, created_at, candidate_id)
+                       SELECT ?, user_scope, source_session_id, source_timestamp,
+                              evidence_role, evidence_text, extraction_method,
+                              reviewer_decision, created_at, candidate_id
+                       FROM memory_evidence WHERE memory_id = ?""",
+                    [new_id, memory_id],
+                )
+                self.connection.execute("COMMIT")
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [new_id]
         )
@@ -2863,6 +2925,7 @@ class DuckDBMemoryStore:
                    VALUES (?, ?, ?, ?)""",
                 [alias, canonical.lower(), self.user_id, now],
             )
+            self._alias_cache = None  # Invalidate cache on write
 
     def remove_alias(self, alias: str, canonical_entity: str | None = None) -> bool:
         """Remove an alias mapping. If canonical_entity is None, removes all
@@ -2883,6 +2946,7 @@ class DuckDBMemoryStore:
                        WHERE alias = ? AND user_scope = ?""",
                     [alias, self.user_id],
                 )
+            self._alias_cache = None  # Invalidate cache on write
             return True
 
     def resolve_aliases(self, text: str) -> List[str]:
@@ -2890,19 +2954,26 @@ class DuckDBMemoryStore:
         found in the text.
 
         Example: resolve_aliases("tell me about my wife") → ["Alex"]
+
+        Uses a per-scope cache to avoid a full-table scan on every search
+        query (issue #27). The cache is invalidated on add_alias /
+        remove_alias.
         """
         if not text:
             return []
         text_lower = text.lower()
         with self._lock:
             assert self.connection is not None
-            rows = self.connection.execute(
-                """SELECT alias, canonical_entity FROM entity_aliases
-                   WHERE user_scope = ?""",
-                [self.user_id],
-            ).fetchall()
+            if self._alias_cache is None:
+                rows = self.connection.execute(
+                    """SELECT alias, canonical_entity FROM entity_aliases
+                       WHERE user_scope = ?""",
+                    [self.user_id],
+                ).fetchall()
+                self._alias_cache = [(r[0], r[1]) for r in rows]
+            aliases = self._alias_cache
         canonicals: set[str] = set()
-        for alias, canonical in rows:
+        for alias, canonical in aliases:
             if alias and alias in text_lower:
                 canonicals.add(canonical)
         return sorted(canonicals)

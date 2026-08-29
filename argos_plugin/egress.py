@@ -223,8 +223,8 @@ def gate(kind: str, text: str = "", cfg: dict | None = None) -> bool:
     conversation-derived payload contains a PII identifier.
     """
     if kind not in {site["kind"] for site in SITES}:
-        logger.warning("egress gate: unknown kind %r (defaulting to allowed)", kind)
-        return True
+        logger.warning("egress gate: unknown kind %r (defaulting to blocked)", kind)
+        return False
     cfg = cfg if cfg is not None else load_config()
     if local_only(cfg):
         return False

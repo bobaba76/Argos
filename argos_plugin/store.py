@@ -2370,6 +2370,75 @@ class DuckDBMemoryStore:
             rows = self.connection.execute(sql, params).fetchall()
         return [self._candidate_row_to_dict(row) for row in rows]
 
+    def project_digest(
+        self,
+        project_id: str | None = None,
+        *,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Per-project pending-proposal digest (#47).
+
+        Returns a digest of candidates grouped by project, with count and
+        list for each. When *project_id* is provided, only that project's
+        candidates are returned. When None, all projects are grouped.
+
+        Args:
+            project_id: Filter to a specific project, or None for all.
+            status: Candidate status to filter on (default "pending").
+            limit: Max candidates per project.
+
+        Returns:
+            A dict with:
+            - ``projects``: list of {project_id, count, candidates}
+            - ``global_count``: count of unscoped (project_id IS NULL) candidates
+        """
+        conditions = [
+            "(user_scope IS NULL OR user_scope = ?)",
+            "status = ?",
+        ]
+        params: list[Any] = [self.user_id, status]
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        sql = (
+            "SELECT candidate_id, category, content, tags, payload, source, "
+            "confidence, durability, scope, project_id, session_id, status, "
+            "created_at, updated_at, reviewed_at, review_reason, evidence_text, "
+            "evidence_role, source_timestamp, review_confidence, review_model, "
+            "quarantine_reason, quarantined_at, provenance_origin, grounding "
+            "FROM memory_candidates"
+        )
+        sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(sql, params).fetchall()
+        candidates = [self._candidate_row_to_dict(row) for row in rows]
+        # Group by project_id.
+        by_project: Dict[str, List[dict]] = {}
+        global_candidates: List[dict] = []
+        for cand in candidates:
+            pid = cand.get("project_id")
+            if pid:
+                by_project.setdefault(pid, []).append(cand)
+            else:
+                global_candidates.append(cand)
+        projects = [
+            {
+                "project_id": pid,
+                "count": len(cands),
+                "candidates": cands,
+            }
+            for pid, cands in sorted(by_project.items())
+        ]
+        return {
+            "projects": projects,
+            "global_count": len(global_candidates),
+            "global_candidates": global_candidates,
+        }
+
     def review_candidate(
         self,
         candidate_id: str,

@@ -58,12 +58,121 @@ def _record_to_dict(record: Any) -> dict | None:
     return record.to_dict() if hasattr(record, "to_dict") else record
 
 
+class _Tenant:
+    """One isolated cell: own store, own graph, own locks (#49).
+
+    Isolation is filesystem-level by construction — each tenant has its
+    own ``.duckdb`` file and graph dir. ``user_scope`` filtering stays in
+    the store as defense-in-depth. Each tenant also carries its own locks,
+    so one tenant's long consolidate/backup never blocks another tenant's
+    calls.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config: dict,
+        home: Path,
+        embedder,
+        reranker,
+        default_scope: str | None = None,
+    ) -> None:
+        self.name = name
+        self.config = config
+        db_name = str(config.get("database_filename", "hybrid_memory.duckdb"))
+        graph_name = str(config.get("graph_dirname", "hybrid_memory_kuzu"))
+        # Default scope for direct (non-RPC) calls like the startup hygiene
+        # sweep. The DEFAULT tenant keeps the historical "default_user" so
+        # the sweep still sees entities written by default clients — a
+        # scope change here silently disabled the sweep (#49 review).
+        self.default_scope = default_scope or "default_user"
+        # The tenant name is the store's default scope; every request
+        # re-scopes per user_id anyway (defense in depth).
+        self.store = DuckDBMemoryStore(
+            home / db_name, user_id=self.default_scope,
+            embedder=embedder, reranker=reranker,
+        )
+        try:
+            self.store._reranker_top_n = max(
+                5, min(int(config.get("reranker_top_n", 20)), 100)
+            )
+        except (TypeError, ValueError):
+            self.store._reranker_top_n = 20
+        try:
+            self.store._phrase_lift_alpha = max(
+                0.0, min(float(config.get("phrase_lift_alpha", 0.0)), 1.0)
+            )
+        except (TypeError, ValueError):
+            self.store._phrase_lift_alpha = 0.0
+        try:
+            self.store._phrase_lift_pool = max(
+                0, min(int(config.get("phrase_lift_pool", 200)), 1000)
+            )
+        except (TypeError, ValueError):
+            self.store._phrase_lift_pool = 200
+        # External-source write policy (per-tenant overlay).
+        self.store.external_sources_require_confirmation = str(
+            config.get("external_sources_require_confirmation", "true")
+        ).lower() in ("true", "1", "yes")
+        try:
+            self.graph = KuzuGraphStore(home / graph_name, user_id=self.default_scope)
+        except Exception as exc:
+            logger.warning(
+                "Kùzu unavailable for tenant %r: %s", name, exc,
+            )
+            self.graph = None
+        self.store_lock = threading.RLock()
+        self.graph_lock = threading.RLock()
+
+    def close(self) -> None:
+        with self.store_lock:
+            try:
+                self.store.close()
+            finally:
+                if self.graph:
+                    with self.graph_lock:
+                        self.graph.close()
+
+
+def _parse_tenants(config: dict, home: Path, embedder, reranker) -> dict:
+    """Build the tenant registry from ``hybrid_memory.json`` (#49).
+
+    With a ``tenants`` map, each entry is a cell: its own database + graph
+    paths (relative to home) and a nested ``config`` overlay applied on top
+    of the global config. Without ``tenants`` (the current single-tenant
+    shape), the global config IS the ``default`` tenant — fully backward
+    compatible.
+    """
+    tenants_map = config.get("tenants")
+    if not isinstance(tenants_map, dict) or not tenants_map:
+        tenants_map = {"default": config}
+    tenants: dict = {}
+    for name, entry in tenants_map.items():
+        entry = entry if isinstance(entry, dict) else {}
+        overlay = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+        merged = dict(config)
+        merged.update(overlay)
+        # Cell paths come from the tenant entry itself.
+        merged["database_filename"] = entry.get(
+            "database_filename", config.get("database_filename", "hybrid_memory.duckdb")
+        )
+        merged["graph_dirname"] = entry.get(
+            "graph_dirname", config.get("graph_dirname", "hybrid_memory_kuzu")
+        )
+        # Default tenant keeps the historical "default_user" scope (#49
+        # review): the startup hygiene sweep and any direct store/graph
+        # calls must see the data default clients write.
+        default_scope = "default_user" if name == "default" else name
+        tenants[name] = _Tenant(
+            name, merged, home, embedder, reranker, default_scope=default_scope,
+        )
+    return tenants
+
+
 class MemoryService:
     def __init__(self, home: Path) -> None:
         self.home = home
         config = _load_config(home)
-        db_name = str(config.get("database_filename", "hybrid_memory.duckdb"))
-        graph_name = str(config.get("graph_dirname", "hybrid_memory_kuzu"))
         model_name = str(
             config.get(
                 "local_embedding_model",
@@ -88,52 +197,37 @@ class MemoryService:
                 reranker = CrossEncoderReranker(reranker_model)
             except Exception as exc:
                 logger.warning("Reranker unavailable in shared service: %s", exc)
-        self.store = DuckDBMemoryStore(
-            home / db_name, user_id="default_user", embedder=self.embedder,
-            reranker=reranker,
+        # Tenant registry (#49): per-tenant stores/graphs behind one service.
+        self._tenants: dict = _parse_tenants(config, home, self.embedder, reranker)
+        # Backward-compat aliases: the DEFAULT tenant's handles. Anything
+        # that referenced self.store/self.graph before still works.
+        self._default_tenant = "default" if "default" in self._tenants else next(
+            iter(self._tenants)
         )
-        try:
-            self.store._reranker_top_n = max(
-                5, min(int(config.get("reranker_top_n", 20)), 100)
-            )
-        except (TypeError, ValueError):
-            self.store._reranker_top_n = 20
-        # Exact-phrase lift (parity with provider config)
-        try:
-            self.store._phrase_lift_alpha = max(
-                0.0, min(float(config.get("phrase_lift_alpha", 0.0)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self.store._phrase_lift_alpha = 0.0
-        try:
-            self.store._phrase_lift_pool = max(
-                0, min(int(config.get("phrase_lift_pool", 200)), 1000)
-            )
-        except (TypeError, ValueError):
-            self.store._phrase_lift_pool = 200
-        # External-source write policy (parity with the provider config).
-        self.store.external_sources_require_confirmation = str(
-            config.get("external_sources_require_confirmation", "true")
-        ).lower() in ("true", "1", "yes")
-        try:
-            self.graph = KuzuGraphStore(home / graph_name, user_id="default_user")
-        except Exception as exc:
-            logger.warning("Kùzu unavailable in shared memory service: %s", exc)
-            self.graph = None
-        self.store_lock = threading.RLock()  # serializes store writes (#20)
-        self.graph_lock = threading.RLock()  # separate graph lock: store and
-        # graph calls no longer serialize behind ONE global lock, so a long
-        # graph traversal no longer queues every store search behind it.
+        default_tenant = self._tenants[self._default_tenant]
+        self.store = default_tenant.store
+        self.graph = default_tenant.graph
         self._lock_wait_total_s = 0.0
         self._lock_wait_count = 0
         self.server = None
 
-    def _call_store(self, method: str, args: dict, user_id: str) -> Any:
-        self.store.set_user_scope(user_id)
+    def _resolve_tenant(self, user_id: str) -> _Tenant:
+        """Map a user_id to its tenant cell (#49).
+
+        Exact match on tenant name; unknown user_ids fall back to the
+        default tenant (backward compatible — a single-tenant config
+        routes every user_id to ``default``).
+        """
+        if user_id in self._tenants:
+            return self._tenants[user_id]
+        return self._tenants[self._default_tenant]
+
+    def _call_store(self, method: str, args: dict, user_id: str, store) -> Any:
+        store.set_user_scope(user_id)
         if method == "search":
             return [
                 _record_to_dict(record)
-                for record in self.store.search(
+                for record in store.search(
                     args.get("query", ""),
                     limit=int(args.get("limit", 5)),
                     exclude_categories=args.get("exclude_categories"),
@@ -146,93 +240,93 @@ class MemoryService:
                                     )
             ]
         if method == "remember":
-            return _record_to_dict(self.store.remember(**args))
+            return _record_to_dict(store.remember(**args))
         if method == "update_memory":
-            return _record_to_dict(self.store.update_memory(**args))
+            return _record_to_dict(store.update_memory(**args))
         if method == "get_memories_by_ids":
             return [
                 _record_to_dict(record)
-                for record in self.store.get_memories_by_ids(
+                for record in store.get_memories_by_ids(
                     args.get("memory_ids", []),
                     include_quarantined=bool(args.get("include_quarantined", False)),
                 )
             ]
         if method == "save_candidate":
-            return self.store.save_candidate(**args)
+            return store.save_candidate(**args)
         if method == "find_semantic_duplicate":
             return _record_to_dict(
-                self.store.find_semantic_duplicate(
+                store.find_semantic_duplicate(
                     content=args.get("content", ""),
                     min_similarity=float(args.get("min_similarity", 0.88)),
                 )
             )
         if method == "list_candidates":
-            return self.store.list_candidates(**args)
+            return store.list_candidates(**args)
         if method == "review_candidate":
-            return self.store.review_candidate(**args)
+            return store.review_candidate(**args)
         if method == "find_supersede_candidates":
-            return self.store.find_supersede_candidates(
+            return store.find_supersede_candidates(
                 candidate_id=args.get("candidate_id", ""),
                 limit=int(args.get("limit", 3)),
             )
         if method == "quarantine_memory":
-            return self.store.quarantine_memory(**args)
+            return store.quarantine_memory(**args)
         if method == "restore_memory":
-            return self.store.restore_memory(**args)
+            return store.restore_memory(**args)
         if method == "record_feedback":
-            return self.store.record_feedback(**args)
+            return store.record_feedback(**args)
         if method == "mark_superseded":
             # Live-admin supersession (e.g. retroactive chains after a new
             # benchmark supersedes an old one).  Sets valid_to; the read side
             # excludes the record automatically.
-            return self.store._mark_superseded(
+            return store._mark_superseded(
                 memory_id=args.get("memory_id", ""),
                 reason=args.get("reason", ""),
                 superseded_by=args.get("superseded_by"),
             )
         if method == "delete_memory":
-            return self.store.delete_memory(**args)
+            return store.delete_memory(**args)
         # -- deletion tombstones (read-only visibility + escape hatch) ---------
         if method == "list_tombstones":
-            return self.store.list_tombstones(
+            return store.list_tombstones(
                 limit=int(args.get("limit", 200)),
             )
         if method == "purge_tombstone":
-            return self.store.purge_tombstone(
+            return store.purge_tombstone(
                 content=args.get("content", ""),
                 category=args.get("category", ""),
             )
         if method == "cleanup_junk":
-            return self.store.cleanup_junk(**args)
+            return store.cleanup_junk(**args)
         if method == "consolidate":
-            return self.store.consolidate(**args)
+            return store.consolidate(**args)
         if method == "count":
-            return self.store.count()
+            return store.count()
         if method == "record_retrieval":
-            self.store.record_retrieval(args.get("memory_ids", []))
+            store.record_retrieval(args.get("memory_ids", []))
             return True
         if method == "get_evidence":
-            return self.store.get_evidence(args.get("memory_id", ""))
+            return store.get_evidence(args.get("memory_id", ""))
         if method == "get_evidence_batch":
-            return self.store.get_evidence_batch(args.get("memory_ids", []) or [])
+            return store.get_evidence_batch(args.get("memory_ids", []) or [])
         if method == "get_memory_history":
             return [
                 _record_to_dict(record)
-                for record in self.store.get_memory_history(
+                for record in store.get_memory_history(
                     args.get("memory_id", ""),
                     max_versions=args.get("max_versions"),
                 )
             ]
         if method == "get_chain_membership":
-            return self.store.get_chain_membership(args.get("memory_ids", []) or [])
+            return store.get_chain_membership(args.get("memory_ids", []) or [])
         if method == "backfill_evidence":
-            return self.store.backfill_evidence(
+            return store.backfill_evidence(
                 retention=args.get("retention", "full")
             )
         if method == "get_scale_metrics":
-            return self.store.get_scale_metrics()
+            return store.get_scale_metrics()
         if method == "set_scale_thresholds":
-            self.store.set_scale_thresholds(
+            store.set_scale_thresholds(
                 args.get("warn_latency_ms", 300.0),
                 args.get("warn_records", 5000),
             )
@@ -240,101 +334,101 @@ class MemoryService:
         if method == "list_recent":
             return [
                 _record_to_dict(record)
-                for record in self.store.list_recent(
+                for record in store.list_recent(
                     limit=int(args.get("limit", 100)),
                 )
             ]
         if method == "get_insights":
             return [
                 _record_to_dict(record)
-                for record in self.store.get_insights(
+                for record in store.get_insights(
                     tags=args.get("tags"),
                     since=args.get("since"),
                     limit=int(args.get("limit", 50)),
                 )
             ]
         if method == "add_alias":
-            self.store.add_alias(
+            store.add_alias(
                 alias=args.get("alias", ""),
                 canonical_entity=args.get("canonical_entity", ""),
             )
             return True
         if method == "remove_alias":
-            return self.store.remove_alias(
+            return store.remove_alias(
                 alias=args.get("alias", ""),
                 canonical_entity=args.get("canonical_entity"),
             )
         if method == "resolve_aliases":
-            return self.store.resolve_aliases(args.get("text", ""))
+            return store.resolve_aliases(args.get("text", ""))
         if method == "list_aliases":
-            return self.store.list_aliases()
+            return store.list_aliases()
         if method == "aliases_for_canonical":
-            return self.store.aliases_for_canonical(args.get("canonical_entity", ""))
+            return store.aliases_for_canonical(args.get("canonical_entity", ""))
         # -- system state KV + distillation data access (P4.2) -----------------
         if method == "get_state":
-            return self.store.get_state(args.get("key", ""))
+            return store.get_state(args.get("key", ""))
         if method == "set_state":
-            self.store.set_state(args.get("key", ""), args.get("value", ""))
+            store.set_state(args.get("key", ""), args.get("value", ""))
             return True
         if method == "count_eligible_since":
-            return self.store.count_eligible_since(args.get("since"))
+            return store.count_eligible_since(args.get("since"))
         if method == "load_eligible_records":
             return [
                 _record_to_dict(record)
-                for record in self.store.load_eligible_records(
+                for record in store.load_eligible_records(
                     args.get("since"), int(args.get("limit", 100)),
                 )
             ]
         if method == "load_high_signal_records":
             return [
                 _record_to_dict(record)
-                for record in self.store.load_high_signal_records(
+                for record in store.load_high_signal_records(
                     int(args.get("limit", 20)),
                 )
             ]
         raise ValueError(f"Unsupported store method: {method}")
 
-    def _call_graph(self, method: str, args: dict, user_id: str) -> Any:
-        if self.graph is None:
+    def _call_graph(self, method: str, args: dict, user_id: str, graph) -> Any:
+        if graph is None:
             raise RuntimeError("Relationship graph is unavailable")
-        self.graph.set_user_scope(user_id)
+        graph.set_user_scope(user_id)
         if method == "search_graph":
-            return self.graph.search_graph(
+            return graph.search_graph(
                 args.get("term", ""),
                 limit=int(args.get("limit", 100)),
             )
         if method == "memory_ids_for_query":
-            return self.graph.memory_ids_for_query(
+            return graph.memory_ids_for_query(
                 args.get("query", ""),
                 limit=int(args.get("limit", 100)),
             )
         if method == "query_graph":
-            return self.graph.query_graph(args.get("entity_id", ""))
+            return graph.query_graph(args.get("entity_id", ""))
         if method == "traverse_graph":
-            return self.graph.traverse_graph(
+            return graph.traverse_graph(
                 args.get("entity_id", ""),
                 depth=args.get("depth", 2),
                 limit=args.get("limit", 100),
             )
         if method == "count_nodes":
-            return self.graph.count_nodes()
+            return graph.count_nodes()
         if method == "count_edges":
-            return self.graph.count_edges()
+            return graph.count_edges()
         if method == "list_nodes":
-            return self.graph.list_nodes(
+            return graph.list_nodes(
                 node_type=args.get("node_type"),
                 limit=int(args.get("limit", 100)),
             )
         if method == "add_relationship":
-            return self.graph.add_relationship(**args)
+            return graph.add_relationship(**args)
         if method == "index_memory":
-            return self.graph.index_memory(**args)
+            return graph.index_memory(**args)
         if method == "remove_memory":
-            return self.graph.remove_memory(**args)
+            return graph.remove_memory(**args)
         if method == "quarantine_junk_entities":
-            return self.graph.quarantine_junk_entities()
+            return graph.quarantine_junk_entities()
         if method == "clear_scope":
-            return list(self.graph.clear_scope())
+            return list(graph.clear_scope())
         raise ValueError(f"Unsupported graph method: {method}")
 
     def dispatch(self, request: dict) -> Any:
@@ -366,24 +460,34 @@ class MemoryService:
         user_id = str(request.get("user_id") or "default_user")
         if component not in {"store", "graph"} or not isinstance(method, str):
             raise ValueError("Invalid service request")
+        # Tenant routing (#49): user_id -> tenant cell. Unknown user_ids
+        # fall back to the default tenant (backward compatible).
+        tenant = self._resolve_tenant(user_id)
         t0 = time.monotonic()
-        # Per-store locks (#20): store and graph calls run concurrently;
-        # health/stats are lock-free (handled above) so a long backup no
-        # longer blocks the health check.
-        lock = self.store_lock if component == "store" else self.graph_lock
+        # Per-tenant locks (#20 + #49): store and graph calls run
+        # concurrently, and one tenant's long operation never blocks
+        # another tenant. Health/stats are lock-free (handled above).
+        lock = tenant.store_lock if component == "store" else tenant.graph_lock
         with lock:
             self._lock_wait_total_s += time.monotonic() - t0
             self._lock_wait_count += 1
             if component == "store":
-                return self._call_store(method, args, user_id)
-            return self._call_graph(method, args, user_id)
+                return self._call_store(method, args, user_id, tenant.store)
+            return self._call_graph(method, args, user_id, tenant.graph)
 
     def _backup(self, args: dict) -> Any:
-        """Service-coordinated backup via EXPORT DATABASE (FORMAT PARQUET)."""
+        """Service-coordinated backup via EXPORT DATABASE (FORMAT PARQUET).
+
+        Per-tenant (#49): pass ``tenant`` in args to back up a specific
+        cell; the default is the default tenant's store. Whole-file EXPORT
+        is cell-scoped by construction.
+        """
         if __package__:
             from .backup import backup_store, list_snapshots
         else:
             from backup import backup_store, list_snapshots
+        tenant_name = str(args.get("tenant") or self._default_tenant)
+        tenant = self._tenants.get(tenant_name) or self._tenants[self._default_tenant]
         # Resolve dst_root from config or default to <home>/backups/memory.
         config = _load_config(self.home)
         backup_cfg = config.get("backup", {}) if isinstance(config.get("backup"), dict) else {}
@@ -394,23 +498,22 @@ class MemoryService:
         retention = int(args.get("retention_snapshots", retention))
         if args.get("list"):
             return {"snapshots": list_snapshots(dst_root)}
-        with self.store_lock:
+        with tenant.store_lock:
             manifest = backup_store(
-                self.store.connection,
+                tenant.store.connection,
                 dst_root,
                 retention_snapshots=retention,
-                source_db_path=self.store.db_path,
+                source_db_path=tenant.store.db_path,
             )
+        manifest["tenant"] = tenant_name
         return manifest
 
     def close(self) -> None:
-        with self.store_lock:
+        for tenant in self._tenants.values():
             try:
-                self.store.close()
-            finally:
-                if self.graph:
-                    with self.graph_lock:
-                        self.graph.close()
+                tenant.close()
+            except Exception as exc:
+                logger.warning("Error closing tenant %r: %s", tenant.name, exc)
 
 
 class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -530,13 +633,15 @@ def serve(home: Path, port: int = 0) -> None:
     # Opportunistic one-time graph hygiene at startup: quarantine junk/leak
     # entity nodes so noise fades from graph-aware recall. Runs off the hot
     # path so it never delays first RPC. Safe to re-run (MERGE + reversible).
-    if service.graph is not None:
-        def _sweep() -> None:
+    # Sweeps every tenant's graph (#49).
+    def _sweep() -> None:
+        for tenant in service._tenants.values():
             try:
-                service.graph.quarantine_junk_entities()
+                if tenant.graph is not None:
+                    tenant.graph.quarantine_junk_entities()
             except Exception:
                 pass  # graph hygiene is non-fatal; do not block service boot
-        threading.Thread(target=_sweep, daemon=True).start()
+    threading.Thread(target=_sweep, daemon=True).start()
 
     def _stop(_signum, _frame) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()

@@ -28,12 +28,16 @@ except ImportError:  # store.py imported as a top-level module (tests)
     from retriever import DuckDBRetriever
 
 try:
-    from .value_extractor import extract_values, values_conflict
+    from .value_extractor import extract_values, values_conflict, is_transition_statement
 except ImportError:  # store.py imported as a top-level module (tests)
-    from value_extractor import extract_values, values_conflict
+    from value_extractor import extract_values, values_conflict, is_transition_statement
+try:
+    from .structural_loss import structural_loss_guard, is_append_only, LossReport
+except ImportError:  # store.py imported as a top-level module (tests)
+    from structural_loss import structural_loss_guard, is_append_only, LossReport
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,6 +58,23 @@ _TEXT_STOPWORDS = frozenset({
     "each", "few", "more", "most", "other", "some", "such", "only",
     "own", "same", "too", "very", "just", "also",
 })
+
+# Shared tokenizer regex (issue #26): text search and phrase-lift must split
+# text identically so contractions ("don't", "it's") tokenize the same in both
+# paths. The apostrophe is included so contractions survive as single tokens;
+# the prior [a-z0-9]+ regex split "don't" into "don" + "t", which silently
+# limited phrase-lift recall on common contractions and made the two rankers
+# disagree about what the text contains.
+_TOKEN_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+
+
+def _tokenize(text: str) -> List[str]:
+    """Tokenize *text* into lowercase word tokens.
+
+    Shared between BM25-lite text search and phrase-lift so both paths see
+    the same token boundaries (issue #26).
+    """
+    return [m.group().lower() for m in _TOKEN_RE.finditer(text or "")]
 
 try:
     import numpy as np
@@ -904,10 +925,7 @@ class DuckDBMemoryStore:
         memories are returned, ranked normally).
         """
         tokens = [
-            t for t in (
-                w.lower() for w in re.findall(
-                    r"[a-z0-9]+", query, flags=re.IGNORECASE)
-            )
+            t for t in _tokenize(query)
             if len(t) > 2 and t not in _TEXT_STOPWORDS
         ][:8]
         if not tokens:
@@ -979,16 +997,23 @@ class DuckDBMemoryStore:
         # BM25-lite ranking over the candidate pool: per-token document
         # frequency -> idf, term frequency -> saturation, length normalization.
         # Pure-Python so no extension/network dependency; O(tokens x docs).
+        # Token-based counting (issue #26): the prior code used
+        # content_lower.count(t) which counts substring occurrences — "cat"
+        # matched "caterpillar" and "concatenate". Tokenizing each doc with
+        # the shared _tokenize() and using Counter gives exact word-boundary
+        # matches. doc_len is now token count (not character count), which is
+        # the standard BM25 length normalization.
         if out:
-            contents = [(r.content or "").lower() for r in out]
-            doc_lens = [len(c) or 1 for c in contents]
+            doc_tokens = [Counter(_tokenize(r.content or "")) for r in out]
+            doc_lens = [sum(c.values()) or 1 for c in doc_tokens]
             avg_len = max(1.0, sum(doc_lens) / len(doc_lens))
             n_docs = len(out)
-            dfs = {t: sum(1 for c in contents if t in c) for t in tokens}
-            for r, content_lower, dlen in zip(out, contents, doc_lens):
+            # df: number of docs containing each query token as an exact token.
+            dfs = {t: sum(1 for c in doc_tokens if t in c) for t in tokens}
+            for r, tokens_counter, dlen in zip(out, doc_tokens, doc_lens):
                 score = 0.0
                 for t in tokens:
-                    tf = content_lower.count(t)
+                    tf = tokens_counter.get(t, 0)
                     if not tf:
                         continue
                     idf = math.log(1.0 + (n_docs - dfs[t] + 0.5) / (dfs[t] + 0.5))
@@ -1140,19 +1165,31 @@ class DuckDBMemoryStore:
     # With k=20, rank 1 → 0.0476 and rank 10 → 0.0323 (spread ~0.015).
     # The wider spread lets relevance survive the importance adjustment.
 
+    # Rank-1 survival guard (#38): if a single arm ranks an item #1 by a
+    # clear margin, the fused top-k must still contain it. RRF can bury a
+    # strong semantic rank-1 that lacks support in the other arm.
+    # "Clear margin" = rank-1 score >= _RANK1_MARGIN_RATIO x rank-2 score.
+    _RANK1_GUARD_TOP_K = 3
+    _RANK1_MARGIN_RATIO = 1.5
+
     @classmethod
     def _rrf_fuse(
         cls,
         vector_results: List[MemoryRecord],
         text_results: List[MemoryRecord],
+        *,
+        enable_rank1_guard: bool = True,
     ) -> List[MemoryRecord]:
         """Fuse vector and text rankings via Reciprocal Rank Fusion.
 
-        RRF score(d) = sum over lists: 1 / (k + rank_in_list)
-        A document appearing at rank 1 in both lists scores higher than
-        one appearing at rank 1 in only one list.  The fused score is
-        stored in ``similarity`` so callers see a single relevance number.
+        Includes the rank-1 survival guard (#38): an arm rank-1 with a
+        clear margin over its own rank-2 must appear in the fused top-k
+        even when the other arm ranks it poorly. ``enable_rank1_guard``
+        is the fusion-policy knob — eval/probe_rank1_loss.py turns it
+        off to measure the raw failure the guard fixes.
         """
+        guard_ids = cls._rank1_guard_ids(vector_results, text_results)
+
         scores: Dict[str, float] = {}
         records_by_id: Dict[str, MemoryRecord] = {}
 
@@ -1176,7 +1213,78 @@ class DuckDBMemoryStore:
 
         fused = list(records_by_id.values())
         fused.sort(key=lambda r: r.similarity, reverse=True)
+        if enable_rank1_guard:
+            fused = cls._ensure_rank1_guards(fused, guard_ids)
         return fused
+
+    @staticmethod
+    def _rank1_guard_ids(
+        vector_results: List[MemoryRecord],
+        text_results: List[MemoryRecord],
+    ) -> List[str]:
+        """Memory ids that are a clear rank-1 in their arm (#38).
+
+        An arm's rank-1 is "clear" when its score is at least
+        _RANK1_MARGIN_RATIO x the arm's rank-2 score (and rank-2 has a
+        positive score). Must be called BEFORE fusion overwrites
+        ``similarity`` with the fused score — callers that fuse the same
+        arm records twice (e.g. the probe) must pass fresh copies to the
+        second call.
+        """
+        ids: List[str] = []
+        for arm in (vector_results, text_results):
+            if len(arm) < 2:
+                continue
+            s1 = float(getattr(arm[0], "similarity", 0.0) or 0.0)
+            s2 = float(getattr(arm[1], "similarity", 0.0) or 0.0)
+            if s1 > 0.0 and (s2 <= 0.0 or s1 >= s2 * DuckDBMemoryStore._RANK1_MARGIN_RATIO):
+                ids.append(arm[0].memory_id)
+        return ids
+
+    @classmethod
+    def _ensure_rank1_guards(
+        cls,
+        fused: List[MemoryRecord],
+        guard_ids: List[str],
+    ) -> List[MemoryRecord]:
+        """Pull clear arm rank-1s that RRF dropped below top-k back in (#38).
+
+        No-op when every guard is already in the fused top-k — the common
+        case where the arms agree. When a guard is missing (RRF buried it),
+        the guards move to the front in fused order: the arm that ranked
+        them #1 by a clear margin wins the tie.
+        """
+        if not guard_ids or not fused:
+            return fused
+        k = cls._RANK1_GUARD_TOP_K
+        guard_set = set(guard_ids)
+        inside_ids = {r.memory_id for r in fused[:k]}
+        if all(g in inside_ids for g in guard_set):
+            return fused
+        head = [r for r in fused if r.memory_id in guard_set]
+        tail = [r for r in fused if r.memory_id not in guard_set]
+        return head + tail
+
+    @staticmethod
+    def _parse_timestamp(ts: str | None) -> datetime | None:
+        """Parse an ISO-8601 timestamp to a timezone-aware UTC datetime.
+
+        Handles naive timestamps (no Z/offset) by assuming UTC — the
+        shared normalization boundary for #28 finding 2 and #33 finding 3.
+        Returns None if the timestamp is missing or unparseable, and logs
+        a warning so silent zero-boost regressions are visible.
+        """
+        if not ts:
+            return None
+        try:
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            # Assume UTC for naive timestamps (no tzinfo).
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.warning("Unparseable timestamp %r: %s", ts, exc)
+            return None
 
     @staticmethod
     def _recency_boost(created_at: str | None) -> float:
@@ -1186,12 +1294,11 @@ class DuckDBMemoryStore:
         """
         if not created_at:
             return 0.0
-        try:
-            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            days_old = max(0, (datetime.now(timezone.utc) - created).days)
-            return 0.10 * math.exp(-days_old / 90.0)
-        except Exception:
+        created = DuckDBMemoryStore._parse_timestamp(created_at)
+        if created is None:
             return 0.0
+        days_old = max(0, (datetime.now(timezone.utc) - created).days)
+        return 0.10 * math.exp(-days_old / 90.0)
 
     # Importance scoring weights — configurable via the store's attributes.
     # These are applied as additive adjustments to similarity (0-1 scale).
@@ -1234,15 +1341,13 @@ class DuckDBMemoryStore:
         if r.dismissed_count > 0:
             dismissal_factor = 1.0  # full penalty if no timestamp available
             if r.updated_at:
-                try:
-                    updated = datetime.fromisoformat(r.updated_at.replace("Z", "+00:00"))
+                updated = cls._parse_timestamp(r.updated_at)
+                if updated is not None:
                     days_since = max(0, (datetime.now(timezone.utc) - updated).days)
                     dismissal_factor = max(
                         0.0,
                         1.0 - days_since / cls._IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS,
                     )
-                except Exception:
-                    pass
             adj += cls._IMPORTANCE_DISMISSED_WEIGHT * r.dismissed_count * dismissal_factor
         # Confidence: reward high-confidence extractions
         if r.confidence is not None:
@@ -1254,20 +1359,16 @@ class DuckDBMemoryStore:
         adj += cls._recency_boost(r.created_at)
         # Age penalty: slow linear decay
         if r.created_at:
-            try:
-                created = datetime.fromisoformat(r.created_at.replace("Z", "+00:00"))
+            created = cls._parse_timestamp(r.created_at)
+            if created is not None:
                 age_days = max(0, (datetime.now(timezone.utc) - created).days)
                 adj -= cls._IMPORTANCE_AGE_DECAY_PER_DAY * min(age_days, cls._IMPORTANCE_AGE_DECAY_CAP_DAYS)
-            except Exception:
-                pass
         # Dormancy penalty: memories not retrieved recently slowly fade
         if r.last_retrieved_at:
-            try:
-                last_ret = datetime.fromisoformat(r.last_retrieved_at.replace("Z", "+00:00"))
+            last_ret = cls._parse_timestamp(r.last_retrieved_at)
+            if last_ret is not None:
                 dormant_days = max(0, (datetime.now(timezone.utc) - last_ret).days)
                 adj -= cls._IMPORTANCE_DORMANCY_DECAY_PER_DAY * min(dormant_days, cls._IMPORTANCE_DORMANCY_CAP_DAYS)
-            except Exception:
-                pass
         return adj
 
     # Clamp the importance adjustment so it can't erase a relevance gap.
@@ -1292,31 +1393,25 @@ class DuckDBMemoryStore:
         base = cls._recency_boost(r.created_at)
         # Age penalty
         if r.created_at:
-            try:
-                created = datetime.fromisoformat(r.created_at.replace("Z", "+00:00"))
+            created = cls._parse_timestamp(r.created_at)
+            if created is not None:
                 age_days = max(0, (datetime.now(timezone.utc) - created).days)
                 base -= cls._IMPORTANCE_AGE_DECAY_PER_DAY * min(age_days, cls._IMPORTANCE_AGE_DECAY_CAP_DAYS)
-            except Exception:
-                pass
         # Dormancy penalty
         if r.last_retrieved_at:
-            try:
-                last_ret = datetime.fromisoformat(r.last_retrieved_at.replace("Z", "+00:00"))
+            last_ret = cls._parse_timestamp(r.last_retrieved_at)
+            if last_ret is not None:
                 dormant_days = max(0, (datetime.now(timezone.utc) - last_ret).days)
                 base -= cls._IMPORTANCE_DORMANCY_DECAY_PER_DAY * min(dormant_days, cls._IMPORTANCE_DORMANCY_CAP_DAYS)
-            except Exception:
-                pass
 
         feedback = cls._IMPORTANCE_HELPFUL_WEIGHT * r.helpful_count
         if r.dismissed_count > 0:
             dismissal_factor = 1.0
             if r.updated_at:
-                try:
-                    updated = datetime.fromisoformat(r.updated_at.replace("Z", "+00:00"))
+                updated = cls._parse_timestamp(r.updated_at)
+                if updated is not None:
                     days_since = max(0, (datetime.now(timezone.utc) - updated).days)
                     dismissal_factor = max(0.0, 1.0 - days_since / cls._IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS)
-                except Exception:
-                    pass
             feedback += cls._IMPORTANCE_DISMISSED_WEIGHT * r.dismissed_count * dismissal_factor
         if r.confidence is not None:
             feedback += cls._IMPORTANCE_CONFIDENCE_WEIGHT * (r.confidence - 0.5)
@@ -1375,10 +1470,10 @@ class DuckDBMemoryStore:
         """Parse an ISO created_at to an epoch float, or -inf if unparseable."""
         if not content:
             return float("-inf")
-        try:
-            return datetime.fromisoformat(content.replace("Z", "+00:00")).timestamp()
-        except Exception:
+        parsed = DuckDBMemoryStore._parse_timestamp(content)
+        if parsed is None:
             return float("-inf")
+        return parsed.timestamp()
 
     @classmethod
     def _apply_p2c(cls, records: List[MemoryRecord]) -> None:
@@ -1393,13 +1488,20 @@ class DuckDBMemoryStore:
                 ti, tj = cls._p2c_ts(ri.created_at), cls._p2c_ts(rj.created_at)
                 if ti == tj:
                     continue
-                # Identical facts at two timestamps; assert older < newer order.
+                # Identical facts at two timestamps; determine older/newer
+                # WITHOUT mutating the loop counters i/j (issue #28 finding 1).
+                # Reassigning i/j mid-iteration corrupts the scan: the inner
+                # loop continues from the swapped j, revisiting pairs in
+                # reversed order, and the bounded-sink check evaluates
+                # against swapped indices.
                 if ti > tj:
-                    ri, rj, i, j = rj, ri, j, i  # now i is the older, j the newer
+                    older_idx, newer_idx = j, i  # rj is older, ri is newer
+                else:
+                    older_idx, newer_idx = i, j  # ri is older, rj is newer
                 # Only demote when the older currently ranks higher AND the pair
                 # is within the bounded sink window (no big leapfrogs).
-                if i < j and (j - i) <= cls._P2C_MAX_SINK:
-                    older, newer = records[i], records[j]
+                if older_idx < newer_idx and (newer_idx - older_idx) <= cls._P2C_MAX_SINK:
+                    older, newer = records[older_idx], records[newer_idx]
                     # Guarantee the newer outranks the older by a small epsilon.
                     target = min(1.0, older.similarity + cls._P2C_SINK_EPSILON)
                     if newer.similarity < target:
@@ -1601,6 +1703,15 @@ class DuckDBMemoryStore:
         When *include_expired* is True, expired memories are included in
         results (ranked normally) — for auditing "what did I know then".
         """
+        # Validate as_of as ISO-8601 (#28 finding 3): a malformed value
+        # silently behaves as a garbage cutoff in SQL temporal comparisons.
+        # Normalize here so downstream SQL gets a valid timestamp.
+        if as_of:
+            parsed_as_of = self._parse_timestamp(as_of)
+            if parsed_as_of is None:
+                logger.warning("Invalid as_of timestamp %r — ignoring temporal filter", as_of)
+                as_of = None
+
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
         if self.embedder and hasattr(self.embedder, "embed"):
@@ -1699,8 +1810,7 @@ class DuckDBMemoryStore:
         # low because token overlap tied it with merely-similar content.
         _alpha = getattr(self, "_phrase_lift_alpha", 0.0)
         if _alpha and _alpha > 0.0:
-            qwords = re.findall(r"[a-z0-9']+", query.lower())
-            qwords = [w for w in qwords if w not in self._PHRASE_STOPWORDS]
+            qwords = [w for w in _tokenize(query) if w not in self._PHRASE_STOPWORDS]
             qbigrams = [(t0, t1) for t0, t1 in zip(qwords, qwords[1:])]
             for r in fused:
                 if not qbigrams or not r.content:
@@ -1805,6 +1915,7 @@ class DuckDBMemoryStore:
         expires_at: Any = _NOT_PROVIDED,
         provenance_origin: Any = None,
         grounding: Any = None,
+        created_at: Any = None,
     ) -> MemoryRecord | None:
         """Insert a memory record. Returns None if deduped away.
 
@@ -1812,6 +1923,14 @@ class DuckDBMemoryStore:
         - ``_NOT_PROVIDED`` (default): auto-TTL logic applies (current behavior).
         - ``None``: explicitly no expiry (skip auto-TTL, store NULL).
         - ISO-8601 string: set to that value (explicit wins over TTL map).
+
+        *created_at* (issue #8): override the creation timestamp. By default
+        the wall clock is used. Pass an ISO-8601 string to backdate a memory
+        to its in-world date (e.g. a conversation from 2022-01-03 ingested
+        today). This also sets ``valid_from`` so version-chain/supersession
+        logic operates on in-world order, not ingest order. The ``updated_at``
+        column always gets the wall clock (the record was physically written
+        now).
 
         Trust-model (batch-2):
         - *provenance_origin* (#43): internal/external taint. When None, derived
@@ -1841,6 +1960,34 @@ class DuckDBMemoryStore:
             str(record_payload.get("provenance_origin") or "").strip().lower()
             == PROVENANCE_EXTERNAL
         )
+        # Ingestion-time inbound security scan (#19): when content arrives
+        # from an external/untrusted channel, scan it at the boundary before
+        # it enters the store. The scanner catches injection, suppression,
+        # and mutation patterns that sanitize_content's instruction-injection
+        # check doesn't cover. Blocked content is refused (raises ValueError)
+        # so it never becomes retrievable memory.
+        if is_external:
+            try:
+                if __package__:
+                    from .inbound_security import scan_inbound_text
+                else:
+                    from inbound_security import scan_inbound_text
+                _scan = scan_inbound_text(content)
+                if _scan.blocked:
+                    raise ValueError(
+                        f"Content blocked by inbound security scan: "
+                        f"{_scan.summary()}. External-origin content "
+                        f"matching poisoning/injection patterns is refused."
+                    )
+            except ImportError:
+                logger.warning(
+                    "Inbound security scanner unavailable for external memory "
+                    "— refusing write as fail-closed"
+                )
+                raise ValueError(
+                    "Inbound security scanner unavailable; external-origin "
+                    "memory cannot be written without the security gate."
+                )
         if provenance_origin is not None:
             prov = normalize_provenance(provenance_origin)
         else:
@@ -1898,6 +2045,15 @@ class DuckDBMemoryStore:
 
         memory_id = f"mem-{uuid.uuid4().hex}"
         now = self._now()
+        # created_at override (issue #8): backdate to an in-world date so
+        # version-chain/supersession logic sees in-world order. valid_from
+        # follows created_at (a memory is valid from its in-world creation,
+        # not from when it was ingested). updated_at stays at the wall clock
+        # (the row was physically written now).
+        if created_at is not None:
+            created_ts = str(created_at)
+        else:
+            created_ts = now
         if not skip_auto_ttl and not record_payload.get("expires_at") and durability == "temporary":
             if getattr(self, "expiry_enabled", False):
                 ttl_map = getattr(self, "ttl_days", _DEFAULT_TTL_DAYS)
@@ -1925,12 +2081,12 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             self.connection.execute(sql, [
                 memory_id, category, content, tags or [],
-                json.dumps(record_payload), now, now,
+                json.dumps(record_payload), created_ts, now,
                 record_payload.get("expires_at"),
                 emb if emb else None,
                 status, source, confidence, durability, scope, project_id,
                 record_payload.get("user_scope"),
-                now,  # valid_from = creation time
+                created_ts,  # valid_from = in-world creation time (issue #8)
                 prov, ground,
             ])
         fetched = self._fetch_records(
@@ -1956,12 +2112,23 @@ class DuckDBMemoryStore:
         ``pending_user_confirmation``, never auto-activates anything.
         Zero LLM — pure regex + token-overlap matching.
 
+        Transition-verb gate (#36): only transition statements ("switched
+        to", "changed to", "stopped", "now uses") trigger a value conflict.
+        A plain restatement ("I use 449 rows") is treated as corroboration,
+        not a supersession candidate — the user may hold several things at
+        once. Without this gate, an over-eager conflict scan could silently
+        supersede a coexisting true value.
+
         ``_category`` is kept for call-site compatibility but intentionally
         unused (dedup/embedding layers still respect category scoping).
 
         Returns ``(old_memory_id, old_content, new_value, old_value)`` for the
         first conflict found, or None if no conflict.
         """
+        # Transition-verb gate (#36): plain restatements are corroboration,
+        # not conflicts. Only transition statements can close a standing fact.
+        if not is_transition_statement(content):
+            return None
         new_values = extract_values(content)
         if not new_values:
             return None
@@ -2105,6 +2272,35 @@ class DuckDBMemoryStore:
             return None
         candidate_status = "quarantined" if _inj else "pending"
         quarantine_reason = f"injection_pattern: {_inj}" if _inj else None
+        # Ingestion-time inbound security scan (#19): when content arrives
+        # from an external/untrusted channel, scan it at the boundary before
+        # it enters the candidate queue. The scanner catches injection,
+        # suppression, and mutation patterns that sanitize_content's
+        # instruction-injection check doesn't cover. Blocked content is
+        # quarantined (not silently dropped) so a human can review it.
+        if external or bool((payload or {}).get("external_source")):
+            try:
+                if __package__:
+                    from .inbound_security import scan_inbound_text
+                else:
+                    from inbound_security import scan_inbound_text
+                _scan = scan_inbound_text(content)
+                if _scan.blocked:
+                    candidate_status = "quarantined"
+                    quarantine_reason = (
+                        f"inbound_security: {_scan.summary()}"
+                    )
+                    logger.warning(
+                        "Inbound security scan blocked external candidate: %s",
+                        _scan.summary(),
+                    )
+            except ImportError:
+                logger.warning(
+                    "Inbound security scanner unavailable for external candidate "
+                    "— quarantining as fail-closed"
+                )
+                candidate_status = "quarantined"
+                quarantine_reason = "inbound_security_scanner_unavailable"
         if category not in VALID_CATEGORIES:
             category = "context_note"
         if dedup:
@@ -2235,6 +2431,75 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             rows = self.connection.execute(sql, params).fetchall()
         return [self._candidate_row_to_dict(row) for row in rows]
+
+    def project_digest(
+        self,
+        project_id: str | None = None,
+        *,
+        status: str = "pending",
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Per-project pending-proposal digest (#47).
+
+        Returns a digest of candidates grouped by project, with count and
+        list for each. When *project_id* is provided, only that project's
+        candidates are returned. When None, all projects are grouped.
+
+        Args:
+            project_id: Filter to a specific project, or None for all.
+            status: Candidate status to filter on (default "pending").
+            limit: Max candidates per project.
+
+        Returns:
+            A dict with:
+            - ``projects``: list of {project_id, count, candidates}
+            - ``global_count``: count of unscoped (project_id IS NULL) candidates
+        """
+        conditions = [
+            "(user_scope IS NULL OR user_scope = ?)",
+            "status = ?",
+        ]
+        params: list[Any] = [self.user_id, status]
+        if project_id is not None:
+            conditions.append("project_id = ?")
+            params.append(project_id)
+        sql = (
+            "SELECT candidate_id, category, content, tags, payload, source, "
+            "confidence, durability, scope, project_id, session_id, status, "
+            "created_at, updated_at, reviewed_at, review_reason, evidence_text, "
+            "evidence_role, source_timestamp, review_confidence, review_model, "
+            "quarantine_reason, quarantined_at, provenance_origin, grounding "
+            "FROM memory_candidates"
+        )
+        sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(sql, params).fetchall()
+        candidates = [self._candidate_row_to_dict(row) for row in rows]
+        # Group by project_id.
+        by_project: Dict[str, List[dict]] = {}
+        global_candidates: List[dict] = []
+        for cand in candidates:
+            pid = cand.get("project_id")
+            if pid:
+                by_project.setdefault(pid, []).append(cand)
+            else:
+                global_candidates.append(cand)
+        projects = [
+            {
+                "project_id": pid,
+                "count": len(cands),
+                "candidates": cands,
+            }
+            for pid, cands in sorted(by_project.items())
+        ]
+        return {
+            "projects": projects,
+            "global_count": len(global_candidates),
+            "global_candidates": global_candidates,
+        }
 
     def review_candidate(
         self,
@@ -2403,6 +2668,35 @@ class DuckDBMemoryStore:
                                 [now, memory.memory_id, now, supersedes_memory_id],
                             )
                             superseded_ok = True
+                            # Superseded-value re-assertion block (#36):
+                            # Record the OLD memory's content+category in the
+                            # tombstone table so a later session that
+                            # re-mentions the old value cannot re-propose it
+                            # as active. Without this, a superseded value
+                            # re-mentioned in session B would re-enter the
+                            # proposal queue and potentially re-activate,
+                            # undoing the supersession from session A.
+                            try:
+                                old_row = self.connection.execute(
+                                    """SELECT content, category FROM memory_records
+                                       WHERE memory_id = ?""",
+                                    [supersedes_memory_id],
+                                ).fetchone()
+                                if old_row:
+                                    old_content, old_category = old_row
+                                    h = self._tombstone_hash(old_content)
+                                    if h and old_category:
+                                        self.connection.execute(
+                                            """INSERT OR REPLACE INTO deletion_tombstones
+                                               (content_hash, category, user_scope, reason, created_at)
+                                               VALUES (?, ?, ?, ?, ?)""",
+                                            [h, old_category, self.user_id,
+                                             f"superseded by {memory.memory_id}", now],
+                                        )
+                            except Exception as exc:
+                                logger.debug(
+                                    "Supersession tombstone write failed: %s", exc
+                                )
                 self.connection.execute(
                     """UPDATE memory_candidates
                        SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?,
@@ -2476,6 +2770,373 @@ class DuckDBMemoryStore:
             result["supersedes_memory_id"] = supersedes_memory_id
             result["superseded"] = superseded_ok
         return result
+
+    def resolve_conflict(
+        self,
+        candidate_id: str,
+        outcome: str,
+        *,
+        reason: str = "",
+        reconciliation_content: str = "",
+        review_source: str = "manual",
+    ) -> dict | None:
+        """Resolve a conflict with an explicit decision (#41).
+
+        Conflict detection currently ends at pending confirmation — detection
+        without a decision surface. This method adds five explicit resolution
+        outcomes so a contradiction ends in a decision, including "both are
+        true":
+
+        - ``keep_old``: reject the new candidate; the existing active memory
+          stays as-is. The candidate is marked rejected.
+        - ``keep_new``: approve the new candidate and supersede the old
+          memory. Equivalent to approve-with-supersede.
+        - ``keep_both``: approve the new candidate WITHOUT superseding the
+          old memory. Both records are retained as active and marked
+          non-conflicting via payload metadata.
+        - ``remove_both``: reject the candidate AND supersede/remove the old
+          memory. Both values are recorded in the tombstone table so
+          re-extraction stays blocked.
+        - ``manual``: approve a human-written reconciliation content as the
+          new memory, supersede the old, and reject the original candidate.
+          Requires non-empty ``reconciliation_content`` (validator-level).
+
+        Args:
+            candidate_id: The pending candidate that conflicts with an
+                          existing memory.
+            outcome: One of keep_old, keep_new, keep_both, remove_both, manual.
+            reason: Optional reason for the resolution.
+            reconciliation_content: Required for ``manual`` outcome — the
+                                     human-authored reconciliation text.
+            review_source: Who is making the decision (manual/tool/auto).
+
+        Returns:
+            A dict with the candidate, memory (if any), and outcome details.
+        """
+        outcome = outcome.strip().lower()
+        allowed_outcomes = {
+            "keep_old", "keep_new", "keep_both", "remove_both", "manual",
+        }
+        if outcome not in allowed_outcomes:
+            raise ValueError(
+                f"invalid conflict resolution outcome: {outcome}. "
+                f"Must be one of: {', '.join(sorted(allowed_outcomes))}"
+            )
+        # Validator-level: manual requires non-empty reconciliation content.
+        if outcome == "manual":
+            if not reconciliation_content or not reconciliation_content.strip():
+                raise ValueError(
+                    "manual conflict resolution requires non-empty "
+                    "reconciliation_content (human-written reconciliation)"
+                )
+        candidates = self.list_candidates(candidate_id=candidate_id, limit=1)
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        if candidate["status"] not in {"pending", "pending_user_confirmation"}:
+            return {"candidate": candidate, "outcome": outcome, "memory": None}
+        # Find the conflicting memory from the candidate's payload.
+        payload = candidate.get("payload") or {}
+        supersession_info = payload.get("value_supersession") or {}
+        old_memory_id = supersession_info.get("supersedes_memory_id")
+        now = self._now()
+        memory = None
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                if outcome == "keep_old":
+                    # Reject the new candidate; old memory stays as-is.
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:keep_old ({reason})".strip(),
+                         candidate_id],
+                    )
+                    self.record_rejection(
+                        candidate["category"], payload,
+                        reason=f"conflict_resolved:keep_old ({reason})"[:200],
+                    )
+
+                elif outcome == "keep_new":
+                    # Approve the new candidate and supersede the old memory.
+                    memory = self.remember(
+                        category=candidate["category"],
+                        content=candidate["content"],
+                        tags=candidate["tags"],
+                        payload=payload,
+                        source=candidate["source"],
+                        confidence=candidate["confidence"],
+                        durability=candidate["durability"],
+                        scope=candidate["scope"],
+                        project_id=candidate["project_id"],
+                        provenance_origin=candidate.get("provenance_origin"),
+                        grounding=candidate.get("grounding"),
+                    )
+                    if memory and old_memory_id:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, superseded_by = ?, updated_at = ?
+                               WHERE memory_id = ?""",
+                            [now, memory.memory_id, now, old_memory_id],
+                        )
+                        # Tombstone the old value (#36 re-assertion block).
+                        try:
+                            old_row = self.connection.execute(
+                                """SELECT content, category FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_row:
+                                h = self._tombstone_hash(old_row[0])
+                                if h and old_row[1]:
+                                    self.connection.execute(
+                                        """INSERT OR REPLACE INTO deletion_tombstones
+                                           (content_hash, category, user_scope, reason, created_at)
+                                           VALUES (?, ?, ?, ?, ?)""",
+                                        [h, old_row[1], self.user_id,
+                                         f"superseded by {memory.memory_id}", now],
+                                    )
+                        except Exception as exc:
+                            logger.debug("Tombstone write failed: %s", exc)
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'approved', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:keep_new ({reason})".strip(),
+                         candidate_id],
+                    )
+
+                elif outcome == "keep_both":
+                    # Approve the new candidate WITHOUT superseding the old.
+                    # Both records are retained as active. Mark them as
+                    # non-conflicting via payload metadata.
+                    both_payload = dict(payload)
+                    both_payload["conflict_resolved"] = "keep_both"
+                    both_payload["conflict_partner"] = old_memory_id
+                    memory = self.remember(
+                        category=candidate["category"],
+                        content=candidate["content"],
+                        tags=candidate["tags"],
+                        payload=both_payload,
+                        source=candidate["source"],
+                        confidence=candidate["confidence"],
+                        durability=candidate["durability"],
+                        scope=candidate["scope"],
+                        project_id=candidate["project_id"],
+                        provenance_origin=candidate.get("provenance_origin"),
+                        grounding=candidate.get("grounding"),
+                    )
+                    # Mark the old memory's payload as non-conflicting too.
+                    if old_memory_id:
+                        try:
+                            old_payload_row = self.connection.execute(
+                                """SELECT payload FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_payload_row and old_payload_row[0]:
+                                old_payload = json.loads(old_payload_row[0])
+                                old_payload["conflict_resolved"] = "keep_both"
+                                old_payload["conflict_partner"] = (
+                                    memory.memory_id if memory else None
+                                )
+                                self.connection.execute(
+                                    """UPDATE memory_records
+                                       SET payload = ?, updated_at = ?
+                                       WHERE memory_id = ?""",
+                                    [json.dumps(old_payload), now, old_memory_id],
+                                )
+                        except Exception as exc:
+                            logger.debug("keep_both old payload update failed: %s", exc)
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'approved', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:keep_both ({reason})".strip(),
+                         candidate_id],
+                    )
+
+                elif outcome == "remove_both":
+                    # Reject the candidate AND remove the old memory.
+                    # Both values are tombstoned so re-extraction stays blocked.
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:remove_both ({reason})".strip(),
+                         candidate_id],
+                    )
+                    self.record_rejection(
+                        candidate["category"], payload,
+                        reason=f"conflict_resolved:remove_both ({reason})"[:200],
+                    )
+                    if old_memory_id:
+                        # Supersede the old memory (set valid_to).
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, updated_at = ?
+                               WHERE memory_id = ? AND valid_to IS NULL""",
+                            [now, now, old_memory_id],
+                        )
+                        # Tombstone the old value.
+                        try:
+                            old_row = self.connection.execute(
+                                """SELECT content, category FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_row:
+                                h = self._tombstone_hash(old_row[0])
+                                if h and old_row[1]:
+                                    self.connection.execute(
+                                        """INSERT OR REPLACE INTO deletion_tombstones
+                                           (content_hash, category, user_scope, reason, created_at)
+                                           VALUES (?, ?, ?, ?, ?)""",
+                                        [h, old_row[1], self.user_id,
+                                         "conflict_resolved:remove_both", now],
+                                    )
+                        except Exception as exc:
+                            logger.debug("remove_both tombstone failed: %s", exc)
+
+                elif outcome == "manual":
+                    # Approve the human-written reconciliation as the new
+                    # memory, supersede the old, reject the original candidate.
+                    reconciled_payload = dict(payload)
+                    reconciled_payload["conflict_resolved"] = "manual"
+                    reconciled_payload["reconciliation"] = True
+                    memory = self.remember(
+                        category=candidate["category"],
+                        content=reconciliation_content,
+                        tags=candidate["tags"],
+                        payload=reconciled_payload,
+                        source="manual_reconciliation",
+                        confidence=1.0,
+                        durability=candidate["durability"],
+                        scope=candidate["scope"],
+                        project_id=candidate["project_id"],
+                        provenance_origin=candidate.get("provenance_origin"),
+                        grounding=candidate.get("grounding"),
+                    )
+                    if memory and old_memory_id:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, superseded_by = ?, updated_at = ?
+                               WHERE memory_id = ?""",
+                            [now, memory.memory_id, now, old_memory_id],
+                        )
+                        # Tombstone the old value.
+                        try:
+                            old_row = self.connection.execute(
+                                """SELECT content, category FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_row:
+                                h = self._tombstone_hash(old_row[0])
+                                if h and old_row[1]:
+                                    self.connection.execute(
+                                        """INSERT OR REPLACE INTO deletion_tombstones
+                                           (content_hash, category, user_scope, reason, created_at)
+                                           VALUES (?, ?, ?, ?, ?)""",
+                                        [h, old_row[1], self.user_id,
+                                         f"superseded by {memory.memory_id} (manual reconciliation)", now],
+                                    )
+                        except Exception as exc:
+                            logger.debug("manual tombstone failed: %s", exc)
+                    # Reject the original candidate (it's been replaced by
+                    # the reconciliation).
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:manual ({reason})".strip(),
+                         candidate_id],
+                    )
+                    self.record_rejection(
+                        candidate["category"], payload,
+                        reason=f"conflict_resolved:manual ({reason})"[:200],
+                    )
+
+                self.connection.execute("COMMIT")
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+        result = {
+            "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
+            "outcome": outcome,
+            "memory": memory.to_dict() if memory else None,
+        }
+        if old_memory_id:
+            result["conflict_memory_id"] = old_memory_id
+        return result
+
+    def find_conflict_pairs(
+        self,
+        *,
+        recent_days: int = 7,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Find candidate conflict pairs for review (#41).
+
+        Bounded-scan rule: only report conflicts involving at least one
+        recent memory (O(today x history); never old-vs-old). This prevents
+        the queue from re-surfacing settled pairs nightly and becoming noise
+        nobody reads.
+
+        Returns a list of conflict dicts, each with:
+        - candidate_id, candidate_content, candidate_created_at
+        - conflict_memory_id, conflict_content
+        - new_value, old_value (from value_supersession payload)
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=recent_days)).isoformat()
+        with self._lock:
+            assert self.connection is not None
+            # Candidates with a value_supersession payload, created within
+            # the recent window, still pending or pending_user_confirmation.
+            rows = self.connection.execute(
+                """SELECT candidate_id, content, payload, created_at
+                   FROM memory_candidates
+                   WHERE status IN ('pending', 'pending_user_confirmation')
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND created_at >= ?
+                     AND json_extract_string(payload, '$.value_supersession.supersedes_memory_id') IS NOT NULL
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                [self.user_id, cutoff, max(1, min(int(limit), 500))],
+            ).fetchall()
+        conflicts = []
+        for candidate_id, content, payload_raw, created_at in rows:
+            try:
+                payload = json.loads(payload_raw) if payload_raw else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            sup = payload.get("value_supersession") or {}
+            old_id = sup.get("supersedes_memory_id")
+            if not old_id:
+                continue
+            # Skip same-id pairs (should never happen, but guard).
+            conflicts.append({
+                "candidate_id": candidate_id,
+                "candidate_content": content,
+                "candidate_created_at": created_at,
+                "conflict_memory_id": old_id,
+                "conflict_content": sup.get("old_content", ""),
+                "new_value": sup.get("new_value", ""),
+                "old_value": sup.get("old_value", ""),
+            })
+        return conflicts
 
     def find_supersede_candidates(
         self, candidate_id: str, limit: int = 3,
@@ -2761,6 +3422,8 @@ class DuckDBMemoryStore:
         tags: List[str] | None = None,
         payload_updates: Dict[str, Any] | None = None,
         expires_at: Any = _NOT_PROVIDED,
+        *,
+        structural_guard: bool = False,
     ) -> MemoryRecord | None:
         """Update an existing memory by creating a new version.
 
@@ -2830,6 +3493,39 @@ class DuckDBMemoryStore:
         new_payload = dict(rec.payload)
         if payload_updates:
             new_payload.update(payload_updates)
+
+        # Structural-loss guard (#42): if content is being rewritten, count
+        # what would be deleted and merge it back. The rewrite succeeds but
+        # cannot destroy — lost sentences, list items, and KV pairs are
+        # appended to the new content. Pure enrichment passes unchanged.
+        # Outcome/decision-shaped records are append-only and exempt.
+        # Opt-in via structural_guard=True — user-initiated updates (value
+        # changes, corrections) don't need the guard; LLM rewrites do.
+        loss_report: LossReport | None = None
+        if (
+            structural_guard
+            and content is not None
+            and not is_append_only(rec.category, rec.payload)
+        ):
+            try:
+                new_content, loss_report = structural_loss_guard(rec.content, new_content)
+                if not loss_report.is_clean():
+                    logger.info(
+                        "Structural-loss guard: merged back %d lost items "
+                        "(sentences=%d, list_items=%d, kv_pairs=%d) for %s",
+                        loss_report.total_lost,
+                        len(loss_report.lost_sentences),
+                        len(loss_report.lost_list_items),
+                        len(loss_report.lost_kv_pairs),
+                        memory_id,
+                    )
+                    # Record the loss report in the payload for audit.
+                    new_payload["structural_loss_repair"] = {
+                        "lost_total": loss_report.total_lost,
+                        "category_counts": loss_report.category_counts(),
+                    }
+            except Exception as exc:
+                logger.debug("Structural-loss guard failed: %s", exc)
 
         # Resolve effective expires_at:
         # _NOT_PROVIDED → carry forward; None → clear (revive); str → set.
@@ -3868,6 +4564,11 @@ class DuckDBMemoryStore:
             cosine: float = 0.0,
         ) -> None:
             if record.memory_id in candidates:
+                return
+            # Append-only exemption (#42): outcome/decision-shaped records
+            # are immutable and never quarantined by dedup. They record what
+            # happened at a point in time and must survive consolidation.
+            if is_append_only(record.category, record.payload):
                 return
             candidates[record.memory_id] = {
                 "memory_id": record.memory_id,

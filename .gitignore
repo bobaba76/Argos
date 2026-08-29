@@ -69,3 +69,6 @@ Thumbs.db
 
 # Devin-only build recipe (kept local; not part of the public release)
 .devin/
+
+# Deploy tooling state (deploy.py) — local sync audit trail, never commit.
+deploy_state.json

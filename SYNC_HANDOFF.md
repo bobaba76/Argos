@@ -84,12 +84,22 @@ git fetch origin && git status -sb   # expect "## master...origin/master" with n
 
 ## Step 3 — C: re-copy the plugin source from D (NOT from F)
 
-C is NOT a git repo — file copy, not git pull:
+C is NOT a git repo — file copy, not git pull. **Use `scripts/deploy.py` —
+it is the ONLY sync path.** It encodes every rule below (runtime modules
+only, protected artifacts never touched, hash-verified copies, auditable
+state):
 
 ```bash
-REPO="<github-root>/Argos/argos_plugin"
-LIVE="$(cygpath -m "$LOCALAPPDATA")/hermes/plugins/hybrid_memory"   # forward slashes, no backslashes!
+cd <github-root>/Argos
+python scripts/deploy.py --check          # drift report; exit 0 clean / 1 drift
+python scripts/deploy.py                  # copy drifted runtime modules (verified)
+python scripts/deploy.py --prune          # opt-in: remove in-scope strays
 ```
+
+`--check` is gate-usable (exit codes); the copy writes `.bak-<ts>` before
+each overwrite and appends `deploy_state.json` (timestamp, source HEAD,
+per-file hashes). The rules below remain authoritative if you must diff by
+hand — deploy.py implements exactly these:
 
 > **MSYS trap (hit 2026-08-23):** `$LOCALAPPDATA` is `C:\Users\...` (backslashes).
 > Passing `"$LOCALAPPDATA/hermes/..."` to `md5sum`/`cmp` mangles the path and
@@ -153,8 +163,10 @@ run in parallel on this machine. Kill both.)
 ## Compact version
 
 **D** (commit+push; run shared-service tests first — include_expired drift
-guard) → **R** (fetch, confirm) → **C** (md5-diff, copy only drifted runtime
-modules from D, preserve `skills/`+`*.duckdb`+`hybrid_memory_service.json`+`_mh_analysis.txt`,
-don't copy `tests/`/`eval`/utility scripts) → **kill stale memory_service
-processes** (they outlive app restarts) → **restart Hermes** → **md5 parity +
-service CreationDate fresh + pytest + memory_search smoke test**.
+guard) → **R** (fetch, confirm) → **C** (`python scripts/deploy.py --check`,
+then `python scripts/deploy.py` — the only sync path; preserves
+`skills/`+`*.duckdb`+`hybrid_memory_service.json`+`_mh_analysis.txt`,
+never copies `tests/`/`eval`/utility scripts) → **kill stale memory_service
+processes** (they outlive app restarts, or `deploy.py --restart-service`)
+→ **restart Hermes** → **md5 parity + service CreationDate fresh + pytest +
+memory_search smoke test**.

@@ -1166,10 +1166,9 @@ class DuckDBMemoryStore:
     # The wider spread lets relevance survive the importance adjustment.
 
     # Rank-1 survival guard (#38): if a single arm ranks an item #1 by a
-    # clear margin, the fused top-k must still contain it. The guard
-    # promotes any arm rank-1 item that was pushed below top-k by RRF.
-    # "Clear margin" = the arm rank-1 score is > _RANK1_MARGIN_RATIO times
-    # the arm rank-2 score (default 1.5x -- a meaningful gap).
+    # clear margin, the fused top-k must still contain it. RRF can bury a
+    # strong semantic rank-1 that lacks support in the other arm.
+    # "Clear margin" = rank-1 score >= _RANK1_MARGIN_RATIO x rank-2 score.
     _RANK1_GUARD_TOP_K = 3
     _RANK1_MARGIN_RATIO = 1.5
 
@@ -1178,27 +1177,18 @@ class DuckDBMemoryStore:
         cls,
         vector_results: List[MemoryRecord],
         text_results: List[MemoryRecord],
+        *,
+        enable_rank1_guard: bool = True,
     ) -> List[MemoryRecord]:
         """Fuse vector and text rankings via Reciprocal Rank Fusion.
 
-        Includes the rank-1 survival guard (#38): if a single arm ranks
-        an item #1 by a clear margin, the fused top-k must still contain
-        it — RRF can suppress a strong semantic rank-1 when the other
-        arms disagree.
+        Includes the rank-1 survival guard (#38): an arm rank-1 with a
+        clear margin over its own rank-2 must appear in the fused top-k
+        even when the other arm ranks it poorly. ``enable_rank1_guard``
+        is the fusion-policy knob — eval/probe_rank1_loss.py turns it
+        off to measure the raw failure the guard fixes.
         """
-        # Capture original arm scores BEFORE fusion overwrites similarity.
-        # The guard needs the original arm-level scores to detect a clear
-        # margin between rank-1 and rank-2.
-        arm_rank1_info: list[tuple[str, float, float]] = []  # (id, r1_score, r2_score)
-        for arm in (vector_results, text_results):
-            if len(arm) >= 2:
-                r1 = arm[0]
-                r2 = arm[1]
-                arm_rank1_info.append((
-                    r1.memory_id,
-                    float(getattr(r1, "similarity", 0.0) or 0.0),
-                    float(getattr(r2, "similarity", 0.0) or 0.0),
-                ))
+        guard_ids = cls._rank1_guard_ids(vector_results, text_results)
 
         scores: Dict[str, float] = {}
         records_by_id: Dict[str, MemoryRecord] = {}
@@ -1223,72 +1213,57 @@ class DuckDBMemoryStore:
 
         fused = list(records_by_id.values())
         fused.sort(key=lambda r: r.similarity, reverse=True)
-
-        # Rank-1 survival guard (#38): if a single arm ranks an item #1
-        # by a clear margin, the fused top-k must still contain it. RRF
-        # can suppress a strong semantic rank-1 when the other arms
-        # disagree — this guard promotes it back into the top-k.
-        fused = cls._rank1_survival_guard(fused, arm_rank1_info)
+        if enable_rank1_guard:
+            fused = cls._ensure_rank1_guards(fused, guard_ids)
         return fused
+
+    @staticmethod
+    def _rank1_guard_ids(
+        vector_results: List[MemoryRecord],
+        text_results: List[MemoryRecord],
+    ) -> List[str]:
+        """Memory ids that are a clear rank-1 in their arm (#38).
+
+        An arm's rank-1 is "clear" when its score is at least
+        _RANK1_MARGIN_RATIO x the arm's rank-2 score (and rank-2 has a
+        positive score). Must be called BEFORE fusion overwrites
+        ``similarity`` with the fused score — callers that fuse the same
+        arm records twice (e.g. the probe) must pass fresh copies to the
+        second call.
+        """
+        ids: List[str] = []
+        for arm in (vector_results, text_results):
+            if len(arm) < 2:
+                continue
+            s1 = float(getattr(arm[0], "similarity", 0.0) or 0.0)
+            s2 = float(getattr(arm[1], "similarity", 0.0) or 0.0)
+            if s1 > 0.0 and (s2 <= 0.0 or s1 >= s2 * DuckDBMemoryStore._RANK1_MARGIN_RATIO):
+                ids.append(arm[0].memory_id)
+        return ids
 
     @classmethod
-    def _rank1_survival_guard(
+    def _ensure_rank1_guards(
         cls,
         fused: List[MemoryRecord],
-        arm_rank1_info: list[tuple[str, float, float]],
+        guard_ids: List[str],
     ) -> List[MemoryRecord]:
-        """Ensure each arm clear rank-1 survives in the fused top-k.
+        """Pull clear arm rank-1s that RRF dropped below top-k back in (#38).
 
-        For each arm, if the rank-1 item has a score > _RANK1_MARGIN_RATIO
-        times the rank-2 score, and it was pushed below _RANK1_GUARD_TOP_K
-        in the fused ranking, promote it into the top-k.
-
-        Args:
-            fused: The RRF-fused ranking (sorted by similarity desc).
-            arm_rank1_info: List of (memory_id, rank1_score, rank2_score)
-                captured BEFORE fusion overwrote the similarity scores.
+        No-op when every guard is already in the fused top-k — the common
+        case where the arms agree. When a guard is missing (RRF buried it),
+        the guards move to the front in fused order: the arm that ranked
+        them #1 by a clear margin wins the tie.
         """
-        if not fused:
+        if not guard_ids or not fused:
             return fused
-        top_k_ids = {r.memory_id for r in fused[:cls._RANK1_GUARD_TOP_K]}
-        # Collect all promotions first, then apply them. This prevents
-        # one promotion from pushing another arm rank-1 out of top-k.
-        to_promote: list[str] = []
-        for r1_id, s1, s2 in arm_rank1_info:
-            # Check for a clear margin: rank-1 score >> rank-2 score.
-            if s2 > 0 and s1 < s2 * cls._RANK1_MARGIN_RATIO:
-                continue
-            if s2 == 0 and s1 == 0:
-                continue
-            # If rank-1 is already in the fused top-k, no promotion needed.
-            if r1_id in top_k_ids:
-                continue
-            to_promote.append(r1_id)
-
-        if not to_promote:
+        k = cls._RANK1_GUARD_TOP_K
+        guard_set = set(guard_ids)
+        inside_ids = {r.memory_id for r in fused[:k]}
+        if all(g in inside_ids for g in guard_set):
             return fused
-
-        # Remove promoted items from their current positions, then insert
-        # them all at the top-k boundary. This ensures they all end up in
-        # the top-k without displacing each other.
-        promoted_records: list[MemoryRecord] = []
-        for r1_id in to_promote:
-            for i, r in enumerate(fused):
-                if r.memory_id == r1_id:
-                    promoted_records.append(fused.pop(i))
-                    logger.debug(
-                        "Rank-1 survival guard: promoting %s (arm rank-1)",
-                        r1_id,
-                    )
-                    break
-        # Insert promoted records at the top-k boundary, in order.
-        insert_pos = cls._RANK1_GUARD_TOP_K - len(promoted_records)
-        if insert_pos < 0:
-            insert_pos = 0
-        for record in promoted_records:
-            fused.insert(insert_pos, record)
-            insert_pos += 1
-        return fused
+        head = [r for r in fused if r.memory_id in guard_set]
+        tail = [r for r in fused if r.memory_id not in guard_set]
+        return head + tail
 
     @staticmethod
     def _parse_timestamp(ts: str | None) -> datetime | None:

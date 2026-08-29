@@ -186,3 +186,176 @@ class TestRank1SurvivalGuard:
         fused = DuckDBMemoryStore._rrf_fuse(vector, text)
         ids = [r.memory_id for r in fused[:3]]
         assert ids == ["mem-A", "mem-B", "mem-C"]
+
+    def test_guard_can_be_disabled(self):
+        """enable_rank1_guard=False exposes the raw RRF failure (#38 probe).
+
+        Each fusion call needs its own copies: _rrf_fuse writes the fused
+        score onto the arm records' similarity, so reusing the same objects
+        would break the second call's guard margin check.
+        """
+        import copy
+        # Vector: mem-A clear #1; text: mem-A absent (the failure shape)
+        vector = [
+            _make_record("mem-A", "alpha", 0.95),
+            _make_record("mem-B", "beta", 0.40),
+            _make_record("mem-C", "gamma", 0.35),
+            _make_record("mem-D", "delta", 0.30),
+        ]
+        text = [
+            _make_record("mem-B", "beta", 0.90),
+            _make_record("mem-C", "gamma", 0.80),
+            _make_record("mem-D", "delta", 0.70),
+            _make_record("mem-E", "epsilon", 0.60),
+        ]
+        raw = DuckDBMemoryStore._rrf_fuse(
+            copy.deepcopy(vector), copy.deepcopy(text), enable_rank1_guard=False,
+        )
+        guarded = DuckDBMemoryStore._rrf_fuse(
+            copy.deepcopy(vector), copy.deepcopy(text),
+        )
+        raw_top3 = {r.memory_id for r in raw[:3]}
+        guarded_top3 = {r.memory_id for r in guarded[:3]}
+        # The raw fusion buries mem-A (both arms disagree); the guard rescues it.
+        assert "mem-A" not in raw_top3, "sanity: raw RRF must drop mem-A"
+        assert "mem-A" in guarded_top3, "guard must rescue mem-A"
+
+
+class TestRank1GuardHelpers:
+    """_rank1_guard_ids and _ensure_rank1_guards in isolation."""
+
+    def test_guard_ids_clear_margin(self):
+        vector = [
+            _make_record("mem-A", "alpha", 0.95),
+            _make_record("mem-B", "beta", 0.40),
+        ]
+        text = [
+            _make_record("mem-C", "gamma", 0.90),
+            _make_record("mem-D", "delta", 0.20),
+        ]
+        ids = DuckDBMemoryStore._rank1_guard_ids(vector, text)
+        assert ids == ["mem-A", "mem-C"]
+
+    def test_guard_ids_no_clear_margin(self):
+        vector = [
+            _make_record("mem-A", "alpha", 0.50),
+            _make_record("mem-B", "beta", 0.49),
+        ]
+        ids = DuckDBMemoryStore._rank1_guard_ids(vector, [])
+        assert ids == []
+
+    def test_guard_ids_skips_single_item_arm(self):
+        vector = [_make_record("mem-A", "alpha", 0.95)]
+        ids = DuckDBMemoryStore._rank1_guard_ids(vector, [])
+        assert ids == []
+
+    def test_ensure_guards_noop_when_inside(self):
+        fused = [
+            _make_record("mem-A", "alpha", 0.9),
+            _make_record("mem-B", "beta", 0.8),
+            _make_record("mem-C", "gamma", 0.7),
+        ]
+        out = DuckDBMemoryStore._ensure_rank1_guards(fused, ["mem-A"])
+        assert [r.memory_id for r in out] == ["mem-A", "mem-B", "mem-C"]
+
+    def test_ensure_guards_promotes_missing(self):
+        fused = [
+            _make_record("mem-C", "gamma", 0.9),
+            _make_record("mem-D", "delta", 0.8),
+            _make_record("mem-E", "epsilon", 0.7),
+            _make_record("mem-A", "alpha", 0.3),
+        ]
+        out = DuckDBMemoryStore._ensure_rank1_guards(fused, ["mem-A"])
+        assert out[0].memory_id == "mem-A", "missing guard must move to front"
+        # Everything still present (permutation).
+        assert {r.memory_id for r in out} == {"mem-A", "mem-C", "mem-D", "mem-E"}
+
+class TestProbeRank1Loss:
+    """probe_rank1_loss should count raw-RRF loss and guard rescue correctly."""
+
+    def _stub_store(self, queries):
+        """A store stub whose vector/text arms come from per-query fixtures."""
+        _probes_dir = _plugin_dir / "eval" / "probes"
+        if str(_probes_dir) not in sys.path:
+            sys.path.insert(0, str(_probes_dir))
+        import probe_rank1_loss  # noqa: F401  (module under test)
+
+        class FakeEmbedder:
+            def embed(self, query):
+                return [0.1] * 384
+
+        class StubStore:
+            def __init__(self, fixtures):
+                self.fixtures = fixtures
+                self.embedder = FakeEmbedder()
+
+            def _vector_search_raw(self, emb, limit, excluded):
+                return self.fixtures["vector"]
+
+            def _text_search_raw(self, query, limit, excluded):
+                return self.fixtures["text"]
+
+        return StubStore({})
+
+    def test_probe_counts_loss_and_rescue(self):
+        _probes_dir = _plugin_dir / "eval" / "probes"
+        if str(_probes_dir) not in sys.path:
+            sys.path.insert(0, str(_probes_dir))
+        import probe_rank1_loss
+
+        # Query 1: vector clear rank-1 (0.95 vs 0.40), absent from text
+        #          -> lost by raw RRF, rescued by guard.
+        # Query 2: arms agree -> no loss.
+        fixtures = {
+            "vector": [
+                _make_record("mem-A", "alpha", 0.95),
+                _make_record("mem-B", "beta", 0.40),
+                _make_record("mem-C", "gamma", 0.35),
+                _make_record("mem-D", "delta", 0.30),
+            ],
+            "text": [
+                _make_record("mem-B", "beta", 0.90),
+                _make_record("mem-C", "gamma", 0.80),
+                _make_record("mem-D", "delta", 0.70),
+                _make_record("mem-E", "epsilon", 0.60),
+            ],
+        }
+        store = self._stub_store(fixtures)
+        store.fixtures = fixtures
+        # Both queries share the same fixture (loss shape).
+        queries = [
+            {"query": "q1", "memory_id": "mem-A"},
+            {"query": "q2", "memory_id": "mem-A"},
+        ]
+        stats = probe_rank1_loss.probe_rank1_loss(store, queries)
+        assert stats["queries_with_clear_vector_rank1"] == 2
+        assert stats["lost_by_raw_rrf"] == 2
+        assert stats["rescued_by_guard"] == 2
+        assert stats["all_rank1"] == 2
+        assert stats["all_rank1_lost"] == 2
+
+    def test_probe_no_loss_when_arms_agree(self):
+        _probes_dir = _plugin_dir / "eval" / "probes"
+        if str(_probes_dir) not in sys.path:
+            sys.path.insert(0, str(_probes_dir))
+        import probe_rank1_loss
+
+        fixtures = {
+            "vector": [
+                _make_record("mem-A", "alpha", 0.95),
+                _make_record("mem-B", "beta", 0.40),
+                _make_record("mem-C", "gamma", 0.30),
+            ],
+            "text": [
+                _make_record("mem-A", "alpha", 0.90),
+                _make_record("mem-B", "beta", 0.30),
+                _make_record("mem-C", "gamma", 0.20),
+            ],
+        }
+        store = self._stub_store(fixtures)
+        store.fixtures = fixtures
+        queries = [{"query": "q1", "memory_id": "mem-A"}]
+        stats = probe_rank1_loss.probe_rank1_loss(store, queries)
+        assert stats["queries_with_clear_vector_rank1"] == 1
+        assert stats["lost_by_raw_rrf"] == 0
+        assert stats["all_rank1_lost"] == 0

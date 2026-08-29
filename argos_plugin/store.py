@@ -31,6 +31,10 @@ try:
     from .value_extractor import extract_values, values_conflict, is_transition_statement
 except ImportError:  # store.py imported as a top-level module (tests)
     from value_extractor import extract_values, values_conflict, is_transition_statement
+try:
+    from .structural_loss import structural_loss_guard, is_append_only, LossReport
+except ImportError:  # store.py imported as a top-level module (tests)
+    from structural_loss import structural_loss_guard, is_append_only, LossReport
 import time
 import uuid
 from collections import Counter, deque
@@ -3287,6 +3291,8 @@ class DuckDBMemoryStore:
         tags: List[str] | None = None,
         payload_updates: Dict[str, Any] | None = None,
         expires_at: Any = _NOT_PROVIDED,
+        *,
+        structural_guard: bool = False,
     ) -> MemoryRecord | None:
         """Update an existing memory by creating a new version.
 
@@ -3356,6 +3362,39 @@ class DuckDBMemoryStore:
         new_payload = dict(rec.payload)
         if payload_updates:
             new_payload.update(payload_updates)
+
+        # Structural-loss guard (#42): if content is being rewritten, count
+        # what would be deleted and merge it back. The rewrite succeeds but
+        # cannot destroy — lost sentences, list items, and KV pairs are
+        # appended to the new content. Pure enrichment passes unchanged.
+        # Outcome/decision-shaped records are append-only and exempt.
+        # Opt-in via structural_guard=True — user-initiated updates (value
+        # changes, corrections) don't need the guard; LLM rewrites do.
+        loss_report: LossReport | None = None
+        if (
+            structural_guard
+            and content is not None
+            and not is_append_only(rec.category, rec.payload)
+        ):
+            try:
+                new_content, loss_report = structural_loss_guard(rec.content, new_content)
+                if not loss_report.is_clean():
+                    logger.info(
+                        "Structural-loss guard: merged back %d lost items "
+                        "(sentences=%d, list_items=%d, kv_pairs=%d) for %s",
+                        loss_report.total_lost,
+                        len(loss_report.lost_sentences),
+                        len(loss_report.lost_list_items),
+                        len(loss_report.lost_kv_pairs),
+                        memory_id,
+                    )
+                    # Record the loss report in the payload for audit.
+                    new_payload["structural_loss_repair"] = {
+                        "lost_total": loss_report.total_lost,
+                        "category_counts": loss_report.category_counts(),
+                    }
+            except Exception as exc:
+                logger.debug("Structural-loss guard failed: %s", exc)
 
         # Resolve effective expires_at:
         # _NOT_PROVIDED → carry forward; None → clear (revive); str → set.
@@ -4391,6 +4430,11 @@ class DuckDBMemoryStore:
             cosine: float = 0.0,
         ) -> None:
             if record.memory_id in candidates:
+                return
+            # Append-only exemption (#42): outcome/decision-shaped records
+            # are immutable and never quarantined by dedup. They record what
+            # happened at a point in time and must survive consolidation.
+            if is_append_only(record.category, record.payload):
                 return
             candidates[record.memory_id] = {
                 "memory_id": record.memory_id,

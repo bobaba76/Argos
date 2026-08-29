@@ -1011,9 +1011,10 @@ class KuzuGraphStore:
         )
 
         # Phase 1: relation extraction (may call the LLM), BEFORE any graph
-        # write. Still serialized by memory_service.dispatch's global lock,
-        # but watchdogged to ~30s worst case — a hung relay can no longer
-        # wedge the service indefinitely (26 Aug 2026 incident).
+        # write. Serialized by memory_service.dispatch's graph lock (#20 —
+        # store and graph calls use separate locks now), watchdogged to
+        # ~30s worst case — a hung relay can no longer wedge the service
+        # indefinitely (26 Aug 2026 incident).
         relations = _extract_relations_watchdogged(
             content, category, tags, use_llm=use_llm
         )

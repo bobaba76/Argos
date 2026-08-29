@@ -18,6 +18,7 @@ import socketserver
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,10 @@ class MemoryService:
         except Exception as exc:
             logger.warning("Kùzu unavailable in shared memory service: %s", exc)
             self.graph = None
-        self.lock = threading.RLock()
+        self.store_lock = threading.RLock()  # serializes store writes (#20)
+        self.graph_lock = threading.RLock()  # separate graph lock: store and
+        # graph calls no longer serialize behind ONE global lock, so a long
+        # graph traversal no longer queues every store search behind it.
         self._lock_wait_total_s = 0.0
         self._lock_wait_count = 0
         self.server = None
@@ -363,7 +367,11 @@ class MemoryService:
         if component not in {"store", "graph"} or not isinstance(method, str):
             raise ValueError("Invalid service request")
         t0 = time.monotonic()
-        with self.lock:
+        # Per-store locks (#20): store and graph calls run concurrently;
+        # health/stats are lock-free (handled above) so a long backup no
+        # longer blocks the health check.
+        lock = self.store_lock if component == "store" else self.graph_lock
+        with lock:
             self._lock_wait_total_s += time.monotonic() - t0
             self._lock_wait_count += 1
             if component == "store":
@@ -386,7 +394,7 @@ class MemoryService:
         retention = int(args.get("retention_snapshots", retention))
         if args.get("list"):
             return {"snapshots": list_snapshots(dst_root)}
-        with self.lock:
+        with self.store_lock:
             manifest = backup_store(
                 self.store.connection,
                 dst_root,
@@ -396,37 +404,62 @@ class MemoryService:
         return manifest
 
     def close(self) -> None:
-        with self.lock:
+        with self.store_lock:
             try:
                 self.store.close()
             finally:
                 if self.graph:
-                    self.graph.close()
+                    with self.graph_lock:
+                        self.graph.close()
 
 
 class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # In-flight request counter (#20): lets shutdown drain handlers instead
+    # of the OS killing them mid-operation (e.g. mid-backup) when the main
+    # thread exits. daemon_threads stays True so a hung client never blocks
+    # process exit forever — the drain is bounded.
+    in_flight = 0
+    in_flight_lock = threading.Lock()
 
 
 class _RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
-        raw = self.rfile.readline(_MAX_REQUEST_BYTES + 1)
-        if len(raw) > _MAX_REQUEST_BYTES:
-            self._write({"ok": False, "error": "request too large"})
-            return
+        server = self.server
+        with server.in_flight_lock:
+            server.in_flight += 1
         try:
-            request = json.loads(raw.decode("utf-8"))
-            if not isinstance(request, dict):
-                raise ValueError("request must be an object")
-            token = str(request.pop("token", ""))
-            if not hmac.compare_digest(token, self.server.auth_token):
-                raise PermissionError("invalid service token")
-            result = self.server.memory_service.dispatch(request)
-            self._write({"ok": True, "result": result})
-        except Exception as exc:
-            logger.debug("Memory service request failed: %s", exc)
-            self._write({"ok": False, "error": str(exc)})
+            raw = self.rfile.readline(_MAX_REQUEST_BYTES + 1)
+            if len(raw) > _MAX_REQUEST_BYTES:
+                self._write({"ok": False, "error": "request too large",
+                             "error_class": "RequestTooLarge"})
+                return
+            try:
+                request = json.loads(raw.decode("utf-8"))
+                if not isinstance(request, dict):
+                    raise ValueError("request must be an object")
+                token = str(request.pop("token", ""))
+                if not hmac.compare_digest(token, server.auth_token):
+                    raise PermissionError("invalid service token")
+                result = server.memory_service.dispatch(request)
+                self._write({"ok": True, "result": result})
+            except Exception as exc:
+                # Error envelope (#20): carry the error class + a short
+                # traceback so clients can distinguish failure kinds; log
+                # the full traceback server-side (diagnostics are silent
+                # today — the client only ever sees str(exc)).
+                logger.warning("Memory service request failed: %s", exc, exc_info=True)
+                tb = traceback.format_exc(limit=6)
+                self._write({
+                    "ok": False,
+                    "error": str(exc),
+                    "error_class": type(exc).__name__,
+                    "traceback": tb[-1200:],
+                })
+        finally:
+            with server.in_flight_lock:
+                server.in_flight -= 1
 
     def _write(self, value: dict) -> None:
         data = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
@@ -448,6 +481,17 @@ def _write_endpoint(path: Path, port: int, token: str) -> None:
 
 
 def serve(home: Path, port: int = 0) -> None:
+    """Run the shared memory service until shut down (RPC shutdown or signal).
+
+    Shutdown reality on Windows (#20): CPython accepts signal.signal(SIGTERM)
+    but SIGTERM is NEVER delivered — os.kill() maps to TerminateProcess, a
+    hard kill. The graceful path on Windows is the RPC ``shutdown`` method
+    (client ``stop_service()``), which calls server.shutdown() and drains
+    in-flight handlers. A hard kill leaves the endpoint file stale; the
+    single-instance guard probes the port on next boot and steals it, and
+    the pid-matched cleanup below removes it on graceful paths. A CTRL_BREAK
+    handler is registered when available (console Ctrl+Break still works).
+    """
     home.mkdir(parents=True, exist_ok=True)
     service = MemoryService(home)
     token = secrets.token_urlsafe(32)
@@ -500,10 +544,25 @@ def serve(home: Path, port: int = 0) -> None:
     signal.signal(signal.SIGTERM, _stop)
     if hasattr(signal, "SIGINT"):
         signal.signal(signal.SIGINT, _stop)
+    # Windows: SIGTERM is never delivered (os.kill -> TerminateProcess), but
+    # console Ctrl+Break IS delivered as SIGBREAK — register it so an
+    # interactive Ctrl+Break gets the graceful path too.
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _stop)
+        except (ValueError, OSError):
+            pass
     logger.info("Shared memory service listening on 127.0.0.1:%s", server.server_address[1])
     try:
         server.serve_forever(poll_interval=0.2)
     finally:
+        # Drain in-flight handlers (bounded) so shutdown doesn't kill a
+        # mid-backup thread (#20). daemon_threads=True still caps the wait.
+        for _ in range(50):  # up to ~5s
+            with server.in_flight_lock:
+                if server.in_flight == 0:
+                    break
+            time.sleep(0.1)
         server.server_close()
         service.close()
         try:

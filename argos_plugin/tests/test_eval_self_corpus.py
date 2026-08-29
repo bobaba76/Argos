@@ -287,25 +287,43 @@ class TestResumeAndBaseline:
         out = tmp_path / "nonexistent.jsonl"
         assert esc._completed_ids(out) == set()
 
-    def test_verdict_pass(self):
-        current = {"overall": {"recall@20": 0.92}}
-        baseline = {"overall": {"recall@20": 0.90}}
+    def test_verdict_pass_on_improvement(self):
+        # ladder max-k = 20 → recall@20 is the judged metric.
+        current = {"ladder": [5, 20], "overall": {"recall@20": 0.92, "mrr": 0.6}}
+        baseline = {"ladder": [5, 20], "overall": {"recall@20": 0.90, "mrr": 0.6}}
         v = esc._verdict(current, baseline)
         assert v.startswith("PASS")
 
-    def test_verdict_fail(self):
-        current = {"overall": {"recall@20": 0.85}}
-        baseline = {"overall": {"recall@20": 0.92}}
+    def test_verdict_fail_on_recall_drop(self):
+        current = {"ladder": [5, 20], "overall": {"recall@20": 0.85, "mrr": 0.6}}
+        baseline = {"ladder": [5, 20], "overall": {"recall@20": 0.92, "mrr": 0.6}}
         v = esc._verdict(current, baseline)
         assert v.startswith("FAIL")
-        assert "-7.0pp" in v or "-7.00" in v
+        assert "recall@20" in v and "7.0pp" in v
 
-    def test_verdict_borderline_pass(self):
-        current = {"overall": {"recall@20": 0.895}}
-        baseline = {"overall": {"recall@20": 0.92}}
+    def test_verdict_fail_on_mrr_drop(self):
+        # Recall unchanged, MRR drops > 0.01 → FAIL under the shared threshold
+        # (the old 3pp verdict ignored MRR entirely — issue #21).
+        current = {"ladder": [5, 20], "overall": {"recall@20": 0.92, "mrr": 0.55}}
+        baseline = {"ladder": [5, 20], "overall": {"recall@20": 0.92, "mrr": 0.60}}
         v = esc._verdict(current, baseline)
-        # -2.5pp → within 3pp threshold → PASS
+        assert v.startswith("FAIL")
+        assert "MRR" in v
+
+    def test_verdict_borderline_pass_within_half_pp(self):
+        # -0.4pp recall, MRR unchanged → within the 0.5pp overall tolerance → PASS.
+        current = {"ladder": [5, 20], "overall": {"recall@20": 0.916, "mrr": 0.60}}
+        baseline = {"ladder": [5, 20], "overall": {"recall@20": 0.920, "mrr": 0.60}}
+        v = esc._verdict(current, baseline)
         assert v.startswith("PASS")
+
+    def test_verdict_borderline_fail_just_over_half_pp(self):
+        # -0.6pp recall → just over the 0.5pp overall tolerance → FAIL
+        # (the old 3pp verdict would have passed this — issue #21).
+        current = {"ladder": [5, 20], "overall": {"recall@20": 0.914, "mrr": 0.60}}
+        baseline = {"ladder": [5, 20], "overall": {"recall@20": 0.920, "mrr": 0.60}}
+        v = esc._verdict(current, baseline)
+        assert v.startswith("FAIL")
 
 
 class TestSuppressRetrieval:

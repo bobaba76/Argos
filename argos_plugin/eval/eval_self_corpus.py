@@ -39,6 +39,11 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 import duckdb  # noqa: E402
 
+_EVAL_DIR = Path(__file__).resolve().parent
+if str(_EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVAL_DIR))
+import verdict  # noqa: E402
+
 # Lazy imports of store/embedder/date_anchor — done in main() so --help
 # is fast and doesn't require the full plugin stack.
 
@@ -482,6 +487,15 @@ def _run_probe(
     for k in ladder:
         per_window[str(k)] = is_hit(target, result_ids[:k], result_contents, chain_ids)
 
+    # Production-window rank (position of the target or a chain member in
+    # the production results) — mirrors run_gate.score_probe so MRR is
+    # comparable across the two tools (issue #21).
+    rank: Optional[int] = None
+    for i, rid in enumerate(result_ids):
+        if rid == target["memory_id"] or rid in chain_ids:
+            rank = i + 1
+            break
+
     wide_rank: Optional[int] = None
     if target["memory_id"] in wide_ids:
         wide_rank = wide_ids.index(target["memory_id"]) + 1
@@ -502,6 +516,7 @@ def _run_probe(
         "target_created_at": target.get("created_at"),
         "hit": hit,
         "per_window": per_window,
+        "rank": rank,
         "wide_pool_rank": wide_rank,
         "not_in_pool": not_in_pool,
         "top_5_ids": result_ids[:5],
@@ -566,8 +581,14 @@ def compute_metrics(
         "category_distribution": category_dist,
         "ladder": ladder,
     }
-    # Overall recall@K.
-    metrics["overall"] = {f"recall@{k}": round(_recall_at(probes, k), 4) for k in ladder}
+    # Overall recall@K + MRR (production-window rank; matches run_gate so the
+    # shared verdict in verdict.py applies identically — issue #21).
+    overall = {f"recall@{k}": round(_recall_at(probes, k), 4) for k in ladder}
+    ranks = [p.get("rank") for p in probes]
+    overall["mrr"] = round(
+        sum((1.0 / r) if r else 0.0 for r in ranks) / len(probes), 4
+    ) if probes else 0.0
+    metrics["overall"] = overall
     # By category.
     metrics["by_category"] = {}
     for k in ladder:
@@ -623,12 +644,20 @@ def _load_baseline(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _verdict(current: Dict[str, Any], baseline: Dict[str, Any]) -> str:
-    cur_r20 = current.get("overall", {}).get("recall@20", 0.0)
-    base_r20 = baseline.get("overall", {}).get("recall@20", 0.0)
-    delta_pp = (cur_r20 - base_r20) * 100.0
-    if delta_pp < -3.0:
-        return f"FAIL recall@20={cur_r20*100:.1f}% (baseline {base_r20*100:.1f}%, {delta_pp:+.1f}pp)"
-    return f"PASS recall@20={cur_r20*100:.1f}% (baseline {base_r20*100:.1f}%)"
+    """PASS/FAIL regression verdict — delegates to the shared gate verdict
+    (issue #21) so eval_self_corpus and run_gate apply the SAME thresholds
+    to the SAME metrics. Both inputs are eval_self_corpus ``run_summary``
+    dicts; they are canonicalized to the gate-scores shape first.
+    """
+    ok, failures = verdict.gate_verdict(
+        verdict.canonicalize_esc_metrics(current),
+        verdict.canonicalize_esc_metrics(baseline),
+    )
+    if ok:
+        cur_r = current.get("overall", {}).get("recall@20", 0.0)
+        base_r = baseline.get("overall", {}).get("recall@20", 0.0)
+        return f"PASS recall@20={cur_r*100:.1f}% (baseline {base_r*100:.1f}%)"
+    return "FAIL " + "; ".join(failures)
 
 
 # ---------------------------------------------------------------------------

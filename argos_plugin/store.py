@@ -28,9 +28,9 @@ except ImportError:  # store.py imported as a top-level module (tests)
     from retriever import DuckDBRetriever
 
 try:
-    from .value_extractor import extract_values, values_conflict
+    from .value_extractor import extract_values, values_conflict, is_transition_statement
 except ImportError:  # store.py imported as a top-level module (tests)
-    from value_extractor import extract_values, values_conflict
+    from value_extractor import extract_values, values_conflict, is_transition_statement
 import time
 import uuid
 from collections import Counter, deque
@@ -2046,12 +2046,23 @@ class DuckDBMemoryStore:
         ``pending_user_confirmation``, never auto-activates anything.
         Zero LLM — pure regex + token-overlap matching.
 
+        Transition-verb gate (#36): only transition statements ("switched
+        to", "changed to", "stopped", "now uses") trigger a value conflict.
+        A plain restatement ("I use 449 rows") is treated as corroboration,
+        not a supersession candidate — the user may hold several things at
+        once. Without this gate, an over-eager conflict scan could silently
+        supersede a coexisting true value.
+
         ``_category`` is kept for call-site compatibility but intentionally
         unused (dedup/embedding layers still respect category scoping).
 
         Returns ``(old_memory_id, old_content, new_value, old_value)`` for the
         first conflict found, or None if no conflict.
         """
+        # Transition-verb gate (#36): plain restatements are corroboration,
+        # not conflicts. Only transition statements can close a standing fact.
+        if not is_transition_statement(content):
+            return None
         new_values = extract_values(content)
         if not new_values:
             return None
@@ -2522,6 +2533,35 @@ class DuckDBMemoryStore:
                                 [now, memory.memory_id, now, supersedes_memory_id],
                             )
                             superseded_ok = True
+                            # Superseded-value re-assertion block (#36):
+                            # Record the OLD memory's content+category in the
+                            # tombstone table so a later session that
+                            # re-mentions the old value cannot re-propose it
+                            # as active. Without this, a superseded value
+                            # re-mentioned in session B would re-enter the
+                            # proposal queue and potentially re-activate,
+                            # undoing the supersession from session A.
+                            try:
+                                old_row = self.connection.execute(
+                                    """SELECT content, category FROM memory_records
+                                       WHERE memory_id = ?""",
+                                    [supersedes_memory_id],
+                                ).fetchone()
+                                if old_row:
+                                    old_content, old_category = old_row
+                                    h = self._tombstone_hash(old_content)
+                                    if h and old_category:
+                                        self.connection.execute(
+                                            """INSERT OR REPLACE INTO deletion_tombstones
+                                               (content_hash, category, user_scope, reason, created_at)
+                                               VALUES (?, ?, ?, ?, ?)""",
+                                            [h, old_category, self.user_id,
+                                             f"superseded by {memory.memory_id}", now],
+                                        )
+                            except Exception as exc:
+                                logger.debug(
+                                    "Supersession tombstone write failed: %s", exc
+                                )
                 self.connection.execute(
                     """UPDATE memory_candidates
                        SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?,
@@ -2595,6 +2635,373 @@ class DuckDBMemoryStore:
             result["supersedes_memory_id"] = supersedes_memory_id
             result["superseded"] = superseded_ok
         return result
+
+    def resolve_conflict(
+        self,
+        candidate_id: str,
+        outcome: str,
+        *,
+        reason: str = "",
+        reconciliation_content: str = "",
+        review_source: str = "manual",
+    ) -> dict | None:
+        """Resolve a conflict with an explicit decision (#41).
+
+        Conflict detection currently ends at pending confirmation — detection
+        without a decision surface. This method adds five explicit resolution
+        outcomes so a contradiction ends in a decision, including "both are
+        true":
+
+        - ``keep_old``: reject the new candidate; the existing active memory
+          stays as-is. The candidate is marked rejected.
+        - ``keep_new``: approve the new candidate and supersede the old
+          memory. Equivalent to approve-with-supersede.
+        - ``keep_both``: approve the new candidate WITHOUT superseding the
+          old memory. Both records are retained as active and marked
+          non-conflicting via payload metadata.
+        - ``remove_both``: reject the candidate AND supersede/remove the old
+          memory. Both values are recorded in the tombstone table so
+          re-extraction stays blocked.
+        - ``manual``: approve a human-written reconciliation content as the
+          new memory, supersede the old, and reject the original candidate.
+          Requires non-empty ``reconciliation_content`` (validator-level).
+
+        Args:
+            candidate_id: The pending candidate that conflicts with an
+                          existing memory.
+            outcome: One of keep_old, keep_new, keep_both, remove_both, manual.
+            reason: Optional reason for the resolution.
+            reconciliation_content: Required for ``manual`` outcome — the
+                                     human-authored reconciliation text.
+            review_source: Who is making the decision (manual/tool/auto).
+
+        Returns:
+            A dict with the candidate, memory (if any), and outcome details.
+        """
+        outcome = outcome.strip().lower()
+        allowed_outcomes = {
+            "keep_old", "keep_new", "keep_both", "remove_both", "manual",
+        }
+        if outcome not in allowed_outcomes:
+            raise ValueError(
+                f"invalid conflict resolution outcome: {outcome}. "
+                f"Must be one of: {', '.join(sorted(allowed_outcomes))}"
+            )
+        # Validator-level: manual requires non-empty reconciliation content.
+        if outcome == "manual":
+            if not reconciliation_content or not reconciliation_content.strip():
+                raise ValueError(
+                    "manual conflict resolution requires non-empty "
+                    "reconciliation_content (human-written reconciliation)"
+                )
+        candidates = self.list_candidates(candidate_id=candidate_id, limit=1)
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        if candidate["status"] not in {"pending", "pending_user_confirmation"}:
+            return {"candidate": candidate, "outcome": outcome, "memory": None}
+        # Find the conflicting memory from the candidate's payload.
+        payload = candidate.get("payload") or {}
+        supersession_info = payload.get("value_supersession") or {}
+        old_memory_id = supersession_info.get("supersedes_memory_id")
+        now = self._now()
+        memory = None
+        with self._lock:
+            assert self.connection is not None
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                if outcome == "keep_old":
+                    # Reject the new candidate; old memory stays as-is.
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:keep_old ({reason})".strip(),
+                         candidate_id],
+                    )
+                    self.record_rejection(
+                        candidate["category"], payload,
+                        reason=f"conflict_resolved:keep_old ({reason})"[:200],
+                    )
+
+                elif outcome == "keep_new":
+                    # Approve the new candidate and supersede the old memory.
+                    memory = self.remember(
+                        category=candidate["category"],
+                        content=candidate["content"],
+                        tags=candidate["tags"],
+                        payload=payload,
+                        source=candidate["source"],
+                        confidence=candidate["confidence"],
+                        durability=candidate["durability"],
+                        scope=candidate["scope"],
+                        project_id=candidate["project_id"],
+                        provenance_origin=candidate.get("provenance_origin"),
+                        grounding=candidate.get("grounding"),
+                    )
+                    if memory and old_memory_id:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, superseded_by = ?, updated_at = ?
+                               WHERE memory_id = ?""",
+                            [now, memory.memory_id, now, old_memory_id],
+                        )
+                        # Tombstone the old value (#36 re-assertion block).
+                        try:
+                            old_row = self.connection.execute(
+                                """SELECT content, category FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_row:
+                                h = self._tombstone_hash(old_row[0])
+                                if h and old_row[1]:
+                                    self.connection.execute(
+                                        """INSERT OR REPLACE INTO deletion_tombstones
+                                           (content_hash, category, user_scope, reason, created_at)
+                                           VALUES (?, ?, ?, ?, ?)""",
+                                        [h, old_row[1], self.user_id,
+                                         f"superseded by {memory.memory_id}", now],
+                                    )
+                        except Exception as exc:
+                            logger.debug("Tombstone write failed: %s", exc)
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'approved', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:keep_new ({reason})".strip(),
+                         candidate_id],
+                    )
+
+                elif outcome == "keep_both":
+                    # Approve the new candidate WITHOUT superseding the old.
+                    # Both records are retained as active. Mark them as
+                    # non-conflicting via payload metadata.
+                    both_payload = dict(payload)
+                    both_payload["conflict_resolved"] = "keep_both"
+                    both_payload["conflict_partner"] = old_memory_id
+                    memory = self.remember(
+                        category=candidate["category"],
+                        content=candidate["content"],
+                        tags=candidate["tags"],
+                        payload=both_payload,
+                        source=candidate["source"],
+                        confidence=candidate["confidence"],
+                        durability=candidate["durability"],
+                        scope=candidate["scope"],
+                        project_id=candidate["project_id"],
+                        provenance_origin=candidate.get("provenance_origin"),
+                        grounding=candidate.get("grounding"),
+                    )
+                    # Mark the old memory's payload as non-conflicting too.
+                    if old_memory_id:
+                        try:
+                            old_payload_row = self.connection.execute(
+                                """SELECT payload FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_payload_row and old_payload_row[0]:
+                                old_payload = json.loads(old_payload_row[0])
+                                old_payload["conflict_resolved"] = "keep_both"
+                                old_payload["conflict_partner"] = (
+                                    memory.memory_id if memory else None
+                                )
+                                self.connection.execute(
+                                    """UPDATE memory_records
+                                       SET payload = ?, updated_at = ?
+                                       WHERE memory_id = ?""",
+                                    [json.dumps(old_payload), now, old_memory_id],
+                                )
+                        except Exception as exc:
+                            logger.debug("keep_both old payload update failed: %s", exc)
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'approved', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:keep_both ({reason})".strip(),
+                         candidate_id],
+                    )
+
+                elif outcome == "remove_both":
+                    # Reject the candidate AND remove the old memory.
+                    # Both values are tombstoned so re-extraction stays blocked.
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:remove_both ({reason})".strip(),
+                         candidate_id],
+                    )
+                    self.record_rejection(
+                        candidate["category"], payload,
+                        reason=f"conflict_resolved:remove_both ({reason})"[:200],
+                    )
+                    if old_memory_id:
+                        # Supersede the old memory (set valid_to).
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, updated_at = ?
+                               WHERE memory_id = ? AND valid_to IS NULL""",
+                            [now, now, old_memory_id],
+                        )
+                        # Tombstone the old value.
+                        try:
+                            old_row = self.connection.execute(
+                                """SELECT content, category FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_row:
+                                h = self._tombstone_hash(old_row[0])
+                                if h and old_row[1]:
+                                    self.connection.execute(
+                                        """INSERT OR REPLACE INTO deletion_tombstones
+                                           (content_hash, category, user_scope, reason, created_at)
+                                           VALUES (?, ?, ?, ?, ?)""",
+                                        [h, old_row[1], self.user_id,
+                                         "conflict_resolved:remove_both", now],
+                                    )
+                        except Exception as exc:
+                            logger.debug("remove_both tombstone failed: %s", exc)
+
+                elif outcome == "manual":
+                    # Approve the human-written reconciliation as the new
+                    # memory, supersede the old, reject the original candidate.
+                    reconciled_payload = dict(payload)
+                    reconciled_payload["conflict_resolved"] = "manual"
+                    reconciled_payload["reconciliation"] = True
+                    memory = self.remember(
+                        category=candidate["category"],
+                        content=reconciliation_content,
+                        tags=candidate["tags"],
+                        payload=reconciled_payload,
+                        source="manual_reconciliation",
+                        confidence=1.0,
+                        durability=candidate["durability"],
+                        scope=candidate["scope"],
+                        project_id=candidate["project_id"],
+                        provenance_origin=candidate.get("provenance_origin"),
+                        grounding=candidate.get("grounding"),
+                    )
+                    if memory and old_memory_id:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, superseded_by = ?, updated_at = ?
+                               WHERE memory_id = ?""",
+                            [now, memory.memory_id, now, old_memory_id],
+                        )
+                        # Tombstone the old value.
+                        try:
+                            old_row = self.connection.execute(
+                                """SELECT content, category FROM memory_records
+                                   WHERE memory_id = ?""",
+                                [old_memory_id],
+                            ).fetchone()
+                            if old_row:
+                                h = self._tombstone_hash(old_row[0])
+                                if h and old_row[1]:
+                                    self.connection.execute(
+                                        """INSERT OR REPLACE INTO deletion_tombstones
+                                           (content_hash, category, user_scope, reason, created_at)
+                                           VALUES (?, ?, ?, ?, ?)""",
+                                        [h, old_row[1], self.user_id,
+                                         f"superseded by {memory.memory_id} (manual reconciliation)", now],
+                                    )
+                        except Exception as exc:
+                            logger.debug("manual tombstone failed: %s", exc)
+                    # Reject the original candidate (it's been replaced by
+                    # the reconciliation).
+                    self.connection.execute(
+                        """UPDATE memory_candidates
+                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                               review_reason = ?
+                           WHERE candidate_id = ?""",
+                        [now, now,
+                         f"conflict_resolved:manual ({reason})".strip(),
+                         candidate_id],
+                    )
+                    self.record_rejection(
+                        candidate["category"], payload,
+                        reason=f"conflict_resolved:manual ({reason})"[:200],
+                    )
+
+                self.connection.execute("COMMIT")
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+        result = {
+            "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
+            "outcome": outcome,
+            "memory": memory.to_dict() if memory else None,
+        }
+        if old_memory_id:
+            result["conflict_memory_id"] = old_memory_id
+        return result
+
+    def find_conflict_pairs(
+        self,
+        *,
+        recent_days: int = 7,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Find candidate conflict pairs for review (#41).
+
+        Bounded-scan rule: only report conflicts involving at least one
+        recent memory (O(today x history); never old-vs-old). This prevents
+        the queue from re-surfacing settled pairs nightly and becoming noise
+        nobody reads.
+
+        Returns a list of conflict dicts, each with:
+        - candidate_id, candidate_content, candidate_created_at
+        - conflict_memory_id, conflict_content
+        - new_value, old_value (from value_supersession payload)
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=recent_days)).isoformat()
+        with self._lock:
+            assert self.connection is not None
+            # Candidates with a value_supersession payload, created within
+            # the recent window, still pending or pending_user_confirmation.
+            rows = self.connection.execute(
+                """SELECT candidate_id, content, payload, created_at
+                   FROM memory_candidates
+                   WHERE status IN ('pending', 'pending_user_confirmation')
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND created_at >= ?
+                     AND json_extract_string(payload, '$.value_supersession.supersedes_memory_id') IS NOT NULL
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                [self.user_id, cutoff, max(1, min(int(limit), 500))],
+            ).fetchall()
+        conflicts = []
+        for candidate_id, content, payload_raw, created_at in rows:
+            try:
+                payload = json.loads(payload_raw) if payload_raw else {}
+            except (json.JSONDecodeError, TypeError):
+                continue
+            sup = payload.get("value_supersession") or {}
+            old_id = sup.get("supersedes_memory_id")
+            if not old_id:
+                continue
+            # Skip same-id pairs (should never happen, but guard).
+            conflicts.append({
+                "candidate_id": candidate_id,
+                "candidate_content": content,
+                "candidate_created_at": created_at,
+                "conflict_memory_id": old_id,
+                "conflict_content": sup.get("old_content", ""),
+                "new_value": sup.get("new_value", ""),
+                "old_value": sup.get("old_value", ""),
+            })
+        return conflicts
 
     def find_supersede_candidates(
         self, candidate_id: str, limit: int = 3,

@@ -1200,6 +1200,27 @@ class DuckDBMemoryStore:
         return fused
 
     @staticmethod
+    def _parse_timestamp(ts: str | None) -> datetime | None:
+        """Parse an ISO-8601 timestamp to a timezone-aware UTC datetime.
+
+        Handles naive timestamps (no Z/offset) by assuming UTC — the
+        shared normalization boundary for #28 finding 2 and #33 finding 3.
+        Returns None if the timestamp is missing or unparseable, and logs
+        a warning so silent zero-boost regressions are visible.
+        """
+        if not ts:
+            return None
+        try:
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            # Assume UTC for naive timestamps (no tzinfo).
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.warning("Unparseable timestamp %r: %s", ts, exc)
+            return None
+
+    @staticmethod
     def _recency_boost(created_at: str | None) -> float:
         """Exponential decay: +0.10 today, ~0.037 at 90 days, ~0.014 at 180.
 
@@ -1207,12 +1228,11 @@ class DuckDBMemoryStore:
         """
         if not created_at:
             return 0.0
-        try:
-            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            days_old = max(0, (datetime.now(timezone.utc) - created).days)
-            return 0.10 * math.exp(-days_old / 90.0)
-        except Exception:
+        created = DuckDBMemoryStore._parse_timestamp(created_at)
+        if created is None:
             return 0.0
+        days_old = max(0, (datetime.now(timezone.utc) - created).days)
+        return 0.10 * math.exp(-days_old / 90.0)
 
     # Importance scoring weights — configurable via the store's attributes.
     # These are applied as additive adjustments to similarity (0-1 scale).
@@ -1255,15 +1275,13 @@ class DuckDBMemoryStore:
         if r.dismissed_count > 0:
             dismissal_factor = 1.0  # full penalty if no timestamp available
             if r.updated_at:
-                try:
-                    updated = datetime.fromisoformat(r.updated_at.replace("Z", "+00:00"))
+                updated = cls._parse_timestamp(r.updated_at)
+                if updated is not None:
                     days_since = max(0, (datetime.now(timezone.utc) - updated).days)
                     dismissal_factor = max(
                         0.0,
                         1.0 - days_since / cls._IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS,
                     )
-                except Exception:
-                    pass
             adj += cls._IMPORTANCE_DISMISSED_WEIGHT * r.dismissed_count * dismissal_factor
         # Confidence: reward high-confidence extractions
         if r.confidence is not None:
@@ -1275,20 +1293,16 @@ class DuckDBMemoryStore:
         adj += cls._recency_boost(r.created_at)
         # Age penalty: slow linear decay
         if r.created_at:
-            try:
-                created = datetime.fromisoformat(r.created_at.replace("Z", "+00:00"))
+            created = cls._parse_timestamp(r.created_at)
+            if created is not None:
                 age_days = max(0, (datetime.now(timezone.utc) - created).days)
                 adj -= cls._IMPORTANCE_AGE_DECAY_PER_DAY * min(age_days, cls._IMPORTANCE_AGE_DECAY_CAP_DAYS)
-            except Exception:
-                pass
         # Dormancy penalty: memories not retrieved recently slowly fade
         if r.last_retrieved_at:
-            try:
-                last_ret = datetime.fromisoformat(r.last_retrieved_at.replace("Z", "+00:00"))
+            last_ret = cls._parse_timestamp(r.last_retrieved_at)
+            if last_ret is not None:
                 dormant_days = max(0, (datetime.now(timezone.utc) - last_ret).days)
                 adj -= cls._IMPORTANCE_DORMANCY_DECAY_PER_DAY * min(dormant_days, cls._IMPORTANCE_DORMANCY_CAP_DAYS)
-            except Exception:
-                pass
         return adj
 
     # Clamp the importance adjustment so it can't erase a relevance gap.
@@ -1313,31 +1327,25 @@ class DuckDBMemoryStore:
         base = cls._recency_boost(r.created_at)
         # Age penalty
         if r.created_at:
-            try:
-                created = datetime.fromisoformat(r.created_at.replace("Z", "+00:00"))
+            created = cls._parse_timestamp(r.created_at)
+            if created is not None:
                 age_days = max(0, (datetime.now(timezone.utc) - created).days)
                 base -= cls._IMPORTANCE_AGE_DECAY_PER_DAY * min(age_days, cls._IMPORTANCE_AGE_DECAY_CAP_DAYS)
-            except Exception:
-                pass
         # Dormancy penalty
         if r.last_retrieved_at:
-            try:
-                last_ret = datetime.fromisoformat(r.last_retrieved_at.replace("Z", "+00:00"))
+            last_ret = cls._parse_timestamp(r.last_retrieved_at)
+            if last_ret is not None:
                 dormant_days = max(0, (datetime.now(timezone.utc) - last_ret).days)
                 base -= cls._IMPORTANCE_DORMANCY_DECAY_PER_DAY * min(dormant_days, cls._IMPORTANCE_DORMANCY_CAP_DAYS)
-            except Exception:
-                pass
 
         feedback = cls._IMPORTANCE_HELPFUL_WEIGHT * r.helpful_count
         if r.dismissed_count > 0:
             dismissal_factor = 1.0
             if r.updated_at:
-                try:
-                    updated = datetime.fromisoformat(r.updated_at.replace("Z", "+00:00"))
+                updated = cls._parse_timestamp(r.updated_at)
+                if updated is not None:
                     days_since = max(0, (datetime.now(timezone.utc) - updated).days)
                     dismissal_factor = max(0.0, 1.0 - days_since / cls._IMPORTANCE_DISMISSAL_FORGIVENESS_DAYS)
-                except Exception:
-                    pass
             feedback += cls._IMPORTANCE_DISMISSED_WEIGHT * r.dismissed_count * dismissal_factor
         if r.confidence is not None:
             feedback += cls._IMPORTANCE_CONFIDENCE_WEIGHT * (r.confidence - 0.5)
@@ -1396,10 +1404,10 @@ class DuckDBMemoryStore:
         """Parse an ISO created_at to an epoch float, or -inf if unparseable."""
         if not content:
             return float("-inf")
-        try:
-            return datetime.fromisoformat(content.replace("Z", "+00:00")).timestamp()
-        except Exception:
+        parsed = DuckDBMemoryStore._parse_timestamp(content)
+        if parsed is None:
             return float("-inf")
+        return parsed.timestamp()
 
     @classmethod
     def _apply_p2c(cls, records: List[MemoryRecord]) -> None:
@@ -1414,13 +1422,20 @@ class DuckDBMemoryStore:
                 ti, tj = cls._p2c_ts(ri.created_at), cls._p2c_ts(rj.created_at)
                 if ti == tj:
                     continue
-                # Identical facts at two timestamps; assert older < newer order.
+                # Identical facts at two timestamps; determine older/newer
+                # WITHOUT mutating the loop counters i/j (issue #28 finding 1).
+                # Reassigning i/j mid-iteration corrupts the scan: the inner
+                # loop continues from the swapped j, revisiting pairs in
+                # reversed order, and the bounded-sink check evaluates
+                # against swapped indices.
                 if ti > tj:
-                    ri, rj, i, j = rj, ri, j, i  # now i is the older, j the newer
+                    older_idx, newer_idx = j, i  # rj is older, ri is newer
+                else:
+                    older_idx, newer_idx = i, j  # ri is older, rj is newer
                 # Only demote when the older currently ranks higher AND the pair
                 # is within the bounded sink window (no big leapfrogs).
-                if i < j and (j - i) <= cls._P2C_MAX_SINK:
-                    older, newer = records[i], records[j]
+                if older_idx < newer_idx and (newer_idx - older_idx) <= cls._P2C_MAX_SINK:
+                    older, newer = records[older_idx], records[newer_idx]
                     # Guarantee the newer outranks the older by a small epsilon.
                     target = min(1.0, older.similarity + cls._P2C_SINK_EPSILON)
                     if newer.similarity < target:
@@ -1622,6 +1637,15 @@ class DuckDBMemoryStore:
         When *include_expired* is True, expired memories are included in
         results (ranked normally) — for auditing "what did I know then".
         """
+        # Validate as_of as ISO-8601 (#28 finding 3): a malformed value
+        # silently behaves as a garbage cutoff in SQL temporal comparisons.
+        # Normalize here so downstream SQL gets a valid timestamp.
+        if as_of:
+            parsed_as_of = self._parse_timestamp(as_of)
+            if parsed_as_of is None:
+                logger.warning("Invalid as_of timestamp %r — ignoring temporal filter", as_of)
+                as_of = None
+
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
         if self.embedder and hasattr(self.embedder, "embed"):

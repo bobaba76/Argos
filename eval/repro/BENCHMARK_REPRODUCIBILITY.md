@@ -160,6 +160,26 @@ hypothesis, abstention=…)` — imported, not reimplemented.
 
 ## 8. Re-running
 
+**ORPHAN SWEEP FIRST (Windows bash-wrapper gotcha — recurring 25/8, 28/8).**
+Hermes terminal backgrounds runs through an MSYS bash wrapper: killing the
+session kills the bash, NOT the python child. The orphan keeps running
+(API spend), holds DB/CPU contention (a relaunched run then hangs silently —
+banner prints, no `embedder warm` line, 0 progress), and can contaminate the
+output file. Strays come from any earlier harness (venv-cuda or plain
+Python311). Run `sweep_lme_orphans.ps1` (repo root, untracked local tool)
+**before every launch and after every abort**:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\sweep_lme_orphans.ps1
+# -DryRun to inspect first. The sweep also removes stale *.lock files whose
+# PID is dead, and never touches hermes serve/gateway/memory-service processes.
+```
+
+Liveness check after launch: the run must print `embedder warm` within ~60
+seconds; if it prints the banner but stalls there, sweep again and relaunch
+(applies to the single-instance guard's stale-lock takeover too). Aborting a
+run = kill it via the sweep, never rely on the launcher kill alone.
+
 Canonical commands (paths relative to the maintainer's LongMemEval checkout;
 the harness already ships in this repo's evaluation tooling):
 

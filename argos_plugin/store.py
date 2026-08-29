@@ -1805,6 +1805,7 @@ class DuckDBMemoryStore:
         expires_at: Any = _NOT_PROVIDED,
         provenance_origin: Any = None,
         grounding: Any = None,
+        created_at: Any = None,
     ) -> MemoryRecord | None:
         """Insert a memory record. Returns None if deduped away.
 
@@ -1812,6 +1813,14 @@ class DuckDBMemoryStore:
         - ``_NOT_PROVIDED`` (default): auto-TTL logic applies (current behavior).
         - ``None``: explicitly no expiry (skip auto-TTL, store NULL).
         - ISO-8601 string: set to that value (explicit wins over TTL map).
+
+        *created_at* (issue #8): override the creation timestamp. By default
+        the wall clock is used. Pass an ISO-8601 string to backdate a memory
+        to its in-world date (e.g. a conversation from 2022-01-03 ingested
+        today). This also sets ``valid_from`` so version-chain/supersession
+        logic operates on in-world order, not ingest order. The ``updated_at``
+        column always gets the wall clock (the record was physically written
+        now).
 
         Trust-model (batch-2):
         - *provenance_origin* (#43): internal/external taint. When None, derived
@@ -1898,6 +1907,15 @@ class DuckDBMemoryStore:
 
         memory_id = f"mem-{uuid.uuid4().hex}"
         now = self._now()
+        # created_at override (issue #8): backdate to an in-world date so
+        # version-chain/supersession logic sees in-world order. valid_from
+        # follows created_at (a memory is valid from its in-world creation,
+        # not from when it was ingested). updated_at stays at the wall clock
+        # (the row was physically written now).
+        if created_at is not None:
+            created_ts = str(created_at)
+        else:
+            created_ts = now
         if not skip_auto_ttl and not record_payload.get("expires_at") and durability == "temporary":
             if getattr(self, "expiry_enabled", False):
                 ttl_map = getattr(self, "ttl_days", _DEFAULT_TTL_DAYS)
@@ -1925,12 +1943,12 @@ class DuckDBMemoryStore:
             assert self.connection is not None
             self.connection.execute(sql, [
                 memory_id, category, content, tags or [],
-                json.dumps(record_payload), now, now,
+                json.dumps(record_payload), created_ts, now,
                 record_payload.get("expires_at"),
                 emb if emb else None,
                 status, source, confidence, durability, scope, project_id,
                 record_payload.get("user_scope"),
-                now,  # valid_from = creation time
+                created_ts,  # valid_from = in-world creation time (issue #8)
                 prov, ground,
             ])
         fetched = self._fetch_records(

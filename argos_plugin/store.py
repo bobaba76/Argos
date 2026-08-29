@@ -33,7 +33,7 @@ except ImportError:  # store.py imported as a top-level module (tests)
     from value_extractor import extract_values, values_conflict
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,6 +54,23 @@ _TEXT_STOPWORDS = frozenset({
     "each", "few", "more", "most", "other", "some", "such", "only",
     "own", "same", "too", "very", "just", "also",
 })
+
+# Shared tokenizer regex (issue #26): text search and phrase-lift must split
+# text identically so contractions ("don't", "it's") tokenize the same in both
+# paths. The apostrophe is included so contractions survive as single tokens;
+# the prior [a-z0-9]+ regex split "don't" into "don" + "t", which silently
+# limited phrase-lift recall on common contractions and made the two rankers
+# disagree about what the text contains.
+_TOKEN_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+
+
+def _tokenize(text: str) -> List[str]:
+    """Tokenize *text* into lowercase word tokens.
+
+    Shared between BM25-lite text search and phrase-lift so both paths see
+    the same token boundaries (issue #26).
+    """
+    return [m.group().lower() for m in _TOKEN_RE.finditer(text or "")]
 
 try:
     import numpy as np
@@ -904,10 +921,7 @@ class DuckDBMemoryStore:
         memories are returned, ranked normally).
         """
         tokens = [
-            t for t in (
-                w.lower() for w in re.findall(
-                    r"[a-z0-9]+", query, flags=re.IGNORECASE)
-            )
+            t for t in _tokenize(query)
             if len(t) > 2 and t not in _TEXT_STOPWORDS
         ][:8]
         if not tokens:
@@ -979,16 +993,23 @@ class DuckDBMemoryStore:
         # BM25-lite ranking over the candidate pool: per-token document
         # frequency -> idf, term frequency -> saturation, length normalization.
         # Pure-Python so no extension/network dependency; O(tokens x docs).
+        # Token-based counting (issue #26): the prior code used
+        # content_lower.count(t) which counts substring occurrences — "cat"
+        # matched "caterpillar" and "concatenate". Tokenizing each doc with
+        # the shared _tokenize() and using Counter gives exact word-boundary
+        # matches. doc_len is now token count (not character count), which is
+        # the standard BM25 length normalization.
         if out:
-            contents = [(r.content or "").lower() for r in out]
-            doc_lens = [len(c) or 1 for c in contents]
+            doc_tokens = [Counter(_tokenize(r.content or "")) for r in out]
+            doc_lens = [sum(c.values()) or 1 for c in doc_tokens]
             avg_len = max(1.0, sum(doc_lens) / len(doc_lens))
             n_docs = len(out)
-            dfs = {t: sum(1 for c in contents if t in c) for t in tokens}
-            for r, content_lower, dlen in zip(out, contents, doc_lens):
+            # df: number of docs containing each query token as an exact token.
+            dfs = {t: sum(1 for c in doc_tokens if t in c) for t in tokens}
+            for r, tokens_counter, dlen in zip(out, doc_tokens, doc_lens):
                 score = 0.0
                 for t in tokens:
-                    tf = content_lower.count(t)
+                    tf = tokens_counter.get(t, 0)
                     if not tf:
                         continue
                     idf = math.log(1.0 + (n_docs - dfs[t] + 0.5) / (dfs[t] + 0.5))
@@ -1699,8 +1720,7 @@ class DuckDBMemoryStore:
         # low because token overlap tied it with merely-similar content.
         _alpha = getattr(self, "_phrase_lift_alpha", 0.0)
         if _alpha and _alpha > 0.0:
-            qwords = re.findall(r"[a-z0-9']+", query.lower())
-            qwords = [w for w in qwords if w not in self._PHRASE_STOPWORDS]
+            qwords = [w for w in _tokenize(query) if w not in self._PHRASE_STOPWORDS]
             qbigrams = [(t0, t1) for t0, t1 in zip(qwords, qwords[1:])]
             for r in fused:
                 if not qbigrams or not r.content:

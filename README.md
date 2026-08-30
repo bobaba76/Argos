@@ -15,7 +15,7 @@ Persistent memory for AI agents, on your own machine. A Hermes plugin: hybrid ve
 
 ## Trust model
 
-Nothing becomes a memory silently. Every turn is mined for facts (regex first, LLM fallback), but the output is a *proposal* — pending until you approve it. The agent can also save explicitly via `memory_save`, which writes directly to active memory (an intentional action, not passive ingestion). Updates chain versions instead of overwriting. Cleanup quarantines instead of deleting; explicit `memory_delete` on a single-version record hard-deletes and tombstones it (re-creation blocked until the tombstone is purged). Distillation proposes but never writes. Every feature is gated by a measurement in the eval harness; ideas that didn't help were turned off.
+Nothing becomes a memory silently. Every turn is mined for facts (regex first, LLM fallback), but the output is a *proposal* — pending until you approve it. `memory_save` is the explicit exception: it writes directly to active memory, an intentional agent action rather than passive ingestion. Updates chain versions instead of overwriting. Cleanup quarantines instead of deleting; explicit `memory_delete` on a single-version record hard-deletes and tombstones it (re-creation is blocked until the tombstone is purged). Distillation proposes but never writes. Every capability listed above is measured by the eval harness or structurally verified against source — see [Verification](#verification).
 
 ## Tools
 
@@ -42,7 +42,19 @@ Sixteen `memory_*` tools, grouped:
 
 Protocols, dataset SHA-256, per-category denominators, model versions, prompts, exact commands, and judged outputs: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
 
-Every claim above — and every capability statement in this README — is audited against source and committed artifacts in [CLAIMS-AUDIT.md](CLAIMS-AUDIT.md). Measured numbers are re-derived by `./eval/repro/verify_repro.sh` (fails on drift).
+## Verification
+
+Every number and capability statement above is backed by a committed, re-runnable artifact — nothing is quoted without evidence.
+
+- **Claims audit** — [CLAIMS-AUDIT.md](CLAIMS-AUDIT.md) maps every claim to its evidence and separates three tiers: *measured* (committed judged artifacts), *structural* (checked against source), and *aspirational* (not claims yet). It is updated whenever a claim changes.
+- **Reproducibility gate** — the Numbers table is re-derived from committed artifacts by `./eval/repro/verify_repro.sh`, which fails on any drift. Run it before quoting a number.
+- **Test suite** — 877 tests across 48 modules (as of 2026-08-30), covering the store, retrieval, security gates, and eval harness; runs on a fresh clone without a live Hermes runtime. `python -m pytest tests/ -q -n 4` (from `argos_plugin/`).
+
+Honest boundaries that travel with the claims:
+
+- Benchmark numbers are self-measured on the maintainer's stack and answerer-conditional (the 89.8% headline uses a GLM-5.3-flash answerer with a gpt-4o judge); small-n bands are indicative.
+- Some measurements are internal-only, not yet banked as committed artifacts — they are deliberately excluded from the public claim set.
+- The plugin is developed and tested on the maintainer's build of Hermes. It uses only stock plugin APIs (memory provider, pre-call hook, user-context injection), but a stock upstream build hasn't been through the test suite yet.
 
 ## What it can't do
 
@@ -55,9 +67,7 @@ Memory data, embeddings, and graph live locally as flat files — no hosted vend
 3. Run `hermes tools` — confirm the 16 `memory_*` tools appear.
 4. Configure in `hybrid_memory.json` or the settings UI (Memory → Argos).
 
-Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md).
-
-Argos is developed and tested on the maintainer's build of Hermes. It uses only stock plugin APIs (memory provider, pre-call hook, user-context injection), so it should work on a plain install, but a stock upstream build hasn't been through the test suite yet.
+Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md). Compatibility boundary: see [Verification](#verification).
 
 ## License
 
@@ -68,4 +78,3 @@ Business Source License 1.1 (BSL 1.1): free for personal and non-production use;
 - [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) — every setting, default, and description
 - [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md) — how the system works under the hood
 - [REINSTALL.md](REINSTALL.md) — reinstall, migration, graph rebuild
-- Tests: `python -m pytest tests/ -v` (run from `argos_plugin/`)

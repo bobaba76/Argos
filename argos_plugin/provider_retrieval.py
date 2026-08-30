@@ -1,0 +1,959 @@
+"""Retrieval mixin: system prompt block, enrichment, chain-unfold, prefetch.
+
+Extracted verbatim from __init__.py during the god-file split (behavior-
+neutral: no renames, no fixes). Consts are imported from provider_core.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Any, Dict, List
+
+try:
+    from .provider_core import (
+        _DEFAULT_INJECT_CONTENT_CHAR_CAP,
+        _INJECTION_FALLBACK_COUNT,
+        _MEMORY_FENCE_NOTE,
+        _PREFETCH_WAIT_SECS,
+        _TRIVIAL_QUERY_PATTERNS,
+        _freshness_marker_for,
+        _neutralize_markup,
+    )
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from provider_core import (
+        _DEFAULT_INJECT_CONTENT_CHAR_CAP,
+        _INJECTION_FALLBACK_COUNT,
+        _MEMORY_FENCE_NOTE,
+        _PREFETCH_WAIT_SECS,
+        _TRIVIAL_QUERY_PATTERNS,
+        _freshness_marker_for,
+        _neutralize_markup,
+    )
+try:
+    from .confirmation import build_confirmation_block
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from confirmation import build_confirmation_block
+
+logger = logging.getLogger(__name__)
+
+
+class ProviderRetrievalMixin:
+    """Injection, enrichment, chain-unfold and prefetch methods."""
+
+    def system_prompt_block(self) -> str:
+        # STATIC text only — must be byte-stable for prompt caching.
+        # Dynamic state (memory count, embedding status) is NOT included here
+        # because it changes between turns and would invalidate the cached prefix.
+        # The prefetch() method injects dynamic recall context separately.
+        graph_status = "available" if self._graph else "unavailable"
+        return (
+            "# Argos (Local)\n"
+            f"Active. Relationship graph: {graph_status}.\n"
+            "You have persistent memory of this user from past conversations — "
+            "any topic: personal life, work, tech, hobbies, relationships. "
+            "Relevant memories are auto-injected before each turn. For deeper or "
+            "multi-hop lookups, call memory_search with different wording.\n"
+            "Categories: personal_fact (stable facts), preference (how they like things), "
+            "insight (self-observations, realizations), event (life events, milestones), "
+            "relationship (people in their life), goal (what they're working toward), "
+            "context_note (situational context).\n"
+            "When the user states a durable fact, preference, or insight — about "
+            "ANY topic — call memory_save immediately — don't wait to be asked. "
+            "Automatic extraction creates pending proposals, not active memories. "
+            "Review them with memory_candidate_list and memory_candidate_review; "
+            "never approve a proposal merely because another model produced it.\n"
+            "\n"
+            "## Save reasoning, not just conclusions\n"
+            "When you work through a non-trivial topic with the user — technical reasoning, "
+            "analytical reasoning, trade-off analysis, decision-making, important "
+            "decisions — save the REASONING CHAIN, not just the final conclusion. "
+            "A bare fact like 'Fact-A might be Fact-B' is far less useful than the full "
+            "reasoning: what evidence supports it, what was considered and ruled out, "
+            "what the uncertainty level is, and what would confirm or deny it. "
+            "Use the content field to store a self-contained reasoning summary "
+            "(200-800 chars is fine — the system handles long content). "
+            "This ensures future sessions can reconstruct WHY a conclusion was reached, "
+            "not just WHAT it was.\n"
+            "\n"
+            "## Quality over quantity\n"
+            "Don't save trivial facts the agent could infer from context ('user uses "
+            "a keyboard', 'user is typing'). Don't save fragments of your own output. "
+            "Don't save the same fact in slightly different wording. One rich, "
+            "well-reasoned memory is worth ten shallow flashcards.\n"
+            "Use memory_graph_search to find relationships between people, tools, "
+            "and concepts in the user's life."
+        )
+
+    # -- retrieval ------------------------------------------------------------
+
+    # -- context-aware retrieval ---------------------------------------------
+
+    # Patterns that indicate a query depends on conversation context to
+    # resolve references. If the query matches any of these AND we have
+    # recent messages, we prepend the context to the query before search.
+    _REFERENTIAL_PATTERNS = [
+        r"\bthat\b", r"\bthis\b", r"\bit\b", r"\bthe thing\b",
+        r"\bwhat about\b", r"\btell me more\b", r"\bhe\b", r"\bshe\b",
+        r"\bhim\b", r"\bher\b", r"\bthem\b", r"\bthey\b",
+        r"\bthe one\b", r"\bthe last\b", r"\bthe other\b",
+        r"\bremember (when|that|the)\b",
+    ]
+
+    @classmethod
+    def _is_referential_query(cls, query: str) -> bool:
+        """Check if a query contains pronouns/references that need context."""
+        import re
+        query_lower = query.lower().strip()
+        # Short queries with referential language are the strongest signal.
+        # Long queries usually have enough keywords on their own.
+        if len(query_lower) > 300:
+            return False
+        for pattern in cls._REFERENTIAL_PATTERNS:
+            if re.search(pattern, query_lower):
+                return True
+        return False
+
+    def _enrich_query_with_context(self, query: str) -> str:
+        """Prepend recent conversation context to a referential query.
+
+        This resolves pronouns like "that", "he", "the thing" by giving
+        the embedder the surrounding conversation as context. The context
+        is prepended (not appended) so the embedder sees it first.
+
+        Returns the original query unchanged if:
+        - context-aware retrieval is disabled
+        - the query doesn't contain referential language
+        - there are no recent messages
+        """
+        if not self._context_aware_retrieval:
+            return query
+        if not self._is_referential_query(query):
+            return query
+        with self._context_lock:
+            recent = list(self._recent_user_messages)
+        if not recent:
+            return query
+        # Build context string from recent messages, capped to max_chars.
+        # We use the last N user messages (most recent last).
+        context_parts: list[str] = []
+        total_chars = 0
+        for msg in reversed(recent):  # most recent first
+            if total_chars + len(msg) > self._context_max_chars:
+                break
+            context_parts.insert(0, msg)
+            total_chars += len(msg)
+        if not context_parts:
+            return query
+        context = " ".join(context_parts)
+        # Prepend context, then the query. The embedder will see both.
+        return f"{context} {query}"
+
+    def _record_user_message(self, message: str) -> None:
+        """Add a user message to the rolling context window."""
+        if not message or not message.strip():
+            return
+        with self._context_lock:
+            self._recent_user_messages.append(message.strip())
+            # Keep only the last N messages.
+            while len(self._recent_user_messages) > self._context_window_size:
+                self._recent_user_messages.pop(0)
+
+    def _expand_and_merge(
+        self,
+        query: str,
+        project_id: str | None,
+        category_filter: str | None,
+        candidate_limit: int,
+        original_results: List[Any],
+    ) -> List[Any]:
+        """Expand a weak query into sub-queries and merge results via RRF.
+
+        Fail-soft: if expansion produces no sub-queries or all sub-query
+        searches fail, return the original results unchanged.
+        """
+        if not self._query_expander or not self._store:
+            return original_results
+
+        try:
+            sub_queries = self._query_expander.expand(query)
+        except Exception as exc:
+            logger.debug("Query expansion failed: %s", exc)
+            return original_results
+
+        if not sub_queries:
+            return original_results
+
+        logger.debug("Query expansion: '%s' → %d sub-queries", query[:50], len(sub_queries))
+
+        # Search each sub-query and merge via Reciprocal Rank Fusion
+        # with the original results.
+        all_results: dict[str, Any] = {}
+        for r in original_results:
+            all_results[r.memory_id] = r
+
+        # RRF: original results get rank-based scores
+        rrf_k = 20  # lowered from 60 to sharpen relevance discrimination
+        rrf_scores: dict[str, float] = {}
+        for rank, r in enumerate(original_results):
+            rrf_scores[r.memory_id] = 1.0 / (rrf_k + rank + 1)
+
+        # Search each sub-query
+        for sq in sub_queries:
+            try:
+                sq_results = self._store.search(
+                    sq,
+                    limit=candidate_limit,
+                    category_filter=category_filter,
+                    project_id=project_id or None,
+                    suppress_retrieval=True,
+                )
+            except Exception as exc:
+                logger.debug("Sub-query search failed for '%s': %s", sq[:30], exc)
+                continue
+
+            for rank, r in enumerate(sq_results):
+                if r.memory_id not in all_results:
+                    all_results[r.memory_id] = r
+                rrf_scores[r.memory_id] = rrf_scores.get(r.memory_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+
+        # Sort by RRF score
+        merged = sorted(
+            all_results.values(),
+            key=lambda r: rrf_scores.get(r.memory_id, 0.0),
+            reverse=True,
+        )
+
+        # Update similarity to RRF score (normalized to 0-1)
+        max_score = max(rrf_scores.values()) if rrf_scores else 1.0
+        for r in merged:
+            r.similarity = rrf_scores.get(r.memory_id, 0.0) / max_score if max_score > 0 else 0.0
+
+        return merged
+
+    def _record_injected(self, records: List[Any]) -> None:
+        """Record retrieval only for the final injected list (not pool filler).
+
+        The store's search(suppress_retrieval=True) skips retrieval accounting
+        for candidate-pool searches; the provider re-records here so only the
+        memories actually injected into the conversation gain popularity credit.
+        """
+        try:
+            if records and self._store is not None and hasattr(self._store, "record_retrieval"):
+                self._store.record_retrieval([r.memory_id for r in records])
+        except Exception as exc:
+            logger.debug("Could not record injected retrieval: %s", exc)
+
+    # -- chain-unfold (ships off; scaffolding for the Hy-Memory headline) -----
+
+    # Change-intent patterns: queries that ask about HOW or WHY a fact changed.
+    # When chain_unfold="auto", a top result with a chain + one of these
+    # triggers a compact arc injection (budget-controlled).
+    _CHANGE_INTENT_PATTERNS = (
+        r"why did (i|you) (stop|start|switch|leave|change|quit|drop|abandon)",
+        r"used to\b",
+        r"what changed\b",
+        r"before vs now\b",
+        r"why.*no longer\b",
+        r"when did (i|you) (change|switch|start|stop|leave|move)",
+        r"how come (i|you) (don't|no longer|stopped|switched)",
+        r"what did i (use to|used to) (think|believe|use|like|prefer)",
+        # Current-state contrast probes: "where do I live NOW", "what car do
+        # I drive NOW", "do I STILL ..." — imply a past->present change and
+        # are the phrasing real users actually use. Added 2026-08-20 after
+        # the scaled eval showed the 8 explicit regexes rejected 90% of
+        # real change queries (recall 10%).
+        r"\b(what|where|which|who)\b[^?]*(now|currently|these days)\b",
+        r"\bhow (much|many|old|tall|long)\b[^?]*(now|currently|these days)\b",
+        r"\bdo i still\b",
+        r"\bam i still\b",
+        r"\bstill (live|drive|work|take|use|play|eat|have|go|plan)\b",
+    )
+
+    def _change_intent_match(self, query: str) -> bool:
+        """True if the query signals change-intent (arc-relevant)."""
+        import re
+        q = query.lower()
+        return any(re.search(p, q) for p in self._CHANGE_INTENT_PATTERNS)
+
+    def _build_chain_arc(self, versions: List[Any]) -> str:
+        """Compact one-line-per-version arc text (token-cheap)."""
+        lines = []
+        for i, v in enumerate(versions, 1):
+            if getattr(v, "status", None) == "quarantined":
+                lines.append(f"v{i} [quarantined]")
+                continue
+            content = v.content
+            if len(content) > 120:
+                content = content[:117] + "..."
+            marker = " (current)" if v.valid_to is None else ""
+            lines.append(f"v{i}{marker}: {content}")
+        return "\n".join(lines)
+
+    def _find_chain_anchor(self, results: List[Any], top_k: int) -> str | None:
+        """Scan the top-K search results for the first one with a chain at
+        >= the similarity floor. Returns the memory_id of the chain head, or
+        None. The per-candidate floor is the precision guard — a chain only
+        unfolds when the hit is genuinely about the query.
+        """
+        candidates = results[:top_k]
+        if not candidates or self._store is None:
+            return None
+        try:
+            membership = self._store.get_chain_membership(
+                [r.memory_id for r in candidates]
+            )
+        except Exception:
+            return None
+        for r in candidates:
+            raw = getattr(r, "raw_similarity", None)
+            if raw is None:
+                raw = getattr(r, "similarity", 0.0) or 0.0
+            if raw < self._chain_unfold_min_similarity:
+                continue
+            info = membership.get(r.memory_id)
+            if info and info.get("has_history"):
+                return r.memory_id
+        return None
+
+    def _query_side_chain_lookup(self, query: str) -> str | None:
+        """Fallback: search deeper for a chain matching the query.
+
+        When change-intent matched but no top-K result has a chain, probe
+        the store for a chain whose content is semantically close to the
+        query (same 0.30 cosine floor). Uses suppress_retrieval=True so the
+        deep search does NOT inflate retrieval counters. This is the
+        "latest version exists but the semantic query didn't rank it in
+        top-K" case.
+        """
+        if self._store is None:
+            return None
+        try:
+            deep = self._store.search(
+                query, limit=20, suppress_retrieval=True,
+            )
+        except Exception:
+            return None
+        if not deep:
+            return None
+        return self._find_chain_anchor(deep, len(deep))
+
+    def _maybe_unfold_chain(self, query: str, results: List[Any]) -> str | None:
+        """Chain-unfold trigger (budget-controlled, separate accounting).
+
+        Returns a compact arc string to inject when chain_unfold is enabled,
+        the query signals change-intent, a TOP-K result has a chain at
+        sufficient similarity, and the arc cost is within budget. Returns
+        None otherwise. Chain versions pulled by the walk do NOT touch
+        retrieval counters — only the separate _chain_unfolded_stats
+        counter is updated.
+
+        Gate (measured 2026-08-13, early chain-unfold eval): the original
+        top-3-any-chain gate fired on unrelated queries (weather query ->
+        Chain A arc) and injected wrong arcs (Query X -> Chain Y arc).
+        Tightened to: TOP-1 result only, raw_similarity >= 0.30 floor
+        (same convention as query-expansion's floor), so a chain only
+        unfolds when the top hit is genuinely about the query.
+
+        Recall rebalance (2026-08-17): the top-1 gate was recall-starved
+        (eval 100% precision / 20% recall — 4/5 misses were
+        retrieval-driven: a real memory outranked the synthetic chain
+        seed). Widened to scan TOP-K results (default K=3) for a chain
+        anchor at >= 0.30, with an optional query-side fallback that
+        searches deeper when no top-K result has a chain. The 0.30
+        per-candidate floor is the precision guard — it targets exactly
+        the measured failure class (chain ranked 2-4 behind a stronger
+        real memory) without re-opening the false-trigger hole.
+        """
+        if self._chain_unfold == "off" or not results or self._store is None:
+            return None
+        if self._chain_unfold == "auto" and not self._change_intent_match(query):
+            return None
+        # Scan top-K results for a chain anchor at >= similarity floor.
+        target_id = self._find_chain_anchor(results, self._chain_unfold_top_k)
+        # Query-side fallback: if no anchor in top-K, search deeper for a
+        # chain whose content is semantically close to the query. Catches
+        # the "chain exists but didn't rank in top-K" case without
+        # lowering the per-candidate similarity floor.
+        if target_id is None and self._chain_unfold_query_fallback:
+            target_id = self._query_side_chain_lookup(query)
+        if target_id is None:
+            return None
+        try:
+            versions = self._store.get_memory_history(
+                target_id, max_versions=self._chain_max_versions,
+            )
+        except Exception:
+            return None
+        if len(versions) < 2:
+            return None
+        arc = self._build_chain_arc(versions)
+        # Option A semantic-arc check: the chain's CURRENT version content
+        # must be semantically close enough to the query (cosine >= floor)
+        # before we inject. This is the precision guard that replaces the
+        # recall-starving top-1 rule — it filters false triggers while still
+        # scanning top-K/fallback for the actual chain. Cheap: one seek + one
+        # dot against already-loaded embedder.
+        if not self._arc_clears_similarity_floor(query, versions):
+            return None
+        # Rough token estimate: ~4 chars/token.
+        token_cost = max(1, len(arc) // 4)
+        if token_cost > self._chain_max_inject:
+            return None
+        self._chain_unfolded_stats["count"] += 1
+        self._chain_unfolded_stats["tokens_injected"] += token_cost
+        return arc
+
+    def _arc_clears_similarity_floor(self, query: str, versions: List[Any]) -> bool:
+        """Cosine(query, current-version content) >= arc floor (Option A)."""
+        try:
+            current = next((v for v in versions if getattr(v, "valid_to", None) is None), None)
+            if current is None:
+                current = versions[-1]
+            content = getattr(current, "content", "") or ""
+            if not content.strip() or self._embedder is None:
+                return True  # fail-open on missing embedder/content
+            qe = self._embedder.embed(query, is_query=True)
+            ce = self._embedder.embed(content)
+            if not qe or not ce or len(qe) != len(ce):
+                return True
+            denom = (sum(a * a for a in qe) ** 0.5) * (sum(b * b for b in ce) ** 0.5)
+            if denom <= 0:
+                return True
+            cos = sum(a * b for a, b in zip(qe, ce)) / denom
+            return cos >= self._chain_unfold_arc_min_similarity
+        except Exception:
+            return True  # fail-open: never let the guard crash inference
+
+    def get_chain_unfold_stats(self) -> Dict[str, int]:
+        """Return chain-unfold accounting (count + tokens injected)."""
+        return dict(self._chain_unfolded_stats)
+
+    def get_scale_metrics(self) -> Dict[str, Any]:
+        """Return current scale-trigger state (delegates to the store).
+
+        The store owns the latency window and record-count sampling — it is
+        the layer that actually executes search (both in-process and via the
+        shared service), so its numbers are the ones the scaling roadmap's
+        measured triggers gate on.
+        """
+        try:
+            return dict(self._store.get_scale_metrics())
+        except Exception:
+            return {"error": "scale metrics unavailable"}
+
+    def _search_memories(
+        self,
+        query: str,
+        limit: int,
+        category_filter: str | None = None,
+        project_id: str | None = None,
+        include_expired: bool = False,
+        include_closed: bool = False,
+    ) -> List[Any]:
+        """Run hybrid search and apply a bounded graph-supported boost.
+
+        When *project_id* is provided, memories from other projects are
+        excluded. When None, the provider's current project scope is used.
+
+        When *include_expired* is True, expired memories are included in
+        results (for auditing).
+        """
+        if self._store is None:
+            return []
+        # Enrich the query with conversation context if it contains
+        # pronouns/references that need resolution.
+        effective_query = self._enrich_query_with_context(query)
+        effective_project = project_id if project_id is not None else self._current_project_id
+        candidate_limit = min(512, max(limit, limit * 4))
+        results = self._store.search(
+            effective_query,
+            limit=candidate_limit,
+            category_filter=category_filter,
+            project_id=effective_project or None,
+            suppress_retrieval=True,
+            include_expired=include_expired,
+            include_closed=include_closed,
+        )
+
+        # Query expansion: if the top hit's RAW similarity (pre-importance)
+        # is below the similarity floor, ask the LLM to rewrite the query
+        # into sub-queries and re-search.
+        # This is lazy (only fires on weak results), cached, and fail-soft
+        # (returns original results on any LLM failure).
+        #
+        # IMPORTANT: we gate on raw_similarity, NOT the final similarity.
+        # The final similarity includes importance boosts (recency, retrieval
+        # frequency) that contaminate the retrieval-strength signal. A memory
+        # can score 1.5 on the adjusted scale but only 0.2 on raw retrieval
+        # strength — that's the signal the gate needs.
+        top_raw_sim = getattr(results[0], "raw_similarity", None) if results else 0.0
+        if top_raw_sim is None:
+            # Fallback for stub records without raw_similarity: use the
+            # final similarity. This is the contaminated score but it's
+            # the best we have for non-MemoryRecord results.
+            top_raw_sim = results[0].similarity if results else 0.0
+        if (
+            self._query_expander
+            and self._query_expander.enabled
+            and results
+            and self._query_expander.should_expand(query, top_raw_sim)
+        ):
+            results = self._expand_and_merge(
+                query, effective_project, category_filter,
+                candidate_limit, results,
+            )
+        elif (
+            self._query_expander
+            and self._query_expander.enabled
+            and not results
+            and self._query_expander.should_expand(query, 0.0)
+        ):
+            # No results at all — try expansion with floor=0
+            results = self._expand_and_merge(
+                query, effective_project, category_filter,
+                candidate_limit, results,
+            )
+
+        if not self._graph or not self._graph_aware_retrieval:
+            final_results = results[:limit]
+            self._record_injected(final_results)
+            return final_results
+        try:
+            # Entity alias resolution: expand the query with canonical
+            # entity names for any aliases found in the query text.
+            # Example: "tell me about my role" → also search for "Entity-A"
+            alias_expansions: list[str] = []
+            if hasattr(self._store, "resolve_aliases"):
+                canonicals = self._store.resolve_aliases(effective_query)
+                if canonicals:
+                    alias_expansions = canonicals
+                    logger.debug(
+                        "Alias expansion: '%s' → %s",
+                        effective_query[:50], alias_expansions,
+                    )
+
+            # Canonical→alias expansion: when the query mentions a canonical
+            # entity name, also search for its aliases in the graph.
+            # Example: "tell me about Entity-A" → also search for "my role"
+            # so memories that say "my role" without naming Entity-A are found.
+            alias_terms: list[str] = []
+            if hasattr(self._store, "aliases_for_canonical"):
+                for canonical in alias_expansions:
+                    try:
+                        aliases = self._store.aliases_for_canonical(canonical)
+                        alias_terms.extend(aliases)
+                    except Exception:
+                        pass
+                # Also check if the query itself contains a canonical name
+                # that has aliases (even if no alias→canonical match fired)
+                if not alias_terms:
+                    for alias_map in (self._store.list_aliases() if hasattr(self._store, "list_aliases") else []):
+                        canonical = alias_map.get("canonical_entity", "")
+                        if canonical and canonical.lower() in effective_query.lower():
+                            try:
+                                aliases = self._store.aliases_for_canonical(canonical)
+                                alias_terms.extend(aliases)
+                            except Exception:
+                                pass
+                if alias_terms:
+                    logger.debug(
+                        "Canonical→alias expansion: '%s' → %s",
+                        effective_query[:50], alias_terms,
+                    )
+
+            graph_ids = self._graph.memory_ids_for_query(
+                effective_query, limit=max(10, candidate_limit)
+            )
+            # Traversal-based candidates: walk TYPED relations from seed
+            # entities (hop-weighted BFS). These are graph-only candidates
+            # eligible for injection under the same similarity floor as
+            # alias-expanded IDs. Disabled unless graph_traversal_enabled
+            # (config) — measured A/B gate.
+            traversal_ids: list[str] = []
+            if self._graph_traversal_enabled:
+                try:
+                    traversal_ids = self._graph.traversal_memory_ids(
+                        effective_query, depth=self._graph_traversal_depth,
+                        limit=max(10, candidate_limit),
+                    )
+                    logger.debug("traversal: %d candidate ids for %r", len(traversal_ids), effective_query[:40])
+                    if traversal_ids:
+                        seen = set(graph_ids)
+                        for tid in traversal_ids:
+                            if tid not in seen:
+                                graph_ids.append(tid)
+                                seen.add(tid)
+                except Exception:
+                    traversal_ids = []
+            # PPR-based candidates (issue #37): Personalized PageRank
+            # diffusion from query-grounded seed entities. Replaces
+            # traversal with diffusion — surfaces multi-hop associations
+            # without a fixed depth cutoff. Disabled unless
+            # graph_ppr_enabled (config) — eval-first A/B gate.
+            ppr_ids: list[str] = []
+            if self._graph_ppr_enabled:
+                try:
+                    ppr_ids = self._graph.ppr_memory_ids(
+                        effective_query,
+                        limit=max(10, candidate_limit),
+                        damping=self._graph_ppr_damping,
+                    )
+                    logger.debug("ppr: %d candidate ids for %r", len(ppr_ids), effective_query[:40])
+                    if ppr_ids:
+                        seen = set(graph_ids)
+                        for pid in ppr_ids:
+                            if pid not in seen:
+                                graph_ids.append(pid)
+                                seen.add(pid)
+                except Exception:
+                    ppr_ids = []
+            # Also query the graph for each canonical entity from aliases
+            for canonical in alias_expansions:
+                try:
+                    extra_ids = self._graph.memory_ids_for_query(
+                        canonical, limit=max(10, candidate_limit)
+                    )
+                    # Merge, preserving order (dedup)
+                    seen = set(graph_ids)
+                    for eid in extra_ids:
+                        if eid not in seen:
+                            graph_ids.append(eid)
+                            seen.add(eid)
+                except Exception:
+                    pass
+            # Also query the graph for each alias term (canonical→alias).
+            # Track which IDs came from alias expansion specifically — these
+            # are the only graph-only candidates eligible for injection, so
+            # we don't re-introduce the noise regression that made
+            # graph_inject_candidates=false necessary in the first place.
+            alias_expanded_ids: list[str] = []
+            for alias_term in alias_terms:
+                try:
+                    extra_ids = self._graph.memory_ids_for_query(
+                        alias_term, limit=max(10, candidate_limit)
+                    )
+                    seen = set(graph_ids)
+                    for eid in extra_ids:
+                        if eid not in seen:
+                            graph_ids.append(eid)
+                            seen.add(eid)
+                            alias_expanded_ids.append(eid)
+                except Exception:
+                    pass
+            if graph_ids:
+                existing = {record.memory_id for record in results}
+                # Graph-only candidate injection. Two guards prevent noise:
+                # 1. graph_inject_candidates must be true (the global gate),
+                #    OR the candidate came from alias expansion specifically
+                #    (the Ticket 1 path: "Entity-A" → "my role" → graph IDs).
+                # 2. The candidate's semantic similarity to the query must
+                #    clear graph_boost_min_similarity — a precision guard
+                #    that stops unrelated graph neighbors from being injected.
+                #    Records from get_memories_by_ids have no similarity
+                #    computed, so we compute it here via the store's embedder.
+                injectable_ids = set(alias_expanded_ids) if alias_expanded_ids else set()
+                if self._graph_traversal_enabled:
+                    injectable_ids.update(traversal_ids)
+                if self._graph_ppr_enabled:
+                    injectable_ids.update(ppr_ids)
+                    logger.debug("graph injectable ids: %d (traversal=%d, ppr=%d, alias=%d)",
+                                 len(injectable_ids), len(traversal_ids),
+                                 len(ppr_ids), len(alias_expanded_ids))
+                elif self._graph_traversal_enabled:
+                    logger.debug("graph injectable ids: %d (traversal=%d, alias=%d)",
+                                 len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
+                if self._graph_inject_candidates:
+                    injectable_ids.update(graph_ids)
+                if injectable_ids:
+                    # Compute query embedding once for similarity scoring.
+                    query_emb: List[float] = []
+                    embedder = getattr(self._store, "embedder", None)
+                    if embedder and hasattr(embedder, "embed"):
+                        try:
+                            query_emb = embedder.embed(effective_query, is_query=True)
+                        except Exception:
+                            query_emb = []
+                    graph_records = self._store.get_memories_by_ids(
+                        list(injectable_ids)
+                    )
+                    for record in graph_records:
+                        if record.memory_id in existing:
+                            continue
+                        # Compute cosine similarity if we have embeddings;
+                        # otherwise fall back to the record's existing
+                        # similarity (set by get_memories_by_ids or a
+                        # prior search path).
+                        sim = 0.0
+                        if query_emb and getattr(record, "embedding", None):
+                            try:
+                                import math
+                                dot = sum(a * b for a, b in zip(query_emb, record.embedding))
+                                norm_q = math.sqrt(sum(a * a for a in query_emb))
+                                norm_r = math.sqrt(sum(b * b for b in record.embedding))
+                                if norm_q > 0 and norm_r > 0:
+                                    sim = dot / (norm_q * norm_r)
+                            except Exception:
+                                sim = 0.0
+                        elif hasattr(record, "similarity"):
+                            sim = record.similarity
+                        record.similarity = sim
+                        record.raw_similarity = sim
+                        if sim >= self._graph_boost_min_similarity:
+                                                    results.append(record)
+                graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
+                graph_count = max(len(graph_ids), 1)
+                alias_id_set = set(alias_expanded_ids)
+                traversal_id_set = set(traversal_ids)
+                ppr_id_set = set(ppr_ids)
+                for record in results:
+                    # Alias-expanded candidates: alias expansion is a
+                    # definitive identity mapping (e.g. "my role" =
+                    # "Entity-A"), not a fuzzy graph neighbor.  The raw
+                    # embedding similarity is low only because the memory
+                    # text doesn't contain the query word — but semantically
+                    # it IS about the query entity.  Floor the similarity
+                    # so high-similarity candidates are unaffected and low-
+                    # similarity ones are lifted above the cutoff.
+                    if record.memory_id in alias_id_set:
+                        record.similarity = max(
+                            record.similarity, self._alias_expansion_boost
+                        )
+                        continue
+                    # Traversal candidates: memory reached by walking TYPED
+                    # relations from a query seed entity. Evidence is
+                    # relational (e.g. Indwe broker <- uses <- user with car
+                    # finance) — semantically meaningful even if the surface
+                    # text doesn't overlap. Floor lifts it above the cutoff
+                    # without a full identity claim (alias-level).
+                    if (self._graph_traversal_enabled
+                            and record.memory_id in traversal_id_set):
+                        record.similarity = max(
+                            record.similarity, self._graph_traversal_boost
+                        )
+                        continue
+                    # PPR candidates (issue #37): memory reached by PageRank
+                    # diffusion from query-grounded seed entities. Same
+                    # relational-evidence rationale as traversal — floor
+                    # lifts it above the cutoff.
+                    if (self._graph_ppr_enabled
+                            and record.memory_id in ppr_id_set):
+                        record.similarity = max(
+                            record.similarity, self._graph_ppr_boost
+                        )
+                        continue
+                    rank = graph_rank.get(record.memory_id)
+                    if rank is None:
+                        continue
+                    if record.similarity < self._graph_boost_min_similarity:
+                        continue
+                    decay = 1.0 - (rank / graph_count)
+                    record.similarity += self._graph_retrieval_boost * max(0.0, decay)
+                results.sort(key=lambda record: record.similarity, reverse=True)
+        except Exception as exc:
+            logger.debug("Graph-aware retrieval failed: %s", exc)
+        final_results = results[:limit]
+        self._record_injected(final_results)
+        return final_results
+
+    # -- prefetch (auto-inject context before each turn) ---------------------
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        self._record_user_message(message)
+        self._start_prefetch(message)
+
+    def _start_prefetch(self, query: str) -> None:
+        if not query or self._store is None:
+            return
+        # Trivial-query gate (opt-in): a greeting or "just a test" has no
+        # information need; retrieving on it burns injection tokens on
+        # near-random top-k items. Short-circuit BEFORE any search work.
+        if getattr(self, "_skip_retrieval_on_trivial", False):
+            try:
+                _q = query.lower().strip()
+                if len(_q.split()) <= 6 and any(
+                    re.fullmatch(p, _q) for p in _TRIVIAL_QUERY_PATTERNS
+                ):
+                    logger.debug("Prefetch skipped (trivial-query gate)")
+                    return
+            except Exception:
+                pass  # gate failure must never break prefetch
+        store = self._store
+        max_items = self._max_injected
+
+        with self._prefetch_lock:
+            if self._prefetch_query == query:
+                if self._prefetch_done or (self._prefetch_thread and self._prefetch_thread.is_alive()):
+                    return
+            self._prefetch_query = query
+            self._prefetch_result = ""
+            self._prefetch_done = False
+
+        def _run() -> None:
+            sections = []
+            body = ""
+            try:
+                confirmation_candidates = store.list_candidates(
+                    status="pending_user_confirmation", limit=1
+                )
+                confirmation = build_confirmation_block(confirmation_candidates)
+                if confirmation:
+                    sections.append(confirmation)
+
+                # History-at-current-time (#3): on historical queries
+                # ("where did I use to live"), widen retrieval to closed
+                # versions so superseded facts are visible again.
+                try:
+                    try:
+                        from .intent_router import is_historical_query
+                    except ImportError:
+                        from intent_router import is_historical_query
+                    _include_closed = (
+                        getattr(self, "_history_at_current_time", False)
+                        and bool(query) and is_historical_query(query)
+                    )
+                except Exception:
+                    _include_closed = False
+                results = self._search_memories(
+                    query, limit=max_items,
+                    include_closed=_include_closed,
+                )
+                _floor = getattr(self, "_injection_min_score", 0.0)
+                if results and _floor > 0:
+                    _kept = [
+                        r for r in results
+                        if float(getattr(r, "similarity", 0.0) or 0.0) >= _floor
+                    ]
+                    if not _kept:
+                        # Never-blind fallback: the floor suppressed every
+                        # candidate. A turn whose evidence all sits below the
+                        # floor still deserves its best (weak) evidence rather
+                        # than silence — inject a few unfiltered top results.
+                        logger.info(
+                            "Injection floor %.2f suppressed all %d candidates; "
+                            "falling back to unfiltered top-%d",
+                            _floor, len(results), _INJECTION_FALLBACK_COUNT,
+                        )
+                        _kept = list(results[:_INJECTION_FALLBACK_COUNT])
+                    results = _kept
+                if results and getattr(self, "_chronological_injection", False):
+                    # P2B: on temporal/multi-hop turns, re-sort the top-k by
+                    # creation timestamp (oldest first) so the model reads a
+                    # timeline in order instead of relevance-scrambled order.
+                    # Relevance order is preserved for ordinary turns.
+                    try:
+                        from .intent_router import is_temporal_or_multihop
+                        if is_temporal_or_multihop(query):
+                            def _ts_key(r):
+                                # created_at is an ISO-8601 string; lexicographic
+                                # order is only chronological when offsets are
+                                # uniform. Normalize to UTC epoch first so
+                                # mixed "Z"/"+14:00"/"-05:00" rows sort
+                                # correctly; unparseable rows keep raw ordering.
+                                ts = getattr(r, "created_at", None) or ""
+                                try:
+                                    from datetime import datetime as _dt
+                                    return _dt.fromisoformat(
+                                        ts.replace("Z", "+00:00")
+                                    ).timestamp()
+                                except (ValueError, TypeError, AttributeError):
+                                    return ts
+                            results = sorted(results, key=_ts_key)
+                    except Exception:
+                        pass  # P2B is best-effort; never break injection
+                if results and getattr(self, "_date_anchor_rerank", False):
+                    # P2B2: date-anchored re-rank — when the temporal turn
+                    # carries an explicit date expression ("10 days ago",
+                    # "last Tuesday", "on March 2nd"), re-sort the top-k by
+                    # proximity to the resolved target date so the model
+                    # reads the right time window first. Zero-LLM; best-effort.
+                    try:
+                        from .intent_router import is_temporal_or_multihop
+                        if is_temporal_or_multihop(query):
+                            from .date_anchor import reorder_by_date
+                            results, _t, _l = reorder_by_date(results, query)
+                    except Exception:
+                        pass  # P2B2 is best-effort; never break injection
+                if results:
+                    lines = []
+                    for r in results:
+                        cat = r.category
+                        content = r.content
+                        _cap = getattr(self, "_inject_cap", _DEFAULT_INJECT_CONTENT_CHAR_CAP)
+                        if len(content) > _cap:
+                            content = content[:_cap].rsplit(" ", 1)[0] + "..."
+                        sim = f" (score: {r.similarity:.2f})" if r.similarity > 0 else ""
+                        date = (r.created_at or "")[:10]
+                        date_s = f"[{date}] " if date else ""
+                        # Expose memory_id so the agent can call memory_fetch_full
+                        # when a capped preview looks relevant but incomplete.
+                        mid = getattr(r, "memory_id", "") or ""
+                        id_s = f" [id: {mid}]" if mid else ""
+                        # Closed version = superseded fact surfaced by a
+                        # historical query; label it so the model treats it
+                        # as past state, not current truth.
+                        hist_s = (
+                            " (previously)" if getattr(r, "valid_to", None) else ""
+                        )
+                        # Freshness marker (Tier-2 anti-staleness): when the
+                        # content carries an explicit date anchor, append a
+                        # compact as-of marker from the record's own update
+                        # time so a stale anchor is never read as current.
+                        fr_s = ""
+                        if getattr(self, "_freshness_markers", False):
+                            try:
+                                _asof = getattr(r, "updated_at", None) or (r.created_at or "")
+                                fr_s = _freshness_marker_for(content, _asof or "")
+                            except Exception:
+                                fr_s = ""
+                        lines.append(f"- {date_s}[{cat}] {content}{fr_s}{sim}{id_s}{hist_s}")
+                    # Memory injection fence (#34): wrap the recalled block
+                    # in a reference-data note so stored instructions cannot
+                    # be read as system guidance. Neutralize < > in content
+                    # so stored markup cannot be interpreted as prompt tags.
+                    fenced_lines = [_neutralize_markup(ln) for ln in lines]
+                    sections.append(
+                        "## Recalled Memories\n"
+                        + f"[{_MEMORY_FENCE_NOTE}]\n"
+                        + "\n".join(fenced_lines)
+                    )
+                body = "\n\n".join(sections)
+            except Exception as e:
+                logger.debug("Prefetch failed: %s", e)
+            with self._prefetch_lock:
+                if self._prefetch_query == query:
+                    self._prefetch_result = body
+                    self._prefetch_done = True
+
+        t = threading.Thread(target=_run, daemon=True, name="hybrid-prefetch")
+        with self._prefetch_lock:
+            # Join the previous prefetch thread before overwriting the handle
+            # (issue #30: was replaced without join, leaving a stale thread
+            # that could complete and write state for an old query).
+            old = self._prefetch_thread
+            self._prefetch_thread = t
+        if old and old.is_alive() and old is not t:
+            old.join(timeout=0.1)  # brief — don't block the new turn
+        t.start()
+
+    def _consume_prefetch_result(self, query: str) -> str | None:
+        with self._prefetch_lock:
+            if self._prefetch_query != query or not self._prefetch_done:
+                return None
+            result = self._prefetch_result
+            self._prefetch_result = ""
+            self._prefetch_done = False
+            return result
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        cached = self._consume_prefetch_result(query)
+        if cached is not None:
+            return cached
+        self._start_prefetch(query)
+        with self._prefetch_lock:
+            thread = self._prefetch_thread if self._prefetch_query == query else None
+        if thread:
+            thread.join(timeout=_PREFETCH_WAIT_SECS)
+        cached = self._consume_prefetch_result(query)
+        if cached is not None:
+            return cached
+        return ""

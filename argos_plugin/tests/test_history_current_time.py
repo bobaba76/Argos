@@ -195,10 +195,12 @@ class TestProviderWiring:
     def test_labelling_present_in_injection_formatter(self):
         # Guard: closed versions must be visibly marked at injection so
         # the model reads them as past state, never current truth.
+        # The formatter lives in provider_retrieval.py since the god-file
+        # split (stage 7); inspect that module, not the package root.
         import inspect
         try:
             import argos_plugin
         except ModuleNotFoundError:
             import argos as argos_plugin
-        srcc = inspect.getsource(argos_plugin)
+        srcc = inspect.getsource(argos_plugin.provider_retrieval)
         assert chr(40) + 'previously' + chr(41) in srcc

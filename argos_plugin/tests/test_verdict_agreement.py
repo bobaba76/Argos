@@ -51,6 +51,41 @@ def _scores(
     }
 
 
+def _esc_scores(
+    overall: dict | None = None,
+    cats: dict | None = None,
+    ladder: list[int] | None = None,
+) -> dict:
+    """Build a synthetic eval_self_corpus-shaped run_summary dict.
+
+    ESC shape: by_category[recall@k][cat] (keyed by window, then category) —
+    the OPPOSITE of the canonical gate shape. Also carries the esc extra
+    keys (sample_size, probe_count) and no per-category MRR.
+    """
+    l = ladder or [5, 20, 96]
+    base_overall = {f"recall@{k}": 0.90 for k in l}
+    base_overall["mrr"] = 0.60
+    if overall:
+        base_overall.update(overall)
+    default_cats = {
+        "personal_fact": {k: 0.90 for k in l},
+        "work_fact": {k: 0.90 for k in l},
+    }
+    if cats:
+        default_cats.update(cats)
+    by_category = {
+        f"recall@{k}": {c: v[k] for c, v in default_cats.items()}
+        for k in l
+    }
+    return {
+        "sample_size": 10,
+        "probe_count": 10,
+        "ladder": l,
+        "overall": base_overall,
+        "by_category": by_category,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Shared verdict module
 # ---------------------------------------------------------------------------
@@ -198,6 +233,47 @@ class TestEvalSelfCorpusVerdict:
         s = _scores()
         result = esc._verdict(s, s)
         assert result.startswith("PASS")
+
+    def test_verdict_fails_esc_shaped_category_regression(self):
+        """ESC-shaped dicts (by_category[recall@k][cat]) must still FAIL on
+        category regressions. Review fix: the direct delegation no-oped the
+        category checks on the esc shape, so a >1pp category drop passed."""
+        import eval_self_corpus as esc
+        base = _esc_scores()
+        cur = _esc_scores(cats={
+            "personal_fact": {5: 0.90, 20: 0.90, 96: 0.88},
+        })
+        result = esc._verdict(cur, base)
+        assert result.startswith("FAIL")
+        assert "personal_fact" in result
+
+    def test_verdict_fails_esc_shaped_mrr_regression(self):
+        """ESC-shaped dicts must also FAIL on MRR regressions (esc overall
+        carries mrr after compute_metrics adds it)."""
+        import eval_self_corpus as esc
+        base = _esc_scores()
+        cur = _esc_scores(overall={"recall@96": 0.90, "mrr": 0.58})
+        result = esc._verdict(cur, base)
+        assert result.startswith("FAIL")
+        assert "MRR" in result
+
+    def test_verdict_pass_esc_shaped_clean(self):
+        import eval_self_corpus as esc
+        s = _esc_scores()
+        result = esc._verdict(s, s)
+        assert result.startswith("PASS")
+
+    def test_canonicalize_esc_round_trips(self):
+        """canonicalize_esc_metrics flips the esc shape to the gate shape."""
+        esc_shape = _esc_scores()
+        canon = verdict.canonicalize_esc_metrics(esc_shape)
+        assert canon["by_category"]["personal_fact"]["recall@96"] == 0.90
+        assert canon["by_category"]["work_fact"]["recall@20"] == 0.90
+        assert canon["overall"]["mrr"] == 0.60
+        assert canon["ladder"] == [5, 20, 96]
+        # Canonical shape must be directly consumable by gate_verdict.
+        ok, failures = verdict.gate_verdict(canon, canon)
+        assert ok and failures == []
 
 
 # ---------------------------------------------------------------------------

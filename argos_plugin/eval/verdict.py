@@ -86,3 +86,32 @@ def verdict_string(current: Dict[str, Any], baseline: Dict[str, Any]) -> str:
     for f in failures:
         parts.append(f"  - {f}")
     return "\n".join(parts)
+
+
+def canonicalize_esc_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an eval_self_corpus ``compute_metrics`` dict into the canonical
+    gate-scores shape so ``gate_verdict`` can consume it.
+
+    eval_self_corpus stores per-category recall as ``by_category[recall@k][cat]``
+    (keyed by window, then category) and historically omitted MRR. The canonical
+    shape is ``by_category[cat][recall@k]`` (keyed by category, then metric) with
+    ``overall["mrr"]`` present. MRR is read from ``overall`` if present (added by
+    compute_metrics); otherwise it defaults to 0.0 in both arms of the verdict,
+    which makes the MRR check a no-op for legacy baselines that never carried it.
+    """
+    ladder = metrics.get("ladder") or [5, 20, 96]
+    overall_in = metrics.get("overall", {}) or {}
+    overall = {k: float(v) for k, v in overall_in.items()}
+    overall.setdefault("mrr", 0.0)
+
+    # Flip by_category[recall@k][cat] -> by_category[cat][recall@k].
+    by_cat_in = metrics.get("by_category", {}) or {}
+    by_category: Dict[str, Dict[str, float]] = {}
+    for window, cat_map in by_cat_in.items():
+        if not isinstance(cat_map, dict):
+            continue
+        for cat, val in cat_map.items():
+            by_category.setdefault(cat, {})[window] = float(val)
+    # by_category MRR is not checked by gate_verdict (only recall@max-k is),
+    # so we do not synthesize per-category MRR here.
+    return {"ladder": list(ladder), "overall": overall, "by_category": by_category}

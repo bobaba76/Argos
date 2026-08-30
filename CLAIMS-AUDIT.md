@@ -74,7 +74,7 @@ committed, re-runnable artifact:
 | Claim | Status | What's missing |
 |---|---|---|
 | Self-corpus gate + personal bench | internal | maintained for the weekly recon |
-| MemConflict 16-question slice — turn-level ingest (28/8 vs 30/8) | internal | Same 16 questions (persona 0, sessions 0–9), same answerer (deepseek-v4-flash via OpenRouter), same levers/prompt. AA 0.406 → 0.344 (one question, n=16), UOCS 0.188 → 0.438, CRS 0.188 → 0.125. Not comparable to the 13/8 180-question baseline (different harness, ingest, scorer handling). Artifacts live in the benchmark clone (`hermes-memconflict-fork`, `argosvault/Results/`), untracked — not banked, so not a public claim yet. |
+| MemConflict 16-question slice — turn-level ingest (28/8 vs 30/8) | internal | Same 16 questions (persona 0, sessions 0–9), same answerer (deepseek-v4-flash via OpenRouter), same levers/prompt. AA 0.406 → 0.344 (one question, n=16), UOCS 0.188 → 0.438, CRS 0.188 → 0.125. **Mechanism caveat (chain-verify 30/8):** store-level chains are absent — 0 of 595 (and 0 of 884 in the 30/8 DB) records have `valid_to`/`superseded_by` set; ingest is `remember(dedup=False)`, so supersession/versioning never fires and chain-unfold has nothing to walk. The UOCS delta is the answerer's timestamp reasoning over the chronologically rendered list (prompt rule "latest wins"), not store update-arithmetic — the #8 store-level intent remains unproven (filed as #74). Not comparable to the 13/8 180-question baseline (different harness, ingest, scorer handling). Artifacts live in the benchmark clone (`hermes-memconflict-fork`, `argosvault/Results/`), untracked — not banked, so not a public claim yet. |
 
 ---
 
@@ -120,3 +120,9 @@ committed, re-runnable artifact:
   turn-level-ingest differentiator), CRS 0.188 → 0.125. The 30/8 prompt-v2 follow-up slice
   (answer-form + status-vs-details rules) was interrupted mid-ingest and remains pending.
   Kept in §3 (not §1) until the benchmark-clone artifacts are banked/committed.
+- **2026-08-30 (chain-verify correction)** — the mechanism attribution above was corrected:
+  store-level version chains are absent across every run DB (0 of 2,424 records with
+  `valid_to`/`superseded_by`; ingest is `remember(dedup=False)`, so supersession never
+  fires and chain-unfold has nothing to walk). The UOCS gain is the answerer's timestamp
+  reasoning over the chronologically rendered list, not store update-arithmetic — the #8
+  store-level intent remains unproven. Filed as #74.

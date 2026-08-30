@@ -20,6 +20,13 @@ the plan, not the shipped behavior.
 | `P5.1-memory-lifecycle.md` | Memory lifecycle: archival tier, forgetting, long-horizon rollups | **DRAFT** — board issue pending |
 | `P5.2-deploy-tooling.md` | One-command repo→live plugin deploy | **DRAFT** — board issue pending |
 | `spec-04-trust-model.md` | Trust-model cluster (provenance taint, grounding, one-way ladder, quote verify) | **IMPLEMENTED** (batch-2: #43, #40, #39, #35) |
+| `spec-05-doc-fact-namespace.md` | Doc-fact namespace: domain separation for document-sourced facts | **APPROVED** 30/8 — implementation folds into the god-file refactor window (#67) |
+| `spec-06-access-scoping.md` | Access scoping: per-user, per-client ACL inside a practice tenant | **APPROVED** 30/8 — implementation parked behind Cells (#49) + spec-05 (#69) |
+| `spec-07-watcher-catalog.md` | The watcher: document catalog, extraction & freshness | **APPROVED** 30/8 — implementation parked in the Cells window (#71); closes #68, #70 on landing |
+
+Specs marked **APPROVED** are signed-off design records awaiting implementation
+(parked by design — see each spec's Gate section); do not hand them to a fresh
+session as "build me these" before their gate opens.
 
 Line numbers and repo paths inside the specs date from their writing time
 (pre-`argos_plugin` rename, pre-`shared_service` RPC) — historical, not current.

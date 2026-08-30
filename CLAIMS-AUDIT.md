@@ -74,6 +74,7 @@ committed, re-runnable artifact:
 | Claim | Status | What's missing |
 |---|---|---|
 | Self-corpus gate + personal bench | internal | maintained for the weekly recon |
+| MemConflict 16-question slice — turn-level ingest (28/8 vs 30/8) | internal | Same 16 questions (persona 0, sessions 0–9), same answerer (deepseek-v4-flash via OpenRouter), same levers/prompt. AA 0.406 → 0.344 (one question, n=16), UOCS 0.188 → 0.438, CRS 0.188 → 0.125. Not comparable to the 13/8 180-question baseline (different harness, ingest, scorer handling). Artifacts live in the benchmark clone (`hermes-memconflict-fork`, `argosvault/Results/`), untracked — not banked, so not a public claim yet. |
 
 ---
 
@@ -113,3 +114,9 @@ committed, re-runnable artifact:
   46+ word seed set). Filed issues #23 (inbound security fail-open on import error,
   `reviewer.py:206-212`) and #24 (egress gate returns True for unknown kind,
   `egress.py:225-227`) — both are fail-closed fixes. No code behavior changed.
+- **2026-08-30** — recorded the MemConflict 16-question re-run pair (issue #8) in §3 as an
+  internal measurement: 28/8 vs 30/8 on the same slice, answerer, and levers shows AA within
+  ±1 question (0.406 → 0.344), UOCS 0.188 → 0.438 (update-order awareness — the
+  turn-level-ingest differentiator), CRS 0.188 → 0.125. The 30/8 prompt-v2 follow-up slice
+  (answer-form + status-vs-details rules) was interrupted mid-ingest and remains pending.
+  Kept in §3 (not §1) until the benchmark-clone artifacts are banked/committed.

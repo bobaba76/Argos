@@ -805,7 +805,7 @@ class TestDuckDBStore:
 
         graph.close()
 
-    def test_alias_expansion_injects_with_similarity_gate(self, tmp_path):
+    def test_alias_expansion_injects_with_similarity_gate(self, tmp_path, deterministic_embedder):
         """Regression: canonical→alias expansion must inject graph-only
         memories that clear the similarity gate, while NOT injecting
         unrelated graph noise.
@@ -839,16 +839,12 @@ class TestDuckDBStore:
 
         from store import DuckDBMemoryStore
         from graph import KuzuGraphStore
-        from embeddings import LocalEmbedder
         try:
             import argos_plugin as _hmp
         except ModuleNotFoundError:
             import argos as _hmp
 
-        embedder = LocalEmbedder(
-            "bge-small-en-v1.5",
-            hermes_home=r"C:\Users\testuser\AppData\Local\hermes",
-        )  # local cached model — hermetic, no hub dependency
+        embedder = deterministic_embedder  # hermetic, model-free (issues #90, #98)
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user", embedder=embedder)
         graph = KuzuGraphStore(tmp_path / "test_kuzu", user_id="test_user")
 

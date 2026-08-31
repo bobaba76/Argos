@@ -20,6 +20,17 @@ root (conftest snapshots/restores the stub keys around every test), so
 the fallback gate when process isolation is needed (e.g. for bisecting
 an import-state regression).
 
+Fast path (issue #98): now that the import-state leak is fixed at the
+root, ``pytest-xdist`` parallelises the suite across CPU cores with no
+deadlock. This is the recommended fast gate:
+
+    python -m pytest tests/ -n auto -q
+
+``-n auto`` spawns one worker per core and distributes tests by file.
+The conftest's ``_restore_import_state_after_test`` autouse fixture
+keeps each worker hermetic. If a future regression wedges xdist, fall
+back to this per-file runner (or ``-n0`` for a single-process bisect).
+
 Run with:
 
     python tests/run_per_file.py              # all files, continue on failure

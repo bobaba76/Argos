@@ -445,9 +445,15 @@ class StoreMaintenanceMixin:
                     continue
                 # Sort by quality score descending, then recency (parsed
                 # timestamp — raw-string lexicographic order mis-orders
-                # mixed ISO forms like "2026-8-1T..." vs "2026-08-30T..."),
-                # then content length. Unparseable timestamps sort as
-                # epoch 0 (oldest) so they never win the recency tiebreak.
+                # mixed ISO forms, e.g. "2026-08-30T00:00:00+00:00" sorts
+                # before "2026-08-30T00:00:00+05:00" even though the +05:00
+                # instant is earlier in UTC), then content length.
+                # Unparseable/missing timestamps fall back to epoch 0 — the
+                # oldest possible instant — so, in this ascending sort, they
+                # sit before any real timestamp and win the recency tiebreak
+                # exactly like the old `r.created_at or ""` (empty string)
+                # did. Quality remains the primary key, so this only matters
+                # between equal-quality duplicates.
                 member_records = [group_records[i] for i in members]
                 member_records.sort(
                     key=lambda r: (

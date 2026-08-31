@@ -275,14 +275,15 @@ def _load_config(hermes_home: str | None = None) -> dict:
 def _flag(cfg: dict, key: str, default: str = "false") -> bool:
     """Parse a string/bool config flag the way initialize() expects.
 
-    Accepts "true"/"1"/"yes"/"on" (case-insensitive) or a real bool;
-    anything else is False. The "on" spelling matches egress._flag so
-    env-style toggles (e.g. chronological_injection="on") behave
-    identically across the two parsers. Extracted so the temporal-lever
-    flags are unit-testable without constructing a full provider.
+    Accepts "true"/"1"/"yes"/"on" (case-insensitive, surrounding
+    whitespace tolerated) or a real bool; anything else is False. The
+    "on" spelling and strip match egress._flag so env-style toggles
+    (e.g. chronological_injection="on") behave identically across the
+    two parsers. Extracted so the temporal-lever flags are unit-testable
+    without constructing a full provider.
     """
     v = cfg.get(key, default)
-    return v.lower() in ("true", "1", "yes", "on") if isinstance(v, str) else bool(v)
+    return v.strip().lower() in ("true", "1", "yes", "on") if isinstance(v, str) else bool(v)
 
 
 # Module-level user_id for module-level helpers (_get_insight_store, etc.)

@@ -97,16 +97,26 @@ class TestDequeImport:
 
 class TestValuesConflictUnit:
     """The idempotency check was ``new_v.value == old_v.value`` only, ignoring
-    unit. "3.5 percent" vs "3.5 years" on the same subject was treated as
-    idempotent (no conflict) → false supersession proposals were suppressed."""
+    unit: same-value/different-unit pairs were collapsed as idempotent, and
+    different-value/different-unit pairs proposed nonsense supersessions.
+    Units now define the quantity: cross-unit pairs are incomparable and
+    never become a supersession candidate."""
 
-    def test_same_value_different_unit_is_conflict(self):
+    def test_same_value_different_unit_is_not_conflict(self):
         from value_extractor import ExtractedValue, values_conflict
         new = [ExtractedValue("interest rate", "3.5", "percent", "3.5%")]
         old = [ExtractedValue("interest rate", "3.5", "years", "3.5 years")]
-        conflict = values_conflict(new, old)
-        assert conflict is not None, \
-            "same value + different unit on same subject must be a conflict"
+        assert values_conflict(new, old) is None, \
+            "same value + different unit is an incomparable quantity, not a supersession"
+
+    def test_different_value_different_unit_is_not_conflict(self):
+        """Cross-dimension pairs must never supersede — the false
+        supersession-proposal class from issue #91 item 2."""
+        from value_extractor import ExtractedValue, values_conflict
+        new = [ExtractedValue("interest rate", "3.5", "percent", "3.5%")]
+        old = [ExtractedValue("interest rate", "4.0", "years", "4.0 years")]
+        assert values_conflict(new, old) is None, \
+            "different unit = incomparable quantities, never a supersession"
 
     def test_same_value_same_unit_is_idempotent(self):
         from value_extractor import ExtractedValue, values_conflict

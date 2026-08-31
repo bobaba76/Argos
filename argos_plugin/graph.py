@@ -744,6 +744,7 @@ class KuzuGraphStore:
         self.database = None
         self.conn = None
         self._db_key = str(self.db_dir.resolve())
+        self._flush_dirty = False  # #88: set when _flush() fails
         self._init_db()
 
     def _init_db(self) -> None:
@@ -805,20 +806,29 @@ class KuzuGraphStore:
         return node_id[len(prefix):] if node_id.startswith(prefix) else node_id
 
     def _flush(self) -> None:
-        """Re-open the connection to force Kuzu to flush the WAL."""
+        """Re-open the connection to force Kuzu to flush the WAL.
+
+        Exception-safe (#88): a flush failure is logged and the instance is
+        marked ``_flush_dirty`` so the next write knows durability is not
+        guaranteed, but the failure does NOT propagate.
+        """
         import kuzu
 
-        with self._shared_conn_lock:
-            if self.database is None:
-                return
-            self.conn = kuzu.Connection(self.database)
-            # Update the shared connection so all instances see the fresh one.
-            with KuzuGraphStore._shared_lock:
-                shared = KuzuGraphStore._shared.get(self._db_key)
-                if shared:
-                    KuzuGraphStore._shared[self._db_key] = (
-                        self.database, self.conn, self._shared_conn_lock, shared[3]
-                    )
+        try:
+            with self._shared_conn_lock:
+                if self.database is None:
+                    return
+                self.conn = kuzu.Connection(self.database)
+                with KuzuGraphStore._shared_lock:
+                    shared = KuzuGraphStore._shared.get(self._db_key)
+                    if shared:
+                        KuzuGraphStore._shared[self._db_key] = (
+                            self.database, self.conn, self._shared_conn_lock, shared[3]
+                        )
+            self._flush_dirty = False
+        except Exception as exc:
+            self._flush_dirty = True
+            logger.warning("Kuzu WAL flush failed (marked dirty): %s", exc)
 
     # -- write operations -----------------------------------------------------
 
@@ -1542,11 +1552,14 @@ class KuzuGraphStore:
                b.attributes AS target_attrs, r.attributes AS relation_attrs
         """
         internal_id = self._internal_id(entity_id)
+        # #76: consume the full result set inside the lock.
         with self._shared_conn_lock:
             results = self.conn.execute(query, parameters={"id": internal_id})
+            rows = []
+            while results.has_next():
+                rows.append(results.get_next())
         edges: List[Dict[str, Any]] = []
-        while results.has_next():
-            row = results.get_next()
+        for row in rows:
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
             edges.append({
@@ -1597,13 +1610,16 @@ class KuzuGraphStore:
         LIMIT $limit
         """
         with self._shared_conn_lock:
+            # #76: consume results inside the lock.
             results = self.conn.execute(
                 query,
                 parameters={"term": term_lower, "scope": self.user_id, "limit": limit * 3},
             )
+            rows = []
+            while results.has_next():
+                rows.append(results.get_next())
         edges: List[Dict[str, Any]] = []
-        while results.has_next():
-            row = results.get_next()
+        for row in rows:
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
             edges.append({
@@ -1643,10 +1659,13 @@ class KuzuGraphStore:
                b.attributes AS target_attrs, r.attributes AS relation_attrs
         """
         with self._shared_conn_lock:
+            # #76: consume results inside the lock.
             results = self.conn.execute(query, parameters=params)
+            rows = []
+            while results.has_next():
+                rows.append(results.get_next())
         edges: List[Dict[str, Any]] = []
-        while results.has_next():
-            row = results.get_next()
+        for row in rows:
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
             source, target = str(row[0]), str(row[3])
@@ -1769,10 +1788,13 @@ class KuzuGraphStore:
                     "RETURN n.id, n.entity_type, n.attributes LIMIT $limit"
             params = {"scope": self.user_id, "limit": limit}
         with self._shared_conn_lock:
+            # #76: consume results inside the lock.
             results = self.conn.execute(query, parameters=params)
+            rows = []
+            while results.has_next():
+                rows.append(results.get_next())
         nodes: List[Dict[str, Any]] = []
-        while results.has_next():
-            row = results.get_next()
+        for row in rows:
             attrs = {}
             try:
                 attrs = json.loads(row[2]) if row[2] else {}

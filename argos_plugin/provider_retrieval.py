@@ -659,6 +659,13 @@ class ProviderRetrievalMixin:
                                  len(injectable_ids), len(traversal_ids), len(alias_expanded_ids))
                 if self._graph_inject_candidates:
                     injectable_ids.update(graph_ids)
+                # #81: pre-compute the boost-eligible ID sets so the inclusion
+                # gate below can exempt them — the boost floor is applied
+                # after the gate, so without exemption below-gate candidates
+                # are dropped before the floor can lift them.
+                alias_id_set_pre = set(alias_expanded_ids)
+                traversal_id_set_pre = set(traversal_ids)
+                ppr_id_set_pre = set(ppr_ids)
                 if injectable_ids:
                     # Compute query embedding once for similarity scoring.
                     query_emb: List[float] = []
@@ -693,8 +700,17 @@ class ProviderRetrievalMixin:
                             sim = record.similarity
                         record.similarity = sim
                         record.raw_similarity = sim
-                        if sim >= self._graph_boost_min_similarity:
-                                                    results.append(record)
+                        # #81: alias/traversal/PPR candidates are exempt from
+                        # the inclusion gate — their boost floor is applied
+                        # below, which lifts below-gate raw similarity above
+                        # the cutoff. Without exemption, the boost never runs.
+                        is_boosted_candidate = (
+                            record.memory_id in alias_id_set_pre
+                            or (self._graph_traversal_enabled and record.memory_id in traversal_id_set_pre)
+                            or (self._graph_ppr_enabled and record.memory_id in ppr_id_set_pre)
+                        )
+                        if is_boosted_candidate or sim >= self._graph_boost_min_similarity:
+                            results.append(record)
                 graph_rank = {memory_id: rank for rank, memory_id in enumerate(graph_ids)}
                 graph_count = max(len(graph_ids), 1)
                 alias_id_set = set(alias_expanded_ids)
@@ -744,8 +760,17 @@ class ProviderRetrievalMixin:
                     decay = 1.0 - (rank / graph_count)
                     record.similarity += self._graph_retrieval_boost * max(0.0, decay)
                 results.sort(key=lambda record: record.similarity, reverse=True)
+        except (NameError, AttributeError, ImportError) as exc:
+            # #84: programming errors must NOT be swallowed.
+            logger.error("Graph-aware retrieval programming error: %s", exc)
+            raise
         except Exception as exc:
-            logger.debug("Graph-aware retrieval failed: %s", exc)
+            # #84: expected fail-soft conditions degrade to unboosted results.
+            self._graph_retrieval_failures = getattr(self, "_graph_retrieval_failures", 0) + 1
+            logger.warning(
+                "Graph-aware retrieval failed (fail-soft, count=%d): %s",
+                self._graph_retrieval_failures, exc,
+            )
         final_results = results[:limit]
         self._record_injected(final_results)
         return final_results

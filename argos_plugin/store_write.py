@@ -177,16 +177,33 @@ class StoreWriteMixin:
         # Explicit expires_at wins over the TTL map.  None = no expiry.
         skip_auto_ttl = expires_at is not _NOT_PROVIDED
         if expires_at is not _NOT_PROVIDED and expires_at is not None:
-            record_payload["expires_at"] = expires_at
+            # #80: normalize to the aware ISO format (_now() shape) so
+            # lexicographic VARCHAR comparisons in SQL are consistent
+            # across mixed ISO forms (Z vs +00:00, date-only vs full).
+            normalized_expiry = self._normalize_timestamp(expires_at)
+            if normalized_expiry is not None:
+                record_payload["expires_at"] = normalized_expiry
+            else:
+                logger.warning(
+                    "Unparseable expires_at %r — storing as-is (may compare "
+                    "wrong lexicographically)", expires_at,
+                )
+                record_payload["expires_at"] = str(expires_at)
         elif expires_at is None:
             # Explicit None: clear any pre-existing payload expiry so the
             # column (populated from record_payload below) is NULL, not
             # a stale value from the caller's payload dict.
             record_payload.pop("expires_at", None)
 
-        if dedup and self._content_exists(content, category):
-            logger.debug("Deduped memory: %s", content[:60])
-            return None
+        if dedup:
+            _dedup_reason = self._content_exists(content, category)
+            if _dedup_reason:
+                # #82: surface the dedup-drop reason at warning level so
+                # silent no-ops are visible to the operator/caller.
+                logger.warning(
+                    "Deduped memory (%s): %s", _dedup_reason, content[:60],
+                )
+                return None
 
         # Deletion tombstone check: this exact fact was hard-deleted by the
         # user; re-feeding the same content would silently resurrect it.
@@ -218,7 +235,9 @@ class StoreWriteMixin:
         # not from when it was ingested). updated_at stays at the wall clock
         # (the row was physically written now).
         if created_at is not None:
-            created_ts = str(created_at)
+            # #80: normalize created_at to the aware ISO format so
+            # valid_from and version-chain comparisons are consistent.
+            created_ts = self._normalize_timestamp(created_at) or str(created_at)
         else:
             created_ts = now
         if not skip_auto_ttl and not record_payload.get("expires_at") and durability == "temporary":
@@ -1043,38 +1062,68 @@ class StoreWriteMixin:
                         provenance_origin=candidate.get("provenance_origin"),
                         grounding=candidate.get("grounding"),
                     )
+                    # #79: when remember() returns None (dedup/tombstone/
+                    # rejection-ledger block), the candidate must NOT be
+                    # marked 'approved' with no memory behind it. Mirror
+                    # review_candidate's 'deduplicated' status.
+                    keep_new_status = "approved"
+                    if memory is None:
+                        keep_new_status = "deduplicated"
                     if memory and old_memory_id:
-                        self.connection.execute(
-                            """UPDATE memory_records
-                               SET valid_to = ?, superseded_by = ?, updated_at = ?
-                               WHERE memory_id = ?""",
-                            [now, memory.memory_id, now, old_memory_id],
-                        )
-                        # Tombstone the old value (#36 re-assertion block).
-                        try:
-                            old_row = self.connection.execute(
-                                """SELECT content, category FROM memory_records
-                                   WHERE memory_id = ?""",
-                                [old_memory_id],
-                            ).fetchone()
-                            if old_row:
-                                h = self._tombstone_hash(old_row[0])
-                                if h and old_row[1]:
-                                    self.connection.execute(
-                                        """INSERT OR REPLACE INTO deletion_tombstones
-                                           (content_hash, category, user_scope, reason, created_at)
-                                           VALUES (?, ?, ?, ?, ?)""",
-                                        [h, old_row[1], self.user_id,
-                                         f"superseded by {memory.memory_id}", now],
-                                    )
-                        except Exception as exc:
-                            logger.debug("Tombstone write failed: %s", exc)
+                        # #78: guard the supersede with valid_to IS NULL and
+                        # user_scope — the old_memory_id comes from the
+                        # candidate's payload and may be stale (already
+                        # superseded) or point at another tenant's record.
+                        # Skip the supersede (and report it) when the target
+                        # is no longer current or out of scope.
+                        check = self.connection.execute(
+                            """SELECT 1 FROM memory_records
+                               WHERE memory_id = ?
+                                 AND (user_scope IS NULL OR user_scope = ?)
+                                 AND valid_to IS NULL""",
+                            [old_memory_id, self.user_id],
+                        ).fetchone()
+                        if check:
+                            self.connection.execute(
+                                """UPDATE memory_records
+                                   SET valid_to = ?, superseded_by = ?, updated_at = ?
+                                   WHERE memory_id = ?
+                                     AND valid_to IS NULL
+                                     AND (user_scope IS NULL OR user_scope = ?)""",
+                                [now, memory.memory_id, now, old_memory_id,
+                                 self.user_id],
+                            )
+                            # Tombstone the old value (#36 re-assertion block).
+                            try:
+                                old_row = self.connection.execute(
+                                    """SELECT content, category FROM memory_records
+                                       WHERE memory_id = ?""",
+                                    [old_memory_id],
+                                ).fetchone()
+                                if old_row:
+                                    h = self._tombstone_hash(old_row[0])
+                                    if h and old_row[1]:
+                                        self.connection.execute(
+                                            """INSERT OR REPLACE INTO deletion_tombstones
+                                               (content_hash, category, user_scope, reason, created_at)
+                                               VALUES (?, ?, ?, ?, ?)""",
+                                            [h, old_row[1], self.user_id,
+                                             f"superseded by {memory.memory_id}", now],
+                                        )
+                            except Exception as exc:
+                                logger.debug("Tombstone write failed: %s", exc)
+                        else:
+                            logger.warning(
+                                "resolve_conflict keep_new: old_memory_id %s "
+                                "is not current/in-scope — supersede skipped",
+                                old_memory_id,
+                            )
                     self.connection.execute(
                         """UPDATE memory_candidates
-                           SET status = 'approved', updated_at = ?, reviewed_at = ?,
+                           SET status = ?, updated_at = ?, reviewed_at = ?,
                                review_reason = ?
                            WHERE candidate_id = ?""",
-                        [now, now,
+                        [keep_new_status, now, now,
                          f"conflict_resolved:keep_new ({reason})".strip(),
                          candidate_id],
                     )
@@ -1149,11 +1198,14 @@ class StoreWriteMixin:
                     )
                     if old_memory_id:
                         # Supersede the old memory (set valid_to).
+                        # #78: add user_scope guard (valid_to IS NULL was
+                        # already present).
                         self.connection.execute(
                             """UPDATE memory_records
                                SET valid_to = ?, updated_at = ?
-                               WHERE memory_id = ? AND valid_to IS NULL""",
-                            [now, now, old_memory_id],
+                               WHERE memory_id = ? AND valid_to IS NULL
+                                 AND (user_scope IS NULL OR user_scope = ?)""",
+                            [now, now, old_memory_id, self.user_id],
                         )
                         # Tombstone the old value.
                         try:
@@ -1195,31 +1247,49 @@ class StoreWriteMixin:
                         grounding=candidate.get("grounding"),
                     )
                     if memory and old_memory_id:
-                        self.connection.execute(
-                            """UPDATE memory_records
-                               SET valid_to = ?, superseded_by = ?, updated_at = ?
-                               WHERE memory_id = ?""",
-                            [now, memory.memory_id, now, old_memory_id],
-                        )
-                        # Tombstone the old value.
-                        try:
-                            old_row = self.connection.execute(
-                                """SELECT content, category FROM memory_records
-                                   WHERE memory_id = ?""",
-                                [old_memory_id],
-                            ).fetchone()
-                            if old_row:
-                                h = self._tombstone_hash(old_row[0])
-                                if h and old_row[1]:
-                                    self.connection.execute(
-                                        """INSERT OR REPLACE INTO deletion_tombstones
-                                           (content_hash, category, user_scope, reason, created_at)
-                                           VALUES (?, ?, ?, ?, ?)""",
-                                        [h, old_row[1], self.user_id,
-                                         f"superseded by {memory.memory_id} (manual reconciliation)", now],
-                                    )
-                        except Exception as exc:
-                            logger.debug("manual tombstone failed: %s", exc)
+                        # #78: guard the supersede (same as keep_new).
+                        check = self.connection.execute(
+                            """SELECT 1 FROM memory_records
+                               WHERE memory_id = ?
+                                 AND (user_scope IS NULL OR user_scope = ?)
+                                 AND valid_to IS NULL""",
+                            [old_memory_id, self.user_id],
+                        ).fetchone()
+                        if check:
+                            self.connection.execute(
+                                """UPDATE memory_records
+                                   SET valid_to = ?, superseded_by = ?, updated_at = ?
+                                   WHERE memory_id = ?
+                                     AND valid_to IS NULL
+                                     AND (user_scope IS NULL OR user_scope = ?)""",
+                                [now, memory.memory_id, now, old_memory_id,
+                                 self.user_id],
+                            )
+                            # Tombstone the old value.
+                            try:
+                                old_row = self.connection.execute(
+                                    """SELECT content, category FROM memory_records
+                                       WHERE memory_id = ?""",
+                                    [old_memory_id],
+                                ).fetchone()
+                                if old_row:
+                                    h = self._tombstone_hash(old_row[0])
+                                    if h and old_row[1]:
+                                        self.connection.execute(
+                                            """INSERT OR REPLACE INTO deletion_tombstones
+                                               (content_hash, category, user_scope, reason, created_at)
+                                               VALUES (?, ?, ?, ?, ?)""",
+                                            [h, old_row[1], self.user_id,
+                                             f"superseded by {memory.memory_id} (manual reconciliation)", now],
+                                        )
+                            except Exception as exc:
+                                logger.debug("manual tombstone failed: %s", exc)
+                        else:
+                            logger.warning(
+                                "resolve_conflict manual: old_memory_id %s "
+                                "is not current/in-scope — supersede skipped",
+                                old_memory_id,
+                            )
                     # Reject the original candidate (it's been replaced by
                     # the reconciliation).
                     self.connection.execute(
@@ -1696,10 +1766,19 @@ class StoreWriteMixin:
 
         # Resolve effective expires_at:
         # _NOT_PROVIDED → carry forward; None → clear (revive); str → set.
+        # #80: normalize string expires_at to the canonical aware-UTC form.
         if expires_at is _NOT_PROVIDED:
             effective_expires = rec.expires_at
+        elif expires_at is None:
+            effective_expires = None
         else:
-            effective_expires = expires_at  # None or string
+            effective_expires = self._normalize_timestamp(expires_at)
+            if effective_expires is None:
+                logger.warning(
+                    "Unparseable expires_at %r in update_memory — storing "
+                    "as-is", expires_at,
+                )
+                effective_expires = str(expires_at)
 
         # If nothing actually changed, return the existing record
         if (content is None and tags is None and not payload_updates
@@ -1747,6 +1826,12 @@ class StoreWriteMixin:
                      now],
                 )
                 # 2. Supersede the old version
+                self.connection.execute(
+                    """UPDATE memory_records
+                       SET valid_to = ?, superseded_by = ?, updated_at = ?
+                       WHERE memory_id = ?""",
+                    [now, new_id, now, memory_id],
+                )
                 self.connection.execute(
                     """UPDATE memory_records
                        SET valid_to = ?, superseded_by = ?, updated_at = ?
@@ -1998,26 +2083,38 @@ class StoreWriteMixin:
                     [memory_id, self.user_id],
                 ).fetchone()
                 if pred:
-                    self.connection.execute(
-                        """UPDATE memory_records
-                           SET valid_to = NULL, superseded_by = NULL, updated_at = ?
-                           WHERE memory_id = ?""",
-                        [now, pred[0]],
-                    )
-                    # The deleted head's content is tombstoned too: deleting
-                    # the current version of a fact must survive re-feeds,
-                    # while the promoted predecessor keeps history intact.
-                    self._record_tombstone(_del_content, _del_category)
-                    self.connection.execute(
-                        "DELETE FROM memory_records WHERE memory_id = ?"
-                        " AND (user_scope IS NULL OR user_scope = ?)",
-                        [memory_id, self.user_id],
-                    )
-                    self.connection.execute(
-                        "DELETE FROM memory_evidence WHERE memory_id = ?"
-                        " AND (user_scope IS NULL OR user_scope = ?)",
-                        [memory_id, self.user_id],
-                    )
+                    # Wrap the multi-statement promote path in a transaction
+                    # (#77): a crash between the predecessor UPDATE and the
+                    # head DELETE would leave two active versions of the same
+                    # fact (valid_to IS NULL on both). Single-statement paths
+                    # (quarantine, hard-delete) are already atomic.
+                    self.connection.execute("BEGIN TRANSACTION")
+                    try:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = NULL, superseded_by = NULL, updated_at = ?
+                               WHERE memory_id = ?""",
+                            [now, pred[0]],
+                        )
+                        # The deleted head's content is tombstoned too:
+                        # deleting the current version of a fact must survive
+                        # re-feeds, while the promoted predecessor keeps
+                        # history intact.
+                        self._record_tombstone(_del_content, _del_category)
+                        self.connection.execute(
+                            "DELETE FROM memory_records WHERE memory_id = ?"
+                            " AND (user_scope IS NULL OR user_scope = ?)",
+                            [memory_id, self.user_id],
+                        )
+                        self.connection.execute(
+                            "DELETE FROM memory_evidence WHERE memory_id = ?"
+                            " AND (user_scope IS NULL OR user_scope = ?)",
+                            [memory_id, self.user_id],
+                        )
+                        self.connection.execute("COMMIT")
+                    except Exception:
+                        self.connection.execute("ROLLBACK")
+                        raise
                     return {
                         "deleted": True, "action": "promoted",
                         "promoted_memory_id": pred[0],

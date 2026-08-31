@@ -902,12 +902,16 @@ class StoreRetrievalMixin:
         """
         # Validate as_of as ISO-8601 (#28 finding 3): a malformed value
         # silently behaves as a garbage cutoff in SQL temporal comparisons.
-        # Normalize here so downstream SQL gets a valid timestamp.
+        # Normalize to the canonical aware-UTC form (#80) so downstream SQL
+        # lexicographic comparisons are consistent across mixed ISO formats
+        # (Z vs +00:00, date-only vs full timestamp).
         if as_of:
             parsed_as_of = self._parse_timestamp(as_of)
             if parsed_as_of is None:
                 logger.warning("Invalid as_of timestamp %r — ignoring temporal filter", as_of)
                 as_of = None
+            else:
+                as_of = parsed_as_of.isoformat()
 
         excluded = {c.lower() for c in (exclude_categories or [])}
         emb: List[float] = []
@@ -1031,12 +1035,21 @@ class StoreRetrievalMixin:
     # Semantic dedup threshold: cosine similarity above this means "same fact".
     _DEDUP_SIMILARITY_THRESHOLD = 0.85
 
-    def _content_exists(self, content: str, category: str) -> bool:
+    def _content_exists(self, content: str, category: str) -> str | None:
         """Check if a very similar content already exists (dedup).
+
+        Returns a reason string (``"exact"``, ``"substring"``,
+        ``"semantic"``) if a duplicate is found, or ``None`` if the content
+        is new. The reason lets the caller surface *why* a dedup drop
+        happened instead of a silent None (#82).
 
         Three-layer check:
         1. Exact match (case-sensitive, same category).
-        2. Substring containment (case-insensitive, for >20 char strings).
+        2. Substring containment (case-insensitive, for >20 char strings)
+           gated by an overlap ratio ≥ 0.8 — the shorter string must cover
+           ≥80% of the longer string so distinct facts that share a long
+           common prefix ("...in 2021" vs "...in 2022") are not silently
+           dropped (#82).
         3. Semantic similarity (cosine similarity on embeddings, when an
            embedder is available).  Catches paraphrased duplicates like
            "User is married to Sam" vs "Sam is the user's partner".
@@ -1052,13 +1065,16 @@ class StoreRetrievalMixin:
                 [content, category, self.user_id],
             ).fetchone()
             if result and result[0] > 0:
-                return True
+                return "exact"
             # Layer 2: substring containment (case-insensitive, current only).
+            # ORDER BY created_at DESC so the scan window is recency-ordered,
+            # not arbitrary storage order (#82).
             result = self.connection.execute(
                 """SELECT content FROM memory_records
                   WHERE category = ?
                     AND valid_to IS NULL
                     AND (user_scope IS NULL OR user_scope = ?)
+                  ORDER BY created_at DESC
                   LIMIT 500""",
                 [category, self.user_id],
             ).fetchall()
@@ -1066,11 +1082,24 @@ class StoreRetrievalMixin:
             for (existing,) in result:
                 existing_lower = existing.lower().strip()
                 if content_lower == existing_lower:
-                    return True
+                    return "substring"
                 # Skip very short strings to avoid false positives.
                 if len(content_lower) > 20 and len(existing_lower) > 20:
                     if content_lower in existing_lower or existing_lower in content_lower:
-                        return True
+                        # #82: gate behind an overlap ratio so a long shared
+                        # prefix does not declare distinct facts as duplicates.
+                        shorter = min(len(content_lower), len(existing_lower))
+                        longer = max(len(content_lower), len(existing_lower))
+                        if longer > 0 and shorter / longer >= 0.8:
+                            return "substring"
+                        # Below the overlap gate — log at debug so the
+                        # near-miss is traceable but the fact is saved.
+                        logger.debug(
+                            "Substring dedup overlap gate blocked drop: "
+                            "%d/%d (%.1f%%) for %r vs %r",
+                            shorter, longer, 100 * shorter / longer,
+                            content_lower[:50], existing_lower[:50],
+                        )
             # Layer 3: semantic similarity via embeddings.
             if self.embedder and hasattr(self.embedder, "embed"):
                 emb = self.embedder.embed(content)
@@ -1089,8 +1118,8 @@ class StoreRetrievalMixin:
                             [category, self.user_id, vec_text, self._DEDUP_SIMILARITY_THRESHOLD],
                         ).fetchone()
                         if result:
-                            return True
+                            return "semantic"
                     except Exception as exc:
                         if not self._is_vector_search_unavailable(exc):
                             logger.debug("Semantic dedup check failed: %s", exc)
-            return False
+            return None

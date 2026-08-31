@@ -19,7 +19,6 @@ import json
 import logging
 import sys
 import types
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -183,26 +182,23 @@ class TestSemanticDedupPairBudget:
     remaining categories were never scanned. Fix: ``continue`` (skip this
     group, keep going)."""
 
-    def test_oversized_group_does_not_block_later_groups(self):
+    def test_oversized_group_does_not_block_later_groups(self, tmp_path):
         """Three groups: A (small, fits), B (huge, exceeds budget), C (small,
         fits remaining budget). With ``break``, C is never checked. With
         ``continue``, C produces candidates."""
-        import numpy as np
         from store_common import MemoryRecord
         from store import DuckDBMemoryStore
 
         # We need a store instance to access the mixin method, but we'll
         # call _detect_semantic_duplicates directly with synthetic records.
         store = DuckDBMemoryStore(
-            Path(__file__).resolve().parent / "_budget_tmp.duckdb",
-            user_id="test_user", embedder=None,
+            tmp_path / "budget.duckdb", user_id="test_user", embedder=None,
         )
         try:
             # Group A: 2 records, 1 pair — semantic duplicates.
             # Group B: 50 records, 1225 pairs — exceeds budget.
             # Group C: 2 records, 1 pair — semantic duplicates.
             base_emb = [1.0, 0.0, 0.0]
-            diff_emb = [0.0, 1.0, 0.0]
 
             records = []
             # Group A (category=cat_a)
@@ -247,7 +243,7 @@ class TestSemanticDedupPairBudget:
             # max_pairs=5: group A (1 pair) fits, group B (1225 pairs) doesn't,
             # group C (1 pair) fits the remaining budget (pairs_checked=1,
             # 1+1=2 ≤ 5).
-            total = store._detect_semantic_duplicates(
+            store._detect_semantic_duplicates(
                 records, min_similarity=0.99, max_pairs=5,
                 add_candidate_fn=add_candidate,
             )
@@ -263,88 +259,112 @@ class TestSemanticDedupPairBudget:
                 "group C must still produce candidates after group B is skipped"
         finally:
             store.close()
-            p = Path(__file__).resolve().parent / "_budget_tmp.duckdb"
-            if p.exists():
-                p.unlink()
-            # Clean up DuckDB side files
-            for suffix in (".wal",):
-                side = p.with_suffix(suffix)
-                if side.exists():
-                    side.unlink()
 
 
 class TestSemanticDedupKeeperSort:
     """Bug B: keeper sort used ``r.created_at or ""`` (raw-string
-    lexicographic recency). Mixed ISO forms misorder — e.g.
-    "2026-8-1T00:00:00+00:00" sorts AFTER "2026-08-30T00:00:00+00:00"
-    lexicographically (because '8' > '0' at position 5) even though
-    Aug 1 is older than Aug 30. Fix: use ``_parse_timestamp``."""
+    lexicographic recency), which mis-orders records carrying different
+    UTC offsets: "2026-08-30T00:00:00+00:00" sorts BEFORE
+    "2026-08-30T00:00:00+05:00" lexicographically ('0' < '5' in the
+    offset), even though the +05:00 instant (Aug 29 19:00 UTC) is the
+    OLDER of the two. Fix: use ``_parse_timestamp`` (UTC-normalised)."""
 
-    def test_keeper_is_chronologically_oldest_not_lexicographically(self):
-        """Two records in the same cluster, equal quality/length, mixed ISO
-        created_at. The sort is ascending by timestamp (oldest = keeper).
-        Lexicographic order would pick the wrong one."""
-        from store_common import MemoryRecord
+    @pytest.fixture()
+    def store(self, tmp_path):
         from store import DuckDBMemoryStore
-
-        store = DuckDBMemoryStore(
-            Path(__file__).resolve().parent / "_keeper_tmp.duckdb",
-            user_id="test_user", embedder=None,
+        s = DuckDBMemoryStore(
+            tmp_path / "keeper.duckdb", user_id="test_user", embedder=None,
         )
-        try:
-            emb = [1.0, 0.0, 0.0]
-            # OLD: Aug 1, 2026 — lexicographically LARGER ("2026-8-1..." > "2026-08-30...")
-            # NEW: Aug 30, 2026 — lexicographically SMALLER
-            old_record = MemoryRecord(
-                memory_id="old",
-                category="cat",
-                content="Duplicate content for keeper sort test here",
-                created_at="2026-8-1T00:00:00+00:00",
-                embedding=emb,
-                confidence=0.5,
-                user_scope="test_user",
-            )
-            new_record = MemoryRecord(
-                memory_id="new",
-                category="cat",
-                content="Duplicate content for keeper sort test here",
-                created_at="2026-08-30T00:00:00+00:00",
-                embedding=emb,
-                confidence=0.5,
-                user_scope="test_user",
-            )
+        yield s
+        s.close()
 
-            candidates = []
+    def _detect(self, store, records):
+        candidates = []
 
-            def add_candidate(record, reason, keeper_id, **kw):
-                candidates.append((record.memory_id, keeper_id))
+        def add_candidate(record, reason, keeper_id, **kw):
+            candidates.append((record.memory_id, keeper_id))
 
-            store._detect_semantic_duplicates(
-                [old_record, new_record],
-                min_similarity=0.99, max_pairs=10,
-                add_candidate_fn=add_candidate,
-            )
+        store._detect_semantic_duplicates(
+            records, min_similarity=0.99, max_pairs=10,
+            add_candidate_fn=add_candidate,
+        )
+        return candidates
 
-            assert len(candidates) == 1, \
-                "exactly one record should be quarantined"
-            quarantined_id, keeper_id = candidates[0]
+    def test_keeper_is_chronologically_oldest_not_lexicographically(self, store):
+        """Two records, equal quality/length, both with VALID ISO created_at
+        but different offsets. Lexicographic order picks the wrong keeper;
+        parsed (UTC-normalised) order picks the chronologically oldest."""
+        from store_common import MemoryRecord
 
-            # The keeper must be the chronologically-oldest record ("old").
-            # Lexicographic order would have made "new" the keeper (because
-            # "2026-08-30..." < "2026-8-1..." as raw strings).
-            assert keeper_id == "old", \
-                f"keeper must be chronologically oldest ('old'), got '{keeper_id}'"
-            assert quarantined_id == "new", \
-                f"quarantined must be chronologically newest ('new'), got '{quarantined_id}'"
-        finally:
-            store.close()
-            p = Path(__file__).resolve().parent / "_keeper_tmp.duckdb"
-            if p.exists():
-                p.unlink()
-            for suffix in (".wal",):
-                side = p.with_suffix(suffix)
-                if side.exists():
-                    side.unlink()
+        emb = [1.0, 0.0, 0.0]
+        # old_record: +05:00 wall-clock Aug 30 = Aug 29 19:00 UTC (OLDER).
+        # Lexicographically LARGER ("...+05:00" > "...+00:00").
+        old_record = MemoryRecord(
+            memory_id="old",
+            category="cat",
+            content="Duplicate content for keeper sort test here",
+            created_at="2026-08-30T00:00:00+05:00",
+            embedding=emb,
+            confidence=0.5,
+            user_scope="test_user",
+        )
+        # new_record: +00:00 Aug 30 = Aug 30 00:00 UTC (NEWER).
+        # Lexicographically SMALLER ("...+00:00" < "...+05:00").
+        new_record = MemoryRecord(
+            memory_id="new",
+            category="cat",
+            content="Duplicate content for keeper sort test here",
+            created_at="2026-08-30T00:00:00+00:00",
+            embedding=emb,
+            confidence=0.5,
+            user_scope="test_user",
+        )
+
+        candidates = self._detect(store, [old_record, new_record])
+
+        assert len(candidates) == 1, \
+            "exactly one record should be quarantined"
+        quarantined_id, keeper_id = candidates[0]
+
+        # Keeper = chronologically-oldest ("old", Aug 29 19:00 UTC).
+        # Lexicographic order would have made "new" the keeper.
+        assert keeper_id == "old", \
+            f"keeper must be chronologically oldest ('old'), got '{keeper_id}'"
+        assert quarantined_id == "new", \
+            f"quarantined must be chronologically newest ('new'), got '{quarantined_id}'"
+
+    def test_unparseable_timestamp_does_not_crash(self, store):
+        """An unparseable created_at must not crash the keeper sort — it
+        falls back to epoch 0 (oldest) exactly like the old ``or ""``."""
+        from store_common import MemoryRecord
+
+        emb = [1.0, 0.0, 0.0]
+        unparseable = MemoryRecord(
+            memory_id="unparseable",
+            category="cat",
+            content="Duplicate content for keeper sort fallback here",
+            created_at="not-a-date",
+            embedding=emb,
+            confidence=0.5,
+            user_scope="test_user",
+        )
+        dated = MemoryRecord(
+            memory_id="dated",
+            category="cat",
+            content="Duplicate content for keeper sort fallback here",
+            created_at="2026-08-30T00:00:00+00:00",
+            embedding=emb,
+            confidence=0.5,
+            user_scope="test_user",
+        )
+
+        candidates = self._detect(store, [unparseable, dated])
+
+        assert len(candidates) == 1, \
+            "exactly one record should be quarantined"
+        # Deterministic selection: the unparseable record sorts as epoch 0
+        # (oldest) and is preferred as keeper, mirroring the old ``or ""``.
+        assert candidates[0][1] == "unparseable"
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +394,12 @@ class TestFlagAcceptsOn:
         m = self._mod()
         assert m._flag({"key": "ON"}, "key") is True
         assert m._flag({"key": "On"}, "key") is True
+
+    def test_surrounding_whitespace_tolerated(self):
+        """Matches egress._flag, which strips before comparing."""
+        m = self._mod()
+        assert m._flag({"key": " on "}, "key") is True
+        assert m._flag({"key": " true "}, "key") is True
 
     def test_off_still_false(self):
         m = self._mod()

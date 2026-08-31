@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 26 test modules in `argos_plugin/tests/` (gate 21, egress, adversarial chains, contradiction matrix, shared-service RPC). |
+| Test suite | ✓ | 48 test modules in `argos_plugin/tests/` (877 tests; full suite green 2026-08-30 via `pytest tests/ -q -n 4`). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -126,3 +126,6 @@ committed, re-runnable artifact:
   fires and chain-unfold has nothing to walk). The UOCS gain is the answerer's timestamp
   reasoning over the chronologically rendered list, not store update-arithmetic — the #8
   store-level intent remains unproven. Filed as #74.
+- **2026-08-30 (sync)** — §2 test-suite row refreshed: was "26 test modules" (27/8); now
+  48 modules / 877 tests, re-verified green on the refactor working tree (12:17, 0 failures).
+  The README Verification section cites the same counts.

@@ -6,6 +6,7 @@ neutral: no renames, no fixes). Consts are imported from provider_core.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from typing import Any, Dict, List
 
@@ -29,10 +30,6 @@ except ImportError:  # provider_retrieval.py imported as a top-level module
         _freshness_marker_for,
         _neutralize_markup,
     )
-try:
-    from .confirmation import build_confirmation_block
-except ImportError:  # provider_retrieval.py imported as a top-level module
-    from confirmation import build_confirmation_block
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +99,6 @@ class ProviderRetrievalMixin:
     @classmethod
     def _is_referential_query(cls, query: str) -> bool:
         """Check if a query contains pronouns/references that need context."""
-        import re
         query_lower = query.lower().strip()
         # Short queries with referential language are the strongest signal.
         # Long queries usually have enough keywords on their own.
@@ -271,7 +267,6 @@ class ProviderRetrievalMixin:
 
     def _change_intent_match(self, query: str) -> bool:
         """True if the query signals change-intent (arc-relevant)."""
-        import re
         q = query.lower()
         return any(re.search(p, q) for p in self._CHANGE_INTENT_PATTERNS)
 
@@ -777,7 +772,6 @@ class ProviderRetrievalMixin:
                     return
             except Exception:
                 pass  # gate failure must never break prefetch
-        store = self._store
         max_items = self._max_injected
 
         with self._prefetch_lock:
@@ -792,12 +786,14 @@ class ProviderRetrievalMixin:
             sections = []
             body = ""
             try:
-                confirmation_candidates = store.list_candidates(
-                    status="pending_user_confirmation", limit=1
-                )
-                confirmation = build_confirmation_block(confirmation_candidates)
-                if confirmation:
-                    sections.append(confirmation)
+                # Confirmation injection removed (#99): the prefetch path no
+                # longer prepends an arbitrary pending_user_confirmation
+                # candidate to every turn. Confirmations are surfaced only
+                # through the explicit memory_candidate_review tool or a
+                # dedicated confirmation surface, so an unrelated pending
+                # candidate cannot interrupt ordinary turns indefinitely.
+                # build_confirmation_block remains available for any future
+                # explicit confirmation surface.
 
                 # History-at-current-time (#3): on historical queries
                 # ("where did I use to live"), widen retrieval to closed

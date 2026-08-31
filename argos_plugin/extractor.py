@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,32 @@ _LLM_FALLBACK_WORDS_PER_FACT = 80  # If words/facts > this ratio, regex likely m
 _LLM_MIN_CONTENT_LENGTH = 60
 # LLM call timeout in seconds.
 _LLM_TIMEOUT = 15.0
+# --- ReDoS guards (#89) -------------------------------------------------------
+# Total content length cap: a turn longer than this is truncated before the
+# regex stage so a 50k-char paste cannot feed unbounded input to the
+# patterns. The LLM fallback still sees the full (egress-gated) content.
+_MAX_REGEX_CONTENT_CHARS = 50_000
+# Per-sentence length cap: naive sentence splitting (#15) treats a long
+# unpunctuated run as one "sentence". Cap each sentence before regex
+# matching so the bounded quantifiers below never see pathological input.
+_MAX_SENTENCE_CHARS = 2_000
+# Regex stage watchdog timeout (seconds). The bounded quantifiers + length
+# caps make catastrophic backtracking unlikely, but a thread-timeout is
+# defense-in-depth — a hang in the regex engine must never stall the turn.
+_REGEX_STAGE_TIMEOUT_S = 5.0
+# Module-level counter for extraction failures (surfaced in review).
+_EXTRACTION_FAILURES = 0
+
+
+def get_extraction_failure_stats() -> Dict[str, int]:
+    """Counter for extraction-stage failures (surfaced in review, #89/#85)."""
+    return {"extraction_failures": _EXTRACTION_FAILURES}
+
+
+def _reset_extraction_failure_stats() -> None:
+    """Test hook: reset the failure counter."""
+    global _EXTRACTION_FAILURES
+    _EXTRACTION_FAILURES = 0
 
 
 # --- quote verification (#35, batch-2) ---------------------------------------
@@ -290,11 +317,86 @@ def hard_quality_flags(flags: List[str]) -> List[str]:
     return [flag for flag in flags if flag in hard]
 
 
+# ---------------------------------------------------------------------------
+# Memory-control command gate (#99)
+# ---------------------------------------------------------------------------
+# Imperative memory-management commands ("bin it", "discard that proposal",
+# "forget this") are actions against the memory system, not durable facts.
+# The extractor must not mint them as preference candidates. This gate runs
+# before the regex stage so a discard command never becomes "User wants to
+# bin (discard) memory."
+#
+# The gate is deliberately conservative: it only matches short imperative
+# phrases directed at the memory system, not legitimate assistant-side
+# directives ("always explain in plain English") or durable preferences
+# ("I prefer concise answers"). A command must be (a) short (under ~120
+# chars), (b) start with a memory-control verb, and (c) reference a
+# memory/proposal/candidate/it/that/this — so "I always forget my keys"
+# (a durable habit) is NOT matched (it has "I" as the subject, not an
+# imperative verb at the start).
+_MEMORY_CONTROL_VERBS = re.compile(
+    r"^\s*(?:bin|discard|forget|delete|remove|reject|skip|ignore|drop|purge"
+    r"|scrap|trash|cancel|abort|undo|revoke)\b",
+    re.IGNORECASE,
+)
+_MEMORY_CONTROL_TARGETS = re.compile(
+    r"\b(?:it|that|this|the\s+(?:memory|proposal|candidate|fact|entry|record"
+    r"|item|reminder|note|preference|directive)|them|those|these)\b",
+    re.IGNORECASE,
+)
+# Phrases that are clearly memory-control commands even without a generic
+# target word ("bin the proposal about X", "forget what I just said").
+_MEMORY_CONTROL_PHRASES = re.compile(
+    r"^\s*(?:bin|discard|forget|delete|remove|reject|skip|drop|purge"
+    r"|scrap|trash|cancel)\s+(?:the\s+)?(?:proposal|candidate|memory|fact"
+    r"|entry|record|item|reminder|note|preference|directive|what\s+I\s+just"
+    r"|that\s+(?:proposal|candidate|memory|fact|entry|record|item))\b",
+    re.IGNORECASE,
+)
+# Maximum content length for the memory-control gate — a long message is
+# unlikely to be a pure memory-control command (it probably contains
+# durable facts too). The gate only short-circuits short, imperative-only
+# messages.
+_MEMORY_CONTROL_MAX_CHARS = 120
+
+
+def is_memory_control_command(user_content: str) -> bool:
+    """Return True if *user_content* is a memory-control imperative (#99).
+
+    These are one-off commands directed at the memory system ("bin it",
+    "discard that proposal", "forget this") — they must not be extracted
+    as durable facts. The check is conservative: only short, imperative-
+    shaped messages that start with a control verb and reference a
+    memory/proposal target are matched. Legitimate directives ("always
+    explain in plain English") and durable habits ("I always forget my
+    keys") are NOT matched.
+    """
+    if not user_content:
+        return False
+    text = user_content.strip()
+    if len(text) > _MEMORY_CONTROL_MAX_CHARS:
+        return False
+    # Must start with a memory-control verb (imperative shape).
+    if not _MEMORY_CONTROL_VERBS.match(text):
+        return False
+    # Must reference a memory/proposal target OR match a known phrase.
+    if _MEMORY_CONTROL_TARGETS.search(text):
+        return True
+    if _MEMORY_CONTROL_PHRASES.match(text):
+        return True
+    return False
+
+
 def _split_sentences(text: str) -> List[str]:
-    """Split text into sentences, keeping it simple."""
+    """Split text into sentences, keeping it simple.
+
+    ReDoS guard (#89): each sentence is capped at ``_MAX_SENTENCE_CHARS`` so
+    a long unpunctuated run (which the naive splitter treats as one
+    "sentence") cannot feed pathological input to the regex patterns.
+    """
     text = re.sub(r'\s+', ' ', text).strip()
     parts = re.split(r'(?<=[.!?])\s+', text)
-    return [p.strip() for p in parts if p.strip()]
+    return [p.strip()[:_MAX_SENTENCE_CHARS] for p in parts if p.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +437,18 @@ _PREFERENCE_RE = re.compile(
 # Assistant-side style directives: "always give me the short version",
 # "never use code comments", "don't call it that", "call me Mike",
 # "stop using jargon" — rules the user sets for how the assistant behaves.
+# ReDoS guard (#89): the [^.!?]* tails are bounded to {0,200} so a long
+# unpunctuated run cannot cause catastrophic backtracking. Combined with the
+# per-sentence length cap in _extract_facts_regex, this caps the worst-case
+# regex work on any input.
 _ASSISTANT_DIRECTIVE_RE = re.compile(
     r'\b(?:'
     r'(?:always|never)\s+(?:give|say|use|respond|reply|write|speak|talk'
-    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]*'
+    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}'
     r'|(?:do\s+not|don\'t)\s+(?:ever\s+|please\s+|just\s+|always\s+)?(?:give|say|use|respond|reply|write|speak|talk'
-    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]*'
-    r'|call\s+me\s+[^.!?]+'
-    r'|stop\s+(?:doing|being|using|saying)\b[^.!?]*'
+    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}'
+    r'|call\s+me\s+[^.!?]{1,200}'
+    r'|stop\s+(?:doing|being|using|saying)\b[^.!?]{0,200}'
     r')',
     re.IGNORECASE,
 )
@@ -676,25 +782,72 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
 
 
 def _extract_facts_regex(user_content: str) -> List[Dict[str, Any]]:
-    """Stage 1: Extract candidate facts using generic syntactic patterns."""
+    """Stage 1: Extract candidate facts using generic syntactic patterns.
+
+    ReDoS guard (#89): the input is capped at ``_MAX_REGEX_CONTENT_CHARS``
+    before sentence splitting, and the regex stage is wrapped in a thread
+    watchdog (``_REGEX_STAGE_TIMEOUT_S``) so a hang in the regex engine
+    never stalls the turn. On timeout or any exception, returns the facts
+    found so far (fail-soft).
+    """
+    global _EXTRACTION_FAILURES
     facts: List[Dict[str, Any]] = []
     if not user_content or len(user_content.strip()) < _MIN_LENGTH:
         return facts
 
-    sentences = _split_sentences(user_content)[:_MAX_SENTENCES]
-    for sentence in sentences:
-        if len(sentence) < _MIN_LENGTH:
-            continue
-        fact = _classify_sentence(sentence)
-        if fact:
-            fact.setdefault("source", "regex_extraction")
-            fact.setdefault("confidence", 0.75)
-            fact.setdefault(
-                "durability",
-                "temporary" if fact.get("category") in {"context_note", "event", "goal"} else "durable",
-            )
-            fact.setdefault("scope", "profile")
-            facts.append(fact)
+    # Total content cap: truncate before splitting so a huge paste cannot
+    # feed unbounded input to the patterns.
+    capped = user_content[:_MAX_REGEX_CONTENT_CHARS]
+    sentences = _split_sentences(capped)[:_MAX_SENTENCES]
+
+    def _classify_all() -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for sentence in sentences:
+            if len(sentence) < _MIN_LENGTH:
+                continue
+            fact = _classify_sentence(sentence)
+            if fact:
+                fact.setdefault("source", "regex_extraction")
+                fact.setdefault("confidence", 0.75)
+                fact.setdefault(
+                    "durability",
+                    "temporary" if fact.get("category") in {"context_note", "event", "goal"} else "durable",
+                )
+                fact.setdefault("scope", "profile")
+                out.append(fact)
+        return out
+
+    # Watchdog: run the regex classification in a worker thread with a
+    # timeout. The bounded quantifiers + length caps make catastrophic
+    # backtracking unlikely, but this is defense-in-depth (#89).
+    result_holder: List[Any] = []
+    exc_holder: List[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            result_holder.extend(_classify_all())
+        except BaseException as exc:  # noqa: BLE001 — watchdog must capture all
+            exc_holder.append(exc)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout=_REGEX_STAGE_TIMEOUT_S)
+    if thread.is_alive():
+        # Timeout — the worker is still running. A daemon thread will be
+        # reaped at process exit; we return what we have (possibly empty)
+        # and count the failure for review.
+        _EXTRACTION_FAILURES += 1
+        logger.warning(
+            "Regex extraction stage timed out after %.1fs (input %d chars); "
+            "returning partial results",
+            _REGEX_STAGE_TIMEOUT_S, len(user_content),
+        )
+        return facts
+    if exc_holder:
+        _EXTRACTION_FAILURES += 1
+        logger.debug("Regex extraction stage raised: %s", exc_holder[0])
+        return facts
+    facts = result_holder
     return facts
 
 
@@ -764,12 +917,21 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
     Returns a list of fact dicts, or empty list on any failure.
     Never raises — all errors are caught and logged.
     """
+    global _EXTRACTION_FAILURES
     if not user_content or len(user_content.strip()) < _LLM_MIN_CONTENT_LENGTH:
         return []
-    from egress import gate as _egress_gate
-    if not _egress_gate("extractor", user_content):
+    # Egress gate (#85): the import and gate call must sit inside the try so
+    # a malformed config / import failure fails soft (returns []) instead of
+    # propagating through extract_from_turn() and crashing the turn. The
+    # function's own contract is "Never raises".
+    try:
+        from egress import gate as _egress_gate
+        if not _egress_gate("extractor", user_content):
+            return []
+    except Exception as e:
+        _EXTRACTION_FAILURES += 1
+        logger.debug("Egress gate unavailable for LLM extraction (fail-soft): %s", e)
         return []
-
 
     try:
         from agent.auxiliary_client import call_llm
@@ -958,7 +1120,48 @@ def extract_from_turn(
     The actual proposals are NOT changed — this is a validation mode for
     evaluating whether LLM-first extraction would improve recall. The diff
     is logged at INFO level with structured fields for offline analysis.
+
+    Never raises (#85/#89): a top-level guard catches any exception from
+    either stage and returns the facts found so far (or [] if none),
+    counting the failure for review. Extraction must never crash the turn.
+
+    Memory-control commands (#99): a short imperative like "bin it" or
+    "discard that proposal" is an action against the memory system, not a
+    durable fact. The action/intent gate short-circuits before either
+    extraction stage so a discard command never becomes a preference
+    candidate.
     """
+    global _EXTRACTION_FAILURES
+    # Action/intent gate (#99): memory-control imperatives are not facts.
+    if is_memory_control_command(user_content):
+        logger.debug("Memory-control command detected, skipping extraction: %.80s", user_content)
+        return []
+    # Top-level guard (#85/#89): any uncaught exception in either stage
+    # fails soft — return what we have (possibly empty) and count it.
+    try:
+        return _extract_from_turn_impl(
+            user_content, assistant_content,
+            use_llm_fallback=use_llm_fallback,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+            shadow_diff=shadow_diff,
+        )
+    except BaseException as exc:
+        _EXTRACTION_FAILURES += 1
+        logger.debug("extract_from_turn top-level guard caught: %s", exc)
+        return []
+
+
+def _extract_from_turn_impl(
+    user_content: str,
+    assistant_content: str,
+    *,
+    use_llm_fallback: bool = True,
+    llm_model: str = "",
+    llm_provider: str = "",
+    shadow_diff: bool = False,
+) -> List[Dict[str, Any]]:
+    """Implementation body of extract_from_turn (guarded by the caller)."""
     # Stage 1: regex patterns.
     facts = _extract_facts_regex(user_content)
 

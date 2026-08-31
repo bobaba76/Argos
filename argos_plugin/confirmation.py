@@ -4,10 +4,45 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
+# Review-model values that indicate a *reviewer failure* (the reviewer could
+# not reach a decision) rather than a genuine confirmation need. These
+# candidates should NOT be rendered as "should this be saved?" prompts —
+# they belong in a separate review/quarantine queue with machine-readable
+# reason codes (#99).
+_REVIEWER_FAILURE_MODELS = frozenset({
+    "reviewer_unavailable",
+    "egress_gate_unavailable",
+    "evidence_gate",
+    "reviewer_unavailable",
+})
+
+
+def is_genuine_confirmation(candidate: dict[str, Any]) -> bool:
+    """Return True if a pending_user_confirmation candidate is a genuine
+    confirmation need (sensitive/ambiguous/external), not a reviewer failure
+    or low-quality outcome (#99).
+
+    Candidates whose ``review_model`` indicates the reviewer could not
+    reach a decision (LLM unavailable, egress failure, no evidence) are
+    NOT genuine confirmations — they are reviewer failures that belong in
+    a separate review queue, not a user-facing "should this be saved?" prompt.
+    """
+    review_model = str(candidate.get("review_model", "")).strip()
+    if review_model in _REVIEWER_FAILURE_MODELS:
+        return False
+    return True
+
 
 def build_confirmation_block(candidates: Iterable[dict[str, Any]]) -> str:
-    """Build one bounded, data-labelled confirmation request for the model."""
-    candidates = list(candidates)
+    """Build one bounded, data-labelled confirmation request for the model.
+
+    Only genuine confirmation candidates are rendered (#99): reviewer-failure
+    outcomes (LLM unavailable, egress failure, no evidence) are skipped so
+    they are not reframed as "should this be saved?".
+    """
+    candidates = [
+        c for c in candidates if is_genuine_confirmation(c)
+    ]
     if not candidates:
         return ""
     candidate = candidates[0]

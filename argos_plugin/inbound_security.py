@@ -138,11 +138,15 @@ def _normalize_for_scan(text: str) -> str:
     normalization layer addresses the character-level evasion class
     without adding LLM-based detection:
 
-    1. Strip zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
+    1. Decode HTML entities (&#x69; = 'i', &lt; = '<') — a common
+       obfuscation technique that hides patterns from regex. This runs
+       FIRST so that entity-encoded zero-width characters (e.g.
+       ``&#8203;``, ``&#x200b;``, ``&ZeroWidthSpace;``) are decoded
+       before the zero-width strip in step 2 (#75).
+    2. Strip zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
        — attackers insert these between keywords to break regex matches
-       while keeping the text visually identical.
-    2. Decode HTML entities (&#x69; = 'i', &lt; = '<') — a common
-       obfuscation technique that hides patterns from regex.
+       while keeping the text visually identical. Running AFTER
+       html.unescape catches entity-encoded zero-width chars (#75).
     3. Normalize homoglyphs via NFKD decomposition — converts lookalike
        Unicode characters to their ASCII equivalents (e.g. Cyrillic 'а'
        to Latin 'a') so patterns match regardless of the input script.
@@ -155,10 +159,12 @@ def _normalize_for_scan(text: str) -> str:
     """
     if not text:
         return ""
-    # 1. Strip zero-width characters.
-    result = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", text)
-    # 2. Decode HTML entities (handles named, decimal, and hex).
-    result = html.unescape(result)
+    # 1. Decode HTML entities (handles named, decimal, and hex).
+    # Must run before zero-width strip so entity-encoded zero-width
+    # chars (&#8203; &#x200b; &ZeroWidthSpace;) are caught (#75).
+    result = html.unescape(text)
+    # 2. Strip zero-width characters (now catches entity-decoded ones).
+    result = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", result)
     # 3. NFKD normalization: decompose homoglyphs to ASCII equivalents.
     result = unicodedata.normalize("NFKD", result)
     # 4. Collapse whitespace (but preserve structure for snippet extraction).

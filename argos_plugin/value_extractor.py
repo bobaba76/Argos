@@ -181,9 +181,11 @@ def values_conflict(
 ) -> Optional[tuple[ExtractedValue, ExtractedValue]]:
     """Check if any new value conflicts with an old value for the same subject.
 
-    A conflict means: same subject (token-overlap >= threshold) AND different
-    value.  Same subject + same value = idempotent (no conflict).  Different
-    subject + same value = no conflict.
+    A conflict means: same subject (token-overlap >= threshold), same unit
+    (normalised), AND different value.  Same subject + same value + same
+    unit = idempotent (no conflict).  Different unit = incomparable
+    quantities ("3.5 percent" vs "3.5 years") — never a supersession
+    candidate.  Different subject = no conflict.
 
     Returns the first conflicting (new, old) pair, or None if no conflict.
     """
@@ -191,16 +193,17 @@ def values_conflict(
         for old_v in old_values:
             if not subject_overlap(new_v.subject, old_v.subject, subject_threshold):
                 continue
-            # Idempotent only when BOTH value and unit match — "3.5 percent"
-            # vs "3.5 years" on the same subject is a real conflict, not a
-            # restatement. Units are normalised (stripped + lower-cased) so
-            # "Percent" / "percent" / None don't masquerade as a conflict.
-            if new_v.value == old_v.value and (
-                (new_v.unit or "").strip().lower()
-                == (old_v.unit or "").strip().lower()
-            ):
+            # Units are normalised (stripped + lower-cased) so "Percent" /
+            # "percent" / None don't masquerade as a unit change.
+            new_unit = (new_v.unit or "").strip().lower()
+            old_unit = (old_v.unit or "").strip().lower()
+            if new_unit != old_unit:
+                # Different dimensions are incomparable quantities — not a
+                # supersession candidate (false-supersession class, #91).
+                continue
+            if new_v.value == old_v.value:
                 continue  # same value + unit — idempotent
-            # Same subject, different value (or same value, different unit) — conflict
+            # Same subject, same unit, different value — conflict
             return (new_v, old_v)
     return None
 

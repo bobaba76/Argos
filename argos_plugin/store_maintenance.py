@@ -53,13 +53,13 @@ class StoreMaintenanceMixin:
             assert self.connection is not None
             if canonical_entity:
                 canonical = canonical_entity.strip().lower()
-                result = self.connection.execute(
+                self.connection.execute(
                     """DELETE FROM entity_aliases
                        WHERE alias = ? AND canonical_entity = ? AND user_scope = ?""",
                     [alias, canonical, self.user_id],
                 )
             else:
-                result = self.connection.execute(
+                self.connection.execute(
                     """DELETE FROM entity_aliases
                        WHERE alias = ? AND user_scope = ?""",
                     [alias, self.user_id],
@@ -388,7 +388,10 @@ class StoreMaintenanceMixin:
                     "of %d records (%d pairs)",
                     max_pairs, len(group_records), group_pairs,
                 )
-                break
+                # Skip THIS group but keep scanning the rest — `break` would
+                # exit the whole groups loop so later categories are never
+                # checked even when they're small enough to fit the budget.
+                continue
             # Build the embedding matrix for this group.
             try:
                 emb_dim = len(group_records[0].embedding)
@@ -440,12 +443,17 @@ class StoreMaintenanceMixin:
             for root, members in clusters.items():
                 if len(members) < 2:
                     continue
-                # Sort by quality score descending, then recency, then content length.
+                # Sort by quality score descending, then recency (parsed
+                # timestamp — raw-string lexicographic order mis-orders
+                # mixed ISO forms like "2026-8-1T..." vs "2026-08-30T..."),
+                # then content length. Unparseable timestamps sort as
+                # epoch 0 (oldest) so they never win the recency tiebreak.
                 member_records = [group_records[i] for i in members]
                 member_records.sort(
                     key=lambda r: (
                         -self._memory_quality_score(r),
-                        r.created_at or "",
+                        self._parse_timestamp(r.created_at)
+                        or datetime.fromtimestamp(0, tz=timezone.utc),
                         -len(r.content or ""),
                     ),
                 )

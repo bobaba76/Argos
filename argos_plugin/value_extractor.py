@@ -191,9 +191,16 @@ def values_conflict(
         for old_v in old_values:
             if not subject_overlap(new_v.subject, old_v.subject, subject_threshold):
                 continue
-            if new_v.value == old_v.value:
-                continue  # same value — idempotent
-            # Same subject, different value — conflict
+            # Idempotent only when BOTH value and unit match — "3.5 percent"
+            # vs "3.5 years" on the same subject is a real conflict, not a
+            # restatement. Units are normalised (stripped + lower-cased) so
+            # "Percent" / "percent" / None don't masquerade as a conflict.
+            if new_v.value == old_v.value and (
+                (new_v.unit or "").strip().lower()
+                == (old_v.unit or "").strip().lower()
+            ):
+                continue  # same value + unit — idempotent
+            # Same subject, different value (or same value, different unit) — conflict
             return (new_v, old_v)
     return None
 

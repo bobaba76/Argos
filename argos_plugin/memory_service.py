@@ -44,7 +44,10 @@ def _load_config(home: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else {}
-    except Exception:
+    except Exception as exc:
+        # Log + return defaults — a malformed config must not be silently
+        # ignored (matches provider_core._load_config's behaviour).
+        logger.warning("malformed config %s: %s", path, exc)
         return {}
 
 

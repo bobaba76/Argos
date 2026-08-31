@@ -261,8 +261,11 @@ def _load_config(hermes_home: str | None = None) -> dict:
             file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
             config.update({k: v for k, v in file_cfg.items()
                            if v is not None and v != ""})
-        except Exception:
-            pass
+        except Exception as exc:
+            # Log + fall through to defaults — a trailing comma or typo in
+            # the user's config must not be silently swallowed (the old
+            # `except: pass` made hybrid_memory.json a no-op with no signal).
+            logger.warning("malformed config %s: %s", config_path, exc)
     # Cache the result for the hot path (issue #29).
     if hermes_home is None:
         _store_config_cache(config)
@@ -272,12 +275,14 @@ def _load_config(hermes_home: str | None = None) -> dict:
 def _flag(cfg: dict, key: str, default: str = "false") -> bool:
     """Parse a string/bool config flag the way initialize() expects.
 
-    Accepts "true"/"1"/"yes" (case-insensitive) or a real bool; anything
-    else is False. Extracted so the temporal-lever flags are unit-testable
-    without constructing a full provider.
+    Accepts "true"/"1"/"yes"/"on" (case-insensitive) or a real bool;
+    anything else is False. The "on" spelling matches egress._flag so
+    env-style toggles (e.g. chronological_injection="on") behave
+    identically across the two parsers. Extracted so the temporal-lever
+    flags are unit-testable without constructing a full provider.
     """
     v = cfg.get(key, default)
-    return v.lower() in ("true", "1", "yes") if isinstance(v, str) else bool(v)
+    return v.lower() in ("true", "1", "yes", "on") if isinstance(v, str) else bool(v)
 
 
 # Module-level user_id for module-level helpers (_get_insight_store, etc.)
@@ -590,20 +595,14 @@ class ProviderCoreMixin:
         # Freshness markers (Tier-2 anti-staleness, default ON): append an
         # as-of marker to injected memories whose content carries a date
         # anchor. Append-only text; ranking and retrieval untouched.
-        fgate = self._config.get("freshness_markers", "true")
-        self._freshness_markers = (
-            fgate.lower() in ("true", "1", "yes") if isinstance(fgate, str) else bool(fgate)
-        )
+        self._freshness_markers = _flag(self._config, "freshness_markers", "true")
 
         # Injection gates (default OFF — benchmark parity; enable per config):
         # skip_retrieval_on_trivial: no heavy retrieval when the turn is a
         # low-information fragment ("test", "hi", "ok"). Explicit memory_search
         # tool calls never pass through this path and stay unaffected.
         # injection_min_score: drop injected items with similarity below floor.
-        tgate = self._config.get("skip_retrieval_on_trivial", "false")
-        self._skip_retrieval_on_trivial = (
-            tgate.lower() in ("true", "1", "yes") if isinstance(tgate, str) else bool(tgate)
-        )
+        self._skip_retrieval_on_trivial = _flag(self._config, "skip_retrieval_on_trivial", "false")
         try:
             self._injection_min_score = float(
                 self._config.get("injection_min_score", _DEFAULT_INJECTION_MIN_SCORE)
@@ -611,37 +610,17 @@ class ProviderCoreMixin:
         except (ValueError, TypeError):
             self._injection_min_score = _DEFAULT_INJECTION_MIN_SCORE
 
-        chrono = self._config.get("chronological_injection", "false")
         self._chronological_injection = _flag(self._config, "chronological_injection", "false")
 
-        da = self._config.get("date_anchor_rerank", "false")
         self._date_anchor_rerank = _flag(self._config, "date_anchor_rerank", "false")
 
-        hist = self._config.get("history_at_current_time", "true")
-        self._history_at_current_time = (
-            hist.lower() in ("true", "1", "yes")
-            if isinstance(hist, str) else bool(hist)
-        )
+        self._history_at_current_time = _flag(self._config, "history_at_current_time", "true")
 
-        auto = self._config.get("auto_extract", "true")
-        self._auto_extract = (
-            auto.lower() in ("true", "1", "yes") if isinstance(auto, str) else bool(auto)
-        )
+        self._auto_extract = _flag(self._config, "auto_extract", "true")
 
-        llm_fb = self._config.get("llm_fallback", "true")
-        self._llm_fallback = (
-            llm_fb.lower() in ("true", "1", "yes") if isinstance(llm_fb, str) else bool(llm_fb)
-        )
-        shadow_diff = self._config.get("extraction_shadow_diff", "false")
-        self._extraction_shadow_diff = (
-            shadow_diff.lower() in ("true", "1", "yes")
-            if isinstance(shadow_diff, str) else bool(shadow_diff)
-        )
-        auto_review = self._config.get("auto_review", "true")
-        self._auto_review = (
-            auto_review.lower() in ("true", "1", "yes")
-            if isinstance(auto_review, str) else bool(auto_review)
-        )
+        self._llm_fallback = _flag(self._config, "llm_fallback", "true")
+        self._extraction_shadow_diff = _flag(self._config, "extraction_shadow_diff", "false")
+        self._auto_review = _flag(self._config, "auto_review", "true")
         # Extraction-time dedupe: proposals whose embedding cosine against an
         # active memory clears this threshold are skipped entirely (no
         # candidate emitted). 1.0 disables semantic dedupe.

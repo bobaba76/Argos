@@ -184,15 +184,28 @@ def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", pro
     # Egress gate (review point 6): refuse the call when local_only is on
     # or the payload carries PII identifiers — the candidate then waits for
     # explicit user confirmation instead of being sent to any LLM.
-    from egress import gate as _egress_gate
-    if not _egress_gate(
-        "reviewer", str(candidate.get("content") or "") + " " + evidence
-    ):
+    # The egress gate is a *gate* — its failure means "route to a human",
+    # not "crash" (#86). Wrap the import + call so any egress failure
+    # (missing module, malformed config) fails closed to
+    # pending_user_confirmation, consistent with every other failure mode
+    # in this function.
+    try:
+        from egress import gate as _egress_gate
+        if not _egress_gate(
+            "reviewer", str(candidate.get("content") or "") + " " + evidence
+        ):
+            return {
+                "decision": "pending_user_confirmation",
+                "confidence": 0.0,
+                "reason": "Egress gate blocked the review call (local_only or sensitive content); awaiting user confirmation.",
+                "review_model": "egress_gate",
+            }
+    except Exception as exc:
         return {
             "decision": "pending_user_confirmation",
             "confidence": 0.0,
-            "reason": "Egress gate blocked the review call (local_only or sensitive content); awaiting user confirmation.",
-            "review_model": "egress_gate",
+            "reason": f"Egress gate unavailable (fail-closed): {exc}",
+            "review_model": "egress_gate_unavailable",
         }
 
     # External-source gate (inbound security). Content tagged as coming from
@@ -341,9 +354,15 @@ Use reject for obvious non-memory text. Use quarantine for malformed or suspicio
     if sensitive and decision == "approve":
         decision = "pending_user_confirmation"
         reason = "Sensitive proposal requires user confirmation. " + reason
-    if confidence < 0.85 and decision in {"approve", "reject", "quarantine"}:
+    # Low-confidence threshold (#99): only an *approve* below 0.85 is
+    # downgraded to pending_user_confirmation — a low-confidence reject or
+    # quarantine is the safe default (it does not create a memory) and must
+    # NOT be reframed as "should this be saved?". Converting a reject to a
+    # confirmation prompt forces the user to adjudicate a reviewer failure,
+    # which is the exact behaviour #99 calls out.
+    if confidence < 0.85 and decision == "approve":
         decision = "pending_user_confirmation"
-        reason = "Reviewer confidence is below the automatic decision threshold. " + reason
+        reason = "Reviewer confidence is below the automatic approval threshold. " + reason
 
     durability = str(parsed.get("durability", candidate.get("durability", "durable"))).lower()
     if durability not in {"permanent", "durable", "temporary"}:

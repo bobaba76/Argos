@@ -1022,9 +1022,6 @@ def _log_shadow_diff(
     regex_contents = {f.get("content", "").lower() for f in regex_facts}
     llm_contents = {f.get("content", "").lower() for f in llm_facts}
 
-    llm_only = [f for f in llm_facts if f.get("content", "").lower() not in regex_contents]
-    regex_only = [f for f in regex_facts if f.get("content", "").lower() not in llm_contents]
-
     # Use near-duplicate matching for more accurate diff
     llm_only_real: List[Dict[str, Any]] = []
     for lf in llm_facts:

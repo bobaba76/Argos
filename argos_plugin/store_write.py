@@ -2099,17 +2099,19 @@ class StoreWriteMixin:
         h = self._tombstone_hash(content)
         with self._lock:
             assert self.connection is not None
-            self.connection.execute(
+            # RETURNING yields the deleted rows so we can distinguish a
+            # real purge from a no-op. DuckDB's cursor.rowcount is always
+            # -1 for DELETE, so we can't use the rowcount approach; the
+            # old code's follow-up COUNT(*) == 0 returned True even when
+            # nothing existed to purge (a no-op masquerading as success).
+            cursor = self.connection.execute(
                 """DELETE FROM deletion_tombstones
-                   WHERE content_hash = ? AND category = ? AND user_scope = ?""",
+                   WHERE content_hash = ? AND category = ? AND user_scope = ?
+                   RETURNING content_hash""",
                 [h, category, self.user_id],
             )
-            check = self.connection.execute(
-                """SELECT COUNT(*) FROM deletion_tombstones
-                   WHERE content_hash = ? AND category = ? AND user_scope = ?""",
-                [h, category, self.user_id],
-            ).fetchone()
-        return bool(check and check[0] == 0)
+            deleted = cursor.fetchone()
+        return deleted is not None
 
     def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Read-only census of deletion tombstones, newest first.

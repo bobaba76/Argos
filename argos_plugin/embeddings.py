@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,6 +29,15 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+
+# Retry-with-backoff for transient model-load failures (issue #83).
+# A previous version set a permanent ``_load_failed`` flag on the first
+# exception (CUDA init race, HF cache lock contention, transient OOM),
+# which degraded the process to text-only search forever — even after the
+# underlying cause cleared. We now retry after an exponentially growing
+# backoff window so a transient outage self-heals.
+_INITIAL_RETRY_DELAY = 5.0   # seconds before the first retry
+_MAX_RETRY_DELAY = 60.0      # cap so a permanently-broken model doesn't spin
 
 # Process-level shared model cache: {model_name: (model, dim)}
 _SHARED_MODELS: Dict[str, Tuple[object, int]] = {}
@@ -167,6 +177,12 @@ class LocalEmbedder:
         self._hermes_home = hermes_home
         self._loaded = False
         self._load_failed = False
+        self._load_failed_at: float = 0.0      # monotonic time of last failure
+        self._retry_delay: float = _INITIAL_RETRY_DELAY
+        # Flips True when a *previously failed* load succeeds (issue #83).
+        # Lets the store opportunistically backfill records that were
+        # written with NULL embeddings during the outage.
+        self.recovered: bool = False
         self._lock = threading.Lock()
         self._dim: Optional[int] = None
 
@@ -184,6 +200,20 @@ class LocalEmbedder:
         """True after a failed load attempt (degraded, not just pending)."""
         return self._load_failed
 
+    def reset_for_retry(self) -> None:
+        """Bypass the backoff window so the next ``embed()`` retries
+        immediately. Intended for tests and for callers that know the
+        underlying cause has cleared.
+
+        Does *not* clear ``_load_failed`` — ``_ensure_loaded`` needs to see
+        a prior failure to mark ``recovered`` on a successful retry. Only
+        the backoff timer is reset (to the epoch, which is always outside
+        any backoff window).
+        """
+        with self._lock:
+            self._load_failed_at = 0.0
+            self._retry_delay = _INITIAL_RETRY_DELAY
+
     @property
     def dimension(self) -> Optional[int]:
         shared = _SHARED_MODELS.get(self._model_name)
@@ -196,21 +226,45 @@ class LocalEmbedder:
 
         Uses a process-level shared cache so the model is only loaded once
         per process, regardless of how many LocalEmbedder instances exist.
+
+        A transient load failure (CUDA init race, HF cache lock contention,
+        transient OOM) is *not* permanent (issue #83): subsequent calls
+        retry after an exponentially growing backoff window. On recovery
+        ``self.recovered`` is set so callers (the store) can backfill
+        records that were written with NULL embeddings during the outage.
         """
-        if self._loaded or self._load_failed:
+        if self._loaded:
+            return
+        # Honor the backoff window before retrying a failed load.
+        if self._load_failed and (time.monotonic() - self._load_failed_at) < self._retry_delay:
             return
         with self._lock:
-            if self._loaded or self._load_failed:
+            if self._loaded:
                 return
+            if self._load_failed:
+                if (time.monotonic() - self._load_failed_at) < self._retry_delay:
+                    return
+                # Backoff window elapsed: clear the flag and retry.
+                was_failed = True
+                self._load_failed = False
+            else:
+                was_failed = False
             # Check if another instance already loaded it.
             with _SHARED_LOCK:
                 shared = _SHARED_MODELS.get(self._model_name)
                 if shared is not None:
                     self._dim = shared[1]
                     self._loaded = True
-                    logger.debug(
-                        "Embedding model reused from cache (dim=%d)", self._dim
-                    )
+                    if was_failed:
+                        self.recovered = True
+                        logger.info(
+                            "Embedding model recovered from cache after prior "
+                            "failure (dim=%d)", self._dim
+                        )
+                    else:
+                        logger.debug(
+                            "Embedding model reused from cache (dim=%d)", self._dim
+                        )
                     return
             try:
                 from sentence_transformers import SentenceTransformer
@@ -233,13 +287,22 @@ class LocalEmbedder:
                     _SHARED_MODELS[self._model_name] = (model, dim)
                 self._dim = dim
                 self._loaded = True
-                logger.info("Embedding model loaded (dim=%d)", self._dim)
+                if was_failed:
+                    self.recovered = True
+                    logger.info(
+                        "Embedding model recovered after prior failure (dim=%d)",
+                        self._dim,
+                    )
+                else:
+                    logger.info("Embedding model loaded (dim=%d)", self._dim)
             except Exception as e:
                 self._load_failed = True
+                self._load_failed_at = time.monotonic()
+                self._retry_delay = min(self._retry_delay * 2, _MAX_RETRY_DELAY)
                 logger.error(
                     "Embedding model '%s' unavailable — falling back to text search. "
-                    "Reason: %s",
-                    self._model_name, e,
+                    "Reason: %s (will retry in %.0fs)",
+                    self._model_name, e, self._retry_delay,
                 )
 
     def _prepare_text(self, text: str, is_query: bool) -> str:

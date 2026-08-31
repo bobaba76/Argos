@@ -134,7 +134,9 @@ class _Tenant:
                         self.graph.close()
 
 
-def _parse_tenants(config: dict, home: Path, embedder, reranker) -> dict:
+def _parse_tenants(
+    config: dict, home: Path, embedder, reranker,
+) -> tuple[dict, dict, bool]:
     """Build the tenant registry from ``hybrid_memory.json`` (#49).
 
     With a ``tenants`` map, each entry is a cell: its own database + graph
@@ -142,11 +144,26 @@ def _parse_tenants(config: dict, home: Path, embedder, reranker) -> dict:
     of the global config. Without ``tenants`` (the current single-tenant
     shape), the global config IS the ``default`` tenant — fully backward
     compatible.
+
+    Returns ``(tenants, user_tenant_map, strict_routing)``:
+
+    - ``tenants``: name -> _Tenant
+    - ``user_tenant_map``: user_id -> tenant name, built from optional
+      ``allowed_user_ids`` lists on each tenant entry (#87). A user_id may
+      appear in at most one tenant's allowlist; duplicates are a config
+      error.
+    - ``strict_routing``: True if any tenant declared ``allowed_user_ids``.
+      When True, dispatch rejects user_ids not in the map (defense-in-depth
+      against tenant spoofing by any local process that holds the endpoint
+      token). When False, the legacy fallback-to-default behavior is
+      preserved (backward compat) with a startup warning.
     """
     tenants_map = config.get("tenants")
     if not isinstance(tenants_map, dict) or not tenants_map:
         tenants_map = {"default": config}
     tenants: dict = {}
+    user_tenant_map: dict = {}
+    strict_routing = False
     for name, entry in tenants_map.items():
         entry = entry if isinstance(entry, dict) else {}
         overlay = entry.get("config") if isinstance(entry.get("config"), dict) else {}
@@ -166,7 +183,19 @@ def _parse_tenants(config: dict, home: Path, embedder, reranker) -> dict:
         tenants[name] = _Tenant(
             name, merged, home, embedder, reranker, default_scope=default_scope,
         )
-    return tenants
+        # Optional per-tenant user_id allowlist (#87).
+        allowed = entry.get("allowed_user_ids")
+        if isinstance(allowed, list):
+            for uid in allowed:
+                uid_s = str(uid)
+                if uid_s in user_tenant_map and user_tenant_map[uid_s] != name:
+                    raise ValueError(
+                        f"allowed_user_ids conflict: {uid_s!r} appears in both "
+                        f"tenant {user_tenant_map[uid_s]!r} and {name!r}"
+                    )
+                user_tenant_map[uid_s] = name
+            strict_routing = True
+    return tenants, user_tenant_map, strict_routing
 
 
 class MemoryService:
@@ -198,7 +227,26 @@ class MemoryService:
             except Exception as exc:
                 logger.warning("Reranker unavailable in shared service: %s", exc)
         # Tenant registry (#49): per-tenant stores/graphs behind one service.
-        self._tenants: dict = _parse_tenants(config, home, self.embedder, reranker)
+        # _parse_tenants also returns the user_id→tenant allowlist and
+        # strict-routing flag (#87).
+        (
+            self._tenants,
+            self._user_tenant_map,
+            self._strict_routing,
+        ) = _parse_tenants(config, home, self.embedder, reranker)
+        if self._strict_routing:
+            logger.info(
+                "Strict tenant routing enabled (#87): %d user_id(s) allowlisted "
+                "across %d tenant(s)",
+                len(self._user_tenant_map), len(self._tenants),
+            )
+        elif len(self._tenants) > 1:
+            logger.warning(
+                "Multi-tenant config without allowed_user_ids (#87): any local "
+                "process with the endpoint token can spoof any user_id and access "
+                "any tenant. Add 'allowed_user_ids' to each tenant entry to "
+                "enable strict routing."
+            )
         # Backward-compat aliases: the DEFAULT tenant's handles. Anything
         # that referenced self.store/self.graph before still works.
         self._default_tenant = "default" if "default" in self._tenants else next(
@@ -212,12 +260,24 @@ class MemoryService:
         self.server = None
 
     def _resolve_tenant(self, user_id: str) -> _Tenant:
-        """Map a user_id to its tenant cell (#49).
+        """Map a user_id to its tenant cell (#49, #87).
 
-        Exact match on tenant name; unknown user_ids fall back to the
-        default tenant (backward compatible — a single-tenant config
-        routes every user_id to ``default``).
+        Strict mode (#87 — any tenant has ``allowed_user_ids``):
+        - user_id in the allowlist → route to the mapped tenant
+        - user_id NOT in the allowlist → raise PermissionError
+
+        Legacy mode (no ``allowed_user_ids`` anywhere):
+        - Exact match on tenant name → that tenant
+        - Unknown user_id → default tenant (backward compatible)
         """
+        if self._strict_routing:
+            tenant_name = self._user_tenant_map.get(user_id)
+            if tenant_name is None:
+                raise PermissionError(
+                    f"user_id {user_id!r} is not allowlisted on this service "
+                    f"(#87 strict routing)"
+                )
+            return self._tenants[tenant_name]
         if user_id in self._tenants:
             return self._tenants[user_id]
         return self._tenants[self._default_tenant]
@@ -460,8 +520,10 @@ class MemoryService:
         user_id = str(request.get("user_id") or "default_user")
         if component not in {"store", "graph"} or not isinstance(method, str):
             raise ValueError("Invalid service request")
-        # Tenant routing (#49): user_id -> tenant cell. Unknown user_ids
-        # fall back to the default tenant (backward compatible).
+        # Tenant routing (#49): user_id -> tenant cell. In strict mode
+        # (#87), unknown user_ids are rejected instead of falling back to
+        # default — prevents tenant spoofing by any local process that
+        # holds the endpoint token.
         tenant = self._resolve_tenant(user_id)
         t0 = time.monotonic()
         # Per-tenant locks (#20 + #49): store and graph calls run

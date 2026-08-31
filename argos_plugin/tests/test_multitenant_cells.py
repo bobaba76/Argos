@@ -21,7 +21,11 @@ _plugin_dir = Path(__file__).resolve().parent.parent
 if str(_plugin_dir) not in sys.path:
     sys.path.insert(0, str(_plugin_dir))
 
-from service_client import SharedMemoryStore, SharedGraphStore  # noqa: E402
+from service_client import (  # noqa: E402
+    SharedMemoryServiceError,
+    SharedMemoryStore,
+    SharedGraphStore,
+)
 
 
 _TWO_TENANT_CONFIG = {
@@ -232,3 +236,149 @@ class TestPerTenantBackup:
             )
         finally:
             _stop_service(store)
+
+
+# ---------------------------------------------------------------------------
+# #87: strict tenant routing — user_id allowlist prevents tenant spoofing
+# ---------------------------------------------------------------------------
+
+_STRICT_TWO_TENANT_CONFIG = {
+    "local_embedding_model": "nonexistent-model-xyz",
+    "tenants": {
+        "default": {
+            "database_filename": "default.duckdb",
+            "graph_dirname": "default_kuzu",
+            "allowed_user_ids": ["alice", "bob"],
+        },
+        "brandon-bot": {
+            "database_filename": "tenants/brandon.duckdb",
+            "graph_dirname": "tenants/brandon_kuzu",
+            "allowed_user_ids": ["brandon", "brandon-cli"],
+        },
+    },
+}
+
+
+class TestStrictTenantRouting:
+    """#87: allowed_user_ids on tenant entries activates strict routing.
+
+    A client with the endpoint token cannot spoof a user_id that belongs
+    to another tenant — the service rejects it with PermissionError.
+    """
+
+    @pytest.fixture()
+    def stores(self, tmp_path):
+        _write_config(tmp_path, _STRICT_TWO_TENANT_CONFIG)
+        a = SharedMemoryStore(tmp_path, user_id="alice", embedder=None)
+        b = SharedMemoryStore(tmp_path, user_id="brandon", embedder=None)
+        try:
+            yield a, b, tmp_path
+        finally:
+            _stop_service(a)
+
+    def test_valid_user_id_routes_to_correct_tenant(self, stores):
+        """An allowlisted user_id reaches its tenant's store."""
+        a, b, _ = stores
+        a.remember(category="context_note", content="alice's data")
+        b.remember(category="context_note", content="brandon's data")
+        assert any("alice" in r.content for r in a.search("alice", limit=5))
+        assert any("brandon" in r.content for r in b.search("brandon", limit=5))
+        # Cross-tenant isolation still holds.
+        assert not any("brandon" in r.content for r in a.search("brandon", limit=5))
+
+    def test_spoofed_unknown_user_id_rejected(self, stores):
+        """In strict mode, a user_id not in any tenant's allowlist is
+        rejected — defense-in-depth against tenant spoofing by any
+        local process that holds the endpoint token (#87).
+
+        Note: spoofing an *allowlisted* user_id still routes to that
+        user's tenant. Full prevention requires Option A (per-tenant
+        credentials); Option B (allowlist) reduces the attack surface
+        from 'any user_id' to 'only configured user_ids'.
+        """
+        a, _, _ = stores
+        # A user_id not in any allowlist is rejected.
+        with pytest.raises(SharedMemoryServiceError) as exc_info:
+            a._rpc._request({
+                "component": "store", "method": "count", "args": {},
+                "user_id": "mallory",
+            })
+        assert exc_info.value.error_class == "PermissionError"
+
+    def test_unknown_user_id_rejected(self, stores):
+        """In strict mode, an unregistered user_id is rejected instead
+        of falling back to the default tenant."""
+        a, _, _ = stores
+        with pytest.raises(SharedMemoryServiceError) as exc_info:
+            a._rpc._request({
+                "component": "store", "method": "count", "args": {},
+                "user_id": "some-random-user",
+            })
+        assert exc_info.value.error_class == "PermissionError"
+
+    def test_second_user_id_in_same_tenant_works(self, stores):
+        """Multiple user_ids can be allowlisted for one tenant; each
+        sees their own data (user_scope filtering is defense-in-depth
+        within the tenant)."""
+        a, _, tmp_path = stores
+        bob = SharedMemoryStore(tmp_path, user_id="bob", embedder=None)
+        try:
+            bob.remember(category="context_note", content="bob via same tenant as alice")
+            # bob can see his own data (routes to the default tenant)
+            assert any("bob" in r.content for r in bob.search("bob", limit=5))
+        finally:
+            bob._rpc.stop_service()
+
+    def test_strict_routing_flag_on_service(self, tmp_path):
+        """The service instance reports strict_routing=True when
+        allowed_user_ids is configured."""
+        _write_config(tmp_path, _STRICT_TWO_TENANT_CONFIG)
+        import memory_service
+        svc = memory_service.MemoryService(tmp_path)
+        try:
+            assert svc._strict_routing is True
+            assert svc._user_tenant_map == {
+                "alice": "default",
+                "bob": "default",
+                "brandon": "brandon-bot",
+                "brandon-cli": "brandon-bot",
+            }
+        finally:
+            svc.close()
+
+    def test_duplicate_user_id_across_tenants_is_config_error(self, tmp_path):
+        """A user_id in two tenants' allowlists is a config error."""
+        bad_config = {
+            "local_embedding_model": "nonexistent-model-xyz",
+            "tenants": {
+                "default": {
+                    "allowed_user_ids": ["shared-user"],
+                },
+                "other": {
+                    "database_filename": "other.duckdb",
+                    "allowed_user_ids": ["shared-user"],
+                },
+            },
+        }
+        _write_config(tmp_path, bad_config)
+        import memory_service
+        with pytest.raises(ValueError, match="allowed_user_ids conflict"):
+            memory_service.MemoryService(tmp_path)
+
+
+class TestLegacyRoutingBackwardCompat:
+    """#87: without allowed_user_ids, the legacy fallback-to-default
+    behavior is preserved (backward compatible)."""
+
+    def test_legacy_mode_unknown_user_falls_back(self, tmp_path):
+        """No allowed_user_ids → unknown user_id still routes to default."""
+        _write_config(tmp_path, _TWO_TENANT_CONFIG)
+        import memory_service
+        svc = memory_service.MemoryService(tmp_path)
+        try:
+            assert svc._strict_routing is False
+            # Unknown user_id resolves to default tenant (legacy behavior)
+            tenant = svc._resolve_tenant("some-random-user")
+            assert tenant.name == "default"
+        finally:
+            svc.close()

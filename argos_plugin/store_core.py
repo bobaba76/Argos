@@ -288,6 +288,11 @@ class StoreCoreMixin:
                 "extracted_at": "VARCHAR",
                 "verified_state": "VARCHAR DEFAULT 'current'",
                 "verified_at": "VARCHAR",
+                # P5.1 (#6): memory lifecycle tier. Missing from the legacy
+                # migration map on the first batch-F release — fresh DBs got it
+                # from CREATE TABLE but pre-existing stores never did, so every
+                # search binder-errored on COALESCE(tier,...). Additive ALTER.
+                "tier": "VARCHAR DEFAULT 'active'",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",

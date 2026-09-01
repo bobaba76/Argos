@@ -285,6 +285,8 @@ class MemoryRecord:
         "raw_similarity",
         "status", "source", "confidence", "durability", "scope", "project_id",
         "user_scope", "namespace", "client_scope", "doc_class",
+        "source_doc_id", "source_loc", "extraction_method",
+        "extracted_at", "verified_state", "verified_at",
         "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
         "quarantine_reason", "quarantined_at",
         "valid_from", "valid_to", "superseded_by",
@@ -314,6 +316,12 @@ class MemoryRecord:
         namespace: str = "conversation",
         client_scope: str | None = None,
         doc_class: str | None = None,
+        source_doc_id: str | None = None,
+        source_loc: str | None = None,
+        extraction_method: str | None = None,
+        extracted_at: str | None = None,
+        verified_state: str = "current",
+        verified_at: str | None = None,
         retrieval_count: int = 0,
         last_retrieved_at: str | None = None,
         helpful_count: int = 0,
@@ -356,6 +364,13 @@ class MemoryRecord:
         # (legacy/conversation records). Reserved 'practice-internal' =
         # principals-only.
         self.doc_class = doc_class
+        # Spec-07 (#71) D4: document-sourced fact provenance + freshness.
+        self.source_doc_id = source_doc_id
+        self.source_loc = source_loc
+        self.extraction_method = extraction_method
+        self.extracted_at = extracted_at
+        self.verified_state = verified_state or "current"
+        self.verified_at = verified_at
         self.retrieval_count = int(retrieval_count or 0)
         self.last_retrieved_at = last_retrieved_at
         self.helpful_count = int(helpful_count or 0)
@@ -396,6 +411,12 @@ class MemoryRecord:
             "namespace": self.namespace,
             "client_scope": self.client_scope,
             "doc_class": self.doc_class,
+            "source_doc_id": self.source_doc_id,
+            "source_loc": self.source_loc,
+            "extraction_method": self.extraction_method,
+            "extracted_at": self.extracted_at,
+            "verified_state": self.verified_state,
+            "verified_at": self.verified_at,
             "retrieval_count": self.retrieval_count,
             "last_retrieved_at": self.last_retrieved_at,
             "helpful_count": self.helpful_count,

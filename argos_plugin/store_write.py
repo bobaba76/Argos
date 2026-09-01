@@ -81,6 +81,12 @@ class StoreWriteMixin:
         namespace: str = "conversation",
         client_scope: str | None = None,
         doc_class: str | None = None,
+        source_doc_id: str | None = None,
+        source_loc: str | None = None,
+        extraction_method: str | None = None,
+        extracted_at: str | None = None,
+        verified_state: str = "current",
+        verified_at: str | None = None,
         status: str = "active",
         expires_at: Any = _NOT_PROVIDED,
         provenance_origin: Any = None,
@@ -275,9 +281,11 @@ class StoreWriteMixin:
                 (memory_id, category, content, tags, payload, created_at, updated_at,
                  expires_at, embedding, status, source, confidence, durability, scope,
                  project_id, user_scope, namespace, client_scope, doc_class,
+                 source_doc_id, source_loc, extraction_method, extracted_at,
+                 verified_state, verified_at,
                  retrieval_count, helpful_count, dismissed_count,
                  valid_from, provenance_origin, grounding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
         """
         with self._lock:
             assert self.connection is not None
@@ -289,6 +297,8 @@ class StoreWriteMixin:
                 status, source, confidence, durability, scope, project_id,
                 record_payload.get("user_scope"),
                 namespace or "conversation", client_scope, doc_class,
+                source_doc_id, source_loc, extraction_method, extracted_at,
+                verified_state or "current", verified_at,
                 created_ts,  # valid_from = in-world creation time (issue #8)
                 prov, ground,
             ])
@@ -1974,9 +1984,11 @@ class StoreWriteMixin:
                        (memory_id, category, content, tags, payload, created_at, updated_at,
                         expires_at, embedding, status, source, confidence, durability, scope,
                         project_id, user_scope, namespace, client_scope, doc_class,
+                        source_doc_id, source_loc, extraction_method, extracted_at,
+                        verified_state, verified_at,
                         retrieval_count, helpful_count, dismissed_count,
                         valid_from, valid_to, superseded_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                     [new_id, rec.category, new_content, new_tags,
                      json.dumps(new_payload), created_ts, now,
                      effective_expires,
@@ -1987,6 +1999,12 @@ class StoreWriteMixin:
                      getattr(rec, "namespace", "conversation") or "conversation",
                      getattr(rec, "client_scope", None),
                      getattr(rec, "doc_class", None),
+                     getattr(rec, "source_doc_id", None),
+                     getattr(rec, "source_loc", None),
+                     getattr(rec, "extraction_method", None),
+                     getattr(rec, "extracted_at", None),
+                     getattr(rec, "verified_state", "current") or "current",
+                     getattr(rec, "verified_at", None),
                      rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
                      created_ts],
                 )

@@ -120,7 +120,14 @@ class StoreCoreMixin:
                     grounding          VARCHAR DEFAULT 'observed',
                     namespace          VARCHAR DEFAULT 'conversation',
                     client_scope       VARCHAR,
-                    doc_class          VARCHAR
+                    doc_class          VARCHAR,
+                    -- Spec-07 (#71) D4: document-sourced fact provenance.
+                    source_doc_id      VARCHAR,
+                    source_loc         VARCHAR,
+                    extraction_method  VARCHAR,
+                    extracted_at       VARCHAR,
+                    verified_state     VARCHAR DEFAULT 'current',
+                    verified_at        VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -151,6 +158,33 @@ class StoreCoreMixin:
                     quarantined_at     VARCHAR,
                     provenance_origin  VARCHAR DEFAULT 'internal',
                     grounding          VARCHAR DEFAULT 'extracted'
+                );
+                CREATE TABLE IF NOT EXISTS file_catalog (
+                    file_id              VARCHAR PRIMARY KEY,
+                    canonical_path       VARCHAR,
+                    size                 BIGINT,
+                    mtime                VARCHAR,
+                    first_seen           VARCHAR,
+                    last_seen            VARCHAR,
+                    status               VARCHAR DEFAULT 'active',
+                    client_scope         VARCHAR,
+                    doc_class            VARCHAR,
+                    doc_type             VARCHAR,
+                    one_line_description VARCHAR,
+                    description_method   VARCHAR DEFAULT 'heuristic',
+                    hot_flags            VARCHAR,
+                    hot_reason           VARCHAR,
+                    extract_hash         VARCHAR,
+                    extracted_at         VARCHAR,
+                    last_touch           VARCHAR,
+                    touch_count          INTEGER DEFAULT 0,
+                    pinned               BOOLEAN DEFAULT FALSE
+                );
+                CREATE TABLE IF NOT EXISTS file_aliases (
+                    file_id    VARCHAR,
+                    path       VARCHAR,
+                    first_seen VARCHAR,
+                    PRIMARY KEY (file_id, path)
                 );
                 CREATE TABLE IF NOT EXISTS entity_aliases (
                     alias              VARCHAR,
@@ -240,6 +274,15 @@ class StoreCoreMixin:
                 # NULL = no class (legacy/conversation records). Reserved
                 # value 'practice-internal' = principals-only.
                 "doc_class": "VARCHAR",
+                # Spec-07 (#71) D4: document-sourced fact provenance.
+                # source_doc_id = file_id (hash, never a path). verified_state
+                # defaults to 'current' so legacy rows are unaffected.
+                "source_doc_id": "VARCHAR",
+                "source_loc": "VARCHAR",
+                "extraction_method": "VARCHAR",
+                "extracted_at": "VARCHAR",
+                "verified_state": "VARCHAR DEFAULT 'current'",
+                "verified_at": "VARCHAR",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",

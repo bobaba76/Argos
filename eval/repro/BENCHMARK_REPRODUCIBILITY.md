@@ -318,6 +318,64 @@ the "stronger answerer ~80+" probe (§4) — the measured answerer effect is
 the matrix above. Judge neutrality was itself measured: judge swap ≤0.6pp,
 answerer swap −8.5pp (§4).
 
+> **Era caveat (#94, read before quoting the matrix).** **Both arms of every
+> cell predate the Aug 29 timestamp-normalization fix** (`3d09aea`,
+> `_parse_timestamp` / `_EPOCH_SENTINEL`). Before that fix, naive timestamps
+> failed `datetime.fromisoformat` and received a **0.0 recency boost** — so
+> recency ranking, age penalty, dormancy decay, dismissal forgiveness, and
+> distillation seed-priority ordering were all operating on broken timestamps.
+> The matrix was measured Aug 25 / committed Aug 26 (`3c557f0`); the four
+> judged files also predate BM25-lite, the rank-1 survival guard (#38), the
+> PPR graph boost (#37), and phrase-lift. The gpt-4o no-distill arm is
+> additionally "banked" (caveat 8). Treat the absolute percentages and the
+> pairwise deltas as **era-specific**: the −5.6 pts gpt-4o delta in particular
+> is expected to narrow once re-measured, because distill-produced memories
+> are newer and were disproportionately penalized by the 0.0-recency-boost
+> bug. The matrix should be re-run on the current codebase before any of these
+> numbers are quoted as current; until then they are a dated snapshot, not a
+> living claim.
+
+### 12.1 Why distill hurts gpt-4o — the ranking-displacement mechanism (#95)
+
+The −5.6 pts gpt-4o regression is **by design, not a bug**, but the mechanism
+is easy to misread as "distill produces bad insights." It does not. The loss
+is a **retrieval-ranking displacement effect**, the same pattern MemDelta
+flags: the gain (or cost) lives in what the answerer sees, not in the write
+path.
+
+The flow:
+
+1. Raw memories (full detail, nuanced, possibly long) and distill insights
+   (~200-char summaries) coexist in the store.
+2. At query time both compete in the same RRF fusion ranking.
+3. Distill insights often rank higher — they are concise, well-formed, and
+   semantically dense, so the vector and text legs score them favorably.
+4. A strong answerer (gpt-4o-class) can synthesize the answer from the raw
+   records; the distill insight is then either redundant or lossy relative
+   to the raw record it displaced from the context window.
+5. A weak answerer (flash-class) cannot synthesize from raw records; the
+   distill insight is net-new signal it would otherwise miss.
+
+So the same distill insight is a **gain for weak answerers and a displacement
+cost for strong ones** — the asymmetry is the expected signature of a ranking
+interaction, not a content-quality defect.
+
+This is a design trade-off, currently documented only here. Mitigations that
+could be explored (not implemented; each needs a benchmark re-run to validate):
+
+- **Per-answerer distill gating:** filter or downweight distill insights when
+  the answerer is known to be strong (the grounding protocol already shows
+  gpt-4o benefits from grounding rather than summarization).
+- **Separate ranking buckets:** give distill insights their own score bucket
+  or a configurable interleaving weight so they cannot crowd out raw records
+  for strong answerers.
+- **Content-length-aware ranking:** downweight very short insights when a
+  richer raw record on the same subject is available in the pool.
+
+Until one of those ships, the operational guidance stands: **a gpt-4o-class
+answerer should disable the distill store** (it pays the displacement cost
+without the synthesis benefit); a flash-class answerer should keep it on.
+
 ## 13. Grounding (LME_GROUNDING=1) and the 449/500 headline (2026-08-25/26)
 
 Grounding = answerer prompt grounded in the retrieved evidence

@@ -1043,6 +1043,26 @@ class StoreRetrievalMixin:
         is new. The reason lets the caller surface *why* a dedup drop
         happened instead of a silent None (#82).
 
+        Thin wrapper over :meth:`_find_current_similar` (which returns the
+        matching ``memory_id`` alongside the reason) — kept for the
+        existing dedup call sites that only need the reason.
+        """
+        memory_id, reason = self._find_current_similar(content, category)
+        return reason
+
+    def _find_current_similar(
+        self, content: str, category: str,
+    ) -> tuple[str | None, str | None]:
+        """Find a current record restating *content*; return ``(memory_id, reason)``.
+
+        Same three-layer detection as :meth:`_content_exists` (exact,
+        substring, semantic) but also returns the ``memory_id`` of the
+        matched current record so callers that need to act on the match
+        — e.g. :meth:`ingest_versioned` (#74) routing a restatement
+        through ``update_memory`` — don't have to re-scan.
+
+        Returns ``(None, None)`` when the content is new.
+
         Three-layer check:
         1. Exact match (case-sensitive, same category).
         2. Substring containment (case-insensitive, for >20 char strings)
@@ -1058,19 +1078,20 @@ class StoreRetrievalMixin:
             assert self.connection is not None
             # Layer 1: exact match (only against current versions).
             result = self.connection.execute(
-                """SELECT COUNT(*) FROM memory_records
+                """SELECT memory_id FROM memory_records
                   WHERE content = ? AND category = ?
                     AND valid_to IS NULL
-                    AND (user_scope IS NULL OR user_scope = ?)""",
+                    AND (user_scope IS NULL OR user_scope = ?)
+                  LIMIT 1""",
                 [content, category, self.user_id],
             ).fetchone()
-            if result and result[0] > 0:
-                return "exact"
+            if result:
+                return result[0], "exact"
             # Layer 2: substring containment (case-insensitive, current only).
             # ORDER BY created_at DESC so the scan window is recency-ordered,
             # not arbitrary storage order (#82).
             result = self.connection.execute(
-                """SELECT content FROM memory_records
+                """SELECT memory_id, content FROM memory_records
                   WHERE category = ?
                     AND valid_to IS NULL
                     AND (user_scope IS NULL OR user_scope = ?)
@@ -1079,10 +1100,10 @@ class StoreRetrievalMixin:
                 [category, self.user_id],
             ).fetchall()
             content_lower = content.lower().strip()
-            for (existing,) in result:
+            for existing_id, existing in result:
                 existing_lower = existing.lower().strip()
                 if content_lower == existing_lower:
-                    return "substring"
+                    return existing_id, "substring"
                 # Skip very short strings to avoid false positives.
                 if len(content_lower) > 20 and len(existing_lower) > 20:
                     if content_lower in existing_lower or existing_lower in content_lower:
@@ -1091,7 +1112,7 @@ class StoreRetrievalMixin:
                         shorter = min(len(content_lower), len(existing_lower))
                         longer = max(len(content_lower), len(existing_lower))
                         if longer > 0 and shorter / longer >= 0.8:
-                            return "substring"
+                            return existing_id, "substring"
                         # Below the overlap gate — log at debug so the
                         # near-miss is traceable but the fact is saved.
                         logger.debug(
@@ -1118,8 +1139,8 @@ class StoreRetrievalMixin:
                             [category, self.user_id, vec_text, self._DEDUP_SIMILARITY_THRESHOLD],
                         ).fetchone()
                         if result:
-                            return "semantic"
+                            return result[0], "semantic"
                     except Exception as exc:
                         if not self._is_vector_search_unavailable(exc):
                             logger.debug("Semantic dedup check failed: %s", exc)
-            return None
+            return None, None

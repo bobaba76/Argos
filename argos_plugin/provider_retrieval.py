@@ -895,6 +895,27 @@ class ProviderRetrievalMixin:
                     except Exception:
                         pass  # P2B2 is best-effort; never break injection
                 if results:
+                    # Spec-06 (#69): access scoping — filter retrieval results
+                    # by the user's ACL mask before ranking/partition. Hidden
+                    # deny: excluded content never appears. The audit row is
+                    # written by the store's search wrapper; this is the
+                    # defence-in-depth re-validation on the injected set.
+                    try:
+                        acl = getattr(self, "_acl_config", None)
+                        if acl is not None and not acl.is_open_store:
+                            try:
+                                from .access_scoping import (
+                                    filter_records_by_access,
+                                )
+                            except ImportError:
+                                from access_scoping import (
+                                    filter_records_by_access,
+                                )
+                            results, _denied = filter_records_by_access(
+                                results, acl, self.user_id,
+                            )
+                    except Exception:
+                        pass  # access filter must never break injection
                     # Spec-05 (#67): presence-aware namespace partition.
                     # Split the injection budget between conversation-sourced
                     # and document-sourced memories so a flood of doc-facts

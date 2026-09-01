@@ -284,7 +284,7 @@ class MemoryRecord:
         "created_at", "updated_at", "expires_at", "embedding", "similarity",
         "raw_similarity",
         "status", "source", "confidence", "durability", "scope", "project_id",
-        "user_scope", "namespace", "client_scope",
+        "user_scope", "namespace", "client_scope", "doc_class",
         "retrieval_count", "last_retrieved_at", "helpful_count", "dismissed_count",
         "quarantine_reason", "quarantined_at",
         "valid_from", "valid_to", "superseded_by",
@@ -313,6 +313,7 @@ class MemoryRecord:
         user_scope: str | None = None,
         namespace: str = "conversation",
         client_scope: str | None = None,
+        doc_class: str | None = None,
         retrieval_count: int = 0,
         last_retrieved_at: str | None = None,
         helpful_count: int = 0,
@@ -351,6 +352,10 @@ class MemoryRecord:
         # keep legacy rows behaving as conversation-sourced, global facts.
         self.namespace = namespace or "conversation"
         self.client_scope = client_scope
+        # Spec-06 (#69): document class for access scoping. NULL = no class
+        # (legacy/conversation records). Reserved 'practice-internal' =
+        # principals-only.
+        self.doc_class = doc_class
         self.retrieval_count = int(retrieval_count or 0)
         self.last_retrieved_at = last_retrieved_at
         self.helpful_count = int(helpful_count or 0)
@@ -390,6 +395,7 @@ class MemoryRecord:
             "project_id": self.project_id,
             "namespace": self.namespace,
             "client_scope": self.client_scope,
+            "doc_class": self.doc_class,
             "retrieval_count": self.retrieval_count,
             "last_retrieved_at": self.last_retrieved_at,
             "helpful_count": self.helpful_count,

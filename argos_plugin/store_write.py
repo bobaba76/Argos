@@ -1832,12 +1832,6 @@ class StoreWriteMixin:
                        WHERE memory_id = ?""",
                     [now, new_id, now, memory_id],
                 )
-                self.connection.execute(
-                    """UPDATE memory_records
-                       SET valid_to = ?, superseded_by = ?, updated_at = ?
-                       WHERE memory_id = ?""",
-                    [now, new_id, now, memory_id],
-                )
                 # 3. Carry the evidence trail forward. memory_evidence is keyed
                 #    by memory_id, so the new version would otherwise orphan the
                 #    provenance row (review point 2: provenance after updates).

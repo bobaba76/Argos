@@ -1110,7 +1110,14 @@ class StoreRetrievalMixin:
     # Semantic dedup threshold: cosine similarity above this means "same fact".
     _DEDUP_SIMILARITY_THRESHOLD = 0.85
 
-    def _content_exists(self, content: str, category: str) -> str | None:
+    def _content_exists(
+        self, content: str, category: str,
+        *,
+        namespace: str | None = None,
+        client_scope: str | None = None,
+        doc_class: str | None = None,
+        source_doc_id: str | None = None,
+    ) -> str | None:
         """Check if a very similar content already exists (dedup).
 
         Returns a reason string (``"exact"``, ``"substring"``,
@@ -1121,12 +1128,62 @@ class StoreRetrievalMixin:
         Thin wrapper over :meth:`_find_current_similar` (which returns the
         matching ``memory_id`` alongside the reason) — kept for the
         existing dedup call sites that only need the reason.
+
+        Doc-identity scoping (#115): when *namespace* is set and not
+        ``"conversation"``, the three dedup layers are scoped by
+        (namespace, client_scope, doc_class, source_doc_id) so distinct
+        documents never collapse on content proximity alone.  When
+        *namespace* is ``"conversation"`` or None, dedup remains global
+        (the conversational paraphrase-dedup feature is preserved).
         """
-        memory_id, reason = self._find_current_similar(content, category)
+        memory_id, reason = self._find_current_similar(
+            content, category,
+            namespace=namespace,
+            client_scope=client_scope,
+            doc_class=doc_class,
+            source_doc_id=source_doc_id,
+        )
         return reason
+
+    @staticmethod
+    def _doc_identity_scope_clause(
+        namespace: str | None,
+        client_scope: str | None,
+        doc_class: str | None,
+        source_doc_id: str | None,
+    ) -> tuple[str, list]:
+        """Build a SQL fragment + params that narrows dedup to the same
+        document identity (#115).
+
+        Returns ``("", [])`` when the caller is in the conversation tier
+        (namespace is None or ``"conversation"``) — global dedup is
+        preserved for paraphrase collapse, which is a feature there.
+
+        For the doc tier, each field uses ``IS NOT DISTINCT FROM`` so NULL
+        matches NULL (a doc-tier fact with no client_scope dedups against
+        other same-namespace facts that also have no client_scope).
+        """
+        if not namespace or namespace == "conversation":
+            return "", []
+        clauses = []
+        params: list = []
+        for col, val in (
+            ("namespace", namespace),
+            ("client_scope", client_scope),
+            ("doc_class", doc_class),
+            ("source_doc_id", source_doc_id),
+        ):
+            clauses.append(f"{col} IS NOT DISTINCT FROM ?")
+            params.append(val)
+        return " AND " + " AND ".join(clauses), params
 
     def _find_current_similar(
         self, content: str, category: str,
+        *,
+        namespace: str | None = None,
+        client_scope: str | None = None,
+        doc_class: str | None = None,
+        source_doc_id: str | None = None,
     ) -> tuple[str | None, str | None]:
         """Find a current record restating *content*; return ``(memory_id, reason)``.
 
@@ -1137,6 +1194,13 @@ class StoreRetrievalMixin:
         through ``update_memory`` — don't have to re-scan.
 
         Returns ``(None, None)`` when the content is new.
+
+        Doc-identity scoping (#115): when *namespace* is set and not
+        ``"conversation"``, all three layers filter by the caller's
+        (namespace, client_scope, doc_class, source_doc_id) so facts from
+        distinct documents survive even when their content is identical or
+        semantically near-identical.  Conversation-tier dedup (namespace
+        ``"conversation"`` or None) remains global.
 
         Three-layer check:
         1. Exact match (case-sensitive, same category).
@@ -1149,16 +1213,20 @@ class StoreRetrievalMixin:
            embedder is available).  Catches paraphrased duplicates like
            "User is married to Sam" vs "Sam is the user's partner".
         """
+        scope_sql, scope_params = self._doc_identity_scope_clause(
+            namespace, client_scope, doc_class, source_doc_id,
+        )
         with self._lock:
             assert self.connection is not None
             # Layer 1: exact match (only against current versions).
             result = self.connection.execute(
-                """SELECT memory_id FROM memory_records
+                f"""SELECT memory_id FROM memory_records
                   WHERE content = ? AND category = ?
                     AND valid_to IS NULL
                     AND (user_scope IS NULL OR user_scope = ?)
+                    {scope_sql}
                   LIMIT 1""",
-                [content, category, self.user_id],
+                [content, category, self.user_id, *scope_params],
             ).fetchone()
             if result:
                 return result[0], "exact"
@@ -1166,13 +1234,14 @@ class StoreRetrievalMixin:
             # ORDER BY created_at DESC so the scan window is recency-ordered,
             # not arbitrary storage order (#82).
             result = self.connection.execute(
-                """SELECT memory_id, content FROM memory_records
+                f"""SELECT memory_id, content FROM memory_records
                   WHERE category = ?
                     AND valid_to IS NULL
                     AND (user_scope IS NULL OR user_scope = ?)
+                    {scope_sql}
                   ORDER BY created_at DESC
                   LIMIT 500""",
-                [category, self.user_id],
+                [category, self.user_id, *scope_params],
             ).fetchall()
             content_lower = content.lower().strip()
             for existing_id, existing in result:
@@ -1209,9 +1278,11 @@ class StoreRetrievalMixin:
                               WHERE category = ? AND embedding IS NOT NULL
                                 AND valid_to IS NULL
                                 AND (user_scope IS NULL OR user_scope = ?)
+                                {scope_sql}
                                 AND list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) > ?
                                LIMIT 1""",
-                            [category, self.user_id, vec_text, self._DEDUP_SIMILARITY_THRESHOLD],
+                            [category, self.user_id, *scope_params,
+                             vec_text, self._DEDUP_SIMILARITY_THRESHOLD],
                         ).fetchone()
                         if result:
                             return result[0], "semantic"

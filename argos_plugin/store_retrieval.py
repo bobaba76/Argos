@@ -63,6 +63,7 @@ class StoreRetrievalMixin:
             user_scope=row.get("user_scope"),
             namespace=row.get("namespace", "conversation"),
             client_scope=row.get("client_scope"),
+            doc_class=row.get("doc_class"),
             retrieval_count=row.get("retrieval_count", 0),
             last_retrieved_at=row.get("last_retrieved_at"),
             helpful_count=row.get("helpful_count", 0),
@@ -1185,3 +1186,90 @@ class StoreRetrievalMixin:
                         if not self._is_vector_search_unavailable(exc):
                             logger.debug("Semantic dedup check failed: %s", exc)
             return None, None
+
+    # -- Spec-06 (#69): access audit log -------------------------------------
+
+    def write_access_audit(
+        self,
+        *,
+        user_id: str,
+        query_text: str,
+        granted_count: int,
+        denied_count: int,
+        denied_scopes: str | None = None,
+        excluded: bool = False,
+        tenant: str | None = None,
+    ) -> None:
+        """Append a row to the access_audit table.
+
+        Called on every query (granted_count > 0) and every deny
+        (denied_count > 0, excluded=True). The audit log is
+        practice-internal — principals-only read.
+        """
+        import uuid
+        try:
+            with self._lock:
+                assert self.connection is not None
+                self.connection.execute(
+                    """INSERT INTO access_audit
+                       (audit_id, ts, tenant, user_id, query_text,
+                        granted_count, denied_count, denied_scopes, excluded)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        str(uuid.uuid4()),
+                        self._now(),
+                        tenant or "default",
+                        user_id,
+                        (query_text or "")[:500],
+                        int(granted_count),
+                        int(denied_count),
+                        denied_scopes,
+                        bool(excluded),
+                    ],
+                )
+        except Exception as exc:
+            logger.warning("access_audit write failed: %s", exc)
+
+    def export_access_audit(
+        self,
+        *,
+        limit: int = 10000,
+        format: str = "jsonl",
+    ) -> str:
+        """Export the access audit log as JSONL or CSV.
+
+        Principals-only read; the caller is responsible for access
+        control on the export itself.
+        """
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    """SELECT audit_id, ts, tenant, user_id, query_text,
+                              granted_count, denied_count, denied_scopes, excluded
+                       FROM access_audit
+                       ORDER BY ts DESC
+                       LIMIT ?""",
+                    [max(1, min(int(limit), 100000))],
+                )
+                columns = [desc[0] for desc in result.description]
+                rows = result.fetchall()
+        except Exception as exc:
+            logger.warning("access_audit export failed: %s", exc)
+            return ""
+        if format == "csv":
+            import csv
+            import io
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(columns)
+            for row in rows:
+                writer.writerow(row)
+            return buf.getvalue()
+        # Default: JSONL
+        import io
+        buf = io.StringIO()
+        for row in rows:
+            row_dict = dict(zip(columns, row))
+            buf.write(json.dumps(row_dict) + "\n")
+        return buf.getvalue()

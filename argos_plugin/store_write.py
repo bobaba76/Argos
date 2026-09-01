@@ -307,6 +307,88 @@ class StoreWriteMixin:
                 logger.debug("Opportunistic NULL-embedding backfill skipped: %s", e)
         return fetched[0] if fetched else None
 
+    # -- versioned ingest (benchmark update-arithmetic, #74) ------------------
+
+    def ingest_versioned(
+        self,
+        category: str,
+        content: str,
+        tags: List[str] | None = None,
+        payload: Dict[str, Any] | None = None,
+        **remember_kwargs: Any,
+    ) -> tuple[MemoryRecord | None, str]:
+        """Ingest with store-level versioning — fire update-arithmetic on restatements.
+
+        Issue #74: the benchmark ingest path called ``remember(dedup=False)``
+        for every turn, so supersession/version links and tombstones never
+        engaged — ``valid_to``/``superseded_by`` stayed NULL on every row and
+        chain-unfold had nothing to walk. This method is the store-side
+        option-2 fix: a drop-in ingest API that detects restatements and
+        routes them through :meth:`update_memory` so version chains form.
+
+        Production behavior is unchanged — ``remember()``'s default
+        ``dedup=True`` is untouched. Benchmark adapters call this instead of
+        ``remember(dedup=False)``.
+
+        Decision table (matched against CURRENT records only):
+
+        - No similar record → ``remember(dedup=False)`` inserts a standalone
+          row. Outcome ``"inserted"``.
+        - Similar record, IDENTICAL content → true duplicate; return the
+          existing record unchanged (no new row, no chain). Outcome
+          ``"duplicate"``.
+        - Similar record, DIFFERENT content → restatement / update; route
+          through ``update_memory`` so the old record gets
+          ``valid_to``/``superseded_by`` and a new version becomes the head.
+          Outcome ``"superseded"``.
+
+        *remember_kwargs* are forwarded to :meth:`remember` /
+        :meth:`update_memory` (e.g. ``created_at``, ``source``,
+        ``confidence``, ``scope``, ``project_id``, ``provenance_origin``,
+        ``grounding``, ``expires_at``).
+
+        Returns ``(record, outcome)`` where *outcome* is one of
+        ``"inserted"`` / ``"superseded"`` / ``"duplicate"`` (or
+        ``"blocked"`` when the insert was refused by a tombstone/rejection
+        gate, mirroring ``remember`` returning ``None``).
+        """
+        if not content or not content.strip():
+            return None, "blocked"
+        existing_id, _reason = self._find_current_similar(content, category)
+        if existing_id is None:
+            rec = self.remember(
+                category=category, content=content, tags=tags,
+                payload=payload, dedup=False, **remember_kwargs,
+            )
+            return rec, "inserted" if rec is not None else "blocked"
+        # A current record restates this content. If the text is identical
+        # it is a true duplicate (no chain needed); otherwise treat it as an
+        # update and supersede via update_memory so a version chain forms.
+        existing = self._fetch_records(
+            """SELECT * FROM memory_records
+               WHERE memory_id = ?
+                 AND (user_scope IS NULL OR user_scope = ?)""",
+            [existing_id, self.user_id],
+        )
+        if not existing:
+            # Raced away between the scan and the fetch — fall back to insert.
+            rec = self.remember(
+                category=category, content=content, tags=tags,
+                payload=payload, dedup=False, **remember_kwargs,
+            )
+            return rec, "inserted" if rec is not None else "blocked"
+        if existing[0].content == content:
+            return existing[0], "duplicate"
+        update_kwargs = {
+            k: v for k, v in remember_kwargs.items()
+            if k in {"expires_at", "structural_guard"}
+        }
+        new_head = self.update_memory(
+            memory_id=existing_id, content=content, tags=tags,
+            payload_updates=payload, **update_kwargs,
+        )
+        return new_head, "superseded" if new_head is not None else "blocked"
+
     # -- value-supersession (stale-number detection) -------------------------
 
     def _find_conflicting_active_value(

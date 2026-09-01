@@ -302,6 +302,7 @@ class MemoryService:
                     suppress_retrieval=bool(args.get("suppress_retrieval", False)),
                                         include_expired=bool(args.get("include_expired", False)),
                                         include_closed=bool(args.get("include_closed", False)),
+                                        include_archived=bool(args.get("include_archived", False)),
                                     )
             ]
         if method == "remember":

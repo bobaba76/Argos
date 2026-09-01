@@ -1789,10 +1789,10 @@ class StoreWriteMixin:
             if not exists or exists[0] == 0:
                 return False
             if feedback == "helpful":
-                sql = "UPDATE memory_records SET helpful_count = COALESCE(helpful_count, 0) + 1, updated_at = ? WHERE memory_id = ?"
+                sql = "UPDATE memory_records SET helpful_count = COALESCE(helpful_count, 0) + 1, updated_at = ?, tier = 'active' WHERE memory_id = ?"
                 params = [now, memory_id]
             elif feedback == "dismissed":
-                sql = "UPDATE memory_records SET dismissed_count = COALESCE(dismissed_count, 0) + 1, updated_at = ? WHERE memory_id = ?"
+                sql = "UPDATE memory_records SET dismissed_count = COALESCE(dismissed_count, 0) + 1, updated_at = ?, tier = 'active' WHERE memory_id = ?"
                 params = [now, memory_id]
             else:
                 sql = """UPDATE memory_records

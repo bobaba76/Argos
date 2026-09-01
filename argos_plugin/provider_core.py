@@ -242,6 +242,14 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "distillation_cooldown_hours": "24",
         "distillation_max_records_per_run": "100",
         "distillation_max_calls": "10",
+        # Lifecycle (P5.1, #6)
+        "archive_enabled": "false",
+        "archive_after_days": "180",
+        "forget_enabled": "false",
+        "forget_after_days": "365",
+        "rollup_enabled": "false",
+        "rollup_interval_days": "30",
+        "rollup_max_records_per_run": "100",
         # Egress (review point 6)
         "local_only": "false",
         "external_sources_require_confirmation": "true",
@@ -382,6 +390,14 @@ class ProviderCoreMixin:
         self._distillation_cooldown_hours: int = 24
         self._distillation_max_records_per_run: int = 100
         self._distillation_max_calls: int = 10
+        # Lifecycle (P5.1, #6): archival tier, forgetting, long-horizon rollups.
+        self._archive_enabled: bool = False
+        self._archive_after_days: int = 180
+        self._forget_enabled: bool = False
+        self._forget_after_days: int = 365
+        self._rollup_enabled: bool = False
+        self._rollup_interval_days: int = 30
+        self._rollup_max_records_per_run: int = 100
         # LLM model/provider for auxiliary tasks (extraction, review, expansion)
         # Empty string = use the auxiliary client's default model
         self._llm_model: str = ""
@@ -900,6 +916,46 @@ class ProviderCoreMixin:
             )
         except (TypeError, ValueError):
             self._distillation_max_calls = 10
+        # Lifecycle config (P5.1, #6)
+        archive_enabled = self._config.get("archive_enabled", "false")
+        self._archive_enabled = (
+            archive_enabled.lower() in ("true", "1", "yes")
+            if isinstance(archive_enabled, str) else bool(archive_enabled)
+        )
+        try:
+            self._archive_after_days = max(
+                1, int(self._config.get("archive_after_days", 180))
+            )
+        except (TypeError, ValueError):
+            self._archive_after_days = 180
+        forget_enabled = self._config.get("forget_enabled", "false")
+        self._forget_enabled = (
+            forget_enabled.lower() in ("true", "1", "yes")
+            if isinstance(forget_enabled, str) else bool(forget_enabled)
+        )
+        try:
+            self._forget_after_days = max(
+                1, int(self._config.get("forget_after_days", 365))
+            )
+        except (TypeError, ValueError):
+            self._forget_after_days = 365
+        rollup_enabled = self._config.get("rollup_enabled", "false")
+        self._rollup_enabled = (
+            rollup_enabled.lower() in ("true", "1", "yes")
+            if isinstance(rollup_enabled, str) else bool(rollup_enabled)
+        )
+        try:
+            self._rollup_interval_days = max(
+                1, int(self._config.get("rollup_interval_days", 30))
+            )
+        except (TypeError, ValueError):
+            self._rollup_interval_days = 30
+        try:
+            self._rollup_max_records_per_run = max(
+                10, min(int(self._config.get("rollup_max_records_per_run", 100)), 1000)
+            )
+        except (TypeError, ValueError):
+            self._rollup_max_records_per_run = 100
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,

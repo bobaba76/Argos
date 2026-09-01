@@ -81,6 +81,7 @@ class StoreRetrievalMixin:
             superseded_by=row.get("superseded_by"),
             provenance_origin=row.get("provenance_origin", PROVENANCE_INTERNAL),
             grounding=row.get("grounding", GROUNDING_OBSERVED),
+            tier=row.get("tier", "active"),
         )
 
     def _fetch_records(
@@ -120,6 +121,7 @@ class StoreRetrievalMixin:
         as_of: str | None = None,
         include_expired: bool = False,
         include_closed: bool = False,
+        include_archived: bool = False,
     ) -> List[MemoryRecord]:
         """BM25-lite text search. Returns filtered records ranked by BM25.
 
@@ -136,6 +138,9 @@ class StoreRetrievalMixin:
 
         When *include_expired* is True, the expiry filter is omitted (expired
         memories are returned, ranked normally).
+
+        P5.1 (#6): when *include_archived* is False (default), archived
+        records (tier='archived') are excluded from the injection pool.
         """
         tokens = [
             t for t in _tokenize(query)
@@ -196,6 +201,9 @@ class StoreRetrievalMixin:
             excluded_placeholders = ", ".join(["?" for _ in excluded])
             category_clause += f" AND LOWER(category) NOT IN ({excluded_placeholders})"
             category_params.extend(e.lower() for e in excluded)
+        # P5.1 (#6): exclude archived records from the injection pool
+        # unless include_archived is explicitly requested.
+        tier_clause = "" if include_archived else " AND COALESCE(tier, 'active') = 'active'"
         sql = (
             "SELECT * FROM memory_records "
             "WHERE COALESCE(status, 'active') = 'active' "
@@ -205,7 +213,8 @@ class StoreRetrievalMixin:
             f"{project_clause}"
             f"{namespace_clause}"
             f"{client_scope_clause}"
-            f"{category_clause} AND ("
+            f"{category_clause}"
+            f"{tier_clause} AND ("
             f"{conditions}) LIMIT 2000"
         )
         results = self._fetch_records(
@@ -265,6 +274,7 @@ class StoreRetrievalMixin:
         as_of: str | None = None,
         include_expired: bool = False,
         include_closed: bool = False,
+        include_archived: bool = False,
     ) -> List[MemoryRecord]:
         """Vector similarity search. Returns filtered records ranked by cosine.
 
@@ -332,6 +342,9 @@ class StoreRetrievalMixin:
             category_clause += f" AND LOWER(category) NOT IN ({excluded_placeholders})"
             params.extend(e.lower() for e in excluded)
         params.append(limit * 4)
+        # P5.1 (#6): exclude archived records from the injection pool
+        # unless include_archived is explicitly requested.
+        tier_clause = "" if include_archived else " AND COALESCE(tier, 'active') = 'active'"
         sql = (
             f"SELECT *, list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) AS sim "
             "FROM memory_records "
@@ -343,7 +356,8 @@ class StoreRetrievalMixin:
             f"{project_clause}"
             f"{namespace_clause}"
             f"{client_scope_clause}"
-            f"{category_clause} "
+            f"{category_clause}"
+            f"{tier_clause} "
             "ORDER BY sim DESC "
             "LIMIT ?"
         )
@@ -932,6 +946,7 @@ class StoreRetrievalMixin:
         suppress_retrieval: bool = False,
         include_expired: bool = False,
         include_closed: bool = False,
+        include_archived: bool = False,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with optional cross-encoder
         re-ranking, feedback, and recency.
@@ -1006,6 +1021,7 @@ class StoreRetrievalMixin:
             project_id=project_id, namespace=namespace,
             client_scope=client_scope, as_of=as_of,
             include_expired=include_expired, include_closed=include_closed,
+            include_archived=include_archived,
         )
 
         if emb:
@@ -1016,6 +1032,7 @@ class StoreRetrievalMixin:
                     client_scope=client_scope, as_of=as_of,
                     include_expired=include_expired,
                     include_closed=include_closed,
+                    include_archived=include_archived,
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):

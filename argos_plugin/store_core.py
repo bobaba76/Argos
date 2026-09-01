@@ -524,6 +524,13 @@ class StoreCoreMixin:
 
     def set_user_scope(self, user_id: str | None) -> None:
         self.user_id = (user_id or "default_user").strip()
+        # Invalidate the alias cache on scope switch: resolve_aliases() builds
+        # _alias_cache filtered by the previous user_id, and a stale cache would
+        # leak one user's canonical entity names into another user's
+        # resolve_aliases() result within a shared-tenant store. The cache is
+        # already invalidated on add_alias/remove_alias; this closes the
+        # scope-switch path (every RPC request calls set_user_scope first).
+        self._alias_cache = None
 
     @staticmethod
     def _now() -> str:

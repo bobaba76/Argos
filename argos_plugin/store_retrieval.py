@@ -742,7 +742,7 @@ class StoreRetrievalMixin:
 
     @classmethod
     def _apply_p2c(cls, records: List[MemoryRecord]) -> None:
-        """If enabled, demote the newer member of each near-duplicate pair above the older."""
+        """If enabled, promote the newer member of each near-duplicate pair above the older."""
         if not cls._P2C_ENABLED:
             return
         for i in range(len(records)):

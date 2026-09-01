@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 48 test modules in `argos_plugin/tests/` (877 tests; full suite green 2026-08-30 via `pytest tests/ -q -n 4`). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
+| Test suite | ✓ | 59 test modules in `argos_plugin/tests/` (1169 `def test_` definitions; full suite green 2026-08-30 via `pytest tests/ -q -n 4`). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -84,7 +84,7 @@ committed, re-runnable artifact:
 |---|---|
 | README Trust model: "Every feature is gated by a measurement in the eval harness" | Aspirational. Feature *areas* are tested, but not every shipped knob has a committed before/after measurement. The measured subset is §1; everything else is structural verification (§2). Treat the sentence as engineering intent, not an audited fact. |
 | MEMORY_SYSTEM.md:102 + CONFIG_REFERENCE.md:79-82 + UI label "Stale-pending sweep": "periodically re-reviews proposals pending too long" | **Implemented (#10, 2026-09-01).** The four config keys are now consumed by `stale_review_sweep.py` — a daemon thread that runs every `stale_review_interval_min`, re-reviews only `pending` candidates older than `stale_review_min_age_min`, caps at `stale_review_max_batch`, and preserves the no-auto-promotion invariant (decision map identical to `review_pending.py`). Fail-soft on LLM error. Started by the provider after initialization; stopped on shutdown. |
-| MEMORY_SYSTEM.md:103 + CONFIG_REFERENCE.md:83: "Role-word learning (role_alias_llm_fallback=true) — when an unknown word appears in 'my X is Name', the LLM is asked if X is a person-role; learned words persist to role_words" | **Implemented for alias minting, not for fact categorization.** The feature works end-to-end in `__init__.py` (`_extract_role_aliases` + `_llm_classify_role_word` + `_persist_learned_role_word`), and the docs accurately describe the mechanism. The gap: `extractor.py` has a separate 12-word hardcoded role lexicon that decides fact *category* (relationship vs personal_fact), while `graph.py` has a 46+ word seed list that decides *alias minting*. LLM learning only feeds the second set. A learned word like "doula" instantly fixes alias retrieval and persists, but the underlying fact is still stored as `personal_fact` forever — extractor.py never consults learned words. Category wrong, alias right; the system papers over the categorization gap at the alias layer. |
+| MEMORY_SYSTEM.md:103 + CONFIG_REFERENCE.md:83: "Role-word learning (role_alias_llm_fallback=true) — when an unknown word appears in 'my X is Name', the LLM is asked if X is a person-role; learned words persist to role_words" | **Implemented end-to-end (#14, closed 2026-08-29).** The two lexicons now converge: `extractor.set_role_words()` is called from `provider_core.py` at init (with the graph's defaults + config) and from `provider_session.py` each time the LLM ambiguity gate learns a new word, so `extractor._all_role_words()` (base + extra) and `graph._get_role_words()` (defaults + override + learned) stay in sync. A learned word like "doula" now correctly categorizes as `relationship` in the extractor *and* mints the alias in the graph. Verified by 16 `set_role_words`/`_set_role_words_override` test references in `test_hybrid_memory.py` (override extends the set, learned word extends the set, LLM ambiguity gate accepts/rejects, fallback-disabled skips the gate). The earlier "category wrong, alias right" gap described in the 2026-08-28 deep review is closed. |
 
 ---
 
@@ -129,3 +129,22 @@ committed, re-runnable artifact:
 - **2026-08-30 (sync)** — §2 test-suite row refreshed: was "26 test modules" (27/8); now
   48 modules / 877 tests, re-verified green on the refactor working tree (12:17, 0 failures).
   The README Verification section cites the same counts.
+- **2026-09-01 (deep-review refresh)** — three entries updated to stop describing closed
+  gaps as open, after verifying code + issue state on `master` HEAD `562f024`:
+  (a) §2 test-suite row refreshed again — 59 test modules / 1169 `def test_` definitions
+      (was 48 / 877). The README Verification section still cites "1007 tests across 50+
+      modules" and is now stale relative to both the audit and the source; flagged for a
+      README refresh.
+  (b) §4 role-word entry rewritten — issue #14 (closed 2026-08-29) converged the two
+      lexicons via `extractor.set_role_words()` called from `provider_core.py` (init) and
+      `provider_session.py` (per learned word). The "category wrong, alias right" gap
+      described in the 2026-08-28 deep review is closed; 16 test references verify the
+      convergence. The entry now records the implemented state, not the pre-fix gap.
+  (c) Issues #23 (inbound security fail-open, closed 2026-08-28) and #24 (egress gate
+      unknown-kind, closed 2026-08-29) are fixed in code: `reviewer.py:225-233` now returns
+      `pending_user_confirmation` with `review_model: "inbound_security_unavailable"` on
+      scanner import failure (fail-closed to human review); `egress.py:244-246` now returns
+      `False` and logs a warning for unknown `kind` (fail-closed). The 2026-08-28 deep-review
+      history entry above is left as-is (it records the *filing*); this entry records the
+      *resolution* so the audit no longer implies either gap is open.
+  No code behavior changed — this is a documentation-only refresh of the living index.

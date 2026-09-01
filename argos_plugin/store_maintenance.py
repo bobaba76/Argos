@@ -967,6 +967,9 @@ class StoreMaintenanceMixin:
 
         Returns the number of rows re-embedded. No-op (returns 0) when
         the embedder is unavailable or there are no NULL-embedding rows.
+        Only current (``valid_to IS NULL``) records in the store's own
+        ``user_scope`` are touched — historical versions and other
+        tenants' rows are left alone.
         """
         embedder = getattr(self, "embedder", None)
         if embedder is None or not hasattr(embedder, "embed"):
@@ -985,7 +988,10 @@ class StoreMaintenanceMixin:
                    WHERE embedding IS NULL
                      AND content IS NOT NULL
                      AND content <> ''
+                     AND valid_to IS NULL
+                     AND (user_scope IS NULL OR user_scope = ?)
                    ORDER BY created_at""",
+                [self.user_id],
             ).fetchall()
         if not rows:
             return 0
@@ -1004,8 +1010,9 @@ class StoreMaintenanceMixin:
                         continue
                     self.connection.execute(
                         "UPDATE memory_records SET embedding = ? "
-                        "WHERE memory_id = ?",
-                        [vec, memory_id],
+                        "WHERE memory_id = ?"
+                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        [vec, memory_id, self.user_id],
                     )
                     updated += 1
             logger.info(

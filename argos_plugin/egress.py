@@ -96,6 +96,14 @@ SITES = [
         "gate": "distillation_enabled",
         "default": False,
     },
+    {
+        "kind": "watcher_extraction",
+        "file": "watcher.py",
+        "trigger": "hot-doc fact extraction (spec-07 D5)",
+        "payload": "document text (PDF/XLSX/CSV/DOCX extraction input)",
+        "gate": "llm_fallback",
+        "default": True,
+    },
 ]
 
 # Non-memory network callers (context providers) — listed for completeness;
@@ -141,6 +149,7 @@ SENSITIVE_KINDS = {
     "query_expansion",
     "role_word",
     "temporal_subcall",
+    "watcher_extraction",
 }
 
 
@@ -163,6 +172,7 @@ GROUPS = [
         ["extractor", "reviewer", "query_expansion", "role_word", "temporal_subcall"],
     ),
     ("Store-derived (config-gated)", ["graph_typing", "distillation"]),
+    ("Document-derived (sensitive-identifier gated)", ["watcher_extraction"]),
 ]
 
 # ---------------------------------------------------------------------------

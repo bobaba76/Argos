@@ -816,6 +816,23 @@ class ProviderCoreMixin:
         # LLM model/provider config (empty = use auxiliary client default)
         self._llm_model = str(self._config.get("llm_model", "")).strip()
         self._llm_provider = str(self._config.get("llm_provider", "")).strip()
+        # Spec-08 (#72): provider abstraction extended to extraction +
+        # answering. Empty = fall back to llm_model/llm_provider, then
+        # auxiliary client default. Switching endpoint = config change,
+        # never a code path change.
+        self._extraction_llm_model = str(
+            self._config.get("extraction_llm_model", "")).strip()
+        self._extraction_llm_provider = str(
+            self._config.get("extraction_llm_provider", "")).strip()
+        self._answering_llm_model = str(
+            self._config.get("answering_llm_model", "")).strip()
+        self._answering_llm_provider = str(
+            self._config.get("answering_llm_provider", "")).strip()
+        # Deployment mode (POPIA): cloud_pilot (default) or local_sku.
+        self._deployment_mode = str(
+            self._config.get("deployment_mode", "cloud_pilot")).strip()
+        self._data_residency = str(
+            self._config.get("data_residency", "cloud")).strip()
         # Expiry config (Spec 1): TTL tiers / best-before dates.
         expiry_enabled = self._config.get("expiry_enabled", "false")
         self._expiry_enabled = (

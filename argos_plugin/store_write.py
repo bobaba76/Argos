@@ -1969,7 +1969,7 @@ class StoreWriteMixin:
                         project_id, user_scope, namespace, client_scope,
                         retrieval_count, helpful_count, dismissed_count,
                         valid_from, valid_to, superseded_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                     [new_id, rec.category, new_content, new_tags,
                      json.dumps(new_payload), created_ts, now,
                      effective_expires,

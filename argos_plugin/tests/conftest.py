@@ -30,6 +30,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -41,6 +42,15 @@ _plugin_dir = Path(__file__).resolve().parent.parent
 # Ensure the plugin dir is on sys.path so its modules are importable.
 if str(_plugin_dir) not in sys.path:
     sys.path.insert(0, str(_plugin_dir))
+
+# Hermetic override (#105 follow-up): the venvs that resolve the real
+# Hermes runtime (an editable install, e.g. hermes-agent/venv via
+# __editable__.hermes_agent-*.pth) would otherwise let unmocked LLM-path
+# tests make real calls. Set ARGOS_HERMETIC_TESTS=1 to force the stubs
+# even when the real runtime is importable — the deterministic, offline
+# behavior the suite assumes. The gate script (run_tests_visible.ps1)
+# sets it; deployed-plugin runs that want the real runtime omit it.
+_FORCE_HERMETIC = os.environ.get("ARGOS_HERMETIC_TESTS", "").strip().lower() in {"1", "true", "yes"}
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +64,20 @@ def _install_hermes_stubs_if_missing() -> None:
 
     When the real packages ARE importable (deployed plugin, or a venv
     that resolves the hermes-agent runtime), this is a no-op and the real
-    modules are used.  The stub shape mirrors what the suite's tests have
+    modules are used — UNLESS ``ARGOS_HERMETIC_TESTS=1``, which evicts any
+    real ``agent``/``tools`` modules from ``sys.modules`` and installs the
+    stubs unconditionally so the suite is deterministic and offline
+    everywhere.  The stub shape mirrors what the suite's tests have
     always assumed: ``agent.memory_provider.MemoryProvider`` and
     ``tools.registry.tool_error`` exist; ``agent.auxiliary_client`` does
     not (the plugin guards that lazy import and degrades to deterministic
     no-LLM paths, which is exactly what the hermetic tests want).
     """
-    if importlib.util.find_spec("agent") is None:
+    if _FORCE_HERMETIC:
+        for _name in list(sys.modules):
+            if _name == "agent" or _name == "tools" or _name.startswith("agent.") or _name.startswith("tools."):
+                del sys.modules[_name]
+    if _FORCE_HERMETIC or importlib.util.find_spec("agent") is None:
         _mp = types.ModuleType("agent.memory_provider")
 
         class MemoryProvider:  # minimal stand-in
@@ -71,7 +88,7 @@ def _install_hermes_stubs_if_missing() -> None:
         _agent.memory_provider = _mp
         sys.modules.setdefault("agent", _agent)
         sys.modules.setdefault("agent.memory_provider", _mp)
-    if importlib.util.find_spec("tools") is None:
+    if _FORCE_HERMETIC or importlib.util.find_spec("tools") is None:
         _tr = types.ModuleType("tools.registry")
         _tr.tool_error = lambda msg: json.dumps({"error": str(msg)})
         _tools = types.ModuleType("tools")

@@ -64,6 +64,12 @@ class StoreRetrievalMixin:
             namespace=row.get("namespace", "conversation"),
             client_scope=row.get("client_scope"),
             doc_class=row.get("doc_class"),
+            source_doc_id=row.get("source_doc_id"),
+            source_loc=row.get("source_loc"),
+            extraction_method=row.get("extraction_method"),
+            extracted_at=row.get("extracted_at"),
+            verified_state=row.get("verified_state", "current"),
+            verified_at=row.get("verified_at"),
             retrieval_count=row.get("retrieval_count", 0),
             last_retrieved_at=row.get("last_retrieved_at"),
             helpful_count=row.get("helpful_count", 0),
@@ -211,6 +217,11 @@ class StoreRetrievalMixin:
                 continue
             if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
                 continue
+            # Spec-07 (#71) D7: stale/unverified facts never presented as
+            # current. invalidated facts are always excluded.
+            vs = getattr(r, "verified_state", "current") or "current"
+            if vs in ("stale", "invalidated"):
+                continue
             out.append(r)
         # BM25-lite ranking over the candidate pool: per-token document
         # frequency -> idf, term frequency -> saturation, length normalization.
@@ -342,6 +353,11 @@ class StoreRetrievalMixin:
             if not self._matches_scope(r.payload):
                 continue
             if not include_expired and self._is_expired(r.expires_at, at=expiry_ref):
+                continue
+            # Spec-07 (#71) D7: stale/unverified facts never presented as
+            # current. invalidated facts are always excluded.
+            vs = getattr(r, "verified_state", "current") or "current"
+            if vs in ("stale", "invalidated"):
                 continue
             out.append(r)
         return out
@@ -1273,3 +1289,188 @@ class StoreRetrievalMixin:
             row_dict = dict(zip(columns, row))
             buf.write(json.dumps(row_dict) + "\n")
         return buf.getvalue()
+
+    # -- Spec-07 (#71): file catalog + watcher -------------------------------
+
+    def upsert_catalog_entry(
+        self,
+        *,
+        file_id: str,
+        canonical_path: str,
+        size: int,
+        mtime: str,
+        doc_type: str,
+        client_scope: str | None = None,
+        doc_class: str | None = None,
+        one_line_description: str | None = None,
+        description_method: str = "heuristic",
+        extract_hash: str | None = None,
+        pinned: bool = False,
+    ) -> None:
+        """Insert or update a file_catalog row. Called by the watcher's
+        scan pass for new and changed files."""
+        now = self._now()
+        try:
+            with self._lock:
+                assert self.connection is not None
+                self.connection.execute(
+                    """INSERT INTO file_catalog
+                       (file_id, canonical_path, size, mtime,
+                        first_seen, last_seen, status,
+                        client_scope, doc_class, doc_type,
+                        one_line_description, description_method,
+                        extract_hash, extracted_at, last_touch,
+                        touch_count, pinned, hot_flags, hot_reason)
+                       VALUES (?, ?, ?, ?, ?, ?, 'active',
+                               ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, NULL, NULL)
+                       ON CONFLICT (file_id) DO UPDATE SET
+                        canonical_path = excluded.canonical_path,
+                        size = excluded.size,
+                        mtime = excluded.mtime,
+                        last_seen = excluded.last_seen,
+                        client_scope = excluded.client_scope,
+                        doc_class = excluded.doc_class,
+                        doc_type = excluded.doc_type,
+                        one_line_description = excluded.one_line_description,
+                        description_method = excluded.description_method,
+                        extract_hash = excluded.extract_hash,
+                        pinned = excluded.pinned""",
+                    [
+                        file_id, canonical_path, size, mtime,
+                        now, now,
+                        client_scope, doc_class, doc_type,
+                        one_line_description, description_method,
+                        extract_hash, pinned,
+                    ],
+                )
+        except Exception as exc:
+            logger.warning("catalog upsert failed for %s: %s", file_id, exc)
+
+    def add_file_alias(self, *, file_id: str, path: str) -> None:
+        """Record an alias path for a known file_id (move/rename detection)."""
+        now = self._now()
+        try:
+            with self._lock:
+                assert self.connection is not None
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO file_aliases
+                       (file_id, path, first_seen) VALUES (?, ?, ?)""",
+                    [file_id, path, now],
+                )
+        except Exception as exc:
+            logger.warning("alias insert failed: %s", exc)
+
+    def tombstone_catalog_entry(self, *, file_id: str) -> None:
+        """Mark a catalog entry as tombstoned (file deleted). Facts sourced
+        from this file become invalidated (D4 lifecycle)."""
+        now = self._now()
+        try:
+            with self._lock:
+                assert self.connection is not None
+                self.connection.execute(
+                    "UPDATE file_catalog SET status = 'tombstoned', last_seen = ? "
+                    "WHERE file_id = ?",
+                    [now, file_id],
+                )
+                # Invalidate facts sourced from this document.
+                self.connection.execute(
+                    "UPDATE memory_records SET verified_state = 'invalidated' "
+                    "WHERE source_doc_id = ? AND verified_state != 'invalidated'",
+                    [file_id],
+                )
+        except Exception as exc:
+            logger.warning("tombstone failed for %s: %s", file_id, exc)
+
+    def get_catalog_entry(self, file_id: str) -> dict | None:
+        """Fetch a catalog entry by file_id."""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    "SELECT * FROM file_catalog WHERE file_id = ?", [file_id]
+                )
+                columns = [desc[0] for desc in result.description]
+                row = result.fetchone()
+                if row:
+                    return dict(zip(columns, row))
+        except Exception as exc:
+            logger.warning("catalog get failed: %s", exc)
+        return None
+
+    def get_catalog_by_path(self, path: str) -> dict | None:
+        """Fetch a catalog entry by canonical_path."""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    "SELECT * FROM file_catalog WHERE canonical_path = ?",
+                    [path],
+                )
+                columns = [desc[0] for desc in result.description]
+                row = result.fetchone()
+                if row:
+                    return dict(zip(columns, row))
+        except Exception as exc:
+            logger.warning("catalog get by path failed: %s", exc)
+        return None
+
+    def list_catalog(
+        self,
+        *,
+        status: str = "active",
+        client_scope: str | None = None,
+        limit: int = 100,
+    ) -> List[dict]:
+        """List catalog entries with optional filters."""
+        conditions = ["status = ?"]
+        params: list = [status]
+        if client_scope:
+            conditions.append("(client_scope IS NULL OR client_scope = ?)")
+            params.append(client_scope)
+        where = " AND ".join(conditions)
+        params.append(max(1, min(int(limit), 10000)))
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    f"SELECT * FROM file_catalog WHERE {where} "
+                    "ORDER BY last_seen DESC LIMIT ?",
+                    params,
+                )
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except Exception as exc:
+            logger.warning("catalog list failed: %s", exc)
+            return []
+
+    def stale_facts_for_doc(self, file_id: str) -> int:
+        """Mark facts from a document as stale (version bump → old facts
+        stale, new facts current). Returns the number of stale-marked rows."""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    "UPDATE memory_records SET verified_state = 'stale' "
+                    "WHERE source_doc_id = ? AND verified_state = 'current'",
+                    [file_id],
+                )
+                return int(result.fetchone()[0]) if result else 0
+        except Exception as exc:
+            logger.warning("stale marking failed for %s: %s", file_id, exc)
+            return 0
+
+    def verify_fact(self, memory_id: str) -> bool:
+        """Principal verify action: flip unverified → current."""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                self.connection.execute(
+                    "UPDATE memory_records SET verified_state = 'current', "
+                    "verified_at = ? WHERE memory_id = ? "
+                    "AND verified_state = 'unverified'",
+                    [self._now(), memory_id],
+                )
+                return True
+        except Exception as exc:
+            logger.warning("verify failed for %s: %s", memory_id, exc)
+            return False

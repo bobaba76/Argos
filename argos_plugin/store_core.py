@@ -183,7 +183,13 @@ class StoreCoreMixin:
                     extracted_at         VARCHAR,
                     last_touch           VARCHAR,
                     touch_count          INTEGER DEFAULT 0,
-                    pinned               BOOLEAN DEFAULT FALSE
+                    pinned               BOOLEAN DEFAULT FALSE,
+                    -- Spec-09 (#112): form-level identity. Deterministic
+                    -- structural fingerprint (page count, table regions,
+                    -- column signatures, heading structure) — distinct from
+                    -- file_id (content) and extract_hash (extraction input).
+                    -- NULL until the catalog pass computes it; never LLM.
+                    layout_family        VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS file_aliases (
                     file_id    VARCHAR,
@@ -507,6 +513,18 @@ class StoreCoreMixin:
                 """)
             except Exception as exc:
                 logger.warning("access_audit table creation failed: %s", exc)
+
+            # Spec-09 (#112): form-level identity — layout_family column on
+            # file_catalog. Additive migration for DBs that predate the
+            # column. NULL = not yet computed (legacy rows stay NULL until
+            # the next catalog pass fingerprints them).
+            try:
+                self.connection.execute(
+                    "ALTER TABLE file_catalog ADD COLUMN IF NOT EXISTS "
+                    "layout_family VARCHAR"
+                )
+            except Exception as exc:
+                logger.warning("file_catalog.layout_family migration failed: %s", exc)
 
             # System state KV table (P4.2 distillation run state, future
             # maintenance passes). Zero migration — CREATE IF NOT EXISTS.

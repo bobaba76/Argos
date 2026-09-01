@@ -182,6 +182,20 @@ def scan_pass(
                             "path": fpath, "reason": "locked or unreadable",
                         })
                         continue
+                    # Spec-09 (#112): form-level identity. Compute the layout
+                    # fingerprint for new/changed files only (file_id not in
+                    # catalog). Unchanged/moved files already have it in the
+                    # catalog (same content → same fingerprint). LLM-free,
+                    # deterministic. Lazy import to keep the module importable
+                    # without the fingerprint module in edge test setups.
+                    layout_family = None
+                    if file_id not in catalog:
+                        try:
+                            from layout_fingerprint import compute_layout_family
+                            layout_family = compute_layout_family(fpath, doc_type)
+                        except Exception as exc:
+                            logger.debug("layout fingerprint skip %s: %s", fpath, exc)
+                            layout_family = None
                     info = {
                         "path": fpath,
                         "file_id": file_id,
@@ -190,6 +204,7 @@ def scan_pass(
                             st.st_mtime, tz=timezone.utc
                         ).isoformat(),
                         "doc_type": doc_type,
+                        "layout_family": layout_family,
                     }
                     if file_id in catalog:
                         # Known content — check if it's at the same path.
@@ -217,6 +232,68 @@ def scan_pass(
                 })
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Spec-09 (#112): layout-family classification of scan results
+# ---------------------------------------------------------------------------
+
+
+def classify_scan_by_layout(
+    scan_result: Dict[str, List[Dict[str, Any]]],
+    known_families: Dict[str, int],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Classify the 'new' and 'changed' buckets by layout family.
+
+    Returns a dict with keys 'known', 'novel', 'unknown' — each a list of
+    file info dicts (the same dicts from scan_result['new'/'changed'],
+    with an added 'layout_class' field).
+
+    'known'   — fingerprint matches an existing family in the catalog.
+    'novel'   — fingerprint not seen in the catalog → surface for full
+                extraction + human labelling (never silently skipped).
+    'unknown' — fingerprint could not be computed (unreadable/unsupported);
+                the file is still processed normally, just no form-level
+                shortcut.
+
+    The known-family short-circuit (skip re-fingerprinting / family lookup
+    on subsequent passes) is subordinate to content: the caller must still
+    apply the content-level re-extract gate (``extract_hash``) for 'changed'
+    files. See ``layout_fingerprint.should_short_circuit_extraction``.
+    """
+    try:
+        from layout_fingerprint import classify_layout
+    except ImportError:
+        classify_layout = None  # type: ignore[assignment]
+    out: Dict[str, List[Dict[str, Any]]] = {
+        "known": [],
+        "novel": [],
+        "unknown": [],
+    }
+    for bucket in ("new", "changed"):
+        for info in scan_result.get(bucket, []):
+            fam = info.get("layout_family")
+            if classify_layout is not None:
+                cls = classify_layout(fam, known_families)
+            else:
+                cls = "unknown" if fam is None else ("known" if fam in known_families else "novel")
+            info_with_cls = dict(info)
+            info_with_cls["layout_class"] = cls
+            out[cls].append(info_with_cls)
+    return out
+
+
+def surface_novel_layouts(
+    scan_result: Dict[str, List[Dict[str, Any]]],
+    known_families: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """Return the list of novel-layout files that must surface for full
+    extraction + human labelling.
+
+    Per the issue acceptance: 'novel layouts always surface for full
+    extraction + human labelling (never silently skipped).'
+    """
+    return classify_scan_by_layout(scan_result, known_families)["novel"]
 
 
 # ---------------------------------------------------------------------------

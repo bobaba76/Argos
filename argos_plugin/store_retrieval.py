@@ -1394,6 +1394,7 @@ class StoreRetrievalMixin:
         description_method: str = "heuristic",
         extract_hash: str | None = None,
         pinned: bool = False,
+        layout_family: str | None = None,
     ) -> None:
         """Insert or update a file_catalog row. Called by the watcher's
         scan pass for new and changed files."""
@@ -1408,9 +1409,11 @@ class StoreRetrievalMixin:
                         client_scope, doc_class, doc_type,
                         one_line_description, description_method,
                         extract_hash, extracted_at, last_touch,
-                        touch_count, pinned, hot_flags, hot_reason)
+                        touch_count, pinned, hot_flags, hot_reason,
+                        layout_family)
                        VALUES (?, ?, ?, ?, ?, ?, 'active',
-                               ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, NULL, NULL)
+                               ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, NULL, NULL,
+                               ?)
                        ON CONFLICT (file_id) DO UPDATE SET
                         canonical_path = excluded.canonical_path,
                         size = excluded.size,
@@ -1422,13 +1425,15 @@ class StoreRetrievalMixin:
                         one_line_description = excluded.one_line_description,
                         description_method = excluded.description_method,
                         extract_hash = excluded.extract_hash,
-                        pinned = excluded.pinned""",
+                        pinned = excluded.pinned,
+                        layout_family = excluded.layout_family""",
                     [
                         file_id, canonical_path, size, mtime,
                         now, now,
                         client_scope, doc_class, doc_type,
                         one_line_description, description_method,
                         extract_hash, pinned,
+                        layout_family,
                     ],
                 )
         except Exception as exc:
@@ -1529,6 +1534,64 @@ class StoreRetrievalMixin:
                 return [dict(zip(columns, row)) for row in result.fetchall()]
         except Exception as exc:
             logger.warning("catalog list failed: %s", exc)
+            return []
+
+    def list_catalog_by_layout_family(
+        self,
+        layout_family: str,
+        *,
+        status: str = "active",
+        limit: int = 100,
+    ) -> List[dict]:
+        """List catalog entries sharing a layout-family fingerprint.
+
+        Spec-09 (#112): form-level retrieval. Used by the known-family
+        short-circuit check and the labelling surface.
+        """
+        params: list = [layout_family, status]
+        params.append(max(1, min(int(limit), 10000)))
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    "SELECT * FROM file_catalog "
+                    "WHERE layout_family = ? AND status = ? "
+                    "ORDER BY last_seen DESC LIMIT ?",
+                    params,
+                )
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except Exception as exc:
+            logger.warning("catalog list by layout_family failed: %s", exc)
+            return []
+
+    def list_layout_families(
+        self,
+        *,
+        status: str = "active",
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate layout-family counts in the catalog.
+
+        Returns one row per distinct layout_family with its document count.
+        Rows with NULL layout_family are excluded (not yet fingerprinted).
+        Used by the labelling surface and the eval stratification script.
+        """
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    "SELECT layout_family, COUNT(*) AS doc_count "
+                    "FROM file_catalog "
+                    "WHERE layout_family IS NOT NULL AND status = ? "
+                    "GROUP BY layout_family "
+                    "ORDER BY doc_count DESC LIMIT ?",
+                    [status, max(1, min(int(limit), 100000))],
+                )
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except Exception as exc:
+            logger.warning("list_layout_families failed: %s", exc)
             return []
 
     def stale_facts_for_doc(self, file_id: str) -> int:

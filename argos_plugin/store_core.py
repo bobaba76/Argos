@@ -127,7 +127,12 @@ class StoreCoreMixin:
                     extraction_method  VARCHAR,
                     extracted_at       VARCHAR,
                     verified_state     VARCHAR DEFAULT 'current',
-                    verified_at        VARCHAR
+                    verified_at        VARCHAR,
+                    -- P5.1 (#6): memory lifecycle tier. 'active' (default,
+                    -- in injection pool) or 'archived' (out of injection
+                    -- pool, searchable via include_archived=True). Zero-
+                    -- migration: existing rows default 'active'.
+                    tier               VARCHAR DEFAULT 'active'
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,

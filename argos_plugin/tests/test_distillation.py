@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import sys
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -43,23 +42,15 @@ if str(_plugin_dir) not in sys.path:
     sys.path.insert(0, str(_plugin_dir))
 
 
-# NOTE: this suite loads the embedder BY NAME, which performs a network
-# HEAD-check that HANGS for minutes without a warm cache. Run with
-# HF_HUB_OFFLINE=1 (or the equivalent) or the suite will stall.
+# NOTE: this suite intentionally uses a deterministic test embedder
+# (_test_embedder.py, issue #98) instead of the real BGE model. The real
+# model costs ~0.3-1.9s per encode on this machine -- with 25-50 seeded
+# records per test that made this file the suite's dominant wall-time cost.
+# The deterministic embedder preserves the lexical-overlap clustering the
+# tests rely on at microseconds per encode, with no model load and no
+# HF_HUB_OFFLINE needed.
 
-_EMBEDDER = None
-_EMBEDDER_LOCK = threading.Lock()
-
-
-def _get_embedder():
-    """Shared embedder — one model load for the whole suite."""
-    global _EMBEDDER
-    if _EMBEDDER is None:
-        with _EMBEDDER_LOCK:
-            if _EMBEDDER is None:
-                from embeddings import LocalEmbedder
-                _EMBEDDER = LocalEmbedder("BAAI/bge-small-en-v1.5")
-    return _EMBEDDER
+from _test_embedder import DeterministicTestEmbedder
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +59,9 @@ def _get_embedder():
 
 @pytest.fixture
 def store(tmp_path):
-    """A fresh DuckDBMemoryStore with the BGE embedder."""
+    """A fresh DuckDBMemoryStore with the deterministic test embedder."""
     from store import DuckDBMemoryStore
-    embedder = _get_embedder()
+    embedder = DeterministicTestEmbedder()
     s = DuckDBMemoryStore(
         tmp_path / "test.duckdb", user_id="test_user", embedder=embedder,
     )

@@ -342,10 +342,15 @@ class StoreWriteMixin:
           ``valid_to``/``superseded_by`` and a new version becomes the head.
           Outcome ``"superseded"``.
 
-        *remember_kwargs* are forwarded to :meth:`remember` /
-        :meth:`update_memory` (e.g. ``created_at``, ``source``,
-        ``confidence``, ``scope``, ``project_id``, ``provenance_origin``,
-        ``grounding``, ``expires_at``).
+        *remember_kwargs* are forwarded to :meth:`remember` (insert path)
+        or :meth:`update_memory` (supersede path). On the insert path all
+        kwargs pass through (``created_at``, ``source``, ``confidence``,
+        ``scope``, ``project_id``, ``provenance_origin``, ``grounding``,
+        ``expires_at``). On the supersede path only ``created_at``,
+        ``expires_at``, and ``structural_guard`` are forwarded — the other
+        metadata (source, confidence, scope, etc.) is carried forward from
+        the prior record by ``update_memory``, which is the correct
+        behavior for a version update.
 
         Returns ``(record, outcome)`` where *outcome* is one of
         ``"inserted"`` / ``"superseded"`` / ``"duplicate"`` (or
@@ -381,7 +386,7 @@ class StoreWriteMixin:
             return existing[0], "duplicate"
         update_kwargs = {
             k: v for k, v in remember_kwargs.items()
-            if k in {"expires_at", "structural_guard"}
+            if k in {"expires_at", "structural_guard", "created_at"}
         }
         new_head = self.update_memory(
             memory_id=existing_id, content=content, tags=tags,
@@ -1770,6 +1775,7 @@ class StoreWriteMixin:
         expires_at: Any = _NOT_PROVIDED,
         *,
         structural_guard: bool = False,
+        created_at: Any = None,
     ) -> MemoryRecord | None:
         """Update an existing memory by creating a new version.
 
@@ -1782,6 +1788,15 @@ class StoreWriteMixin:
         - ``_NOT_PROVIDED`` (default): carry the old expiry forward unchanged.
         - ``None``: clear the expiry (revive the memory).
         - ISO-8601 string: set to that value.
+
+        *created_at* (issue #8 / #74): override the new version's creation
+        timestamp. By default the wall clock is used. Pass an ISO-8601 string
+        to backdate the new version to its in-world date (e.g. "married
+        Helen" on 2022-06-01 superseding "dating Helen" from 2022-01-01).
+        This sets both ``created_at`` and ``valid_from`` on the new version
+        so version-chain/supersession logic and ``as_of`` temporal queries
+        operate on in-world order, not ingest order. ``updated_at`` always
+        gets the wall clock (the row was physically written now).
 
         The old record is preserved for history queries (as_of parameter).
         If no content/tags/payload changes are provided, returns the existing
@@ -1889,6 +1904,15 @@ class StoreWriteMixin:
                 )
                 effective_expires = str(expires_at)
 
+        # created_at override (issue #8 / #74): backdate the new version to
+        # its in-world date so valid_from and version-chain order reflect
+        # when the event happened, not when it was ingested. Mirrors the
+        # same logic in remember(). updated_at stays at the wall clock.
+        if created_at is not None:
+            created_ts = self._normalize_timestamp(created_at) or str(created_at)
+        else:
+            created_ts = now
+
         # If nothing actually changed, return the existing record
         if (content is None and tags is None and not payload_updates
                 and expires_at is _NOT_PROVIDED):
@@ -1925,14 +1949,14 @@ class StoreWriteMixin:
                         valid_from, valid_to, superseded_by)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                     [new_id, rec.category, new_content, new_tags,
-                     json.dumps(new_payload), now, now,
+                     json.dumps(new_payload), created_ts, now,
                      effective_expires,
                      new_emb if new_emb else None,
                      rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
                      rec.project_id,
                      rec.payload.get("user_scope"),
                      rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
-                     now],
+                     created_ts],
                 )
                 # 2. Supersede the old version
                 self.connection.execute(

@@ -163,6 +163,71 @@ class TestIngestVersioned:
         assert outcome == "blocked"
         assert rec is None
 
+    def test_created_at_survives_supersede_path(self, store):
+        """created_at on the supersede path sets the new version's
+        created_at AND valid_from to the in-world date, not the wall clock.
+
+        This is the #8/#74 scenario: "dating Helen" (2022-01-01) is
+        superseded by "married to Helen" (2022-06-01). Without the fix the
+        new version got created_at=wall_clock and valid_from=wall_clock,
+        breaking as_of queries and in-world chain order. With the fix the
+        new version carries its in-world date.
+        """
+        rec1, out1 = store.ingest_versioned(
+            category="personal_fact", content="User is currently dating Helen",
+            created_at="2022-01-01T10:00:00+00:00",
+        )
+        rec2, out2 = store.ingest_versioned(
+            category="personal_fact", content="User is currently dating Helen now",
+            created_at="2022-06-01T10:00:00+00:00",
+        )
+        assert out1 == "inserted"
+        assert out2 == "superseded"
+        # The new version's created_at and valid_from are the in-world date.
+        assert rec2.created_at == "2022-06-01T10:00:00+00:00"
+        assert rec2.valid_from == "2022-06-01T10:00:00+00:00"
+        # updated_at is the wall clock (physically written now), not the
+        # in-world date.
+        assert rec2.updated_at != "2022-06-01T10:00:00+00:00"
+        # The prior version keeps its original in-world date.
+        history = store.get_memory_history(rec2.memory_id)
+        assert len(history) == 2
+        assert history[0].created_at == "2022-01-01T10:00:00+00:00"
+        assert history[0].valid_from == "2022-01-01T10:00:00+00:00"
+        # Chain is in in-world chronological order (oldest first).
+        assert history[0].valid_from < history[1].valid_from
+
+    def test_created_at_supersede_as_of_query(self, store):
+        """as_of temporal queries see the new version only after its
+        in-world valid_from date, not from the ingest wall clock onward.
+
+        "Dating Helen" (2022-01-01) superseded by "married to Helen"
+        (2022-06-01). A query as_of 2022-03-01 (between the two in-world
+        dates) must see the OLD version, not the new one — the marriage
+        hadn't happened yet in-world.
+        """
+        store.ingest_versioned(
+            category="personal_fact", content="User is currently dating Helen",
+            created_at="2022-01-01T10:00:00+00:00",
+        )
+        store.ingest_versioned(
+            category="personal_fact", content="User is currently dating Helen now",
+            created_at="2022-06-01T10:00:00+00:00",
+        )
+        # As of 2022-03-01 (before the marriage's in-world date): the old
+        # version is current, the new version is not yet valid.
+        results_before = store.search(
+            "Helen", limit=10, as_of="2022-03-01T00:00:00+00:00",
+        )
+        assert any("dating" in r.content for r in results_before)
+        assert not any("now" in r.content for r in results_before)
+        # As of 2022-07-01 (after the marriage's in-world date): the new
+        # version is current.
+        results_after = store.search(
+            "Helen", limit=10, as_of="2022-07-01T00:00:00+00:00",
+        )
+        assert any("now" in r.content for r in results_after)
+
     def test_semantic_restatement_supersedes(self, embedded_store):
         """A paraphrased restatement (different wording, same fact) is caught
         by the semantic dedup layer and routed through update_memory.

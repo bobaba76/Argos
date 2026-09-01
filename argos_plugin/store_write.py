@@ -78,6 +78,8 @@ class StoreWriteMixin:
         durability: str | None = None,
         scope: str = "profile",
         project_id: str | None = None,
+        namespace: str = "conversation",
+        client_scope: str | None = None,
         status: str = "active",
         expires_at: Any = _NOT_PROVIDED,
         provenance_origin: Any = None,
@@ -271,9 +273,10 @@ class StoreWriteMixin:
             INSERT INTO memory_records
                 (memory_id, category, content, tags, payload, created_at, updated_at,
                  expires_at, embedding, status, source, confidence, durability, scope,
-                 project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
+                 project_id, user_scope, namespace, client_scope,
+                 retrieval_count, helpful_count, dismissed_count,
                  valid_from, provenance_origin, grounding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
         """
         with self._lock:
             assert self.connection is not None
@@ -284,6 +287,7 @@ class StoreWriteMixin:
                 emb if emb else None,
                 status, source, confidence, durability, scope, project_id,
                 record_payload.get("user_scope"),
+                namespace or "conversation", client_scope,
                 created_ts,  # valid_from = in-world creation time (issue #8)
                 prov, ground,
             ])
@@ -505,7 +509,8 @@ class StoreWriteMixin:
     def _candidate_row_to_dict(self, row: tuple) -> dict:
         (
             candidate_id, category, content, tags, payload, source, confidence,
-            durability, scope, project_id, session_id, status, created_at,
+            durability, scope, project_id, namespace, client_scope, session_id,
+            status, created_at,
             updated_at, reviewed_at, review_reason, evidence_text, evidence_role,
             source_timestamp, review_confidence, review_model,
             quarantine_reason, quarantined_at, provenance_origin, grounding,
@@ -521,6 +526,8 @@ class StoreWriteMixin:
             "durability": durability,
             "scope": scope,
             "project_id": project_id,
+            "namespace": namespace or "conversation",
+            "client_scope": client_scope,
             "session_id": session_id,
             "status": status,
             "created_at": created_at,
@@ -550,6 +557,8 @@ class StoreWriteMixin:
         durability: str = "durable",
         scope: str = "profile",
         project_id: str | None = None,
+        namespace: str = "conversation",
+        client_scope: str | None = None,
         session_id: str = "",
         evidence_text: str = "",
         evidence_role: str = "user_turn",
@@ -687,15 +696,18 @@ class StoreWriteMixin:
             self.connection.execute(
                 """INSERT INTO memory_candidates
                   (candidate_id, category, content, tags, payload, source,
-                   confidence, durability, scope, project_id, session_id,
+                   confidence, durability, scope, project_id,
+                   namespace, client_scope,
+                   session_id,
                    user_scope, status, created_at, updated_at, evidence_text,
                    evidence_role, source_timestamp, quarantine_reason, quarantined_at,
                    provenance_origin, grounding)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     candidate_id, category, content.strip(), tags or [],
                     json.dumps(candidate_payload), source, normalized_confidence,
                     durability or "durable", scope or "profile", project_id,
+                    namespace or "conversation", client_scope,
                     session_id or "", candidate_payload.get("user_scope"),
                     candidate_status, now, now, evidence_text,
                     evidence_role or "user_turn", source_timestamp,
@@ -722,7 +734,7 @@ class StoreWriteMixin:
         elif status:
             conditions.append("status = ?")
             params.append(status)
-        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model, quarantine_reason, quarantined_at, provenance_origin, grounding FROM memory_candidates"
+        sql = "SELECT candidate_id, category, content, tags, payload, source, confidence, durability, scope, project_id, namespace, client_scope, session_id, status, created_at, updated_at, reviewed_at, review_reason, evidence_text, evidence_role, source_timestamp, review_confidence, review_model, quarantine_reason, quarantined_at, provenance_origin, grounding FROM memory_candidates"
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
@@ -765,7 +777,8 @@ class StoreWriteMixin:
             params.append(project_id)
         sql = (
             "SELECT candidate_id, category, content, tags, payload, source, "
-            "confidence, durability, scope, project_id, session_id, status, "
+            "confidence, durability, scope, project_id, "
+            "namespace, client_scope, session_id, status, "
             "created_at, updated_at, reviewed_at, review_reason, evidence_text, "
             "evidence_role, source_timestamp, review_confidence, review_model, "
             "quarantine_reason, quarantined_at, provenance_origin, grounding "
@@ -930,6 +943,8 @@ class StoreWriteMixin:
                 durability=selected_durability,
                 scope=selected_scope,
                 project_id=candidate["project_id"],
+                namespace=candidate.get("namespace", "conversation"),
+                client_scope=candidate.get("client_scope"),
                 provenance_origin=candidate_provenance,
                 grounding=candidate_grounding,
             )
@@ -1173,6 +1188,8 @@ class StoreWriteMixin:
                         durability=candidate["durability"],
                         scope=candidate["scope"],
                         project_id=candidate["project_id"],
+                        namespace=candidate.get("namespace", "conversation"),
+                        client_scope=candidate.get("client_scope"),
                         provenance_origin=candidate.get("provenance_origin"),
                         grounding=candidate.get("grounding"),
                     )
@@ -1259,6 +1276,8 @@ class StoreWriteMixin:
                         durability=candidate["durability"],
                         scope=candidate["scope"],
                         project_id=candidate["project_id"],
+                        namespace=candidate.get("namespace", "conversation"),
+                        client_scope=candidate.get("client_scope"),
                         provenance_origin=candidate.get("provenance_origin"),
                         grounding=candidate.get("grounding"),
                     )
@@ -1357,6 +1376,8 @@ class StoreWriteMixin:
                         durability=candidate["durability"],
                         scope=candidate["scope"],
                         project_id=candidate["project_id"],
+                        namespace=candidate.get("namespace", "conversation"),
+                        client_scope=candidate.get("client_scope"),
                         provenance_origin=candidate.get("provenance_origin"),
                         grounding=candidate.get("grounding"),
                     )
@@ -1945,9 +1966,10 @@ class StoreWriteMixin:
                     """INSERT INTO memory_records
                        (memory_id, category, content, tags, payload, created_at, updated_at,
                         expires_at, embedding, status, source, confidence, durability, scope,
-                        project_id, user_scope, retrieval_count, helpful_count, dismissed_count,
+                        project_id, user_scope, namespace, client_scope,
+                        retrieval_count, helpful_count, dismissed_count,
                         valid_from, valid_to, superseded_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
                     [new_id, rec.category, new_content, new_tags,
                      json.dumps(new_payload), created_ts, now,
                      effective_expires,
@@ -1955,6 +1977,8 @@ class StoreWriteMixin:
                      rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
                      rec.project_id,
                      rec.payload.get("user_scope"),
+                     getattr(rec, "namespace", "conversation") or "conversation",
+                     getattr(rec, "client_scope", None),
                      rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
                      created_ts],
                 )

@@ -61,6 +61,8 @@ class StoreRetrievalMixin:
             scope=row.get("scope", "profile"),
             project_id=row.get("project_id"),
             user_scope=row.get("user_scope"),
+            namespace=row.get("namespace", "conversation"),
+            client_scope=row.get("client_scope"),
             retrieval_count=row.get("retrieval_count", 0),
             last_retrieved_at=row.get("last_retrieved_at"),
             helpful_count=row.get("helpful_count", 0),
@@ -106,6 +108,8 @@ class StoreRetrievalMixin:
         self, query: str, limit: int, excluded: set[str],
         category_filter: str | None = None,
         project_id: str | None = None,
+        namespace: str | None = None,
+        client_scope: str | None = None,
         as_of: str | None = None,
         include_expired: bool = False,
         include_closed: bool = False,
@@ -117,6 +121,11 @@ class StoreRetrievalMixin:
         fusion has a comparable signal.
         When *project_id* is provided, memories from other projects are
         excluded; global memories (project_id IS NULL) remain visible.
+
+        Spec-05 (#67): *namespace* filters by source namespace
+        ('conversation'/'document'); None = no filter (backward compatible).
+        *client_scope* filters to a client's rows OR global (NULL) rows;
+        None = no filter.
 
         When *include_expired* is True, the expiry filter is omitted (expired
         memories are returned, ranked normally).
@@ -130,6 +139,8 @@ class StoreRetrievalMixin:
         patterns = [f"%{t}%" for t in tokens]
         conditions = " OR ".join(["content ILIKE ?" for _ in patterns])
         project_clause = ""
+        namespace_clause = ""
+        client_scope_clause = ""
         expiry_ref = as_of if as_of else self._now()
         if include_expired:
             expiry_clause = ""
@@ -141,6 +152,13 @@ class StoreRetrievalMixin:
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
+        if namespace:
+            namespace_clause = " AND namespace = ?"
+            params.append(namespace)
+        if client_scope:
+            # NULL = global: a client-scoped query still sees global rows.
+            client_scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
+            params.append(client_scope)
         # Temporal filter: default to current (valid_to IS NULL),
         # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)).
         # include_closed widens to closed versions too — used by the
@@ -178,6 +196,8 @@ class StoreRetrievalMixin:
             "AND (user_scope IS NULL OR user_scope = ?) "
             f"{expiry_clause}"
             f"{project_clause}"
+            f"{namespace_clause}"
+            f"{client_scope_clause}"
             f"{category_clause} AND ("
             f"{conditions}) LIMIT 2000"
         )
@@ -228,6 +248,8 @@ class StoreRetrievalMixin:
         self, emb: List[float], limit: int, excluded: set[str],
         category_filter: str | None = None,
         project_id: str | None = None,
+        namespace: str | None = None,
+        client_scope: str | None = None,
         as_of: str | None = None,
         include_expired: bool = False,
         include_closed: bool = False,
@@ -239,10 +261,15 @@ class StoreRetrievalMixin:
         When *project_id* is provided, memories from other projects are
         excluded; global memories (project_id IS NULL) remain visible.
 
+        Spec-05 (#67): *namespace* / *client_scope* filter the same way as
+        _text_search_raw. None = no filter (backward compatible).
+
         When *include_expired* is True, the expiry filter is omitted (expired
         memories are returned, ranked normally).
         """
         project_clause = ""
+        namespace_clause = ""
+        client_scope_clause = ""
         # String-cast the query vector as a fixed-size array constant.
         # A Python-list parameter binds through an interpreted per-row path
         # (~1ms/row — measured ~1.2s at 1k rows); the string-cast form is
@@ -275,6 +302,14 @@ class StoreRetrievalMixin:
         if project_id:
             project_clause = " AND (project_id IS NULL OR project_id = ?)"
             params.append(project_id)
+        if namespace:
+            namespace_clause = " AND namespace = ?"
+            params.append(namespace)
+        if client_scope:
+            client_scope_clause = (
+                " AND (client_scope IS NULL OR client_scope = ?)"
+            )
+            params.append(client_scope)
         # Push category_filter and excluded into SQL (issue #27).
         category_clause = ""
         if category_filter:
@@ -294,6 +329,8 @@ class StoreRetrievalMixin:
             "  AND (user_scope IS NULL OR user_scope = ?) "
             f"{expiry_clause}"
             f"{project_clause}"
+            f"{namespace_clause}"
+            f"{client_scope_clause}"
             f"{category_clause} "
             "ORDER BY sim DESC "
             "LIMIT ?"
@@ -872,6 +909,8 @@ class StoreRetrievalMixin:
         exclude_categories: List[str] | None = None,
         category_filter: str | None = None,
         project_id: str | None = None,
+        namespace: str | None = None,
+        client_scope: str | None = None,
         as_of: str | None = None,
         suppress_retrieval: bool = False,
         include_expired: bool = False,
@@ -947,7 +986,8 @@ class StoreRetrievalMixin:
         vector_results: List[MemoryRecord] = []
         text_results: List[MemoryRecord] = self._text_search_raw(
             query, pool_size, excluded, category_filter,
-            project_id=project_id, as_of=as_of,
+            project_id=project_id, namespace=namespace,
+            client_scope=client_scope, as_of=as_of,
             include_expired=include_expired, include_closed=include_closed,
         )
 
@@ -955,7 +995,8 @@ class StoreRetrievalMixin:
             try:
                 vector_results = self._vector_search_raw(
                     emb, pool_size, excluded, category_filter,
-                    project_id=project_id, as_of=as_of,
+                    project_id=project_id, namespace=namespace,
+                    client_scope=client_scope, as_of=as_of,
                     include_expired=include_expired,
                     include_closed=include_closed,
                 )

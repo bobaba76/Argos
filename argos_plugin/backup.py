@@ -360,6 +360,25 @@ def restore_store(
                     p.unlink()
         except Exception:
             pass
+        # Rollback the partial swap: if the live DB was moved to
+        # backup_of_live but the temp→live rename failed (disk error, file
+        # handle, cross-device), restore the live DB so the system is not
+        # left with no database at live_db_path. Only roll back when the
+        # live path is empty AND the backup exists (the swap started).
+        try:
+            if backup_of_live.exists() and not live_db_path.exists():
+                backup_of_live.rename(live_db_path)
+                for wal_suffix in (".wal",):
+                    wal_bak = Path(str(backup_of_live) + wal_suffix)
+                    wal_live = Path(str(live_db_path) + wal_suffix)
+                    if wal_bak.exists() and not wal_live.exists():
+                        wal_bak.rename(wal_live)
+        except Exception:
+            logger.warning(
+                "restore rollback failed: live DB may be missing at %s; "
+                "the pre-restore backup is at %s",
+                live_db_path, backup_of_live,
+            )
         raise
 
 

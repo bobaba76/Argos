@@ -297,14 +297,15 @@ def test_shared_service_search_forwards_namespace_kwargs(tmp_path):
             namespace="conversation",
         )
         # Proxy convention: namespace/client_scope forwarded through RPC.
-        doc = store.search("about", limit=10, namespace="document")
-        conv = store.search("about", limit=10, namespace="conversation")
+        # NOTE: "about" is a _TEXT_STOPWORD — use a content word instead.
+        doc = store.search("invoice", limit=10, namespace="document")
+        conv = store.search("meeting", limit=10, namespace="conversation")
         assert any("doc fact" in r.content for r in doc)
         assert all("chat note" not in r.content for r in doc)
         assert any("chat note" in r.content for r in conv)
         assert all("doc fact" not in r.content for r in conv)
         # client_scope filter through RPC.
-        acme = store.search("about", limit=10, client_scope="acme")
+        acme = store.search("invoice", limit=10, client_scope="acme")
         assert any("doc fact" in r.content for r in acme)
     finally:
         try:

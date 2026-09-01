@@ -38,7 +38,7 @@ DEFAULT_LIMIT = 200
 MIN_LIMIT = 150
 MAX_LIMIT = 1000
 MIN_APPROVED = 50
-_SHA_KEYS = ("memory_id", "category", "query", "template")
+_SHA_KEYS = ("memory_id", "category", "query", "template", "layout_family")
 
 
 def gold_sha256(lines: List[Dict[str, Any]]) -> str:
@@ -102,6 +102,7 @@ def build_gold(
             "content": mem.get("content") or "",
             "query": probe["query"],
             "template": probe["template"],
+            "layout_family": mem.get("layout_family"),
             "status": "approved" if auto_approve else "pending",
         })
     out_path = Path(out_path)
@@ -184,10 +185,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         user_id=args.user_id, auto_approve=args.auto_approve,
     )
     by_cat: Dict[str, int] = {}
+    by_fam: Dict[str, int] = {}
     for l in lines:
         by_cat[l["category"]] = by_cat.get(l["category"], 0) + 1
+        fam = l.get("layout_family") or "none"
+        by_fam[fam] = by_fam.get(fam, 0) + 1
     print(f"Wrote {len(lines)} probes to {Path(args.out)}")
     print(f"  categories: {by_cat}")
+    print(f"  layout_families: {by_fam}")
     print("  Review the JSONL (status: approved/rejected), then re-run with --freeze.")
     return 0
 

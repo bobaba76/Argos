@@ -160,13 +160,15 @@ def _sample_memories(
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     rows = conn.execute(
         """
-        SELECT memory_id, category, content, tags, created_at,
-               expires_at, valid_to, superseded_by, status, project_id
-        FROM memory_records
-        WHERE COALESCE(status, 'active') = 'active'
-          AND valid_to IS NULL
-          AND (expires_at IS NULL OR expires_at > ?)
-          AND (user_scope IS NULL OR user_scope = ?)
+        SELECT m.memory_id, m.category, m.content, m.tags, m.created_at,
+               m.expires_at, m.valid_to, m.superseded_by, m.status,
+               m.project_id, m.source_doc_id, f.layout_family
+        FROM memory_records m
+        LEFT JOIN file_catalog f ON m.source_doc_id = f.file_id
+        WHERE COALESCE(m.status, 'active') = 'active'
+          AND m.valid_to IS NULL
+          AND (m.expires_at IS NULL OR m.expires_at > ?)
+          AND (m.user_scope IS NULL OR m.user_scope = ?)
         """,
         [now, user_id],
     ).fetchall()
@@ -175,6 +177,7 @@ def _sample_memories(
     cols = [
         "memory_id", "category", "content", "tags", "created_at",
         "expires_at", "valid_to", "superseded_by", "status", "project_id",
+        "source_doc_id", "layout_family",
     ]
     records = [dict(zip(cols, r)) for r in rows]
     rng = random.Random(seed)
@@ -513,6 +516,7 @@ def _run_probe(
         "target_category": target.get("category"),
         "target_content_len": len(target.get("content") or ""),
         "target_created_at": target.get("created_at"),
+        "target_layout_family": target.get("layout_family"),
         "hit": hit,
         "per_window": per_window,
         "rank": rank,
@@ -566,6 +570,16 @@ def _group_recall(
     return {g: _recall_at(ps, k) for g, ps in sorted(groups.items())}
 
 
+def _group_probes(
+    probes: List[Dict[str, Any]], key_fn,
+) -> Dict[str, int]:
+    """Return {group_key: count} for a probe grouping (Spec-09 #112)."""
+    counts: Dict[str, int] = {}
+    for p in probes:
+        counts[key_fn(p)] = counts.get(key_fn(p), 0) + 1
+    return counts
+
+
 def compute_metrics(
     probes: List[Dict[str, Any]],
     ladder: List[int],
@@ -616,6 +630,22 @@ def compute_metrics(
             g: round(v, 4)
             for g, v in _group_recall(probes, k, lambda p: _age_bucket(p["target_created_at"])).items()
         }
+    # By layout family (Spec-09 #112): per-family accuracy reported alongside
+    # the aggregate, so a pilot dominated by a few repeated templates can't
+    # pass as general accuracy. Probes with no layout_family (conversation-
+    # sourced memories, or document-sourced from un-fingerprinted files) are
+    # grouped under 'none'.
+    metrics["by_layout_family"] = {}
+    for k in ladder:
+        metrics["by_layout_family"][f"recall@{k}"] = {
+            g: round(v, 4)
+            for g, v in _group_recall(
+                probes, k, lambda p: p.get("target_layout_family") or "none"
+            ).items()
+        }
+    metrics["layout_family_distribution"] = dict(
+        sorted(_group_probes(probes, lambda p: p.get("target_layout_family") or "none").items())
+    )
     # not_in_pool_rate + avg_rank_of_hits.
     not_in_pool = sum(1 for p in probes if p["not_in_pool"])
     metrics["not_in_pool_rate"] = round(not_in_pool / len(probes), 4) if probes else 0.0
@@ -858,6 +888,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  recall@{k}: {r*100:.1f}%", flush=True)
     print(f"  not_in_pool_rate: {metrics['not_in_pool_rate']*100:.1f}%", flush=True)
     print(f"  avg_rank_of_hits: {metrics['avg_rank_of_hits']}", flush=True)
+    # Spec-09 (#112): per-layout-family accuracy alongside the aggregate.
+    fam_dist = metrics.get("layout_family_distribution", {})
+    if fam_dist:
+        print(f"  layout_family_distribution: {fam_dist}", flush=True)
+        by_fam = metrics.get("by_layout_family", {})
+        recall20_fam = by_fam.get("recall@20", {})
+        if recall20_fam:
+            print("  by_layout_family (recall@20):", flush=True)
+            for fam, v in recall20_fam.items():
+                # Truncate the fingerprint for display; full hash is in the JSON.
+                label = fam[:12] if fam != "none" else "none"
+                print(f"    {label:14s}: {v*100:.1f}% (n={fam_dist.get(fam, 0)})", flush=True)
     if metrics["by_template"]:
         print("  by_template (recall@20):", flush=True)
         for t, v in metrics["by_template"].get("recall@20", {}).items():

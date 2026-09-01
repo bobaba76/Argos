@@ -100,9 +100,7 @@ def test_tool_path_can_set_approved(tmp_path):
 
 def test_auto_path_maps_approve_to_reviewed_approved(tmp_path, monkeypatch):
     """The provider's auto-reviewer maps reviewer 'approve' to reviewed_approved."""
-    import importlib
-
-    hm = importlib.import_module("argos_plugin")
+    import argos_plugin
 
     fake_review = {
         "decision": "approve",
@@ -112,15 +110,23 @@ def test_auto_path_maps_approve_to_reviewed_approved(tmp_path, monkeypatch):
         "durability": "durable",
         "scope": "profile",
     }
+    # Patch the module global _review_candidate actually calls
+    # (argos_plugin.provider_session), not the package-level re-export.
+    # Patching argos_plugin.review_candidate_with_llm was inert, so the real
+    # reviewer ran: a real LLM call on runtimes that resolve
+    # agent.auxiliary_client (e.g. the CPU venv) and a deterministic
+    # pending_user_confirmation on hermetic ones (e.g. venv-cuda) (#105).
+    import argos_plugin.provider_session as _provider_session_mod
     monkeypatch.setattr(
-        hm, "review_candidate_with_llm", lambda *a, **k: fake_review
+        _provider_session_mod, "review_candidate_with_llm",
+        lambda *a, **k: fake_review,
     )
 
     store = _make_store(tmp_path)
     try:
         cid = _add_pending(store)
 
-        class _StubProvider(hm.ArgosProvider):
+        class _StubProvider(argos_plugin.ArgosProvider):
             def __init__(self, store):
                 self._store = store
                 self._llm_model = None

@@ -10,7 +10,7 @@ import threading
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Deque, Dict, Optional
 
 try:
     from .store_common import _DEFAULT_TTL_DAYS

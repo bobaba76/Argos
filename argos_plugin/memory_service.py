@@ -296,6 +296,8 @@ class MemoryService:
                     exclude_categories=args.get("exclude_categories"),
                     category_filter=args.get("category_filter"),
                     project_id=args.get("project_id"),
+                    namespace=args.get("namespace"),
+                    client_scope=args.get("client_scope"),
                     as_of=args.get("as_of"),
                     suppress_retrieval=bool(args.get("suppress_retrieval", False)),
                                         include_expired=bool(args.get("include_expired", False)),

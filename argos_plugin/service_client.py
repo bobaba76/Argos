@@ -127,6 +127,7 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
         project_id=value.get("project_id"),
         namespace=value.get("namespace", "conversation"),
         client_scope=value.get("client_scope"),
+        doc_class=value.get("doc_class"),
         retrieval_count=value.get("retrieval_count", 0),
         last_retrieved_at=value.get("last_retrieved_at"),
         helpful_count=value.get("helpful_count", 0),

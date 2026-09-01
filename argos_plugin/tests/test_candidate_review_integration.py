@@ -6,11 +6,18 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 # Keep this test independently importable when pytest collects it first.
 _plugin_dir = Path(__file__).resolve().parent.parent
 for _path in (_plugin_dir.parent, _plugin_dir):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
+
+# Every test here spawns the shared memory service subprocess. Group them
+# onto a single xdist worker (pytest -n auto --dist loadgroup) so parallel
+# runs serialize the spawns instead of racing them (#98).
+pytestmark = pytest.mark.xdist_group("shared_service")
 
 
 def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):

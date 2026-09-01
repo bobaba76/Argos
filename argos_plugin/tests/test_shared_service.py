@@ -4,6 +4,13 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
+# Every test here spawns the shared memory service subprocess. Group them
+# onto a single xdist worker (pytest -n auto --dist loadgroup) so parallel
+# runs serialize the spawns instead of racing them (#98).
+pytestmark = pytest.mark.xdist_group("shared_service")
+
 
 def test_shared_service_store_and_graph(tmp_path):
     from service_client import SharedGraphStore, SharedMemoryStore

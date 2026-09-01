@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 # Ensure plugin dir is importable.
 _plugin_dir = Path(__file__).resolve().parent.parent
 if str(_plugin_dir) not in sys.path:
@@ -192,6 +194,7 @@ def test_retention_prunes_oldest(tmp_path):
 # Service-coordinated RPC path
 # ---------------------------------------------------------------------------
 
+@pytest.mark.xdist_group("shared_service")
 def test_service_coordinated_backup(tmp_path):
     """The backup RPC path through the shared service produces a valid snapshot."""
     from service_client import SharedMemoryStore, SharedMemoryServiceError

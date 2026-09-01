@@ -119,7 +119,8 @@ class StoreCoreMixin:
                     provenance_origin  VARCHAR DEFAULT 'internal',
                     grounding          VARCHAR DEFAULT 'observed',
                     namespace          VARCHAR DEFAULT 'conversation',
-                    client_scope       VARCHAR
+                    client_scope       VARCHAR,
+                    doc_class          VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -134,6 +135,7 @@ class StoreCoreMixin:
                     project_id         VARCHAR,
                     namespace          VARCHAR DEFAULT 'conversation',
                     client_scope       VARCHAR,
+                    doc_class          VARCHAR,
                     session_id         VARCHAR,
                     status             VARCHAR DEFAULT 'pending',
                     created_at         VARCHAR,
@@ -234,6 +236,10 @@ class StoreCoreMixin:
                 # client_scope = global (visible inside any client query).
                 "namespace": "VARCHAR DEFAULT 'conversation'",
                 "client_scope": "VARCHAR",
+                # Spec-06 (#69): document class for access scoping.
+                # NULL = no class (legacy/conversation records). Reserved
+                # value 'practice-internal' = principals-only.
+                "doc_class": "VARCHAR",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",
@@ -248,6 +254,7 @@ class StoreCoreMixin:
                 "grounding": "VARCHAR DEFAULT 'extracted'",
                 "namespace": "VARCHAR DEFAULT 'conversation'",
                 "client_scope": "VARCHAR",
+                "doc_class": "VARCHAR",
             }
             for name, definition in columns.items():
                 try:
@@ -416,6 +423,37 @@ class StoreCoreMixin:
                 """)
             except Exception as exc:
                 logger.warning("user_scope index creation failed: %s", exc)
+
+            # Spec-06 (#69): access scoping index on client_scope + doc_class
+            # for the retrieval pre-filter. Additive, no behaviour change
+            # when the columns are NULL (legacy rows).
+            try:
+                self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_memory_client_scope_doc_class
+                    ON memory_records (client_scope, doc_class)
+                """)
+            except Exception as exc:
+                logger.warning("client_scope/doc_class index creation failed: %s", exc)
+
+            # Spec-06 (#69): append-only access audit log. Every query and
+            # every deny writes a row. Exportable via the service API.
+            # Principals-only read; rotates on a configurable window.
+            try:
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS access_audit (
+                        audit_id      VARCHAR PRIMARY KEY,
+                        ts            VARCHAR,
+                        tenant        VARCHAR,
+                        user_id       VARCHAR,
+                        query_text    VARCHAR,
+                        granted_count INTEGER DEFAULT 0,
+                        denied_count  INTEGER DEFAULT 0,
+                        denied_scopes VARCHAR,
+                        excluded      BOOLEAN DEFAULT FALSE
+                    )
+                """)
+            except Exception as exc:
+                logger.warning("access_audit table creation failed: %s", exc)
 
             # System state KV table (P4.2 distillation run state, future
             # maintenance passes). Zero migration — CREATE IF NOT EXISTS.

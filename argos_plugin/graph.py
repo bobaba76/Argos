@@ -1771,12 +1771,29 @@ class KuzuGraphStore:
             frontier = next_frontier
 
         selected_nodes = [node_data[n] for n in distances if n in node_data]
-        return {
+        result = {
             "entity_id": seed["id"],
             "depth": depth,
             "nodes": selected_nodes[:limit],
             "edges": selected_edges[:limit],
         }
+        # Spec-06 (#69): graph guard — post-traversal filter drops
+        # cross-scope neighbours so a shared director between Client A
+        # and Client B doesn't surface B's facts to a user with only A
+        # in their mask. The graph is the leak vector; it gets its own
+        # filter, not just the retrieval filter.
+        acl = getattr(self, "_acl_config", None)
+        if acl is not None and not acl.is_open_store:
+            try:
+                from .access_scoping import filter_graph_neighbours
+            except ImportError:
+                from access_scoping import filter_graph_neighbours
+            nodes, edges, _dropped = filter_graph_neighbours(
+                result["nodes"], result["edges"], acl, self.user_id,
+            )
+            result["nodes"] = nodes
+            result["edges"] = edges
+        return result
 
     def list_nodes(self, node_type: str | None = None, limit: int = 100) -> List[Dict[str, Any]]:
         if node_type:

@@ -117,6 +117,14 @@ Proposals are never active memory until reviewed. The agent can also save explic
 
 When `expiry_enabled=true`, memories expire by category based on `expiry_ttl_days` (default: `context_note`=30, `event`=180, `goal`=180; other categories use `expiry_default_days`=90). `expiry_auto_suggest` suggests expiry for memories that look time-limited. Disabled by default.
 
+### Memory lifecycle (P5.1)
+
+Three independent phases, each shippable on its own. All ship OFF by default (conservative — enable after soak).
+
+1. **Archival tier** (`archive_enabled=true`) — at session end, records older than `archive_after_days` (180) with no retrievals/feedback are moved to `tier='archived'`. Archived = out of the injection pool and default search, still retrievable via `include_archived=True`. Exempt: `personal_fact`, `preference`, `insight`, `relationship`, `goal`. Any update/feedback revives. Deterministic, zero LLM.
+2. **Forgetting** (`forget_enabled=true`) — auto-*quarantine* (reversible, never delete) of `context_note`/`event`/`goal` older than `forget_after_days` (365) with no retrievals/feedback. Restore via `memory_restore`. Deterministic, zero LLM.
+3. **Long-horizon rollups** (`rollup_enabled=true`) — monthly bounded LLM pass that emits **proposals only** — profile-style "what has stayed true / changed" summaries (`source='rollup'`) through the standard review pipeline. Never writes active memory. Reuses P4.2's cooldown/budget/fail-soft seam. Typical cost R0.10-0.60/run.
+
 ### Distillation pass (the dream)
 
 A bounded, LLM-assisted consolidation pass that turns accumulated records + feedback into *proposed* insights, guardrails, and contradiction warnings. Disabled by default (`distillation_enabled: false`).

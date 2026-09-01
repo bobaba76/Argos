@@ -369,6 +369,7 @@ class SharedMemoryStore:
             suppress_retrieval: bool = False,
             include_expired: bool = False,
             include_closed: bool = False,
+            include_archived: bool = False,
         ) -> List[MemoryRecord]:
             values = self._rpc.call(
                 "store", "search", query=query, limit=limit,
@@ -381,6 +382,7 @@ class SharedMemoryStore:
                 suppress_retrieval=suppress_retrieval,
                 include_expired=include_expired,
                 include_closed=include_closed,
+                include_archived=include_archived,
             )
             return [_record_from_dict(value) for value in (values or [])]
 

@@ -868,6 +868,175 @@ class StoreMaintenanceMixin:
             "diagnostics": diagnostics,
         }
 
+    # -- P5.1 (#6): memory lifecycle — archival, forgetting, rollups ----------
+
+    def archive_stale_records(
+        self,
+        *,
+        archive_after_days: int = 180,
+        exempt_categories: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Archive active records older than *archive_after_days* with no
+        retrievals/feedback. Archived = out of injection pool + default
+        search, still retrievable via ``include_archived=True``.
+
+        Exempt categories (default: facts, preferences, insights,
+        relationships, goal) are never archived. Any update/feedback
+        revives an archived record (see ``revive_record``).
+
+        Deterministic, zero LLM. Returns a summary dict.
+        """
+        if exempt_categories is None:
+            exempt_categories = ["personal_fact", "preference",
+                                 "insight", "relationship",
+                                 "goal"]
+        exempt_set = {c.lower() for c in exempt_categories}
+        now = datetime.now(timezone.utc)
+        cutoff_iso = (now - timedelta(days=max(1, archive_after_days))).isoformat()
+        with self._lock:
+            assert self.connection is not None
+            # Build the exempt clause dynamically.
+            if exempt_set:
+                placeholders = ", ".join(["?" for _ in exempt_set])
+                exempt_clause = f" AND LOWER(category) NOT IN ({placeholders})"
+                params: list = [cutoff_iso, self.user_id, *exempt_set]
+            else:
+                exempt_clause = ""
+                params = [cutoff_iso, self.user_id]
+            rows = self.connection.execute(
+                f"""SELECT memory_id FROM memory_records
+                   WHERE COALESCE(status, 'active') = 'active'
+                     AND valid_to IS NULL
+                     AND COALESCE(tier, 'active') = 'active'
+                     AND created_at < ?
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND retrieval_count = 0
+                     AND helpful_count = 0
+                     AND dismissed_count = 0
+                     {exempt_clause}""",
+                params,
+            ).fetchall()
+            archived_ids = [r[0] for r in rows]
+            for memory_id in archived_ids:
+                self.connection.execute(
+                    "UPDATE memory_records SET tier = 'archived', updated_at = ? "
+                    "WHERE memory_id = ?",
+                    [now.isoformat(), memory_id],
+                )
+        if archived_ids:
+            logger.info("Archived %d stale records (P5.1)", len(archived_ids))
+        return {
+            "archived_count": len(archived_ids),
+            "archived_ids": archived_ids,
+            "archive_after_days": archive_after_days,
+        }
+
+    def revive_record(self, memory_id: str) -> bool:
+        """Revive an archived record back to active tier.
+
+        Called automatically on update_memory / feedback / explicit re-save.
+        Also callable directly. Returns True if the record was archived
+        and is now revived, False if it was already active or not found.
+        """
+        with self._lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                "SELECT tier FROM memory_records WHERE memory_id = ?",
+                [memory_id],
+            ).fetchone()
+            if not row:
+                return False
+            if (row[0] or "active") != "archived":
+                return False
+            self.connection.execute(
+                "UPDATE memory_records SET tier = 'active', updated_at = ? "
+                "WHERE memory_id = ?",
+                [self._now(), memory_id],
+            )
+        logger.debug("Revived archived record %s", memory_id)
+        return True
+
+    def forget_stale_records(
+        self,
+        *,
+        forget_after_days: int = 365,
+        categories: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Auto-quarantine zero-value drift: context_note/event/goal older
+        than *forget_after_days* with no retrievals/feedback.
+
+        Reversible — quarantine, never delete. The user can restore via
+        ``memory_restore``. Deterministic, zero LLM.
+        """
+        if categories is None:
+            categories = ["context_note", "event", "goal"]
+        cat_set = {c.lower() for c in categories}
+        now = datetime.now(timezone.utc)
+        cutoff_iso = (now - timedelta(days=max(1, forget_after_days))).isoformat()
+        with self._lock:
+            assert self.connection is not None
+            placeholders = ", ".join(["?" for _ in cat_set])
+            rows = self.connection.execute(
+                f"""SELECT memory_id FROM memory_records
+                   WHERE COALESCE(status, 'active') = 'active'
+                     AND valid_to IS NULL
+                     AND COALESCE(tier, 'active') = 'active'
+                     AND created_at < ?
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND retrieval_count = 0
+                     AND helpful_count = 0
+                     AND dismissed_count = 0
+                     AND LOWER(category) IN ({placeholders})""",
+                [cutoff_iso, self.user_id, *cat_set],
+            ).fetchall()
+            forgotten_ids = [r[0] for r in rows]
+        quarantined = 0
+        for memory_id in forgotten_ids:
+            if self.quarantine_memory(memory_id, "forgotten: stale zero-value drift (P5.1)"):
+                quarantined += 1
+        if quarantined:
+            logger.info("Forgot %d stale records (P5.1 quarantine)", quarantined)
+        return {
+            "forgotten_count": quarantined,
+            "forgotten_ids": forgotten_ids[:quarantined],
+            "forget_after_days": forget_after_days,
+        }
+
+    def run_lifecycle_maintenance(
+        self,
+        *,
+        archive_enabled: bool = False,
+        archive_after_days: int = 180,
+        archive_exempt_categories: list[str] | None = None,
+        forget_enabled: bool = False,
+        forget_after_days: int = 365,
+    ) -> dict[str, Any]:
+        """Run the lifecycle maintenance pass (archive + forget).
+
+        Called from the session-end hook. Both phases are independently
+        gated. Deterministic, zero LLM. Fail-soft: any error in one
+        phase doesn't block the other.
+        """
+        report: dict[str, Any] = {}
+        if archive_enabled:
+            try:
+                report["archive"] = self.archive_stale_records(
+                    archive_after_days=archive_after_days,
+                    exempt_categories=archive_exempt_categories,
+                )
+            except Exception as exc:
+                logger.debug("Archive pass failed: %s", exc)
+                report["archive"] = {"error": str(exc)}
+        if forget_enabled:
+            try:
+                report["forget"] = self.forget_stale_records(
+                    forget_after_days=forget_after_days,
+                )
+            except Exception as exc:
+                logger.debug("Forget pass failed: %s", exc)
+                report["forget"] = {"error": str(exc)}
+        return report
+
     # -- system state KV (P4.2 distillation, future maintenance) -------------
 
     def get_state(self, key: str) -> str | None:

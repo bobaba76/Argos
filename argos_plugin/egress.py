@@ -104,6 +104,14 @@ SITES = [
         "gate": "llm_fallback",
         "default": True,
     },
+    {
+        "kind": "memory_rollup",
+        "file": "rollup.py",
+        "trigger": "long-horizon rollup pass (P5.1 Phase 3)",
+        "payload": "stored memory content (oldest active low-retrieval records)",
+        "gate": "rollup_enabled",
+        "default": False,
+    },
 ]
 
 # Non-memory network callers (context providers) — listed for completeness;
@@ -173,6 +181,7 @@ GROUPS = [
     ),
     ("Store-derived (config-gated)", ["graph_typing", "distillation"]),
     ("Document-derived (sensitive-identifier gated)", ["watcher_extraction"]),
+    ("Lifecycle-derived (config-gated)", ["memory_rollup"]),
 ]
 
 # ---------------------------------------------------------------------------

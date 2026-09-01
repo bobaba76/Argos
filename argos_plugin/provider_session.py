@@ -20,11 +20,13 @@ try:
     from .extractor import extract_from_turn
     from .reviewer import review_candidate_with_llm, suggest_expiry
     from .distillation import run_distillation
+    from .rollup import run_rollup
 except ImportError:  # provider_session.py imported as a top-level module
     from store import VALID_CATEGORIES
     from extractor import extract_from_turn
     from reviewer import review_candidate_with_llm, suggest_expiry
     from distillation import run_distillation
+    from rollup import run_rollup
 try:
     from tools.registry import tool_error
 except ImportError:  # hermes runtime absent (conftest stub shape)
@@ -699,6 +701,71 @@ class ProviderSessionMixin:
             # session boundary the desktop actually delivers — end-of-session
             # where it exists, and every chat rotation via session switch.
             self._maybe_run_distillation()
+            # Lifecycle maintenance (P5.1, #6): archival + forgetting.
+            # Deterministic, zero LLM. Both phases independently gated.
+            self._maybe_run_lifecycle_maintenance()
+            # Rollup (P5.1 Phase 3): LLM proposals-only pass.
+            self._maybe_run_rollup()
+
+    def _maybe_run_lifecycle_maintenance(self) -> None:
+        """Run the archival + forgetting pass at session end (P5.1, #6).
+
+        Both phases are independently gated by config. Deterministic, zero
+        LLM. Fail-soft: never blocks session lifecycle.
+        """
+        if not (getattr(self, "_archive_enabled", False) or
+                getattr(self, "_forget_enabled", False)):
+            return
+        if not self._store:
+            return
+        try:
+            report = self._store.run_lifecycle_maintenance(
+                archive_enabled=getattr(self, "_archive_enabled", False),
+                archive_after_days=getattr(self, "_archive_after_days", 180),
+                forget_enabled=getattr(self, "_forget_enabled", False),
+                forget_after_days=getattr(self, "_forget_after_days", 365),
+            )
+            archive_rpt = report.get("archive")
+            if archive_rpt and archive_rpt.get("archived_count"):
+                logger.info(
+                    "Lifecycle: archived %d stale records",
+                    archive_rpt["archived_count"],
+                )
+            forget_rpt = report.get("forget")
+            if forget_rpt and forget_rpt.get("forgotten_count"):
+                logger.info(
+                    "Lifecycle: forgot %d stale records (quarantine)",
+                    forget_rpt["forgotten_count"],
+                )
+        except Exception as e:
+            logger.debug("Lifecycle maintenance failed: %s", e)
+
+    def _maybe_run_rollup(self) -> None:
+        """Run the gated long-horizon rollup pass (P5.1 Phase 3, #6).
+
+        LLM-assisted, proposals only. Reuses P4.2's cooldown/budget/fail-soft
+        seam. Never blocks session lifecycle.
+        """
+        if not getattr(self, "_rollup_enabled", False):
+            return
+        if not self._store:
+            return
+        try:
+            rollup_report = run_rollup(
+                self._store,
+                llm_model=self._llm_model,
+                llm_provider=self._llm_provider,
+                interval_days=getattr(self, "_rollup_interval_days", 30),
+                max_records_per_run=getattr(self, "_rollup_max_records_per_run", 100),
+            )
+            if rollup_report.get("ran"):
+                logger.info(
+                    "Rollup: %d proposals, %d LLM calls",
+                    rollup_report.get("proposals_emitted", 0),
+                    rollup_report.get("llm_calls", 0),
+                )
+        except Exception as e:
+            logger.debug("Rollup failed: %s", e)
 
     def _maybe_run_distillation(self) -> None:
         """Run the gated distillation pass ("the dream") when enabled.

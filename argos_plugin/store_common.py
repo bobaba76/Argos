@@ -291,6 +291,7 @@ class MemoryRecord:
         "quarantine_reason", "quarantined_at",
         "valid_from", "valid_to", "superseded_by",
         "provenance_origin", "grounding",
+        "tier",
     )
 
     def __init__(
@@ -333,6 +334,7 @@ class MemoryRecord:
         superseded_by: str | None = None,
         provenance_origin: str = PROVENANCE_INTERNAL,
         grounding: str = GROUNDING_OBSERVED,
+        tier: str = "active",
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -389,6 +391,9 @@ class MemoryRecord:
         # normalize_grounding. Sanitization never alters provenance_origin.
         self.provenance_origin = normalize_provenance(provenance_origin)
         self.grounding = normalize_grounding(grounding)
+        # P5.1 (#6): lifecycle tier — 'active' (in injection pool) or
+        # 'archived' (out of pool, searchable via include_archived).
+        self.tier = tier or "active"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -428,6 +433,7 @@ class MemoryRecord:
             "superseded_by": self.superseded_by,
             "provenance_origin": self.provenance_origin,
             "grounding": self.grounding,
+            "tier": self.tier,
         }
 
 

@@ -117,7 +117,9 @@ class StoreCoreMixin:
                     valid_to           VARCHAR,
                     superseded_by      VARCHAR,
                     provenance_origin  VARCHAR DEFAULT 'internal',
-                    grounding          VARCHAR DEFAULT 'observed'
+                    grounding          VARCHAR DEFAULT 'observed',
+                    namespace          VARCHAR DEFAULT 'conversation',
+                    client_scope       VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -130,6 +132,8 @@ class StoreCoreMixin:
                     durability         VARCHAR,
                     scope              VARCHAR,
                     project_id         VARCHAR,
+                    namespace          VARCHAR DEFAULT 'conversation',
+                    client_scope       VARCHAR,
                     session_id         VARCHAR,
                     status             VARCHAR DEFAULT 'pending',
                     created_at         VARCHAR,
@@ -224,6 +228,12 @@ class StoreCoreMixin:
                 "superseded_by": "VARCHAR",
                 "provenance_origin": "VARCHAR DEFAULT 'internal'",
                 "grounding": "VARCHAR DEFAULT 'observed'",
+                # Spec-05 (#67): doc-fact namespace + client scope. Additive,
+                # mirrors the project_id pattern. namespace defaults to
+                # 'conversation' so legacy rows are conversation-sourced; NULL
+                # client_scope = global (visible inside any client query).
+                "namespace": "VARCHAR DEFAULT 'conversation'",
+                "client_scope": "VARCHAR",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",
@@ -236,6 +246,8 @@ class StoreCoreMixin:
                 "quarantined_at": "VARCHAR",
                 "provenance_origin": "VARCHAR DEFAULT 'internal'",
                 "grounding": "VARCHAR DEFAULT 'extracted'",
+                "namespace": "VARCHAR DEFAULT 'conversation'",
+                "client_scope": "VARCHAR",
             }
             for name, definition in columns.items():
                 try:

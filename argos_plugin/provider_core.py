@@ -305,6 +305,10 @@ class ProviderCoreMixin:
         self._agent_context: str = "primary"
         self._platform: str = "cli"
         self._max_injected: int = _DEFAULT_MAX_INJECTED
+        # Spec-05 (#67): client scope for namespace-aware injection
+        # partitioning. None = not client-scoped (default floors 24/24).
+        # Set per-query by the provider when a client folder is in scope.
+        self._client_scope: str | None = None
         self._auto_extract: bool = True
         self._llm_fallback: bool = True
         self._extraction_shadow_diff: bool = False

@@ -895,6 +895,30 @@ class ProviderRetrievalMixin:
                     except Exception:
                         pass  # P2B2 is best-effort; never break injection
                 if results:
+                    # Spec-05 (#67): presence-aware namespace partition.
+                    # Split the injection budget between conversation-sourced
+                    # and document-sourced memories so a flood of doc-facts
+                    # cannot crowd out conversational memories (and vice
+                    # versa). Floors only bite when both namespaces are
+                    # populated — a single-namespace store gets all slots.
+                    # v1 floors are explicitly untuned (24/24, inverted
+                    # 12/40 for client-scoped queries).
+                    try:
+                        try:
+                            from .namespace_partition import (
+                                partition_by_namespace,
+                            )
+                        except ImportError:
+                            from namespace_partition import (
+                                partition_by_namespace,
+                            )
+                        results = partition_by_namespace(
+                            results,
+                            cap=max_items,
+                            client_scoped=bool(getattr(self, "_client_scope", None)),
+                        )
+                    except Exception:
+                        pass  # partition must never break injection
                     lines = []
                     for r in results:
                         cat = r.category

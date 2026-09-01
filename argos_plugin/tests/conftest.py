@@ -165,3 +165,73 @@ def _register_argos_alias() -> None:
 
 
 _register_argos_alias()
+
+
+# ---------------------------------------------------------------------------
+# Deterministic embedder for hermetic, model-free tests (issues #90, #98)
+# ---------------------------------------------------------------------------
+
+class DeterministicEmbedder:
+    """Hashing-trick embedder with no external model dependency.
+
+    Real ``LocalEmbedder`` tests load a ~130MB sentence-transformers model
+    and share the HF cache across concurrent pytest processes — the root
+    cause of the ``test_alias_expansion_injects_with_similarity_gate``
+    flake (#90) and a major contributor to the 15–20 minute suite wall
+    time (#98). This stand-in produces a stable vector space via the
+    signing hashing trick: each lowercased alphanumeric token is hashed
+    to a dimension and adds +1/-1, then the vector is L2-normalized.
+
+    Cosine similarity therefore reflects token overlap, which is exactly
+    what retrieval/ranking tests need to assert ordering and gate
+    behaviour without touching the real model. It is hermetic (no cache,
+    no network, no torch), deterministic, and runs in microseconds.
+
+    Duck-typed to match ``LocalEmbedder``: ``embed``, ``embed_batch``,
+    ``is_available``, ``dimension``.
+    """
+
+    def __init__(self, dim: int = 128) -> None:
+        self._dim = dim
+
+    def _vec(self, text: str) -> list[float]:
+        import hashlib
+        import math
+        v = [0.0] * self._dim
+        for tok in _tokenize(text):
+            h = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(h[:4], "little") % self._dim
+            sign = 1.0 if (h[4] & 1) == 0 else -1.0
+            v[idx] += sign
+        norm = math.sqrt(sum(x * x for x in v))
+        if norm > 0:
+            v = [x / norm for x in v]
+        return v
+
+    def embed(self, text: str, *, is_query: bool = False) -> list[float]:
+        if not text or not text.strip():
+            return []
+        return self._vec(text)
+
+    def embed_batch(self, texts, *, is_query: bool = False) -> list[list[float]]:
+        return [self.embed(t, is_query=is_query) for t in texts]
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
+
+
+def _tokenize(text: str) -> list[str]:
+    import re
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if t]
+
+
+@pytest.fixture
+def deterministic_embedder() -> "DeterministicEmbedder":
+    """A fresh hermetic embedder for retrieval/ranking tests (issues #90, #98)."""
+    return DeterministicEmbedder()
+

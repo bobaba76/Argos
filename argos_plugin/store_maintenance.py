@@ -955,6 +955,72 @@ class StoreMaintenanceMixin:
 
     # -- lifecycle ------------------------------------------------------------
 
+    def backfill_null_embeddings(self, batch_size: int = 64) -> int:
+        """Re-embed memory records whose ``embedding`` column is NULL.
+
+        Called after the embedder recovers from a transient load failure
+        (issue #83): records written during the outage stored NULL
+        embeddings and were therefore invisible to vector/graph-boost
+        retrieval (``_search_memories`` scores them 0.0 and the SQL leg
+        filters ``embedding IS NOT NULL``). This walks those rows and
+        re-embeds their stored ``content`` with the current embedder.
+
+        Returns the number of rows re-embedded. No-op (returns 0) when
+        the embedder is unavailable or there are no NULL-embedding rows.
+        Only current (``valid_to IS NULL``) records in the store's own
+        ``user_scope`` are touched — historical versions and other
+        tenants' rows are left alone.
+        """
+        embedder = getattr(self, "embedder", None)
+        if embedder is None or not hasattr(embedder, "embed"):
+            return 0
+        # Confirm the embedder can actually produce vectors right now.
+        if hasattr(embedder, "is_available") and not embedder.is_available:
+            # Trigger a (re)load attempt — it may have recovered.
+            if hasattr(embedder, "_ensure_loaded"):
+                embedder._ensure_loaded()
+            if hasattr(embedder, "is_available") and not embedder.is_available:
+                return 0
+        with self._lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                """SELECT memory_id, content FROM memory_records
+                   WHERE embedding IS NULL
+                     AND content IS NOT NULL
+                     AND content <> ''
+                     AND valid_to IS NULL
+                     AND (user_scope IS NULL OR user_scope = ?)
+                   ORDER BY created_at""",
+                [self.user_id],
+            ).fetchall()
+        if not rows:
+            return 0
+        updated = 0
+        for i in range(0, len(rows), batch_size):
+            chunk = rows[i:i + batch_size]
+            texts = [r[1] for r in chunk]
+            if hasattr(embedder, "embed_batch"):
+                vecs = embedder.embed_batch(texts)
+            else:
+                vecs = [embedder.embed(t) for t in texts]
+            with self._lock:
+                assert self.connection is not None
+                for (memory_id, _content), vec in zip(chunk, vecs):
+                    if not vec:
+                        continue
+                    self.connection.execute(
+                        "UPDATE memory_records SET embedding = ? "
+                        "WHERE memory_id = ?"
+                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        [vec, memory_id, self.user_id],
+                    )
+                    updated += 1
+            logger.info(
+                "Backfilled %d/%d NULL-embedding records (issue #83 recovery)",
+                updated, len(rows),
+            )
+        return updated
+
     def close(self) -> None:
         with self._lock:
             conn = getattr(self, "connection", None)

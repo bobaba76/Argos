@@ -254,6 +254,18 @@ class StoreWriteMixin:
         emb: List[float] = []
         if self.embedder and hasattr(self.embedder, "embed"):
             emb = self.embedder.embed(content)
+        # Issue #83: a record stored without an embedding can never be
+        # similarity-scored (the vector leg filters `embedding IS NOT NULL`
+        # and graph-boost retrieval scores NULL-embedding records 0.0).
+        # Surface this loudly instead of silently degrading retrieval
+        # quality for the affected records. On embedder recovery the
+        # opportunistic backfill below re-embeds them.
+        if not emb:
+            logger.warning(
+                "Storing memory without embedding (embedder unavailable) — "
+                "record will be text-search-only until backfilled: %s",
+                content[:80],
+            )
 
         sql = """
             INSERT INTO memory_records
@@ -278,6 +290,21 @@ class StoreWriteMixin:
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
         )
+        # Issue #83: if the embedder just recovered from a prior failure,
+        # opportunistically backfill records that were written with NULL
+        # embeddings during the outage. Runs once per recovery (the flag
+        # is cleared after) so it doesn't fire on every remember().
+        if emb and getattr(self.embedder, "recovered", False):
+            try:
+                self.embedder.recovered = False
+                backfilled = self.backfill_null_embeddings()
+                if backfilled:
+                    logger.info(
+                        "Re-embedded %d NULL-embedding records after embedder "
+                        "recovery (issue #83)", backfilled,
+                    )
+            except Exception as e:
+                logger.debug("Opportunistic NULL-embedding backfill skipped: %s", e)
         return fetched[0] if fetched else None
 
     # -- value-supersession (stale-number detection) -------------------------

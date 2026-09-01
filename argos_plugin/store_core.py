@@ -427,17 +427,53 @@ class StoreCoreMixin:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
+    def _normalize_timestamp(ts: str | None) -> str | None:
+        """Normalize an ISO-8601 timestamp to the aware UTC form used by
+        ``_now()`` (``datetime.now(timezone.utc).isoformat()``).
+
+        Handles ``Z`` suffixes, naive timestamps (assumed UTC), and date-only
+        strings (``2020-01-15`` → ``2020-01-15T00:00:00+00:00``). Returns
+        ``None`` if the input is missing or unparseable. This is the write-
+        boundary normalization for #80: storing all timestamps in one
+        canonical form prevents lexicographic VARCHAR comparison mismatches
+        across mixed ISO formats.
+        """
+        if not ts:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.isoformat()
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    @staticmethod
     def _is_expired(expires_at: str | None, at: str | None = None) -> bool:
         if not expires_at:
             return False
         try:
             exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            ref = (
-                datetime.fromisoformat(at.replace("Z", "+00:00"))
-                if at else datetime.now(timezone.utc)
-            )
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if at:
+                ref = datetime.fromisoformat(at.replace("Z", "+00:00"))
+                if ref.tzinfo is None:
+                    ref = ref.replace(tzinfo=timezone.utc)
+            else:
+                ref = datetime.now(timezone.utc)
             return exp <= ref
-        except Exception:
+        except (ValueError, TypeError, AttributeError) as exc:
+            # #80: fail loud — a date-only or unparseable expires_at must
+            # not be silently treated as "never expires". Log the warning so
+            # the broken value is visible; return False only because there is
+            # no valid expiry to enforce (the record is treated as non-
+            # expiring, but the operator can see the bad data in logs).
+            logger.warning(
+                "Unparseable expires_at %r (at=%r): %s — treating as no "
+                "expiry. Normalize timestamps at the write boundary.",
+                expires_at, at, exc,
+            )
             return False
 
     def _matches_scope(self, payload: dict) -> bool:

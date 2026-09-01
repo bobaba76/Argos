@@ -1173,6 +1173,14 @@ class ProviderSessionMixin:
             # memory_update tool path (the direct DuckDBMemoryStore path accepted
             # positional args, so store-level tests missed this).
             update_kwargs: Dict[str, Any] = {"memory_id": memory_id, "content": content, "tags": tags}
+            # #93: the memory_update tool is the LLM-agent-driven content
+            # rewrite path — exactly the case the structural-loss guard
+            # was designed for. Wire structural_guard=True so an agent
+            # rewrite cannot silently delete sentences, list items, or KV
+            # pairs. Direct API callers (user-initiated updates) call
+            # store.update_memory() without the guard.
+            if content is not None:
+                update_kwargs["structural_guard"] = True
             # Expiry (Spec 1): pass expires_at only when enabled AND the
             # caller explicitly provided it (None = clear/revive, str = set).
             if getattr(self, "_expiry_enabled", False) and "expires_at" in args:

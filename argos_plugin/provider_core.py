@@ -1102,3 +1102,28 @@ class ProviderCoreMixin:
             self._auto_extract_paused,
             "shared_service" if use_shared_service else "direct",
         )
+
+        # #10: start the stale-review sweep thread. Re-reviews proposals
+        # stranded in 'pending' after a failed/rate-limited reviewer call.
+        # Daemon thread — never blocks the hot path, exits on process exit.
+        self._stale_sweep_thread = None
+        if self._stale_review_sweep_enabled:
+            try:
+                from stale_review_sweep import StaleReviewSweepThread
+            except ImportError:
+                from .stale_review_sweep import StaleReviewSweepThread
+            self._stale_sweep_thread = StaleReviewSweepThread(
+                self._store,
+                interval_min=self._stale_review_interval_min,
+                min_age_min=self._stale_review_min_age_min,
+                max_batch=self._stale_review_max_batch,
+                llm_model=self._llm_model,
+                llm_provider=self._llm_provider,
+            )
+            self._stale_sweep_thread.start()
+            logger.info(
+                "stale-review sweep started: interval=%dmin, min_age=%dmin, batch=%d",
+                self._stale_review_interval_min,
+                self._stale_review_min_age_min,
+                self._stale_review_max_batch,
+            )

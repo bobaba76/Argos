@@ -647,6 +647,111 @@ class ProviderSessionMixin:
             finally:
                 self._sync_queue.task_done()
 
+    # -- stale-pending review sweep (#10) ------------------------------------
+
+    def _ensure_stale_sweep(self) -> None:
+        """Start the periodic stale-pending review sweep if enabled."""
+        if not getattr(self, "_stale_review_sweep_enabled", False):
+            return
+        if self._stale_sweep_thread and self._stale_sweep_thread.is_alive():
+            return
+        self._stale_sweep_stop.clear()
+        self._stale_sweep_thread = threading.Thread(
+            target=self._stale_sweep_loop, daemon=True, name="stale-review-sweep"
+        )
+        self._stale_sweep_thread.start()
+
+    def _stale_sweep_loop(self) -> None:
+        """Periodically re-review proposals stranded in 'pending'.
+
+        Runs on ``stale_review_interval_min`` cadence. Each tick re-reviews
+        ``pending`` candidates older than ``stale_review_min_age_min``,
+        capped at ``stale_review_max_batch``. Fail-soft: any error in a
+        tick is logged and the loop continues. The loop exits when
+        ``_stale_sweep_stop`` is set (shutdown).
+        """
+        import time as _time
+        from datetime import datetime, timezone, timedelta
+        interval_s = max(60, getattr(self, "_stale_review_interval_min", 15) * 60)
+        while not self._stale_sweep_stop.is_set():
+            try:
+                self._run_stale_review_sweep()
+            except Exception as e:
+                logger.warning("Stale-review sweep tick failed: %s", e)
+            # Sleep in small increments so shutdown is responsive.
+            waited = 0.0
+            while waited < interval_s and not self._stale_sweep_stop.is_set():
+                _time.sleep(1.0)
+                waited += 1.0
+
+    def _run_stale_review_sweep(self) -> int:
+        """Re-review stale pending candidates. Returns the count reviewed.
+
+        Consumes all four ``stale_review_*`` config attributes:
+        - ``_stale_review_sweep_enabled``: gate (checked by caller)
+        - ``_stale_review_min_age_min``: only re-review proposals older than this
+        - ``_stale_review_max_batch``: cap proposals per tick (bounds LLM cost)
+        - ``_stale_review_interval_min``: cadence (used by the loop, not here)
+
+        Reuses ``_review_candidate`` so the decision map, value-supersession
+        guard, and no-auto-promotion invariant are identical to the
+        turn-driven auto-review path.
+        """
+        from datetime import datetime, timezone, timedelta
+        if not getattr(self, "_stale_review_sweep_enabled", False):
+            return 0
+        store = self._store
+        if store is None:
+            return 0
+        min_age_min = getattr(self, "_stale_review_min_age_min", 30)
+        max_batch = getattr(self, "_stale_review_max_batch", 25)
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=min_age_min)
+        # Over-fetch (up to the store's 500 cap) then filter by age so we
+        # don't miss old candidates buried under fresh ones. list_candidates
+        # orders by created_at DESC, so the oldest are at the end — fetch
+        # enough to find them.
+        try:
+            candidates = store.list_candidates(
+                status="pending", limit=max(max_batch * 4, 100)
+            )
+        except Exception as e:
+            logger.warning("Stale-review sweep: list_candidates failed: %s", e)
+            return 0
+        stale: list[dict] = []
+        for cand in candidates:
+            created_str = cand.get("created_at")
+            if not created_str:
+                continue
+            try:
+                created = datetime.fromisoformat(created_str)
+            except (ValueError, TypeError):
+                continue
+            if created <= cutoff:
+                stale.append(cand)
+        # Oldest first — they've been stranded the longest.
+        stale.sort(key=lambda c: c.get("created_at", ""))
+        stale = stale[:max_batch]
+        if not stale:
+            return 0
+        reviewed = 0
+        for cand in stale:
+            if self._stale_sweep_stop.is_set():
+                break
+            try:
+                self._review_candidate(cand)
+                reviewed += 1
+            except Exception as e:
+                logger.warning(
+                    "Stale-review sweep: failed to re-review %s: %s",
+                    cand.get("candidate_id", "?"), e,
+                )
+        if reviewed:
+            logger.info(
+                "Stale-review sweep: re-reviewed %d pending proposals "
+                "(min_age=%dmin, batch_cap=%d)", reviewed, min_age_min, max_batch,
+            )
+        return reviewed
+
     # -- session end ---------------------------------------------------------
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
@@ -1571,7 +1676,9 @@ class ProviderSessionMixin:
             self._sync_queue.put_nowait(None)
         except queue.Full:
             pass  # worker will exit on idle timeout
-        for t in (self._prefetch_thread, self._sync_thread):
+        # Signal the stale-review sweep to stop (#10).
+        self._stale_sweep_stop.set()
+        for t in (self._prefetch_thread, self._sync_thread, self._stale_sweep_thread):
             if t and t.is_alive():
                 t.join(timeout=5.0)
         if self._store:

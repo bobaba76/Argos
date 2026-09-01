@@ -76,10 +76,10 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 | `llm_fallback` | `true` | Use the host LLM to create proposals when regex misses. Adds latency + token cost; proposals stay pending until reviewed. |
 | `extraction_shadow_diff` | `false` | Run LLM extraction in parallel with regex and log the diff (validation mode; no proposal changes). |
 | `auto_review` | `true` | Auxiliary LLM reviews new proposals; obvious junk quarantined, sensitive ones stay pending. |
-| `stale_review_sweep_enabled` | `true` | Periodically re-review proposals pending too long. |
-| `stale_review_interval_min` | `15` | Sweep interval in minutes. |
-| `stale_review_min_age_min` | `30` | Min proposal age (minutes) before it's eligible for the stale sweep. |
-| `stale_review_max_batch` | `25` | Max proposals re-reviewed per sweep. |
+| `stale_review_sweep_enabled` | `true` | Enables the periodic stale-pending review sweep — a daemon thread that re-reviews proposals stranded in `pending` (e.g. after a failed/rate-limited reviewer call). |
+| `stale_review_interval_min` | `15` | Minutes between stale-pending re-review sweeps. |
+| `stale_review_min_age_min` | `30` | Only re-review `pending` proposals older than this many minutes (fresh ones may still be mid-review). |
+| `stale_review_max_batch` | `25` | Maximum proposals re-reviewed per sweep tick (bounds LLM cost on a large backlog). |
 | `role_alias_llm_fallback` | `true` | Ask the LLM if an unknown "my X is Name" word is a person-role; learned words persist to `role_words`. |
 | `extraction_dup_threshold` | *(from schema)* | Dedup threshold for extraction proposals. |
 

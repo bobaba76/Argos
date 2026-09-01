@@ -99,7 +99,7 @@ Every turn (`sync_turn`) is processed by a background worker:
 2. **LLM fallback** (`llm_fallback=true`) — when regex misses, the auxiliary LLM proposes facts. Adds latency + token cost; proposals stay pending.
 3. **Shadow-diff** (`extraction_shadow_diff=true`) — runs LLM extraction alongside regex and logs what each found that the other missed. Validation mode only.
 4. **Auto-review** (`auto_review=true`) — the auxiliary LLM reviews each new proposal: obvious junk quarantined, sensitive/contextless proposals stay pending, clear facts approved.
-5. **Stale-review sweep** (`stale_review_sweep_enabled=true`) — periodically re-reviews proposals pending too long.
+5. **Stale-review sweep** (`stale_review_sweep_enabled=true`) — a periodic daemon thread re-reviews proposals stranded in `pending` (e.g. after a failed/rate-limited reviewer call). Runs every `stale_review_interval_min` minutes; only re-reviews proposals older than `stale_review_min_age_min`; caps at `stale_review_max_batch` per tick to bound LLM cost. Reuses the same auto-reviewer and no-auto-promotion invariant as the turn-driven path.
 6. **Role-word learning** (`role_alias_llm_fallback=true`) — when an unknown word appears in "my X is Name", the LLM is asked if X is a person-role; learned words persist to `role_words`.
 
 Proposals are never active memory until reviewed. The agent can also save explicitly via `memory_save`, bypassing the proposal queue.

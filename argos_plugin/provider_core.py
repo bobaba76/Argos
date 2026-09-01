@@ -394,6 +394,12 @@ class ProviderCoreMixin:
         self._sync_thread: Optional[threading.Thread] = None
         self._sync_lock = threading.Lock()
         self._sync_worker_started = False
+        # Stale-pending review sweep (#10): periodic daemon thread that
+        # re-reviews proposals stranded in 'pending' (e.g. after a
+        # failed/rate-limited reviewer call). Consumes the four
+        # _stale_review_* config attributes parsed in initialize().
+        self._stale_sweep_thread: Optional[threading.Thread] = None
+        self._stale_sweep_stop = threading.Event()
 
     @property
     def name(self) -> str:
@@ -1070,6 +1076,12 @@ class ProviderCoreMixin:
             pass
 
         self._initialized = True
+        # Start the stale-pending review sweep (#10). Fail-soft: a startup
+        # error must never block initialization.
+        try:
+            self._ensure_stale_sweep()
+        except Exception as e:
+            logger.warning("Stale-review sweep failed to start: %s", e)
         logger.info(
             "Argos initialized: %d memories, graph=%s, embeddings=%s, "
             "auto_extract=%s, auto_review=%s, paused=%s, storage=%s, proposals=on",

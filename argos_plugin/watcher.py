@@ -25,6 +25,7 @@ the venv). Deterministic, no LLM calls in the catalog pass.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -495,3 +496,117 @@ def verified_state_on_ocr_numeric() -> str:
 def verified_state_on_verify() -> str:
     """A principal verify action flips unverified → current."""
     return VERIFIED_CURRENT
+
+
+# ---------------------------------------------------------------------------
+# D5 — Doc-fact extraction (LLM pass, uses extraction_llm_model/provider)
+# ---------------------------------------------------------------------------
+
+_DOC_FACT_SYSTEM_PROMPT = """You are a document fact extractor for a legal/accounting practice memory system.
+
+Extract factual statements from the document text below. Each fact must be:
+- A standalone statement (readable without the surrounding context)
+- Attributable to this document (not general knowledge)
+- Numeric values must be exact (transcribe digits, don't round)
+
+Output JSON: a list of objects with keys:
+  "content": the fact statement (string)
+  "category": one of "personal_fact", "event", "goal", "context_note"
+  "source_loc": page/sheet/row reference if discernible (string, or null)
+  "confidence": 0.0-1.0 (your confidence in the extraction accuracy)
+
+Output ONLY the JSON list. No commentary."""
+
+
+def extract_doc_facts_llm(
+    text: str,
+    *,
+    model: str = "",
+    provider: str = "",
+    timeout: float = 30.0,
+) -> List[Dict[str, Any]]:
+    """Extract facts from document text using the LLM.
+
+    Uses the extraction-specific model/provider (Spec-08 #72). Falls
+    back to the auxiliary client default when empty. Never raises —
+    the extraction pass must not crash the watcher.
+
+    Returns a list of fact dicts, or empty list on any failure.
+    """
+    if not text or len(text.strip()) < 50:
+        return []
+    try:
+        from egress import gate as _egress_gate
+        if not _egress_gate("watcher_extraction", text):
+            return []
+    except Exception:
+        pass  # egress gate unavailable — fail soft
+
+    try:
+        from agent.auxiliary_client import call_llm
+    except ImportError:
+        logger.debug("LLM unavailable for doc-fact extraction: auxiliary_client not importable")
+        return []
+    except Exception:
+        return []
+
+    messages = [
+        {"role": "system", "content": _DOC_FACT_SYSTEM_PROMPT},
+        {"role": "user", "content": text[:8000]},  # cap input length
+    ]
+    try:
+        response = call_llm(
+            task="doc_fact_extraction",
+            messages=messages,
+            temperature=0.0,
+            max_tokens=2000,
+            timeout=timeout,
+            model=model or None,
+            provider=provider or None,
+        )
+    except Exception as exc:
+        logger.debug("Doc-fact LLM call failed: %s", exc)
+        return []
+    if response is None:
+        return []
+    try:
+        raw = response.choices[0].message.content
+    except (AttributeError, IndexError, KeyError):
+        return []
+    try:
+        facts = json.loads(raw)
+        if isinstance(facts, list):
+            return facts
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return []
+
+
+def extract_facts_from_doc(
+    path: str | Path,
+    doc_type: str,
+    *,
+    extraction_llm_model: str = "",
+    extraction_llm_provider: str = "",
+) -> Tuple[List[Dict[str, Any]], str, str, str]:
+    """Full extraction pipeline for a single document.
+
+    1. Prepare extraction input (text from PDF/XLSX/CSV/DOCX).
+    2. Hash the extraction input (extract_hash — the re-extract gate).
+    3. Extract facts via LLM (using extraction-specific model/provider).
+
+    Returns (facts, extract_hash, method, text).
+    - facts: list of fact dicts from the LLM
+    - extract_hash: SHA-256 of the extraction input
+    - method: 'text' / 'ocr' / 'excel'
+    - text: the extraction input (for debugging/audit)
+    """
+    text, method, extract_hash = prepare_extraction_input(path, doc_type)
+    if not text.strip():
+        return [], extract_hash, method, text
+    facts = extract_doc_facts_llm(
+        text,
+        model=extraction_llm_model,
+        provider=extraction_llm_provider,
+    )
+    return facts, extract_hash, method, text

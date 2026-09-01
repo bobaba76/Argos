@@ -205,7 +205,13 @@ class StoreWriteMixin:
             record_payload.pop("expires_at", None)
 
         if dedup:
-            _dedup_reason = self._content_exists(content, category)
+            _dedup_reason = self._content_exists(
+                content, category,
+                namespace=namespace,
+                client_scope=client_scope,
+                doc_class=doc_class,
+                source_doc_id=source_doc_id,
+            )
             if _dedup_reason:
                 # #82: surface the dedup-drop reason at warning level so
                 # silent no-ops are visible to the operator/caller.
@@ -572,6 +578,7 @@ class StoreWriteMixin:
         namespace: str = "conversation",
         client_scope: str | None = None,
         doc_class: str | None = None,
+        source_doc_id: str | None = None,
         session_id: str = "",
         evidence_text: str = "",
         evidence_role: str = "user_turn",
@@ -666,6 +673,12 @@ class StoreWriteMixin:
         candidate_payload = dict(payload or {})
         candidate_payload.setdefault("user_scope", self.user_id)
         candidate_payload.setdefault("source", source)
+        # #115: carry source_doc_id through the candidate payload so
+        # review_candidate can forward it to remember() as a dedicated
+        # kwarg (memory_candidates has no source_doc_id column, but
+        # memory_records does — the dedup scope clause needs the column).
+        if source_doc_id is not None:
+            candidate_payload["source_doc_id"] = source_doc_id
         if external:
             candidate_payload["external_source"] = True
         # Trust-model defaults (batch-2): provenance taint + grounding.
@@ -946,6 +959,16 @@ class StoreWriteMixin:
         if decision in {"approved", "reviewed_approved"}:
             selected_durability = durability or candidate["durability"]
             selected_scope = scope or candidate["scope"]
+            # #115: source_doc_id is carried in the candidate payload (no
+            # source_doc_id column on memory_candidates) — extract it so
+            # remember() stores it in the memory_records.source_doc_id column
+            # and the doc-identity dedup scope can use it.
+            _cand_payload = candidate.get("payload") or {}
+            if isinstance(_cand_payload, str):
+                try:
+                    _cand_payload = json.loads(_cand_payload)
+                except (json.JSONDecodeError, TypeError):
+                    _cand_payload = {}
             remember_kwargs: Dict[str, Any] = dict(
                 category=candidate["category"],
                 content=candidate["content"],
@@ -959,9 +982,19 @@ class StoreWriteMixin:
                 namespace=candidate.get("namespace", "conversation"),
                 client_scope=candidate.get("client_scope"),
                 doc_class=candidate.get("doc_class"),
+                source_doc_id=_cand_payload.get("source_doc_id"),
                 provenance_origin=candidate_provenance,
                 grounding=candidate_grounding,
             )
+            # #115: when the reviewer has confirmed a supersession chain
+            # (supersedes_memory_id is set), the new memory MUST be created
+            # so the chain can grow.  If dedup fires first, remember()
+            # returns None and the elif supersedes_memory_id branch below
+            # never executes — the old value stays current forever.  The
+            # reviewer has already decided this is a replacement, so dedup
+            # would only re-litigate that decision and silently undo it.
+            if supersedes_memory_id:
+                remember_kwargs["dedup"] = False
             # Pass explicit expires_at through to remember() (Spec 1).
             if expires_at is not _NOT_PROVIDED:
                 remember_kwargs["expires_at"] = expires_at

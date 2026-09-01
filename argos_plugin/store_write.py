@@ -2310,17 +2310,28 @@ class StoreWriteMixin:
             # Head with no predecessor: hard delete. Fingerprint the content
             # first so a later re-feed (source re-ingest, extractor replay)
             # cannot silently resurrect it — atlas deletion-canary step 6.
-            self._record_tombstone(_del_content, _del_category)
-            self.connection.execute(
-                "DELETE FROM memory_records WHERE memory_id = ?"
-                " AND (user_scope IS NULL OR user_scope = ?)",
-                [memory_id, self.user_id],
-            )
-            self.connection.execute(
-                "DELETE FROM memory_evidence WHERE memory_id = ?"
-                " AND (user_scope IS NULL OR user_scope = ?)",
-                [memory_id, self.user_id],
-            )
+            # Wrap in a transaction (matching the promote path at #77): a
+            # crash between the tombstone INSERT and the memory DELETE would
+            # leave a tombstone for a record that still exists, blocking
+            # re-creation via remember()'s tombstone check even though the
+            # original is still active.
+            self.connection.execute("BEGIN TRANSACTION")
+            try:
+                self._record_tombstone(_del_content, _del_category)
+                self.connection.execute(
+                    "DELETE FROM memory_records WHERE memory_id = ?"
+                    " AND (user_scope IS NULL OR user_scope = ?)",
+                    [memory_id, self.user_id],
+                )
+                self.connection.execute(
+                    "DELETE FROM memory_evidence WHERE memory_id = ?"
+                    " AND (user_scope IS NULL OR user_scope = ?)",
+                    [memory_id, self.user_id],
+                )
+                self.connection.execute("COMMIT")
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
             return {"deleted": True, "action": "deleted"}
 
     # -- deletion tombstones ---------------------------------------------------

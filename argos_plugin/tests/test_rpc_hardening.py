@@ -40,6 +40,7 @@ def _start_service(tmp_path: Path):
 class TestErrorEnvelope:
     """Client errors should carry the server-reported error class."""
 
+    @pytest.mark.xdist_group("shared_service")
     def test_error_class_surfaced(self, tmp_path):
         store = _start_service(tmp_path)
         try:
@@ -206,6 +207,7 @@ class TestThreadLocalScope:
         )
         assert seen["rpc_user_id"] == "default_user"
 
+    @pytest.mark.xdist_group("shared_service")
     def test_concurrent_scopes_no_race(self, tmp_path):
         """Two threads set different scopes and read them back — no bleed."""
         store = _start_service(tmp_path)
@@ -246,6 +248,7 @@ class TestServerLocks:
         service.graph_lock = threading.RLock()
         assert service.store_lock is not service.graph_lock
 
+    @pytest.mark.xdist_group("shared_service")
     def test_in_flight_counter_drains(self, tmp_path):
         """The in-flight counter returns to zero after a request."""
         store = _start_service(tmp_path)

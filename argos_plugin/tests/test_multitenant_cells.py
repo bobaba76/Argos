@@ -27,6 +27,11 @@ from service_client import (  # noqa: E402
     SharedGraphStore,
 )
 
+# Every test in this file spawns the shared memory service subprocess.
+# Group them onto a single xdist worker (pytest -n auto --dist loadgroup)
+# so parallel runs serialize the spawns instead of racing them (#98).
+pytestmark = pytest.mark.xdist_group("shared_service")
+
 
 _TWO_TENANT_CONFIG = {
     "local_embedding_model": "nonexistent-model-xyz",

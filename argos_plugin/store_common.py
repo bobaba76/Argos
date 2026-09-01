@@ -269,10 +269,18 @@ def rejection_key(candidate: dict) -> tuple:
         or str(payload.get("insight") or "").strip().lower()
         or str(payload.get("event") or "").strip().lower()
     )
-    predicate = f"{category}:{slot}" if slot else category
     scope = str(
         candidate.get("user_scope") or payload.get("user_scope") or "default_user"
     ).strip().lower()
+    # NO SLOT -> unidentifiable claim. Returning a bare-category predicate
+    # here makes one rejected candidate block an ENTIRE category of future
+    # writes (observed live 1/9: reviewer rejected two slot-less candidates
+    # and every slot-less 'insight'/'context_note' remember started returning
+    # None via rejection_check). A rejection is only enforceable when the
+    # claim slot is known; otherwise there is nothing to block.
+    if not slot:
+        return ("", "", scope)
+    predicate = f"{category}:{slot}"
     return (subject, predicate, scope)
 
 

@@ -59,6 +59,7 @@ if ($PytestArgs.Count -eq 0) {
 
 # -- Environment: hermetic embeddings + unbuffered live output ----------------
 $env:HF_HUB_OFFLINE = "1"
+$env:ARGOS_HERMETIC_TESTS = "1"
 $env:PYTHONUNBUFFERED = "1"
 $log = Join-Path $env:LOCALAPPDATA "Temp/argos_tests_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 

@@ -266,3 +266,48 @@ class TestBackfillNullEmbeddings:
         # The recovered flag was consumed.
         assert emb.recovered is False
         store.close()
+
+    def test_backfill_respects_user_scope(self, tmp_path):
+        """The backfill must only touch records in the store's own
+        user_scope. In a shared database file, one user's recovery must
+        not read or rewrite another user's rows (same isolation rule the
+        rest of the store enforces via ``user_scope`` guards)."""
+        from store import DuckDBMemoryStore
+
+        db_path = tmp_path / "shared.duckdb"
+        # User A writes a NULL-embedding record while its embedder is broken.
+        emb_a = _ToggleEmbedder()
+        emb_a.broken = True
+        store_a = DuckDBMemoryStore(db_path, user_id="alice", embedder=emb_a)
+        alice_rec = store_a.remember(
+            category="personal_fact", content="alice's secret", dedup=False,
+        )
+        assert alice_rec is not None
+        store_a.close()
+
+        # User B (different tenant, same file) also has a NULL-embedding
+        # record; B's embedder then recovers.
+        emb_b = _ToggleEmbedder()
+        emb_b.broken = True
+        store_b = DuckDBMemoryStore(db_path, user_id="bob", embedder=emb_b)
+        bob_rec = store_b.remember(
+            category="personal_fact", content="bob's secret", dedup=False,
+        )
+        assert bob_rec is not None
+        emb_b.broken = False
+        n = store_b.backfill_null_embeddings()
+        # Only B's record is re-embedded.
+        assert n == 1
+        a_row = store_b.connection.execute(
+            "SELECT embedding FROM memory_records WHERE memory_id = ?",
+            [alice_rec.memory_id],
+        ).fetchone()
+        b_row = store_b.connection.execute(
+            "SELECT embedding FROM memory_records WHERE memory_id = ?",
+            [bob_rec.memory_id],
+        ).fetchone()
+        assert a_row[0] is None, (
+            "Alice's record must not be touched by Bob's backfill"
+        )
+        assert b_row[0] is not None
+        store_b.close()

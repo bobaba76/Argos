@@ -1565,6 +1565,130 @@ class StoreRetrievalMixin:
             logger.warning("catalog list by layout_family failed: %s", exc)
             return []
 
+    # -- rejection quality monitor (#121, read-only) -------------------------
+
+    def query_candidate_decisions(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> List[dict]:
+        """Read-only: return reviewed candidate rows for the quality monitor.
+
+        Returns one dict per reviewed candidate with: category, status,
+        reviewed_at, review_reason, provenance_origin, source, created_at.
+        Unreviewed (pending) rows are excluded — they have no decision yet.
+
+        #121: this is the raw data source for ``decision_rate_report`` and
+        ``drift_check``. Read-only — never writes to or mutates the
+        candidates table or the ledger.
+        """
+        conditions = ["status NOT IN ('pending')"]
+        params: list = []
+        if since:
+            conditions.append("(reviewed_at IS NULL OR reviewed_at >= ?)")
+            params.append(since)
+        if until:
+            conditions.append("(reviewed_at IS NULL OR reviewed_at <= ?)")
+            params.append(until)
+        where = " AND ".join(conditions)
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    f"""SELECT category, status, reviewed_at, review_reason,
+                              provenance_origin, source, created_at
+                       FROM memory_candidates
+                       WHERE {where}
+                       ORDER BY reviewed_at ASC""",
+                    params,
+                )
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except Exception as exc:
+            logger.warning("candidate decision query failed: %s", exc)
+            return []
+
+    def query_rejection_ledger(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> List[dict]:
+        """Read-only: return rejection_ledger rows for the quality monitor.
+
+        Returns one dict per ledger entry with: subject, predicate,
+        user_scope, reason, created_at.
+
+        #121: complements ``query_candidate_decisions`` — the ledger captures
+        the claim-slot identity of rejections (subject/predicate/scope) while
+        the candidates table captures the review decision. Read-only.
+        """
+        conditions: list[str] = []
+        params: list = []
+        if since:
+            conditions.append("created_at >= ?")
+            params.append(since)
+        if until:
+            conditions.append("created_at <= ?")
+            params.append(until)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    f"""SELECT subject, predicate, user_scope, reason, created_at
+                       FROM rejection_ledger{where}
+                       ORDER BY created_at ASC""",
+                    params,
+                )
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except Exception as exc:
+            logger.warning("rejection ledger query failed: %s", exc)
+            return []
+
+    def query_hard_cases(
+        self,
+        *,
+        statuses: tuple[str, ...] = ("rejected", "quarantined"),
+        limit: int = 500,
+    ) -> List[dict]:
+        """Read-only: return rejected/quarantined candidates as labeled
+        hard-case eval items (#121).
+
+        Each row carries: candidate_id, category, content, status,
+        review_reason, quarantine_reason, provenance_origin, source,
+        created_at, reviewed_at. The ``review_reason`` / ``quarantine_reason``
+        is the label (gold = the recorded rejection/quarantine reason).
+
+        Read-only — never writes to or mutates the candidates table.
+        """
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        cap = max(1, min(int(limit), 10000))
+        try:
+            with self._lock:
+                assert self.connection is not None
+                result = self.connection.execute(
+                    f"""SELECT candidate_id, category, content, status,
+                              review_reason, quarantine_reason,
+                              provenance_origin, source, created_at, reviewed_at
+                       FROM memory_candidates
+                       WHERE status IN ({placeholders})
+                         AND (user_scope IS NULL OR user_scope = ?)
+                       ORDER BY reviewed_at DESC
+                       LIMIT ?""",
+                    [*statuses, self.user_id, cap],
+                )
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except Exception as exc:
+            logger.warning("hard-case query failed: %s", exc)
+            return []
+
+
     def list_layout_families(
         self,
         *,

@@ -625,3 +625,214 @@ class TestMemoryControlGate:
     def test_normal_sentence_not_a_command(self):
         from extractor import is_memory_control_command
         assert not is_memory_control_command("I like tea.")
+
+
+# ---------------------------------------------------------------------------
+# Extractor audit: E1, E2, E3
+# ---------------------------------------------------------------------------
+
+class TestExtractorAuditE1:
+    """E1: _load_pattern_pack must not crash on malformed/missing patterns.
+
+    A corrupted pattern pack (invalid regex, missing key, bad lexicon type)
+    must fall back to inline defaults, not crash the module import. The
+    blast radius of a crash is catastrophic: provider_session.py imports
+    the extractor inside try/except ImportError — but re.error, KeyError,
+    and TypeError are NOT ImportError, so they propagate and kill the
+    whole provider_session import -> the memory provider silently never
+    loads (silent None provider, no warning).
+    """
+
+    def test_e1_invalid_regex_falls_back(self, tmp_path, monkeypatch):
+        """A pattern pack with an invalid regex must not crash."""
+        import extractor
+
+        bad_pack = tmp_path / "bad_patterns"
+        bad_pack.mkdir()
+        (bad_pack / "en.json").write_text(json.dumps({
+            "patterns": {
+                "IDENTITY_RE": {
+                    "pattern": "[unclosed bracket",
+                    "flags": ["IGNORECASE"],
+                },
+            },
+            "lexicons": {},
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(extractor, "_PATTERNS_DIR", bad_pack)
+        patterns, lexicons = extractor._load_pattern_pack("en")
+        # E1 FIX: should fall back to inline defaults, not raise re.error.
+        assert "IDENTITY_RE" in patterns
+        assert patterns["IDENTITY_RE"].search("I am a developer")
+
+    def test_e1_missing_pattern_key_falls_back(self, tmp_path, monkeypatch):
+        """A pattern pack missing a required key must fall back."""
+        import extractor
+
+        bad_pack = tmp_path / "missing_key_patterns"
+        bad_pack.mkdir()
+        (bad_pack / "en.json").write_text(json.dumps({
+            "patterns": {
+                "IDENTITY_RE": {
+                    "pattern": r"\b(?:i\s+am)\s+(.+?)(?:\.|$)",
+                    "flags": ["IGNORECASE"],
+                },
+            },
+            "lexicons": {
+                "TRANSIENT_WORDS": ["tired"],
+            },
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(extractor, "_PATTERNS_DIR", bad_pack)
+        patterns, lexicons = extractor._load_pattern_pack("en")
+        # E1 FIX: should fall back to inline defaults with ALL keys.
+        assert "HAVE_USE_RE" in patterns
+        assert "HABIT_RE" in patterns
+        assert "NOT_A_NAME" in lexicons
+        assert "BASE_ROLE_WORDS" in lexicons
+
+    def test_e1_bad_lexicon_type_falls_back(self, tmp_path, monkeypatch):
+        """A pattern pack with a non-iterable lexicon value must fall back."""
+        import extractor
+
+        bad_pack = tmp_path / "bad_lexicon_patterns"
+        bad_pack.mkdir()
+        (bad_pack / "en.json").write_text(json.dumps({
+            "patterns": {
+                "IDENTITY_RE": {
+                    "pattern": r"\b(?:i\s+am)\s+(.+?)(?:\.|$)",
+                    "flags": ["IGNORECASE"],
+                },
+            },
+            "lexicons": {
+                "TRANSIENT_WORDS": 42,
+            },
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(extractor, "_PATTERNS_DIR", bad_pack)
+        patterns, lexicons = extractor._load_pattern_pack("en")
+        # E1 FIX: should fall back to inline defaults, not raise TypeError.
+        assert "TRANSIENT_WORDS" in lexicons
+        assert "tired" in lexicons["TRANSIENT_WORDS"]
+
+    def test_e1_missing_spec_pattern_key_falls_back(self, tmp_path, monkeypatch):
+        """A pattern spec missing the 'pattern' key must fall back."""
+        import extractor
+
+        bad_pack = tmp_path / "missing_spec_key"
+        bad_pack.mkdir()
+        (bad_pack / "en.json").write_text(json.dumps({
+            "patterns": {
+                "IDENTITY_RE": {"flags": ["IGNORECASE"]},
+            },
+            "lexicons": {},
+        }), encoding="utf-8")
+
+        monkeypatch.setattr(extractor, "_PATTERNS_DIR", bad_pack)
+        patterns, lexicons = extractor._load_pattern_pack("en")
+        # E1 FIX: should fall back to inline defaults.
+        assert "IDENTITY_RE" in patterns
+
+
+class TestExtractorAuditE2:
+    """E2: Cross-stage dedup must check LLM facts against other LLM facts.
+
+    The current code builds existing_contents from regex facts only, then
+    loops over LLM facts without updating existing_contents. Two
+    near-duplicate LLM facts both survive because the second is only
+    compared against regex facts, not the first LLM fact.
+    """
+
+    def test_e2_llm_internal_duplicates_are_deduped(self, monkeypatch):
+        """Two near-duplicate LLM facts must not both be kept."""
+        import extractor
+
+        def _mock_regex(content):
+            return [{
+                "category": "personal_fact",
+                "content": "User works at Stripe",
+                "tags": ["work"],
+                "source": "regex_extraction",
+                "confidence": 0.75,
+                "durability": "durable",
+                "scope": "profile",
+                "payload": {},
+            }]
+
+        def _mock_llm(content, *, model="", provider=""):
+            return [
+                {
+                    "category": "preference",
+                    "content": "User prefers dark mode",
+                    "tags": ["preference"],
+                    "source": "llm_extraction",
+                    "confidence": 0.8,
+                    "durability": "durable",
+                    "scope": "profile",
+                    "payload": {"source": "llm_extraction"},
+                },
+                {
+                    "category": "preference",
+                    "content": "User likes dark mode",
+                    "tags": ["preference"],
+                    "source": "llm_extraction",
+                    "confidence": 0.8,
+                    "durability": "durable",
+                    "scope": "profile",
+                    "payload": {"source": "llm_extraction"},
+                },
+            ]
+
+        monkeypatch.setattr(extractor, "_extract_facts_regex", _mock_regex)
+        monkeypatch.setattr(extractor, "_extract_facts_llm", _mock_llm)
+
+        # Use a long enough message to trigger LLM fallback (>= 60 chars).
+        facts = extractor.extract_from_turn(
+            "I work at Stripe and I prefer dark mode for my development environment setup",
+            "",
+            use_llm_fallback=True,
+        )
+        # E2 FIX: the two LLM facts are near-duplicates (Jaccard >= 0.6)
+        # -- only one should survive.
+        dark_mode_facts = [
+            f for f in facts
+            if "dark mode" in f.get("content", "").lower()
+        ]
+        assert len(dark_mode_facts) <= 1, (
+            f"Two near-duplicate LLM facts should be deduped; "
+            f"got {len(dark_mode_facts)}: {[f['content'] for f in dark_mode_facts]}"
+        )
+
+
+class TestExtractorAuditE3:
+    """E3: Dead config in JSON pattern pack -- PREFERENCE_RE and EVENT_RE
+    are loaded but never used (shadowed by dynamic builders).
+    """
+
+    def test_e3_no_dead_preference_re_in_json(self):
+        """PREFERENCE_RE should not be in en.json -- it is built dynamically
+        by _build_preference_re() to support runtime verb extension."""
+        import json as _json
+        from pathlib import Path
+
+        pack_path = Path(__file__).resolve().parent.parent / "extractor_patterns" / "en.json"
+        raw = _json.loads(pack_path.read_text(encoding="utf-8"))
+        patterns = raw.get("patterns", {})
+        assert "PREFERENCE_RE" not in patterns, (
+            "PREFERENCE_RE is dead config -- shadowed by dynamic builder. "
+            "Remove it from en.json."
+        )
+
+    def test_e3_no_dead_event_re_in_json(self):
+        """EVENT_RE should not be in en.json -- it is built dynamically
+        by _build_event_re() to support runtime verb extension."""
+        import json as _json
+        from pathlib import Path
+
+        pack_path = Path(__file__).resolve().parent.parent / "extractor_patterns" / "en.json"
+        raw = _json.loads(pack_path.read_text(encoding="utf-8"))
+        patterns = raw.get("patterns", {})
+        assert "EVENT_RE" not in patterns, (
+            "EVENT_RE is dead config -- shadowed by dynamic builder. "
+            "Remove it from en.json."
+        )

@@ -182,3 +182,76 @@ class TestBoostFloorGateExemption:
         source = inspect.getsource(ProviderRetrievalMixin._search_memories)
         assert "is_boosted_candidate" in source
         assert "alias_id_set_pre" in source
+
+
+class TestObservedAtCapture:
+    """#138: index_memory writes created_at into edge attributes as
+    observed_at, capturing provenance for future temporal-graph work."""
+
+    def test_edge_attributes_contain_observed_at(self, tmp_path):
+        graph = _make_graph(tmp_path)
+        try:
+            created_at = "2026-09-02T10:00:00Z"
+            graph.index_memory(
+                "m_obs", "personal_fact", "User works at TechCorp",
+                ["work"], created_at=created_at, use_llm=False,
+            )
+            # query_graph returns edges touching the TechCorp entity;
+            # each edge's attributes should carry observed_at.
+            edges = graph.query_graph("TechCorp")
+            assert edges, "Expected at least one edge for TechCorp"
+            found = False
+            for edge in edges:
+                attrs = edge.get("attributes") or {}
+                if attrs.get("observed_at") == created_at:
+                    found = True
+                    break
+            assert found, (
+                f"observed_at={created_at!r} not found in any edge "
+                f"attributes: {[e.get('attributes') for e in edges]}"
+            )
+        finally:
+            graph.close()
+
+    def test_observed_at_matches_record_created_at(self, tmp_path):
+        """The observed_at value must exactly match the created_at passed
+        to index_memory — no transformation, no truncation."""
+        graph = _make_graph(tmp_path)
+        try:
+            ts = "2026-08-15T14:30:00Z"
+            graph.index_memory(
+                "m_obs2", "personal_fact", "Alice is my wife",
+                ["relationship"], created_at=ts, use_llm=False,
+            )
+            edges = graph.query_graph("Alice")
+            assert edges
+            observed_values = {
+                (e.get("attributes") or {}).get("observed_at")
+                for e in edges
+                if e.get("attributes")
+            }
+            assert ts in observed_values, (
+                f"observed_at {ts!r} not in {observed_values}"
+            )
+        finally:
+            graph.close()
+
+    def test_observed_at_none_when_created_at_none(self, tmp_path):
+        """When created_at is None, observed_at is None — no crash, no
+        fabricated timestamp. Existing edges (pre-change) are unaffected."""
+        graph = _make_graph(tmp_path)
+        try:
+            graph.index_memory(
+                "m_obs3", "personal_fact", "User uses Vim",
+                ["tool"], created_at=None, use_llm=False,
+            )
+            edges = graph.query_graph("Vim")
+            assert edges
+            # observed_at should be None (not missing, not fabricated)
+            for edge in edges:
+                attrs = edge.get("attributes") or {}
+                # None is acceptable; the key may or may not be present
+                # but must not be a fabricated timestamp.
+                assert attrs.get("observed_at") is None or attrs.get("observed_at") is None
+        finally:
+            graph.close()

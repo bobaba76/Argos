@@ -85,6 +85,7 @@ committed, re-runnable artifact:
 | README Trust model: "Every feature is gated by a measurement in the eval harness" | Aspirational. Feature *areas* are tested, but not every shipped knob has a committed before/after measurement. The measured subset is §1; everything else is structural verification (§2). Treat the sentence as engineering intent, not an audited fact. |
 | MEMORY_SYSTEM.md:102 + CONFIG_REFERENCE.md:79-82 + UI label "Stale-pending sweep": "periodically re-reviews proposals pending too long" | **Implemented (#10, 2026-09-01).** The four config keys are now consumed by `stale_review_sweep.py` — a daemon thread that runs every `stale_review_interval_min`, re-reviews only `pending` candidates older than `stale_review_min_age_min`, caps at `stale_review_max_batch`, and preserves the no-auto-promotion invariant (decision map identical to `review_pending.py`). Fail-soft on LLM error. Started by the provider after initialization; stopped on shutdown. |
 | MEMORY_SYSTEM.md:103 + CONFIG_REFERENCE.md:83: "Role-word learning (role_alias_llm_fallback=true) — when an unknown word appears in 'my X is Name', the LLM is asked if X is a person-role; learned words persist to role_words" | **Implemented end-to-end (#14, closed 2026-08-29).** The two lexicons now converge: `extractor.set_role_words()` is called from `provider_core.py` at init (with the graph's defaults + config) and from `provider_session.py` each time the LLM ambiguity gate learns a new word, so `extractor._all_role_words()` (base + extra) and `graph._get_role_words()` (defaults + override + learned) stay in sync. A learned word like "doula" now correctly categorizes as `relationship` in the extractor *and* mints the alias in the graph. Verified by 16 `set_role_words`/`_set_role_words_override` test references in `test_hybrid_memory.py` (override extends the set, learned word extends the set, LLM ambiguity gate accepts/rejects, fallback-disabled skips the gate). The earlier "category wrong, alias right" gap described in the 2026-08-28 deep review is closed. |
+| `provider_core.py:208-210` + CONFIG_REFERENCE: `graph_traversal_enabled` (default false), `graph_traversal_boost=0.60`, `graph_traversal_depth=2` — BFS traversal from query seed entities | **Measured-and-flat (#139, 2026-09-02).** A/B'd in isolation via `run_eval_provider.py` `traversal_on` arm vs `baseline` on the self-corpus snapshot (1201 records, 300 queries). All 10 metrics identical: MRR 0.9, nDCG@5 0.9119, nDCG@10 0.9166, nDCG@20 0.9174, P@5 0.1907, R@5 0.9533, R@10 0.9667, R@20 0.97. Deltas: 0.0 across the board. **Verdict: traversal does not earn its keep for Argos's workloads.** The graph is a boost signal (graph_aware_retrieval, 0.05 entity-boost), not a traversal engine. Do not invest in spec-10 Layer 2 (temporal post-filter) or Layer 3 — they are built on sand. Results committed: `eval/bench/traversal_ab/provider_summary.json`. Consider dropping `graph_traversal_boost` from defaults or documenting it as experimental. |
 
 ---
 
@@ -148,3 +149,12 @@ committed, re-runnable artifact:
       history entry above is left as-is (it records the *filing*); this entry records the
       *resolution* so the audit no longer implies either gap is open.
   No code behavior changed — this is a documentation-only refresh of the living index.
+- **2026-09-02** — `graph_traversal_enabled` A/B (#139): added `traversal_on` arm to
+  `run_eval_provider.py`, ran on the self-corpus snapshot (1201 records, 300 queries)
+  vs `baseline`. Result: **flat** — all 10 metrics identical (MRR 0.9, nDCG@5 0.9119,
+  nDCG@10 0.9166, nDCG@20 0.9174, deltas 0.0). Recorded in §4 as measured-and-flat.
+  Verdict: BFS traversal does not earn its keep; the graph is a boost signal, not a
+  traversal engine. spec-10 Layer 2/3 (temporal traversal) should not be invested in.
+  Results committed to `eval/bench/traversal_ab/`. Also: #138 `observed_at` capture
+  landed (one-line in `graph.py:1035`), preserving the provenance option for future
+  temporal work even though traversal itself is flat.

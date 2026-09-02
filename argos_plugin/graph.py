@@ -1033,6 +1033,7 @@ class KuzuGraphStore:
         for relation in relations:
             attributes = dict(relation.get("attributes") or {})
             attributes["memory_id"] = str(memory_id)
+            attributes["observed_at"] = created_at  # #138: capture provenance for temporal-graph work
             self.add_relationship(
                 relation["source"],
                 relation["source_type"],

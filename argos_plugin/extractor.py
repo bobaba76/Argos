@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,97 @@ def _reset_extraction_failure_stats() -> None:
     """Test hook: reset the failure counter."""
     global _EXTRACTION_FAILURES
     _EXTRACTION_FAILURES = 0
+
+
+# --- Pattern pack loader (#134) ---------------------------------------------
+# Patterns and lexicons live in config data files
+# (extractor_patterns/<locale>.json) so domain packs and locale packs can
+# be added without code changes. Loaded once at module init (build-once,
+# auditable). Falls back to inline defaults if the data file is missing or
+# unreadable — extraction must never crash on a missing config file.
+#
+# ReDoS audit (#134): the patterns are stored as complete regex strings
+# (not dynamically-built alternations), so the bounded {0,200} tails,
+# per-sentence/per-content caps, and the _REGEX_STAGE_TIMEOUT_S watchdog
+# all survive unchanged. Dynamic alternation from lexicons is #136, which
+# must re.escape() every member and preserve the bounded tails.
+
+_PATTERNS_DIR = Path(__file__).resolve().parent / "extractor_patterns"
+
+_FLAG_MAP = {
+    "IGNORECASE": re.IGNORECASE,
+    "DOTALL": re.DOTALL,
+    "MULTILINE": re.MULTILINE,
+    "VERBOSE": re.VERBOSE,
+}
+
+
+def _compile_flags(flag_names: list[str]) -> int:
+    """Convert flag-name list to a combined re flag integer."""
+    flags = 0
+    for name in flag_names:
+        flags |= _FLAG_MAP.get(name, 0)
+    return flags
+
+
+def _load_pattern_pack(locale: str = "en") -> tuple[Dict[str, "re.Pattern"], Dict[str, frozenset]]:
+    """Load compiled patterns and lexicons for *locale* from the data file.
+
+    Returns ``(patterns, lexicons)`` where *patterns* maps name → compiled
+    regex and *lexicons* maps name → frozenset. Falls back to inline
+    defaults if the file is missing or unreadable (defense-in-depth).
+    """
+    path = _PATTERNS_DIR / f"{locale}.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Pattern pack %s not loaded (%s); using inline defaults", path, exc)
+        return _inline_pattern_defaults()
+
+    patterns: Dict[str, "re.Pattern"] = {}
+    for name, spec in raw.get("patterns", {}).items():
+        patterns[name] = re.compile(spec["pattern"], _compile_flags(spec.get("flags", [])))
+    lexicons: Dict[str, frozenset] = {}
+    for name, entries in raw.get("lexicons", {}).items():
+        lexicons[name] = frozenset(entries)
+    return patterns, lexicons
+
+
+def _inline_pattern_defaults() -> tuple[Dict[str, "re.Pattern"], Dict[str, frozenset]]:
+    """Inline fallback patterns/lexicons, used when the JSON data file is
+    unavailable. Kept in sync with ``extractor_patterns/en.json``."""
+    patterns = {
+        "IDENTITY_RE": re.compile(r'\b(?:i\s+am|i\'m)\s+(?:a\s+|an\s+)?(.+?)(?:\.|$)', re.IGNORECASE),
+        "HAVE_USE_RE": re.compile(r'\b(?:i\s+(?:have|own|use|take|\'ve\s+got|\'m\s+using))\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "WORK_RE": re.compile(r'\b(?:i\s+work\s+(?:at|for|with)|i\'m\s+(?:working\s+at|employed\s+at))\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "PREFERENCE_RE": re.compile(r'\b(?:i\s+(?:prefer|like|love|hate|enjoy|dislike|can\'t\s+stand|don\'t\s+like|don\'t\s+enjoy)|i\'d\s+(?:rather|prefer)|i\'m\s+(?:a\s+fan\s+of|not\s+a\s+fan\s+of|into|keen\s+on))\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "ASSISTANT_DIRECTIVE_RE": re.compile(r'\b(?:(?:always|never)\s+(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}|(?:do\s+not|don\'t)\s+(?:ever\s+|please\s+|just\s+|always\s+)?(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}|call\s+me\s+[^.!?]{1,200}|stop\s+(?:doing|being|using|saying)\b[^.!?]{0,200})', re.IGNORECASE),
+        "HABIT_RE": re.compile(r'\b(?:i\s+(?:always|never|usually|typically|generally|rarely|often))\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "GOAL_RE": re.compile(r'\b(?:i\'m\s+working\s+on|i\s+want\s+to|i\'m\s+trying\s+to|i\'m\s+going\s+to|i\s+need\s+to|i\'m\s+planning\s+to|i\'m\s+learning|i\'m\s+studying)\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "SWITCH_RE": re.compile(r'\b(?:i\s+(?:switched|moved|migrated|transitioned)\s+from\s+(.+?)\s+to\s+(.+?))(?:\.|$)', re.IGNORECASE),
+        "EVENT_RE": re.compile(r'\bi\s+(started|began|stopped|quit|resumed|finished|completed|launched)\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "INSIGHT_RE": re.compile(r'\b(?:i\s+(?:tend\s+to|struggle\s+with|realized|noticed|found\s+that|learned\s+that)|i\'ve\s+been\s+noticing|i\s+think\s+i|i\s+feel\s+like\s+i)\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "RELATIONSHIP_RE": re.compile(r'\b([A-Z][a-z]+)\s+is\s+(?:my|the)\s+(\w+(?:\s+\w+)?)\b'),
+        "MY_X_IS_RE": re.compile(r'\bmy\s+(\w+(?:\s+\w+)?)\s+is\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "LOCATION_RE": re.compile(r'\b(?:i\s+live\s+in|i\'m\s+(?:based\s+in|from)|i\s+reside\s+in)\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "ONGOING_RE": re.compile(r'\b(?:i\'ve\s+been)\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        "ATTRIBUTE_RE": re.compile(r'\b(?:i\s+(?:have|own)\s+)(.+?)(?:[.,;]|$)', re.IGNORECASE),
+        "AGENT_SPEAK_PATTERNS": re.compile(r"(?:i'll\s+search|i'll\s+look|i'll\s+check|let me|authoritative\s+sources|i'll\s+find|i'll\s+research|searching\s+for|looking\s+up|completed\s+implementation\s+of|now\s+includes\s+\d+\s+tools|ships\s+off\s+by\s+default|deployment\s+reference\s+specifies|handoff\s+doc\s+is\s+located|implementation\s+of\s+evolution|work\s+items?\s+(?:from\s+the\s+handoff|complete)|service\s+\(pids?\s+\d+)", re.IGNORECASE),
+    }
+    lexicons = {
+        "TRANSIENT_WORDS": frozenset({"tired", "hungry", "thirsty", "here", "there", "ready", "done", "fine", "ok", "okay", "good", "great", "busy", "free", "back", "sorry", "glad", "happy", "sad", "angry", "confused", "stuck", "not sure", "not certain", "not really", "not happy", "sick", "bored", "excited", "worried", "anxious", "stressed", "exhausted", "overwhelmed", "frustrated", "annoyed", "grateful"}),
+        "NOT_A_NAME": frozenset({"this", "that", "it", "there", "here", "what", "who", "where", "today", "tomorrow", "yesterday", "now", "then"}),
+        "BASE_ROLE_WORDS": frozenset({"wife", "husband", "partner", "boyfriend", "girlfriend", "boss", "advisor", "doctor", "teacher", "mentor", "friend", "colleague", "manager", "supervisor"}),
+        "TRIVIAL_FACTS": frozenset({"literally glm 5", "literally glm5", "a human", "a person", "typing", "using a keyboard", "on a computer", "online", "here", "there", "ready", "done", "back"}),
+        "ABBREVIATIONS": frozenset({"inc", "ltd", "pty", "corp", "co", "no", "st", "ave", "blvd", "vs", "e.g", "i.e", "etc", "approx", "mr", "mrs", "ms", "dr", "prof", "sr", "jr"}),
+        "PREFERENCE_VERBS": frozenset({"prefer", "like", "love", "hate", "enjoy", "dislike"}),
+        "EVENT_VERBS": frozenset({"started", "began", "stopped", "quit", "resumed", "finished", "completed", "launched"}),
+    }
+    return patterns, lexicons
+
+
+# Load the default (en) pattern pack once at module init.
+_PATTERNS, _LEXICONS = _load_pattern_pack("en")
 
 
 # --- quote verification (#35, batch-2) ---------------------------------------
@@ -166,30 +258,13 @@ def apply_quote_verification(fact: Dict[str, Any], source_text: str) -> Dict[str
 # Phrases that indicate the extracted text is actually agent output, not a
 # user fact.  These appear when the regex accidentally matches text the
 # assistant said (e.g. "I'll search authoritative sources").
-_AGENT_SPEAK_PATTERNS = re.compile(
-    r"(?:i'll\s+search|i'll\s+look|i'll\s+check|let me|authoritative\s+sources"
-    r"|i'll\s+find|i'll\s+research|searching\s+for|looking\s+up"
-    # Implementation-status reports: when a work summary/handoff is pasted
-    # into the chat, the LLM extraction stage reads it as "user facts" and
-    # mints the agent's self-report as memories (e.g. "Completed
-    # implementation of evolution chains feature", "Memory provider now
-    # includes 13 tools", "Chain-unfold configuration ships off by
-    # default"). These are agent/dev-log narration, not user facts.
-    r"|completed\s+implementation\s+of|now\s+includes\s+\d+\s+tools"
-    r"|ships\s+off\s+by\s+default|deployment\s+reference\s+specifies"
-    r"|handoff\s+doc\s+is\s+located|implementation\s+of\s+evolution"
-    r"|work\s+items?\s+(?:from\s+the\s+handoff|complete)"
-    r"|service\s+\(pids?\s+\d+)",
-    re.IGNORECASE,
-)
+# Loaded from the pattern pack (#134); see _inline_pattern_defaults for the
+# fallback definition.
+_AGENT_SPEAK_PATTERNS = _PATTERNS["AGENT_SPEAK_PATTERNS"]
 
 # Trivial facts that aren't worth storing — the agent can infer these from
 # context or they add no value to future conversations.
-_TRIVIAL_FACTS = frozenset({
-    "literally glm 5", "literally glm5", "a human", "a person",
-    "typing", "using a keyboard", "on a computer", "online",
-    "here", "there", "ready", "done", "back",
-})
+_TRIVIAL_FACTS = _LEXICONS["TRIVIAL_FACTS"]
 
 # Content that looks like a sentence fragment (starts with lowercase,
 # no subject, or is a partial clause).
@@ -387,15 +462,55 @@ def is_memory_control_command(user_content: str) -> bool:
     return False
 
 
+# Abbreviations that drive extraction-quality false-splits (#135). Trimmed
+# to business-relevant suffixes + titles that the regex patterns commonly
+# over-capture (e.g. _WORK_RE grabbing "Inc" as a workplace), NOT a general
+# NLP-style suppress set. Stored lowercased without the trailing dot; the
+# merge step strips the dot before comparing. Loaded from the pattern pack
+# (#134).
+_ABBREVIATIONS = _LEXICONS["ABBREVIATIONS"]
+
+
 def _split_sentences(text: str) -> List[str]:
-    """Split text into sentences, keeping it simple.
+    """Split text into sentences, preserving line boundaries (#133) and
+    rejoining abbreviation false-splits (#135).
+
+    Newlines are treated as hard sentence boundaries — a pasted list or
+    note keeps its line structure instead of being collapsed into one
+    run-on sentence. Within each line, spaces/tabs are normalized and the
+    sentence is split on ``[.!?]`` followed by whitespace as before. A
+    post-filter then rejoins fragments where the split point was an
+    abbreviation (``Inc.``, ``Dr.``, ``Ltd.`` …) so ``_WORK_RE`` does not
+    grab ``Inc`` as a workplace. Abbreviation merging never crosses a
+    newline boundary.
 
     ReDoS guard (#89): each sentence is capped at ``_MAX_SENTENCE_CHARS`` so
     a long unpunctuated run (which the naive splitter treats as one
     "sentence") cannot feed pathological input to the regex patterns.
     """
-    text = re.sub(r'\s+', ' ', text).strip()
-    parts = re.split(r'(?<=[.!?])\s+', text)
+    parts: List[str] = []
+    for line in text.split('\n'):
+        # Normalize spaces/tabs within the line, but keep newlines as
+        # boundaries (do not collapse '\n' into a space). An empty line is
+        # a hard boundary — it contributes no sentence and prevents the
+        # surrounding lines from merging.
+        line = re.sub(r'[ \t]+', ' ', line).strip()
+        if not line:
+            continue
+        line_parts = re.split(r'(?<=[.!?])\s+', line)
+        # Merge fragments where the split point was an abbreviation (#135).
+        # Done per-line so an abbreviation never merges across a newline.
+        merged: List[str] = []
+        for part in line_parts:
+            if merged:
+                prev = merged[-1].rstrip()
+                # Last token of the previous fragment, trailing dot stripped.
+                last_word = prev.rsplit(None, 1)[-1].rstrip('.') if prev else ""
+                if last_word.lower() in _ABBREVIATIONS:
+                    merged[-1] = prev + " " + part
+                    continue
+            merged.append(part)
+        parts.extend(merged)
     return [p.strip()[:_MAX_SENTENCE_CHARS] for p in parts if p.strip()]
 
 
@@ -408,31 +523,52 @@ def _split_sentences(text: str) -> List[str]:
 # "I use/take X" pattern.  This makes the extractor general-purpose.
 
 # "I am/is a <something>" — identity, role, profession.
-_IDENTITY_RE = re.compile(
-    r'\b(?:i\s+am|i\'m)\s+(?:a\s+|an\s+)?(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_IDENTITY_RE = _PATTERNS["IDENTITY_RE"]
 
 # "I have/own/use/take <something>" — possession, usage, tools.
-_HAVE_USE_RE = re.compile(
-    r'\b(?:i\s+(?:have|own|use|take|\'ve\s+got|\'m\s+using))\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_HAVE_USE_RE = _PATTERNS["HAVE_USE_RE"]
 
 # "I work at/for <something>" / "I'm a <job>" — work context.
-_WORK_RE = re.compile(
-    r'\b(?:i\s+work\s+(?:at|for|with)|i\'m\s+(?:working\s+at|employed\s+at))\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_WORK_RE = _PATTERNS["WORK_RE"]
 
 # "I prefer/like/love/hate/enjoy <something>" — preferences.
-_PREFERENCE_RE = re.compile(
-    r'\b(?:i\s+(?:prefer|like|love|hate|enjoy|dislike|can\'t\s+stand'
-    r'|don\'t\s+like|don\'t\s+enjoy)'
-    r'|i\'d\s+(?:rather|prefer)'
-    r'|i\'m\s+(?:a\s+fan\s+of|not\s+a\s+fan\s+of|into|keen\s+on))\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+# The simple verb alternation is built dynamically from the base lexicon +
+# any extra verbs added via set_preference_verbs() (#136), so a domain pack
+# can add "adore"/"detest" without code changes. The multi-word phrases
+# ("can't stand", "a fan of", "keen on" …) are structural and stay fixed.
+# ReDoS (#89/#136): every verb is re.escape()'d before joining; the
+# bounded (.+?) tail and per-sentence cap are preserved.
+_BASE_PREFERENCE_VERBS = _LEXICONS["PREFERENCE_VERBS"]
+_extra_preference_verbs: set[str] = set()
+
+# Fixed multi-word preference phrases (not simple verbs — structural).
+_PREFERENCE_PHRASES = r"can\'t\s+stand|don\'t\s+like|don\'t\s+enjoy"
+
+
+def _build_preference_re() -> "re.Pattern":
+    verbs = _BASE_PREFERENCE_VERBS | _extra_preference_verbs
+    verb_alt = "|".join(re.escape(v) for v in sorted(verbs))
+    return re.compile(
+        rf'\b(?:i\s+(?:{verb_alt}|{_PREFERENCE_PHRASES})'
+        r"|i\'d\s+(?:rather|prefer)"
+        r"|i\'m\s+(?:a\s+fan\s+of|not\s+a\s+fan\s+of|into|keen\s+on))\s+(.+?)(?:\.|$)",
+        re.IGNORECASE,
+    )
+
+
+def set_preference_verbs(words: set[str] | frozenset[str] | None) -> None:
+    """Extend the preference-verb set at runtime (#136).
+
+    A domain pack can add verbs like "adore", "detest", "fancy" without
+    editing extractor.py. The regex is rebuilt from the combined
+    (base + extra) set with re.escape on every member.
+    """
+    global _extra_preference_verbs, _PREFERENCE_RE
+    _extra_preference_verbs = {w.lower().strip() for w in (words or set()) if w}
+    _PREFERENCE_RE = _build_preference_re()
+
+
+_PREFERENCE_RE = _build_preference_re()
 
 # Assistant-side style directives: "always give me the short version",
 # "never use code comments", "don't call it that", "call me Mike",
@@ -441,103 +577,100 @@ _PREFERENCE_RE = re.compile(
 # unpunctuated run cannot cause catastrophic backtracking. Combined with the
 # per-sentence length cap in _extract_facts_regex, this caps the worst-case
 # regex work on any input.
-_ASSISTANT_DIRECTIVE_RE = re.compile(
-    r'\b(?:'
-    r'(?:always|never)\s+(?:give|say|use|respond|reply|write|speak|talk'
-    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}'
-    r'|(?:do\s+not|don\'t)\s+(?:ever\s+|please\s+|just\s+|always\s+)?(?:give|say|use|respond|reply|write|speak|talk'
-    r'|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}'
-    r'|call\s+me\s+[^.!?]{1,200}'
-    r'|stop\s+(?:doing|being|using|saying)\b[^.!?]{0,200}'
-    r')',
-    re.IGNORECASE,
-)
+_ASSISTANT_DIRECTIVE_RE = _PATTERNS["ASSISTANT_DIRECTIVE_RE"]
 
 # "I always/never/usually <something>" — habits and patterns.
-_HABIT_RE = re.compile(
-    r'\b(?:i\s+(?:always|never|usually|typically|generally|rarely|often))\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_HABIT_RE = _PATTERNS["HABIT_RE"]
 
 # "I'm working on/trying to/going to/need to/want to <something>" — goals.
-_GOAL_RE = re.compile(
-    r'\b(?:i\'m\s+working\s+on|i\s+want\s+to|i\'m\s+trying\s+to'
-    r'|i\'m\s+going\s+to|i\s+need\s+to|i\'m\s+planning\s+to'
-    r'|i\'m\s+learning|i\'m\s+studying)\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_GOAL_RE = _PATTERNS["GOAL_RE"]
 
 # "I switched from X to Y" / "I moved from X to Y" — transitions.
-_SWITCH_RE = re.compile(
-    r'\b(?:i\s+(?:switched|moved|migrated|transitioned)\s+from\s+(.+?)\s+to\s+(.+?))(?:\.|$)',
-    re.IGNORECASE,
-)
+_SWITCH_RE = _PATTERNS["SWITCH_RE"]
 
 # "I started/began/stopped/quit/resumed <something>" — events.
-_EVENT_RE = re.compile(
-    r'\bi\s+(started|began|stopped|quit|resumed|finished|completed|launched)\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+# The verb alternation is built dynamically from the base lexicon + any
+# extra verbs added via set_event_verbs() (#136), so a domain pack can add
+# "deployed"/"shipped"/"approved" without code changes.
+# ReDoS (#89/#136): every verb is re.escape()'d before joining; the bounded
+# (.+?) tail and per-sentence cap are preserved.
+_BASE_EVENT_VERBS = _LEXICONS["EVENT_VERBS"]
+_extra_event_verbs: set[str] = set()
+
+
+def _build_event_re() -> "re.Pattern":
+    verbs = _BASE_EVENT_VERBS | _extra_event_verbs
+    verb_alt = "|".join(re.escape(v) for v in sorted(verbs))
+    return re.compile(
+        rf"\bi\s+({verb_alt})\s+(.+?)(?:\.|$)",
+        re.IGNORECASE,
+    )
+
+
+def set_event_verbs(words: set[str] | frozenset[str] | None) -> None:
+    """Extend the event-verb set at runtime (#136).
+
+    A domain pack can add verbs like "deployed", "shipped", "approved",
+    "signed", "filed" without editing extractor.py. The regex is rebuilt
+    from the combined (base + extra) set with re.escape on every member.
+    """
+    global _extra_event_verbs, _EVENT_RE
+    _extra_event_verbs = {w.lower().strip() for w in (words or set()) if w}
+    _EVENT_RE = _build_event_re()
+
+
+_EVENT_RE = _build_event_re()
 
 # "I tend to/struggle with/realized/noticed" — insights, self-observations.
 # "i've been noticing", "i think i", "i feel like i" are top-level alternatives.
-_INSIGHT_RE = re.compile(
-    r'\b(?:'
-    r'i\s+(?:tend\s+to|struggle\s+with|realized|noticed|found\s+that|learned\s+that)'
-    r'|i\'ve\s+been\s+noticing'
-    r'|i\s+think\s+i'
-    r'|i\s+feel\s+like\s+i'
-    r')\s+'
-    r'(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_INSIGHT_RE = _PATTERNS["INSIGHT_RE"]
 
 # "X is my <relation>" — relationship introduction (any relationship).
-_RELATIONSHIP_RE = re.compile(
-    r'\b([A-Z][a-z]+)\s+is\s+(?:my|the)\s+(\w+(?:\s+\w+)?)\b',
-)
+_RELATIONSHIP_RE = _PATTERNS["RELATIONSHIP_RE"]
 
 # "My <thing> is <value>" — attributes, config, ownership.
-_MY_X_IS_RE = re.compile(
-    r'\bmy\s+(\w+(?:\s+\w+)?)\s+is\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_MY_X_IS_RE = _PATTERNS["MY_X_IS_RE"]
 
 # "I live in/am based in/am from <place>" — location.
-_LOCATION_RE = re.compile(
-    r'\b(?:i\s+live\s+in|i\'m\s+(?:based\s+in|from)|i\s+reside\s+in)\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_LOCATION_RE = _PATTERNS["LOCATION_RE"]
 
 # "I've been doing X for Y" / "I've been on X for Y" — ongoing states.
-_ONGOING_RE = re.compile(
-    r'\b(?:i\'ve\s+been)\s+(.+?)(?:\.|$)',
-    re.IGNORECASE,
-)
+_ONGOING_RE = _PATTERNS["ONGOING_RE"]
 
 # "I have/own X" — possession attribute (scoped to have/own only so it
 # doesn't shadow _HAVE_USE_RE for "I use/take X" — issue #32).
-_ATTRIBUTE_RE = re.compile(
-    r'\b(?:i\s+(?:have|own)\s+)'
-    r'(.+?)(?:[.,;]|$)',
-    re.IGNORECASE,
-)
+_ATTRIBUTE_RE = _PATTERNS["ATTRIBUTE_RE"]
 
 
 # Words that are not valid names for relationship extraction.
-_NOT_A_NAME = frozenset({
-    "this", "that", "it", "there", "here", "what", "who", "where",
-    "today", "tomorrow", "yesterday", "now", "then",
-})
+_NOT_A_NAME = _LEXICONS["NOT_A_NAME"]
+
+# Transient states for the identity gate ("I am tired", "I am ready"). A
+# detail that is or starts with one of these is not a durable identity fact.
+# The base set is loaded from the pattern pack (#134); extra words can be
+# added at runtime via set_transient_words() (#136).
+_BASE_TRANSIENT_WORDS = _LEXICONS["TRANSIENT_WORDS"]
+_extra_transient_words: set[str] = set()
+
+
+def set_transient_words(words: set[str] | frozenset[str] | None) -> None:
+    """Extend the transient-word set at runtime (#136).
+
+    A domain pack can add transient states specific to its context (e.g.
+    "on leave", "in transit") without editing extractor.py.
+    """
+    global _extra_transient_words
+    _extra_transient_words = {w.lower().strip() for w in (words or set()) if w}
+
+
+def _all_transient_words() -> frozenset[str]:
+    """Return the complete transient-word set (base + extra)."""
+    return _BASE_TRANSIENT_WORDS | _extra_transient_words
 
 # Base relationship role words for the "My X is Y" gate. Extended at runtime
 # by set_role_words() with the graph's learned/configured role words so the
 # extractor and graph converge on one lexicon (issue #14).
-_BASE_ROLE_WORDS = frozenset({
-    "wife", "husband", "partner", "boyfriend", "girlfriend",
-    "boss", "advisor", "doctor", "teacher", "mentor",
-    "friend", "colleague", "manager", "supervisor",
-})
+_BASE_ROLE_WORDS = _LEXICONS["BASE_ROLE_WORDS"]
 _extra_role_words: set[str] = set()
 
 
@@ -605,12 +738,20 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
     if m:
         workplace = m.group(1).strip().rstrip('.')
         if len(workplace) > 2:
-            return {
-                "category": "personal_fact",
-                "content": f"User works at: {workplace}",
-                "tags": ["personal_fact", "work"],
-                "payload": {"workplace": workplace, "fact_type": "work"},
-            }
+            # Abbreviation guard (#135): a bare single-token corporate suffix
+            # ("Inc", "Pty", "Ltd", "Corp" …) captured because the regex
+            # stopped at the suffix's period is not a real workplace name.
+            # A multi-token capture like "Acme Inc" is a real name + suffix
+            # and is kept.
+            if " " not in workplace and workplace.lower() in _ABBREVIATIONS:
+                pass  # fall through to other patterns / no fact
+            else:
+                return {
+                    "category": "personal_fact",
+                    "content": f"User works at: {workplace}",
+                    "tags": ["personal_fact", "work"],
+                    "payload": {"workplace": workplace, "fact_type": "work"},
+                }
 
     # Location: "I live in Berlin" / "I'm from Tokyo"
     m = _LOCATION_RE.search(sentence)
@@ -756,19 +897,11 @@ def _classify_sentence(sentence: str) -> Dict[str, Any] | None:
         # Filter out transient states ("I am tired", "I am here", "I am ready",
         # "I am tired and hungry right now"). Check both exact match and
         # whether the detail starts with a transient word.
-        _TRANSIENT_WORDS = frozenset({
-            "tired", "hungry", "thirsty", "here", "there", "ready", "done",
-            "fine", "ok", "okay", "good", "great", "busy", "free", "back",
-            "sorry", "glad", "happy", "sad", "angry", "confused", "stuck",
-            "not sure", "not certain", "not really", "not happy",
-            "sick", "bored", "excited", "worried", "anxious", "stressed",
-            "exhausted", "overwhelmed", "frustrated", "annoyed", "grateful",
-        })
         detail_lower = detail.lower()
         first_word = detail_lower.split()[0] if detail_lower else ""
         is_transient = (
-            detail_lower in _TRANSIENT_WORDS
-            or first_word in _TRANSIENT_WORDS
+            detail_lower in _all_transient_words()
+            or first_word in _all_transient_words()
         )
         if len(detail) > 5 and not is_transient:
             return {

@@ -724,6 +724,71 @@ _GRAPH_TYPED_RELATIONS = frozenset({
 })
 
 
+def _backfill_memory_ids(conn) -> int:
+    """G4 (2/9 review): populate the RelatesTo.memory_ids column from the
+    attributes JSON blob for pre-migration edges.
+
+    The G4 column migration (ALTER TABLE ... ADD memory_ids STRING[]) leaves
+    existing rows NULL, and remove_memory's native list_contains filter
+    would silently miss every old edge whose evidence list lives only in
+    the JSON attributes. This folds attrs['memory_ids'] (and the legacy
+    singular attrs['memory_id']) into the column.
+
+    Idempotent: rows with the column already populated (or with no memory
+    evidence in attributes) are skipped, so after the first successful run
+    the candidate set is empty and later calls only pay the selective scan.
+
+    Returns the number of edges backfilled (0 when nothing to do or on
+    failure — failures are logged, never fatal).
+    """
+    try:
+        _bf = conn.execute(
+            """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+               WHERE r.memory_ids IS NULL
+                 AND CONTAINS(r.attributes, 'memory_id')
+               RETURN a.id, r.relation_type, b.id, r.attributes"""
+        )
+        _bf_rows = []
+        while _bf.has_next():
+            _bf_rows.append(_bf.get_next())
+    except Exception as exc:
+        logger.warning("G4 memory_ids backfill scan failed: %s", exc)
+        return 0
+    _bf_count = 0
+    for _src, _rel, _dst, _attrs in _bf_rows:
+        try:
+            _a = json.loads(_attrs) if _attrs else {}
+        except Exception:
+            _a = {}
+        _mids = _a.get("memory_ids")
+        if not isinstance(_mids, list):
+            _mids = [_a["memory_id"]] if _a.get("memory_id") else None
+        if not _mids:
+            continue
+        _mids = [str(m) for m in _mids]
+        try:
+            conn.execute(
+                """MATCH (a:Entity {id: $src})-[r:RelatesTo {relation_type: $rel}]->(b:Entity {id: $dst})
+                   SET r.memory_ids = $mids""",
+                parameters={
+                    "src": _src, "rel": _rel,
+                    "dst": _dst, "mids": _mids,
+                },
+            )
+            _bf_count += 1
+        except Exception as exc:
+            logger.warning(
+                "G4 memory_ids backfill row failed (%s-%s-%s): %s",
+                _src, _rel, _dst, exc,
+            )
+    if _bf_count:
+        logger.info(
+            "G4 backfill: populated memory_ids on %d pre-migration edge(s)",
+            _bf_count,
+        )
+    return _bf_count
+
+
 class KuzuGraphStore:
     """Kuzu-backed relationship graph with thread-safe access.
 
@@ -792,6 +857,12 @@ class KuzuGraphStore:
                 except RuntimeError as e:
                     if not _is_already_exists_error(e):
                         logger.debug("Kuzu memory_ids migration: %s", e)
+                # G4 backfill (2/9 review): the ALTER adds the column but
+                # existing rows are NULL — remove_memory's list_contains
+                # filter would silently miss every pre-migration edge whose
+                # evidence list lives only in the attributes JSON blob.
+                # One-time idempotent migration (see _backfill_memory_ids).
+                _backfill_memory_ids(conn)
 
             # Reuse the shared connection.
             self.database, self.conn, self._shared_conn_lock, ref_count = shared
@@ -1090,8 +1161,11 @@ class KuzuGraphStore:
                 """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
                    WHERE a.id = $memory_node OR b.id = $memory_node
                       OR list_contains(r.memory_ids, $mid)
+                      OR (r.memory_ids IS NULL
+                         AND CONTAINS(r.attributes, $midq))
                    RETURN a.id, r.relation_type, b.id, r.attributes""",
-                parameters={"memory_node": memory_node, "mid": memory_id},
+                parameters={"memory_node": memory_node, "mid": memory_id,
+                            "midq": '"' + memory_id + '"'},
             )
             edges = []
             while result.has_next():
@@ -1104,6 +1178,11 @@ class KuzuGraphStore:
                 memory_ids = attrs.get("memory_ids", [])
                 if not isinstance(memory_ids, list):
                     memory_ids = [memory_ids] if memory_ids else []
+                # G4 (2/9 review): legacy edges may carry the evidence under
+                # the singular 'memory_id' key — fold it in so the precise
+                # match below mirrors the old full-scan behavior.
+                if not memory_ids and attrs.get("memory_id"):
+                    memory_ids = [str(attrs["memory_id"])]
                 if memory_id not in {str(item) for item in memory_ids} and source != memory_node and target != memory_node:
                     continue
                 remaining = [item for item in memory_ids if str(item) != memory_id]

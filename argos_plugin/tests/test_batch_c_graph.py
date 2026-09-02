@@ -3,6 +3,7 @@ boost-floor gate exemption (#81), and graph block error visibility (#84).
 """
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -698,5 +699,90 @@ class TestGraphAuditG4G5G6:
                     f"m_g4a should be removed from memory_ids; "
                     f"edge {src}->{tgt} still has: {mids}"
                 )
+        finally:
+            graph.close()
+
+
+class TestGraphG4BackfillAndFallback:
+    """G4 review (2/9): pre-migration edges (memory_ids column NULL,
+    evidence only in the attributes JSON blob) must still be cleaned by
+    remove_memory — via the init-time backfill when it has run, and via
+    the NULL-column fallback clause when it hasn't."""
+
+    @staticmethod
+    def _old_format_edge(graph, attrs, relation="works_at"):
+        graph.upsert_node("person:alice", "person", {})
+        graph.upsert_node("company:acme", "company", {})
+        graph.conn.execute(
+            """MATCH (a:Entity {id: $s}), (b:Entity {id: $t})
+               CREATE (a)-[r:RelatesTo {relation_type: $rel,
+                 attributes: $attrs, user_scope: $scope}]->(b)""",
+            parameters={
+                "s": graph._internal_id("person:alice"),
+                "t": graph._internal_id("company:acme"),
+                "rel": relation,
+                "attrs": json.dumps(attrs),
+                "scope": graph.user_id,
+            },
+        )
+
+    def test_backfill_populates_column_from_attrs(self, tmp_path):
+        graph = _make_graph(tmp_path)
+        try:
+            self._old_format_edge(graph, {"memory_ids": ["m1"]})
+            from graph import _backfill_memory_ids
+            n = _backfill_memory_ids(graph.conn)
+            assert n == 1
+            res = graph.conn.execute(
+                "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) RETURN r.memory_ids"
+            )
+            assert res.has_next()
+            assert res.get_next()[0] == ["m1"]
+        finally:
+            graph.close()
+
+    def test_backfill_handles_legacy_singular_memory_id(self, tmp_path):
+        graph = _make_graph(tmp_path)
+        try:
+            self._old_format_edge(graph, {"memory_id": "m9"})
+            from graph import _backfill_memory_ids
+            n = _backfill_memory_ids(graph.conn)
+            assert n == 1
+            res = graph.conn.execute(
+                "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) RETURN r.memory_ids"
+            )
+            assert res.has_next()
+            assert res.get_next()[0] == ["m9"]
+        finally:
+            graph.close()
+
+    def test_remove_memory_finds_legacy_edge_after_backfill(self, tmp_path):
+        graph = _make_graph(tmp_path)
+        try:
+            self._old_format_edge(graph, {"memory_ids": ["m1"]})
+            from graph import _backfill_memory_ids
+            _backfill_memory_ids(graph.conn)
+            assert graph.remove_memory("m1") is True
+            res = graph.conn.execute(
+                "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) RETURN r.attributes"
+            )
+            attrs = json.loads(res.get_next()[0])
+            assert attrs.get("status") == "quarantined"
+        finally:
+            graph.close()
+
+    def test_remove_memory_finds_legacy_edge_via_fallback(self, tmp_path):
+        """Without backfill, the NULL-column + quoted-id LIKE fallback must
+        still catch the old-format edge (this is the regression that failed
+        on the original G4 change)."""
+        graph = _make_graph(tmp_path)
+        try:
+            self._old_format_edge(graph, {"memory_ids": ["m1"]})
+            assert graph.remove_memory("m1") is True
+            res = graph.conn.execute(
+                "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) RETURN r.attributes"
+            )
+            attrs = json.loads(res.get_next()[0])
+            assert attrs.get("status") == "quarantined"
         finally:
             graph.close()

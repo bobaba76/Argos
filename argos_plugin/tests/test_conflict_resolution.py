@@ -983,3 +983,70 @@ class TestWritePathAuditD5D6D7:
         finally:
             store.close()
 
+
+
+# ---------------------------------------------------------------------------
+# D6 review (2/9): the token pre-filter + LIMIT must never hide a real conflict
+# ---------------------------------------------------------------------------
+
+class TestD6ConflictScanCapEscalation:
+    """When >50 active records match the token pre-filter, the bounded scan
+    must escalate to a full scan — a genuine conflict outside the 50-row
+    window must still be found (regression: returned None on 80-row stores,
+    silently accepting a contradictory fact)."""
+
+    def _seed(self, tmp_path, n_fillers, db_name="test_d6_cap.duckdb"):
+        store = DuckDBMemoryStore(tmp_path / db_name)
+        with store._lock:
+            c = store.connection
+            for i in range(n_fillers):
+                c.execute(
+                    "INSERT INTO memory_records (memory_id, content, category,"
+                    " user_scope, status, valid_to, created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    [f"filler{i}", f"accuracy discussions are overrated thing number {i}",
+                     "personal_fact", store.user_id, "active", None,
+                     "2026-09-01T00:00:00", "2026-09-01T00:00:00"],
+                )
+            # Target row sorts LAST under the deterministic ORDER BY
+            # (created_at DESC, memory_id DESC) — older created_at — so it
+            # sits outside the 50-row window and only the full-scan
+            # escalation can find it.
+            c.execute(
+                "INSERT INTO memory_records (memory_id, content, category,"
+                " user_scope, status, valid_to, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                ["target_old", "accuracy on the test set is 89.8 percent",
+                 "personal_fact", store.user_id, "active", None,
+                 "2020-01-01T00:00:00", "2020-01-01T00:00:00"],
+            )
+        return store
+
+    def test_conflict_found_beyond_cap(self, tmp_path):
+        store = self._seed(tmp_path, 80)
+        try:
+            # Transition statement (switched) with a different value — the
+            # same trigger pattern as TestValueSupersessionTransitionGate.
+            conflict = store._find_conflicting_active_value(
+                "I switched to accuracy on the test set of 82.2 percent",
+                "personal_fact",
+            )
+            assert conflict is not None, (
+                "A conflict outside the 50-row pre-filter window must still "
+                "be found (full-scan escalation on cap hit)"
+            )
+            assert conflict[0] == "target_old"
+        finally:
+            store.close()
+
+    def test_conflict_still_found_below_cap(self, tmp_path):
+        store = self._seed(tmp_path, 5)
+        try:
+            conflict = store._find_conflicting_active_value(
+                "I switched to accuracy on the test set of 82.2 percent",
+                "personal_fact",
+            )
+            assert conflict is not None
+            assert conflict[0] == "target_old"
+        finally:
+            store.close()

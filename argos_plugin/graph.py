@@ -876,7 +876,7 @@ class KuzuGraphStore:
                 effective_type = "person"
             query = """
             MERGE (n:Entity {id: $id})
-            ON MATCH SET n.entity_type = $type, n.attributes = $attrs, n.user_scope = $scope
+            ON MATCH SET n.entity_type = $type, n.attributes = $attrs
             ON CREATE SET n.entity_type = $type, n.attributes = $attrs, n.user_scope = $scope
             """
             self.conn.execute(query, parameters={
@@ -1099,7 +1099,7 @@ class KuzuGraphStore:
                 memory_ids = attrs.get("memory_ids", [])
                 if not isinstance(memory_ids, list):
                     memory_ids = [memory_ids] if memory_ids else []
-                if memory_id not in {str(item) for item in memory_ids} and source != memory_node:
+                if memory_id not in {str(item) for item in memory_ids} and source != memory_node and target != memory_node:
                     continue
                 remaining = [item for item in memory_ids if str(item) != memory_id]
                 if remaining:
@@ -1645,15 +1645,24 @@ class KuzuGraphStore:
         node_ids = [self._internal_id(node_id) for node_id in node_ids]
         # Parameterized IN-list: node ids are passed as query parameters,
         # never interpolated into the Cypher string (injection-safe).
-        params = {}
+        params = {"scope": self.user_id}
         placeholders = []
         for i, nid in enumerate(node_ids):
             params[f"id{i}"] = str(nid)
             placeholders.append(f"$id{i}")
         ph_list = ", ".join(placeholders)
+        # G2: add user_scope filter (defense-in-depth). ID prefixing
+        # already prevents cross-scope matches in practice, but if a
+        # cross-scope edge ever exists (corruption, manual edit), this
+        # filter ensures it is not returned to a different scope.
+        # Use AND (both endpoints in scope) — stricter than search_graph's
+        # OR, but correct for traversal/PPR where we walk from known
+        # in-scope nodes: both endpoints of a legitimate edge should be
+        # in the same scope.
         query = f"""
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        WHERE a.id IN [{ph_list}] OR b.id IN [{ph_list}]
+        WHERE (a.id IN [{ph_list}] OR b.id IN [{ph_list}])
+          AND a.user_scope = $scope AND b.user_scope = $scope
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,

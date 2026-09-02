@@ -1,0 +1,226 @@
+{
+  "patterns": {
+    "IDENTITY_RE": {
+      "pattern": "\\b(?:i\\s+am|i\\'m)\\s+(?:a\\s+|an\\s+)?(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "HAVE_USE_RE": {
+      "pattern": "\\b(?:i\\s+(?:have|own|use|take|\\'ve\\s+got|\\'m\\s+using))\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "WORK_RE": {
+      "pattern": "\\b(?:i\\s+work\\s+(?:at|for|with)|i\\'m\\s+(?:working\\s+at|employed\\s+at))\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "PREFERENCE_RE": {
+      "pattern": "\\b(?:i\\s+(?:prefer|like|love|hate|enjoy|dislike|can\\'t\\s+stand|don\\'t\\s+like|don\\'t\\s+enjoy)|i\\'d\\s+(?:rather|prefer)|i\\'m\\s+(?:a\\s+fan\\s+of|not\\s+a\\s+fan\\s+of|into|keen\\s+on))\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "ASSISTANT_DIRECTIVE_RE": {
+      "pattern": "\\b(?:(?:always|never)\\s+(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|(?:do\\s+not|don\\'t)\\s+(?:ever\\s+|please\\s+|just\\s+|always\\s+)?(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|call\\s+me\\s+[^.!?]{1,200}|stop\\s+(?:doing|being|using|saying)\\b[^.!?]{0,200})",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "HABIT_RE": {
+      "pattern": "\\b(?:i\\s+(?:always|never|usually|typically|generally|rarely|often))\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "GOAL_RE": {
+      "pattern": "\\b(?:i\\'m\\s+working\\s+on|i\\s+want\\s+to|i\\'m\\s+trying\\s+to|i\\'m\\s+going\\s+to|i\\s+need\\s+to|i\\'m\\s+planning\\s+to|i\\'m\\s+learning|i\\'m\\s+studying)\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "SWITCH_RE": {
+      "pattern": "\\b(?:i\\s+(?:switched|moved|migrated|transitioned)\\s+from\\s+(.+?)\\s+to\\s+(.+?))(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "EVENT_RE": {
+      "pattern": "\\bi\\s+(started|began|stopped|quit|resumed|finished|completed|launched)\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "INSIGHT_RE": {
+      "pattern": "\\b(?:i\\s+(?:tend\\s+to|struggle\\s+with|realized|noticed|found\\s+that|learned\\s+that)|i\\'ve\\s+been\\s+noticing|i\\s+think\\s+i|i\\s+feel\\s+like\\s+i)\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "RELATIONSHIP_RE": {
+      "pattern": "\\b([A-Z][a-z]+)\\s+is\\s+(?:my|the)\\s+(\\w+(?:\\s+\\w+)?)\\b",
+      "flags": []
+    },
+    "MY_X_IS_RE": {
+      "pattern": "\\bmy\\s+(\\w+(?:\\s+\\w+)?)\\s+is\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "LOCATION_RE": {
+      "pattern": "\\b(?:i\\s+live\\s+in|i\\'m\\s+(?:based\\s+in|from)|i\\s+reside\\s+in)\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "ONGOING_RE": {
+      "pattern": "\\b(?:i\\'ve\\s+been)\\s+(.+?)(?:\\.|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "ATTRIBUTE_RE": {
+      "pattern": "\\b(?:i\\s+(?:have|own)\\s+)(.+?)(?:[.,;]|$)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    "AGENT_SPEAK_PATTERNS": {
+      "pattern": "(?:i'll\\s+search|i'll\\s+look|i'll\\s+check|let me|authoritative\\s+sources|i'll\\s+find|i'll\\s+research|searching\\s+for|looking\\s+up|completed\\s+implementation\\s+of|now\\s+includes\\s+\\d+\\s+tools|ships\\s+off\\s+by\\s+default|deployment\\s+reference\\s+specifies|handoff\\s+doc\\s+is\\s+located|implementation\\s+of\\s+evolution|work\\s+items?\\s+(?:from\\s+the\\s+handoff|complete)|service\\s+\\(pids?\\s+\\d+)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    }
+  },
+  "lexicons": {
+    "PREFERENCE_VERBS": [
+      "dislike",
+      "enjoy",
+      "hate",
+      "like",
+      "love",
+      "prefer"
+    ],
+    "EVENT_VERBS": [
+      "began",
+      "completed",
+      "finished",
+      "launched",
+      "quit",
+      "resumed",
+      "started",
+      "stopped"
+    ],
+    "TRANSIENT_WORDS": [
+      "angry",
+      "annoyed",
+      "anxious",
+      "back",
+      "bored",
+      "busy",
+      "confused",
+      "done",
+      "excited",
+      "exhausted",
+      "fine",
+      "free",
+      "frustrated",
+      "glad",
+      "good",
+      "grateful",
+      "great",
+      "happy",
+      "here",
+      "hungry",
+      "not certain",
+      "not happy",
+      "not really",
+      "not sure",
+      "ok",
+      "okay",
+      "overwhelmed",
+      "ready",
+      "sad",
+      "sick",
+      "sorry",
+      "stressed",
+      "stuck",
+      "there",
+      "thirsty",
+      "tired",
+      "worried"
+    ],
+    "NOT_A_NAME": [
+      "here",
+      "it",
+      "now",
+      "that",
+      "then",
+      "there",
+      "this",
+      "today",
+      "tomorrow",
+      "what",
+      "where",
+      "who",
+      "yesterday"
+    ],
+    "BASE_ROLE_WORDS": [
+      "advisor",
+      "boss",
+      "boyfriend",
+      "colleague",
+      "doctor",
+      "friend",
+      "girlfriend",
+      "husband",
+      "manager",
+      "mentor",
+      "partner",
+      "supervisor",
+      "teacher",
+      "wife"
+    ],
+    "TRIVIAL_FACTS": [
+      "a human",
+      "a person",
+      "back",
+      "done",
+      "here",
+      "literally glm 5",
+      "literally glm5",
+      "on a computer",
+      "online",
+      "ready",
+      "there",
+      "typing",
+      "using a keyboard"
+    ],
+    "ABBREVIATIONS": [
+      "approx",
+      "ave",
+      "blvd",
+      "co",
+      "corp",
+      "dr",
+      "e.g",
+      "etc",
+      "i.e",
+      "inc",
+      "jr",
+      "ltd",
+      "mr",
+      "mrs",
+      "ms",
+      "no",
+      "prof",
+      "pty",
+      "sr",
+      "st",
+      "vs"
+    ]
+  }
+}

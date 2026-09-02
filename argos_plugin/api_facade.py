@@ -25,9 +25,10 @@ project_id, or client_scope fields are rejected or narrowed — never
 widened. The authenticated principal, tenant, and maximum permitted
 data scope come from the credential, not the request body.
 
-ACL is fail-closed in API mode (D3): the API refuses to start if the
-ACL config is invalid/unreadable. Unknown principals are denied, never
-mapped to a default tenant.
+ACL is fail-closed in API mode (D3): a corrupted/unreadable ACL config
+refuses to start (never silently degrades to an open store); a truly
+absent config starts open with a startup warning (v1 single-user legacy).
+Unknown principals are denied, never mapped to a default tenant.
 
 Idempotency (D5): every mutation carries an idempotency key. Same key +
 same request → return original result (no duplicate). Same key + different
@@ -388,7 +389,10 @@ class ArgosAPIFacade:
 
     1. Operation allowlist — no raw RPC passthrough, no admin/destructive.
     2. Server-derived identity — client identity fields rejected/narrowed.
-    3. Fail-closed ACL — API mode refuses start on invalid ACL.
+    3. Fail-closed ACL — API mode refuses to start when an ACL config
+       was provided but is invalid/unreadable (parse_error); a truly
+       absent config starts open with a startup warning (v1 single-user
+       legacy, never silent).
     4. Input validation — strict schemas, bounds, no internal flags.
     5. Idempotency — key registry with replay/conflict semantics.
     6. Audit — hashed query, no tokens, one row per operation.
@@ -409,10 +413,15 @@ class ArgosAPIFacade:
             store: a SharedMemoryStore (or compatible) that talks to the
                 memory service via RPC.
             acl: ACL configuration for this tenant. If None and
-                api_mode is True, the facade fails closed (deny-all).
+                api_mode is True, the facade starts with the open store
+                and logs a warning (v1 single-user legacy — external
+                callers see the tenant's own data, no access-scoping
+                masks). If an ACL config was provided but is corrupted
+                (parse_error), API mode refuses to start (fail closed).
             api_mode: when True, the facade enforces fail-closed ACL
                 semantics. Unknown principals are denied, never mapped
-                to a default tenant. Invalid ACL → refuse to start.
+                to a default tenant. Corrupted ACL config → refuse to
+                start; absent config → open store + warning.
             idempotency: idempotency key registry. A default in-memory
                 registry is created if None.
         """
@@ -422,16 +431,17 @@ class ArgosAPIFacade:
         self._idempotency = idempotency or IdempotencyRegistry()
 
         # D3: In API mode, the ACL must be valid. Fail-closed means we
-        # refuse to operate if the ACL is invalid/unreadable — never
-        # fall back to an open store.
+        # refuse to operate if an ACL config was provided but is
+        # invalid/unreadable (parse_error) — a corrupted config must
+        # never silently degrade to an open store. A truly ABSENT config
+        # (no file, api_mode with no acl) is the v1 single-user legacy
+        # choice: the facade starts with the open store and warns loudly.
+        if api_mode and self._acl.parse_error:
+            raise ValueError(
+                "ACL config invalid/unreadable — refusing to start in API "
+                "mode (fail closed). Fix or remove the ACL config file."
+            )
         if api_mode and self._acl.is_open_store:
-            # Open store is acceptable in API mode ONLY if no ACL config
-            # was provided at all (single-user legacy). But if someone
-            # tried to configure an ACL and it came back empty (parse
-            # error), we fail closed. The distinction is: a truly absent
-            # config (no file) is the user's choice; a corrupted config
-            # that silently defaulted to open is the security hole.
-            # For v1, we accept open store in API mode but log a warning.
             logger.warning(
                 "API mode active with open-store ACL — external callers "
                 "have no access-scoping enforcement. Configure an ACL for "

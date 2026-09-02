@@ -50,6 +50,7 @@ class ACLConfig:
         user_roles: Dict[str, str] | None = None,
         deny_lists: Dict[str, List[Dict[str, Any]]] | None = None,
         enforcement_on: bool = False,
+        parse_error: bool = False,
     ) -> None:
         # roles: {role_name: {"client_scopes": ["acme", "beta"], "wheel": False}}
         self.roles = roles or {}
@@ -60,6 +61,12 @@ class ACLConfig:
         # Enforcement flips on when the second staff user joins (D6).
         # Pilot (single-user) = audit skeleton only, no enforcement.
         self.enforcement_on = enforcement_on
+        # True when an ACL config FILE existed but could not be loaded
+        # (JSON error, unreadable, structurally invalid). Distinguishes
+        # "no ACL configured" (user's choice, open store) from "ACL
+        # configured but corrupted" (must fail closed in API mode).
+        # See ArgosAPIFacade (D3).
+        self.parse_error = parse_error
 
     @classmethod
     def from_file(cls, path: str | Path) -> "ACLConfig":
@@ -72,14 +79,35 @@ class ACLConfig:
             data = json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("ACL config %s unreadable: %s — defaulting to open store", p, exc)
-            return cls()
+            # Fail-closed marker: the file EXISTS but is corrupted. API
+            # mode refuses to start on this (see ArgosAPIFacade D3); the
+            # internal/intra-process path keeps today's open-store fallback.
+            return cls(parse_error=True)
         return cls.from_dict(data)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ACLConfig":
-        """Build from a parsed dict (used by tests and the service loader)."""
+        """Build from a parsed dict (used by tests and the service loader).
+
+        Structurally invalid data (wrong container types) is reported
+        via ``parse_error`` instead of silently becoming an open store.
+        """
         if not data:
             return cls()
+        # Absent keys are valid (defaults apply); only WRONG TYPES are
+        # structurally invalid.
+        roles = data.get("roles")
+        user_roles = data.get("user_roles")
+        deny_lists = data.get("deny_lists")
+        bad = (
+            (roles is not None and not isinstance(roles, dict))
+            or (user_roles is not None and not isinstance(user_roles, dict))
+            or (deny_lists is not None and not isinstance(deny_lists, dict))
+            or not isinstance(data.get("enforcement_on", False), bool)
+        )
+        if bad:
+            logger.warning("ACL config structurally invalid — defaulting to open store (parse_error)")
+            return cls(parse_error=True)
         return cls(
             roles=data.get("roles") or {},
             user_roles=data.get("user_roles") or {},

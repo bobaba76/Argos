@@ -291,6 +291,43 @@ class TestFailClosedACL:
         # Bob is not in user_roles → deny-all (empty mask).
         assert acl.allow_mask("bob") == set()
 
+    def test_api_mode_refuses_corrupted_acl(self):
+        """API mode + corrupted ACL config → refuse to start (fail closed).
+        Absent config (no parse_error) keeps v1 open-store + warning."""
+        with pytest.raises(ValueError):
+            ArgosAPIFacade(StubStore(), acl=ACLConfig(parse_error=True), api_mode=True)
+        # Internal (non-API) mode still accepts the degraded config — the
+        # store identity is the server's own, no external boundary.
+        facade = ArgosAPIFacade(StubStore(), acl=ACLConfig(parse_error=True), api_mode=False)
+        assert facade is not None
+
+    def test_from_file_corrupted_json_sets_parse_error(self, tmp_path):
+        """A config FILE that exists but is unreadable must be marked
+        parse_error — distinguishable from a deliberately absent config."""
+        p = tmp_path / "acl.json"
+        p.write_text("{not valid json!!", encoding="utf-8")
+        cfg = ACLConfig.from_file(p)
+        assert cfg.parse_error is True
+        assert cfg.is_open_store is True  # degraded, but flagged
+
+    def test_from_file_missing_stays_absent(self, tmp_path):
+        """No config file = user's choice: open store, no parse_error."""
+        cfg = ACLConfig.from_file(tmp_path / "does-not-exist.json")
+        assert cfg.parse_error is False
+        assert cfg.is_open_store is True
+
+    def test_from_dict_missing_keys_are_not_invalid(self):
+        """Absent keys (e.g. no 'enforcement_on') are defaults, NOT
+        structural errors — only wrong container types are."""
+        cfg = ACLConfig.from_dict(
+            {"roles": {"staff": {"client_scopes": ["acme"]}}}
+        )
+        assert cfg.parse_error is False
+        assert cfg.enforcement_on is False
+        # Wrong type is still an error.
+        bad = ACLConfig.from_dict({"roles": "not-a-dict"})
+        assert bad.parse_error is True
+
 
 # ---------------------------------------------------------------------------
 # Spec test 4: Candidate idempotency

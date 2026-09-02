@@ -172,3 +172,13 @@ committed, re-runnable artifact:
   window nondeterministic). Fixed: deterministic `ORDER BY created_at DESC, memory_id
   DESC` + full-scan escalation on cap hit — the answer no longer changes with row
   count; common path stays bounded. 2 new red-green tests (red proven on pre-fix code).
+- **2026-09-02 (evening, part 2) — facade fail-closed doc/code mismatch fixed**: the
+  class/`__init__`/module docstrings claimed API mode "fails closed (deny-all)" on an
+  invalid ACL, while the code started with the open store and only warned. Worse, the
+  real hole was in `ACLConfig.from_file`: a corrupted/unreadable config file silently
+  degraded to an open store with NO way to distinguish it from a deliberately absent
+  config. Fixed: `ACLConfig.parse_error` flag (set on unreadable/structurally-invalid
+  configs; absent file stays clearly absent); API mode now refuses to start
+  (ValueError) when `parse_error` is set — fail closed; absent config keeps the v1
+  open-store + startup warning behavior (pinned by existing test). Docstrings updated
+  to describe the actual contract. 4 new tests.

@@ -26,11 +26,13 @@ if __package__:
     from .embeddings import LocalEmbedder
     from .graph import KuzuGraphStore
     from .store import DuckDBMemoryStore
+    from .access_scoping import ACLConfig, filter_records_by_access
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from embeddings import LocalEmbedder
     from graph import KuzuGraphStore
     from store import DuckDBMemoryStore
+    from access_scoping import ACLConfig, filter_records_by_access
 
 logger = logging.getLogger("argos.service")
 _ENDPOINT_NAME = "hybrid_memory_service.json"
@@ -199,6 +201,19 @@ class _Tenant:
                 "Kùzu unavailable for tenant %r: %s", name, exc,
             )
             self.graph = None
+        # Per-tenant ACL (#128): load ACLConfig from the tenant's config
+        # overlay. The acl key may contain roles, user_roles, deny_lists,
+        # and enforcement_on. Missing ACL config = open store (backward
+        # compatible). When enforcement is on, unassigned users fail
+        # closed (deny-all).
+        acl_data = config.get("acl") if isinstance(config.get("acl"), dict) else {}
+        self.acl = ACLConfig.from_dict(acl_data)
+        # Attach the ACL to the store and graph so the existing
+        # _acl_config checks in provider_retrieval.py and graph.py
+        # enforce it. This is the production wiring that was missing.
+        self.store._acl_config = self.acl
+        if self.graph is not None:
+            self.graph._acl_config = self.acl
         self.store_lock = threading.RLock()
         self.graph_lock = threading.RLock()
 
@@ -360,38 +375,65 @@ class MemoryService:
             return self._tenants[user_id]
         return self._tenants[self._default_tenant]
 
-    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None) -> Any:
+    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None, tenant: "_Tenant | None" = None) -> Any:
         store.set_user_scope(user_id)
         if method == "search":
-            return [
-                _record_to_dict(record)
-                for record in store.search(
-                    args.get("query", ""),
-                    limit=int(args.get("limit", 5)),
-                    exclude_categories=args.get("exclude_categories"),
-                    category_filter=args.get("category_filter"),
-                    project_id=args.get("project_id"),
-                    namespace=args.get("namespace"),
-                    client_scope=args.get("client_scope"),
-                    as_of=args.get("as_of"),
-                    suppress_retrieval=bool(args.get("suppress_retrieval", False)),
-                                        include_expired=bool(args.get("include_expired", False)),
-                                        include_closed=bool(args.get("include_closed", False)),
-                                        include_archived=bool(args.get("include_archived", False)),
-                                    )
-            ]
+            records = store.search(
+                args.get("query", ""),
+                limit=int(args.get("limit", 5)),
+                exclude_categories=args.get("exclude_categories"),
+                category_filter=args.get("category_filter"),
+                project_id=args.get("project_id"),
+                namespace=args.get("namespace"),
+                client_scope=args.get("client_scope"),
+                as_of=args.get("as_of"),
+                suppress_retrieval=bool(args.get("suppress_retrieval", False)),
+                                include_expired=bool(args.get("include_expired", False)),
+                                include_closed=bool(args.get("include_closed", False)),
+                                include_archived=bool(args.get("include_archived", False)),
+                            )
+            # #128: ACL enforcement — filter results by the user's ACL
+            # mask. Denied content is hidden (not merely removed after
+            # answer generation). Write an audit row with granted/denied
+            # counts.
+            acl = getattr(store, "_acl_config", None)
+            if acl is not None and not acl.is_open_store:
+                visible, denied_count = filter_records_by_access(records, acl, user_id)
+                # Write audit row.
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=args.get("query", ""),
+                    granted_count=len(visible),
+                    denied_count=denied_count,
+                    tenant=tenant.name if tenant else "default",
+                    excluded=denied_count > 0,
+                )
+                records = visible
+            return [_record_to_dict(record) for record in records]
         if method == "remember":
             return _record_to_dict(store.remember(**args))
         if method == "update_memory":
             return _record_to_dict(store.update_memory(**args))
         if method == "get_memories_by_ids":
-            return [
-                _record_to_dict(record)
-                for record in store.get_memories_by_ids(
-                    args.get("memory_ids", []),
-                    include_quarantined=bool(args.get("include_quarantined", False)),
-                )
-            ]
+            records = store.get_memories_by_ids(
+                args.get("memory_ids", []),
+                include_quarantined=bool(args.get("include_quarantined", False)),
+            )
+            # #128: ACL enforcement on fetch-by-ID.
+            acl = getattr(store, "_acl_config", None)
+            if acl is not None and not acl.is_open_store:
+                visible, denied_count = filter_records_by_access(records, acl, user_id)
+                if denied_count > 0:
+                    store.write_access_audit(
+                        user_id=user_id,
+                        query_text=f"fetch:{','.join(args.get('memory_ids', [])[:5])}",
+                        granted_count=len(visible),
+                        denied_count=denied_count,
+                        tenant=tenant.name if tenant else "default",
+                        excluded=True,
+                    )
+                records = visible
+            return [_record_to_dict(record) for record in records]
         if method == "save_candidate":
             return store.save_candidate(**args)
         if method == "find_semantic_duplicate":
@@ -524,6 +566,32 @@ class MemoryService:
             return store.list_aliases()
         if method == "aliases_for_canonical":
             return store.aliases_for_canonical(args.get("canonical_entity", ""))
+        # #128: Audit export — restricted to wheel/principals only.
+        if method == "export_access_audit":
+            acl = getattr(store, "_acl_config", None)
+            if acl is not None and not acl.is_open_store:
+                # Only wheel users (principals) may export the audit log.
+                mask = acl.allow_mask(user_id)
+                if mask is not set() and mask is not None:
+                    # Non-wheel user (mask is a finite set, not None).
+                    # But we need to check if they're wheel specifically.
+                    pass
+                role = acl.role_for(user_id)
+                if role is None:
+                    raise PermissionError(
+                        "Audit export is restricted to authorized principals. "
+                        "Unassigned users may not export."
+                    )
+                role_def = acl.roles.get(role, {})
+                if not role_def.get("wheel", False):
+                    raise PermissionError(
+                        "Audit export is restricted to principals (wheel role). "
+                        f"Role {role!r} is not authorized."
+                    )
+            return store.export_access_audit(
+                limit=int(args.get("limit", 10000)),
+                format=args.get("format", "jsonl"),
+            )
         # -- system state KV + distillation data access (P4.2) -----------------
         if method == "get_state":
             return store.get_state(args.get("key", ""))
@@ -611,6 +679,15 @@ class MemoryService:
                 name: t.policy.to_dict()
                 for name, t in self._tenants.items()
             }
+            tenant_acl_status = {
+                name: {
+                    "enforcement_on": t.acl.enforcement_on,
+                    "is_open_store": t.acl.is_open_store,
+                    "role_count": len(t.acl.roles),
+                    "user_count": len(t.acl.user_roles),
+                }
+                for name, t in self._tenants.items()
+            }
             return {
                 "status": "ok",
                 "pid": os.getpid(),
@@ -621,6 +698,7 @@ class MemoryService:
                 "tenant_count": len(self._tenants),
                 "strict_routing": self._strict_routing,
                 "tenant_policies": tenant_policies,
+                "tenant_acl_status": tenant_acl_status,
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
                 "lock_wait_count": self._lock_wait_count,
             }
@@ -659,7 +737,7 @@ class MemoryService:
             self._lock_wait_total_s += time.monotonic() - t0
             self._lock_wait_count += 1
             if component == "store":
-                return self._call_store(method, args, user_id, tenant.store, tenant.policy)
+                return self._call_store(method, args, user_id, tenant.store, tenant.policy, tenant)
             return self._call_graph(method, args, user_id, tenant.graph)
 
     def _backup(self, args: dict) -> Any:

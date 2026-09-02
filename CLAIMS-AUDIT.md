@@ -158,3 +158,17 @@ committed, re-runnable artifact:
   Results committed to `eval/bench/traversal_ab/`. Also: #138 `observed_at` capture
   landed (one-line in `graph.py:1035`), preserving the provenance option for future
   temporal work even though traversal itself is flat.
+- **2026-09-02 (evening) — 2/9 review fixes landed**: Hermes re-audited the same-day
+  G4/D6 changes after merge and found two gaps that the merged tests missed.
+  (a) **G4 recheck**: the `memory_ids STRING[]` column migration (ALTER) never
+  backfilled existing rows, and the old JSON-scan fallback was deleted — pre-migration
+  edges became invisible to `remove_memory` (probe: old-format edge returned
+  changed=False). Fixed: `_backfill_memory_ids()` one-time idempotent migration at
+  first DB open (folds attrs `memory_ids` + legacy singular `memory_id` into the
+  column), a NULL-column + quoted-id CONTAINS fallback clause in `remove_memory`, and
+  singular-key folding in the cleanup loop. 4 new red-green tests.
+  (b) **D6 recheck**: the token pre-filter + `LIMIT 50` conflict scan could drop the
+  one conflicting row when >50 active records match any token (no ORDER BY made the
+  window nondeterministic). Fixed: deterministic `ORDER BY created_at DESC, memory_id
+  DESC` + full-scan escalation on cap hit — the answer no longer changes with row
+  count; common path stays bounded. 2 new red-green tests (red proven on pre-fix code).

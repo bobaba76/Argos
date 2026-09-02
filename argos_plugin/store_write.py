@@ -485,16 +485,34 @@ class StoreWriteMixin:
                          AND (user_scope IS NULL OR user_scope = ?)
                          AND COALESCE(status, 'active') = 'active'
                          AND ({_like_clauses})
+                       ORDER BY created_at DESC, memory_id DESC
                        LIMIT 50""",
                     [self.user_id, *_subject_tokens],
                 ).fetchall()
+                # D6 (2/9 review): the pre-filter LIMIT can drop the ONE
+                # conflicting row when >50 active records match any token
+                # (no ORDER BY made it nondeterministic; the cap made it
+                # silently lossy). If the filter hit the cap, escalate to a
+                # full scan so the answer never changes with row count.
+                # The common path (few matching rows) stays bounded.
+                if len(rows) == 50:
+                    extra = self.connection.execute(
+                        """SELECT memory_id, content FROM memory_records
+                           WHERE valid_to IS NULL
+                             AND (user_scope IS NULL OR user_scope = ?)
+                             AND COALESCE(status, 'active') = 'active'
+                           ORDER BY created_at DESC, memory_id DESC""",
+                        [self.user_id],
+                    ).fetchall()
+                    _seen = {r[0] for r in rows}
+                    rows = rows + [r for r in extra if r[0] not in _seen]
             else:
                 rows = self.connection.execute(
                     """SELECT memory_id, content FROM memory_records
                        WHERE valid_to IS NULL
                          AND (user_scope IS NULL OR user_scope = ?)
                          AND COALESCE(status, 'active') = 'active'
-                       LIMIT 50""",
+                       ORDER BY created_at DESC, memory_id DESC""",
                     [self.user_id],
                 ).fetchall()
         for old_id, old_content in rows:

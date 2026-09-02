@@ -1115,6 +1115,16 @@ class StoreRetrievalMixin:
         self._apply_feedback_and_recency(fused)
         self._apply_p2c(fused)  # P2C: demote older of a near-duplicate pair (flag-gated)
         final = fused[:limit]
+        # #142: clamp final similarity to [0, 1] — additive stages (phrase-lift,
+        # importance, graph boost) can push a high base similarity above 1.0.
+        # The clamp is applied AFTER sorting so feedback signals still break
+        # ties (the unclamped value determines rank order; the clamped value
+        # is what the caller sees).
+        for r in final:
+            if r.similarity > 1.0:
+                r.similarity = 1.0
+            elif r.similarity < 0.0:
+                r.similarity = 0.0
         if not suppress_retrieval:
             self._record_retrieval(final)
         return final

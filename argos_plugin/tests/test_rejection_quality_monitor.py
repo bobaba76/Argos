@@ -256,25 +256,194 @@ class TestDriftCheck:
             now = datetime.now(timezone.utc)
             prev = (now - timedelta(weeks=1, days=3)).isoformat()
             cur = (now - timedelta(days=3)).isoformat()
-            # prev: 0/4 rejected = 0%, cur: 1/4 rejected = 25%, delta = 0.25
-            for i in range(4):
+            # prev: 0/10 rejected = 0%, cur: 3/10 rejected = 30%, delta = 0.30
+            # (n=10 in both windows — above min_sample_count=5 default)
+            for i in range(10):
                 _seed_candidates(store, [
                     ("insight", "approved", prev, "ok", "internal", "x"),
                 ])
+            for i in range(7):
+                _seed_candidates(store, [
+                    ("insight", "approved", cur, "ok", "internal", "x"),
+                ])
+            for i in range(3):
+                _seed_candidates(store, [
+                    ("insight", "rejected", cur, "bad", "internal", "x"),
+                ])
+            from rejection_quality_monitor import drift_check
+
+            # threshold=0.2 → should flag (delta 0.30 >= 0.2)
+            r1 = drift_check(store, window="weekly", threshold=0.2)
+            assert any(f["bucket"] == "insight" for f in r1["flags"])
+            # threshold=0.4 → should NOT flag (delta 0.30 < 0.4)
+            r2 = drift_check(store, window="weekly", threshold=0.4)
+            assert not any(f["bucket"] == "insight" for f in r2["flags"])
+        finally:
+            store.close()
+
+
+# ---------------------------------------------------------------------------
+# #137: minimum-sample guard — tiny-sample buckets don't get flagged
+# ---------------------------------------------------------------------------
+
+class TestDriftCheckMinSampleGuard:
+    """drift_check should not flag buckets where either window has fewer
+    than min_sample_count decisions (#137). Small samples are noise — a
+    0→1 flip with n=1 produces delta=1.0 but is meaningless.
+    """
+
+    def test_tiny_sample_not_flagged(self, tmp_path):
+        """A bucket with 1 decision in each window (0→1 rejection, delta=1.0)
+        should NOT be flagged when min_sample_count=5 (default)."""
+        store = _make_store(tmp_path)
+        try:
+            now = datetime.now(timezone.utc)
+            prev = (now - timedelta(weeks=1, days=3)).isoformat()
+            cur = (now - timedelta(days=3)).isoformat()
+            # prev: 1 approved, 0 rejected = 0%
+            # cur: 0 approved, 1 rejected = 100%
+            # delta = 1.0 — would flag without the guard
             _seed_candidates(store, [
-                ("insight", "approved", cur, "ok", "internal", "x"),
-                ("insight", "approved", cur, "ok", "internal", "x"),
-                ("insight", "approved", cur, "ok", "internal", "x"),
-                ("insight", "rejected", cur, "bad", "internal", "x"),
+                ("tiny_cat", "approved", prev, "ok", "internal", "x"),
+                ("tiny_cat", "rejected", cur, "bad", "internal", "x"),
             ])
             from rejection_quality_monitor import drift_check
 
-            # threshold=0.2 → should flag (delta 0.25 >= 0.2)
-            r1 = drift_check(store, window="weekly", threshold=0.2)
-            assert any(f["bucket"] == "insight" for f in r1["flags"])
-            # threshold=0.3 → should NOT flag (delta 0.25 < 0.3)
-            r2 = drift_check(store, window="weekly", threshold=0.3)
-            assert not any(f["bucket"] == "insight" for f in r2["flags"])
+            result = drift_check(store, window="weekly", threshold=0.5)
+            # Should NOT be in flags (n=1 < min_sample_count=5)
+            assert not any(f["bucket"] == "tiny_cat" for f in result["flags"]), (
+                "tiny-sample bucket should not be flagged"
+            )
+            # Should be in low_sample_buckets
+            low = [b for b in result["low_sample_buckets"] if b["bucket"] == "tiny_cat"]
+            assert len(low) == 1, "tiny-sample bucket should be in low_sample_buckets"
+            assert low[0]["delta"] == 1.0
+        finally:
+            store.close()
+
+    def test_boundary_case_below_min_not_flagged(self, tmp_path):
+        """A bucket with min_sample_count-1 decisions in one window should
+        NOT be flagged, even with a large delta."""
+        store = _make_store(tmp_path)
+        try:
+            now = datetime.now(timezone.utc)
+            prev = (now - timedelta(weeks=1, days=3)).isoformat()
+            cur = (now - timedelta(days=3)).isoformat()
+            # prev: 4 approved = 0% rejected (n=4, below min=5)
+            # cur: 10 rejected = 100% (n=10, above min=5)
+            for _ in range(4):
+                _seed_candidates(store, [
+                    ("boundary_cat", "approved", prev, "ok", "internal", "x"),
+                ])
+            for _ in range(10):
+                _seed_candidates(store, [
+                    ("boundary_cat", "rejected", cur, "bad", "internal", "x"),
+                ])
+            from rejection_quality_monitor import drift_check
+
+            result = drift_check(store, window="weekly", threshold=0.5,
+                                 min_sample_count=5)
+            # prev_total=4 < 5 → low_sample, not flagged
+            assert not any(f["bucket"] == "boundary_cat" for f in result["flags"]), (
+                "bucket with prev_total=4 < min_sample_count=5 should not be flagged"
+            )
+            low = [b for b in result["low_sample_buckets"] if b["bucket"] == "boundary_cat"]
+            assert len(low) == 1
+        finally:
+            store.close()
+
+    def test_boundary_case_at_min_flagged(self, tmp_path):
+        """A bucket with exactly min_sample_count decisions in both windows
+        SHOULD be flagged if the delta exceeds the threshold."""
+        store = _make_store(tmp_path)
+        try:
+            now = datetime.now(timezone.utc)
+            prev = (now - timedelta(weeks=1, days=3)).isoformat()
+            cur = (now - timedelta(days=3)).isoformat()
+            # prev: 5 approved = 0% rejected (n=5, at min)
+            # cur: 1 approved, 4 rejected = 80% (n=5, at min)
+            # delta = 0.8 → flags at threshold=0.5
+            for _ in range(5):
+                _seed_candidates(store, [
+                    ("healthy_cat", "approved", prev, "ok", "internal", "x"),
+                ])
+            _seed_candidates(store, [
+                ("healthy_cat", "approved", cur, "ok", "internal", "x"),
+            ])
+            for _ in range(4):
+                _seed_candidates(store, [
+                    ("healthy_cat", "rejected", cur, "bad", "internal", "x"),
+                ])
+            from rejection_quality_monitor import drift_check
+
+            result = drift_check(store, window="weekly", threshold=0.5,
+                                 min_sample_count=5)
+            # Both windows have n=5 ≥ 5 → should flag
+            flagged = [f for f in result["flags"] if f["bucket"] == "healthy_cat"]
+            assert len(flagged) == 1, (
+                "bucket with n=5 in both windows should be flagged"
+            )
+            assert flagged[0]["direction"] == "up"
+            # Should NOT be in low_sample_buckets
+            low = [b for b in result["low_sample_buckets"] if b["bucket"] == "healthy_cat"]
+            assert len(low) == 0
+        finally:
+            store.close()
+
+    def test_healthy_volume_still_flags(self, tmp_path):
+        """A bucket with large volume in both windows should still flag
+        normally — the guard doesn't suppress real drift."""
+        store = _make_store(tmp_path)
+        try:
+            now = datetime.now(timezone.utc)
+            prev = (now - timedelta(weeks=1, days=3)).isoformat()
+            cur = (now - timedelta(days=3)).isoformat()
+            # prev: 20 approved = 0% rejected
+            # cur: 4 approved, 16 rejected = 80%
+            # delta = 0.8 → flags at threshold=0.5
+            for _ in range(20):
+                _seed_candidates(store, [
+                    ("big_cat", "approved", prev, "ok", "internal", "x"),
+                ])
+            for _ in range(4):
+                _seed_candidates(store, [
+                    ("big_cat", "approved", cur, "ok", "internal", "x"),
+                ])
+            for _ in range(16):
+                _seed_candidates(store, [
+                    ("big_cat", "rejected", cur, "bad", "internal", "x"),
+                ])
+            from rejection_quality_monitor import drift_check
+
+            result = drift_check(store, window="weekly", threshold=0.5)
+            flagged = [f for f in result["flags"] if f["bucket"] == "big_cat"]
+            assert len(flagged) == 1
+            assert flagged[0]["delta"] >= 0.5
+        finally:
+            store.close()
+
+    def test_min_sample_zero_disables_guard(self, tmp_path):
+        """Setting min_sample_count=0 disables the guard (legacy behavior)."""
+        store = _make_store(tmp_path)
+        try:
+            now = datetime.now(timezone.utc)
+            prev = (now - timedelta(weeks=1, days=3)).isoformat()
+            cur = (now - timedelta(days=3)).isoformat()
+            # n=1 in each window, delta=1.0
+            _seed_candidates(store, [
+                ("legacy_cat", "approved", prev, "ok", "internal", "x"),
+                ("legacy_cat", "rejected", cur, "bad", "internal", "x"),
+            ])
+            from rejection_quality_monitor import drift_check
+
+            result = drift_check(store, window="weekly", threshold=0.5,
+                                 min_sample_count=0)
+            # With guard disabled, should flag
+            flagged = [f for f in result["flags"] if f["bucket"] == "legacy_cat"]
+            assert len(flagged) == 1, (
+                "min_sample_count=0 should disable guard (legacy behavior)"
+            )
+            assert len(result["low_sample_buckets"]) == 0
         finally:
             store.close()
 

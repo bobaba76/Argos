@@ -195,6 +195,7 @@ def drift_check(
     end: Optional[str] = None,
     threshold: float = 0.15,
     by: str = "category",
+    min_sample_count: int = 5,
 ) -> Dict[str, Any]:
     """Flag buckets whose rejection rate moved beyond *threshold* between
     the current window and the preceding window of the same length.
@@ -208,12 +209,18 @@ def drift_check(
         end: optional ISO cutoff for the END of the current window.
         threshold: absolute rate change (0.0–1.0) that triggers a flag.
         by: bucketing axis (same as ``decision_rate_report``).
+        min_sample_count: minimum decisions in EITHER window for a bucket
+            to be eligible for flagging (#137). Buckets below this
+            threshold in either window are excluded from ``flags`` and
+            placed in ``low_sample_buckets`` instead. Set to 0 to
+            disable the guard (legacy behavior). Default 5.
 
     Returns::
 
         {
           "window": "weekly",
           "threshold": 0.15,
+          "min_sample_count": 5,
           "current_window": {"since": ..., "until": ...},
           "previous_window": {"since": ..., "until": ...},
           "flags": [
@@ -224,6 +231,7 @@ def drift_check(
             },
             ...
           ],
+          "low_sample_buckets": [ ... ],  # buckets below min_sample_count (#137)
           "all_buckets": [ ... ]   # every bucket with both-window data
         }
 
@@ -253,9 +261,11 @@ def drift_check(
         return {
             "window": window,
             "threshold": threshold,
+            "min_sample_count": min_sample_count,
             "error": "drift_check requires a time-bounded window "
                      "(daily/weekly/monthly), not 'all'",
             "flags": [],
+            "low_sample_buckets": [],
             "all_buckets": [],
         }
     cur_rows = store.query_candidate_decisions(since=since_cur, until=until_cur)
@@ -281,6 +291,7 @@ def drift_check(
     cur_rates = _rates(cur_rows)
     prev_rates = _rates(prev_rows)
     flags: List[Dict[str, Any]] = []
+    low_sample_buckets: List[Dict[str, Any]] = []
     all_buckets: List[Dict[str, Any]] = []
     for key in sorted(set(cur_rates) | set(prev_rates)):
         cur_total, cur_rate = cur_rates.get(key, (0, 0.0))
@@ -296,14 +307,27 @@ def drift_check(
             "direction": "up" if delta > 0 else ("down" if delta < 0 else "flat"),
         }
         all_buckets.append(entry)
-        if abs(delta) >= threshold and (cur_total > 0 or prev_total > 0):
+        # #137: minimum-sample guard. Buckets where either window has
+        # fewer than min_sample_count decisions are excluded from flags
+        # (small samples are noise — a 0→1 flip with n=1 produces delta=1.0
+        # but is meaningless). They go to low_sample_buckets instead so
+        # consumers can still see them without tripping alerts.
+        is_low_sample = (
+            min_sample_count > 0
+            and (cur_total < min_sample_count or prev_total < min_sample_count)
+        )
+        if is_low_sample:
+            low_sample_buckets.append(entry)
+        elif abs(delta) >= threshold and (cur_total > 0 or prev_total > 0):
             flags.append(entry)
     return {
         "window": window,
         "threshold": threshold,
+        "min_sample_count": min_sample_count,
         "current_window": {"since": since_cur, "until": until_cur},
         "previous_window": {"since": since_prev, "until": until_prev},
         "flags": flags,
+        "low_sample_buckets": low_sample_buckets,
         "all_buckets": all_buckets,
     }
 

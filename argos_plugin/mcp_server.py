@@ -117,6 +117,48 @@ def _capabilities_input_schema() -> Dict[str, Any]:
     }
 
 
+def _propose_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_propose (class A write).
+
+    The idempotency_key is required for propose operations (D5).
+    Provenance fields (source, provenance_origin, grounding) are
+    server-set and intentionally absent from this schema — the facade
+    rejects them if the caller attempts to set them.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["content", "idempotency_key"],
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The fact or observation to propose for review.",
+                "maxLength": 10000,
+            },
+            "category": {
+                "type": "string",
+                "description": "Memory category (defaults to context_note).",
+                "default": "context_note",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for the proposed memory.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": (
+                    "Client-generated unique key. Same key + same body → "
+                    "returns original result (no duplicate). Same key + "
+                    "different body → 409 conflict."
+                ),
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
 # Tool name → (facade operation, input schema, description, output schema).
 # Deterministic ordering (D6): sorted by tool name.
 TOOL_DEFINITIONS: List[Dict[str, Any]] = [
@@ -178,6 +220,29 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_propose",
+        "description": (
+            "Propose a new memory for human review. The candidate enters "
+            "the review queue — it does NOT become active memory until a "
+            "human approves it. An idempotency key is required: retrying "
+            "with the same key and body returns the original result."
+        ),
+        "inputSchema": _propose_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "candidate_id": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "quarantined", "error"],
+                },
+                "reason": {"type": "string"},
+                "scan_summary": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "memory_search",
         "description": "Search memories by natural-language query.",
         "inputSchema": _search_input_schema(),
@@ -214,6 +279,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_fetch": "fetch",
     "memory_fetch_history": "fetch_history",
     "memory_capabilities": "capabilities",
+    "memory_propose": "memory_propose",
 }
 
 
@@ -387,10 +453,11 @@ class MCPServer:
                 "version": "1.0.0",
             },
             "instructions": (
-                "Argos memory search. Use memory_search to find memories, "
+                "Argos memory service. Use memory_search to find memories, "
                 "memory_fetch to get one by ID, memory_fetch_history for "
-                "version history, and memory_capabilities to list available "
-                "operations."
+                "version history, memory_propose to submit a fact for human "
+                "review (requires an idempotency key), and "
+                "memory_capabilities to list available operations."
             ),
         }
         self._send(_make_response(msg_id, result=result))
@@ -420,10 +487,17 @@ class MCPServer:
                 ),
             ))
             return
+        # Extract the idempotency key for mutation operations (D5).
+        # The facade's validator ignores this field — it's passed as a
+        # keyword arg, not in the params dict.
+        idempotency_key = arguments.pop("idempotency_key", None)
         # Call the facade. The facade handles validation, auth, ACL,
         # idempotency, audit, and error redaction.
         try:
-            result = self._facade.execute(self._auth, operation, arguments)
+            result = self._facade.execute(
+                self._auth, operation, arguments,
+                idempotency_key=idempotency_key,
+            )
             # MCP tools/call returns a CallToolResult with content array.
             # For structured results, we use the content as JSON.
             self._send(_make_response(msg_id, result={

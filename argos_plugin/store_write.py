@@ -541,8 +541,10 @@ class StoreWriteMixin:
             self.connection.execute(
                 """UPDATE memory_records
                    SET valid_to = ?, superseded_by = ?, updated_at = ?
-                   WHERE memory_id = ?""",
-                [now, superseded_by, now, memory_id],
+                   WHERE memory_id = ?
+                     AND valid_to IS NULL
+                     AND (user_scope IS NULL OR user_scope = ?)""",
+                [now, superseded_by, now, memory_id, self.user_id],
             )
         logger.info(
             "Value-supersession: %s superseded (%s) by %s",
@@ -1101,8 +1103,11 @@ class StoreWriteMixin:
                             self.connection.execute(
                                 """UPDATE memory_records
                                    SET valid_to = ?, superseded_by = ?, updated_at = ?
-                                   WHERE memory_id = ?""",
-                                [now, memory.memory_id, now, supersedes_memory_id],
+                                   WHERE memory_id = ?
+                                     AND valid_to IS NULL
+                                     AND (user_scope IS NULL OR user_scope = ?)""",
+                                [now, memory.memory_id, now, supersedes_memory_id,
+                                 self.user_id],
                             )
                             superseded_ok = True
                             # Superseded-value re-assertion block (#36):

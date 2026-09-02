@@ -61,6 +61,74 @@ def _record_to_dict(record: Any) -> dict | None:
     return record.to_dict() if hasattr(record, "to_dict") else record
 
 
+# -- Per-tenant policy (#127) ------------------------------------------------
+
+def _cfg_bool(val: Any, default: bool = False) -> bool:
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes", "on") if val is not None else default
+
+
+def _cfg_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+class TenantPolicy:
+    """Per-tenant policy overlay (#127).
+
+    Captures all policy fields that must be tenant-scoped:
+    - review_mode: "confirm" (default, human approval required) or "auto"
+    - max_injected_items: injection cap per turn
+    - inject_content_char_cap: per-memory char cap in injection
+    - external_sources_require_confirmation: external-origin auto-activate gate
+    - local_only: no plugin-owned auxiliary LLM calls
+
+    Policy is resolved from the tenant's merged config at startup and
+    is immutable for the lifetime of a request. A client-supplied
+    argument cannot change policy state.
+
+    Any policy not explicitly overridden by the tenant config inherits
+    from the global configuration (already merged into the tenant's
+    config dict by _parse_tenants).
+    """
+
+    __slots__ = (
+        "review_mode", "max_injected_items", "inject_content_char_cap",
+        "external_sources_require_confirmation", "local_only",
+    )
+
+    def __init__(self, config: dict) -> None:
+        self.review_mode: str = str(
+            config.get("review_mode", "confirm")
+        ).strip().lower()
+        if self.review_mode not in ("confirm", "auto"):
+            self.review_mode = "confirm"  # fail closed
+        self.max_injected_items: int = max(
+            0, min(_cfg_int(config.get("max_injected_items"), 5), 50)
+        )
+        self.inject_content_char_cap: int = max(
+            100, min(_cfg_int(config.get("inject_content_char_cap"), 800), 5000)
+        )
+        self.external_sources_require_confirmation: bool = _cfg_bool(
+            config.get("external_sources_require_confirmation"), True
+        )
+        self.local_only: bool = _cfg_bool(
+            config.get("local_only"), False
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "review_mode": self.review_mode,
+            "max_injected_items": self.max_injected_items,
+            "inject_content_char_cap": self.inject_content_char_cap,
+            "external_sources_require_confirmation": self.external_sources_require_confirmation,
+            "local_only": self.local_only,
+        }
+
+
 class _Tenant:
     """One isolated cell: own store, own graph, own locks (#49).
 
@@ -89,6 +157,12 @@ class _Tenant:
         # the sweep still sees entities written by default clients — a
         # scope change here silently disabled the sweep (#49 review).
         self.default_scope = default_scope or "default_user"
+        # Per-tenant policy overlay (#127): captures review_mode, injection
+        # caps, local_only, external_sources_require_confirmation. Resolved
+        # from the tenant's merged config (global + overlay). Immutable for
+        # the lifetime of a request — a client-supplied argument cannot
+        # change policy state.
+        self.policy = TenantPolicy(config)
         # The tenant name is the store's default scope; every request
         # re-scopes per user_id anyway (defense in depth).
         self.store = DuckDBMemoryStore(
@@ -113,10 +187,11 @@ class _Tenant:
             )
         except (TypeError, ValueError):
             self.store._phrase_lift_pool = 200
-        # External-source write policy (per-tenant overlay).
-        self.store.external_sources_require_confirmation = str(
-            config.get("external_sources_require_confirmation", "true")
-        ).lower() in ("true", "1", "yes")
+        # External-source write policy (per-tenant overlay, #127).
+        # Now resolved through TenantPolicy and applied to the store.
+        self.store.external_sources_require_confirmation = (
+            self.policy.external_sources_require_confirmation
+        )
         try:
             self.graph = KuzuGraphStore(home / graph_name, user_id=self.default_scope)
         except Exception as exc:
@@ -285,7 +360,7 @@ class MemoryService:
             return self._tenants[user_id]
         return self._tenants[self._default_tenant]
 
-    def _call_store(self, method: str, args: dict, user_id: str, store) -> Any:
+    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None) -> Any:
         store.set_user_scope(user_id)
         if method == "search":
             return [
@@ -329,6 +404,25 @@ class MemoryService:
         if method == "list_candidates":
             return store.list_candidates(**args)
         if method == "review_candidate":
+            # #127: Per-tenant review_mode enforcement. If the tenant's
+            # policy is "confirm" (the default), auto-review approvals are
+            # downgraded to pending_user_confirmation — a human must
+            # approve. This prevents a permissive tenant's auto-reviewer
+            # from activating memories in a restrictive tenant.
+            # Policy state is immutable — a client-supplied review_mode
+            # in the args is stripped and ignored.
+            args = dict(args)  # don't mutate the caller's dict
+            args.pop("review_mode", None)  # policy is server-derived, not client
+            if policy is not None and policy.review_mode == "confirm":
+                review_source = str(args.get("review_source", "manual"))
+                decision = str(args.get("decision", ""))
+                if review_source == "auto_review" and decision in {"approved", "reviewed_approved"}:
+                    args["decision"] = "pending_user_confirmation"
+                    args["reason"] = (
+                        "Tenant policy (review_mode=confirm): auto-review "
+                        "cannot activate memories without human confirmation. "
+                        + str(args.get("reason", ""))
+                    ).strip()
             return store.review_candidate(**args)
         if method == "find_supersede_candidates":
             return store.find_supersede_candidates(
@@ -508,10 +602,15 @@ class MemoryService:
         if request.get("method") == "get_status":
             # #147: return a config fingerprint + runtime info so clients
             # can detect staleness (service running old config/code vs disk).
+            # #127: include per-tenant policy summaries.
             import hashlib
             config = _load_config(self.home)
             config_str = json.dumps(config, sort_keys=True)
             config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()[:16]
+            tenant_policies = {
+                name: t.policy.to_dict()
+                for name, t in self._tenants.items()
+            }
             return {
                 "status": "ok",
                 "pid": os.getpid(),
@@ -521,6 +620,7 @@ class MemoryService:
                 ),
                 "tenant_count": len(self._tenants),
                 "strict_routing": self._strict_routing,
+                "tenant_policies": tenant_policies,
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
                 "lock_wait_count": self._lock_wait_count,
             }
@@ -559,7 +659,7 @@ class MemoryService:
             self._lock_wait_total_s += time.monotonic() - t0
             self._lock_wait_count += 1
             if component == "store":
-                return self._call_store(method, args, user_id, tenant.store)
+                return self._call_store(method, args, user_id, tenant.store, tenant.policy)
             return self._call_graph(method, args, user_id, tenant.graph)
 
     def _backup(self, args: dict) -> Any:

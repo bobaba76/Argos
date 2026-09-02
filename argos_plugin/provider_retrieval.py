@@ -772,6 +772,11 @@ class ProviderRetrievalMixin:
                         continue
                     decay = 1.0 - (rank / graph_count)
                     record.similarity += self._graph_retrieval_boost * max(0.0, decay)
+                # #142: clamp all results to [0, 1] — graph boost is additive
+                # and can push a high-similarity record above 1.0.
+                for record in results:
+                    if record.similarity > 1.0:
+                        record.similarity = 1.0
                 results.sort(key=lambda record: record.similarity, reverse=True)
         except (NameError, AttributeError, ImportError) as exc:
             # #84: programming errors must NOT be swallowed.

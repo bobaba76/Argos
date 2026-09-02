@@ -505,6 +505,25 @@ class MemoryService:
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
                 "lock_wait_count": self._lock_wait_count,
             }
+        if request.get("method") == "get_status":
+            # #147: return a config fingerprint + runtime info so clients
+            # can detect staleness (service running old config/code vs disk).
+            import hashlib
+            config = _load_config(self.home)
+            config_str = json.dumps(config, sort_keys=True)
+            config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()[:16]
+            return {
+                "status": "ok",
+                "pid": os.getpid(),
+                "config_hash": config_hash,
+                "reranker_enabled": str(config.get("reranker_enabled", "true")).lower() in (
+                    "true", "1", "yes"
+                ),
+                "tenant_count": len(self._tenants),
+                "strict_routing": self._strict_routing,
+                "lock_wait_total_s": round(self._lock_wait_total_s, 4),
+                "lock_wait_count": self._lock_wait_count,
+            }
         if request.get("method") == "stats":
             return {
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
@@ -664,37 +683,41 @@ def serve(home: Path, port: int = 0) -> None:
     handler is registered when available (console Ctrl+Break still works).
     """
     home.mkdir(parents=True, exist_ok=True)
+    endpoint = endpoint_path(home)
+
+    # #143: Single-instance guard BEFORE DB init. On Windows, a venv launcher
+    # stub spawns the base interpreter as the real service child, then the
+    # launcher process continues executing this script. Without this early
+    # guard, the launcher opens the DB, hits the file lock (child already
+    # owns it), and crashes with exit 1. By probing for a healthy service
+    # before constructing MemoryService (which opens the DB), the launcher
+    # exits 0 cleanly if the child is already running.
+    try:
+        existing = json.loads(endpoint.read_text(encoding="utf-8"))
+        if existing.get("host") and existing.get("port") and existing.get("token"):
+            probe_sock = socket.create_connection(
+                (str(existing["host"]), int(existing["port"])), timeout=2.0
+            )
+            probe_sock.sendall((json.dumps({"token": str(existing["token"]), "method": "health"}) + "\n").encode("utf-8"))
+            _resp = b""
+            while b"\n" not in _resp:
+                chunk = probe_sock.recv(65536)
+                if not chunk:
+                    break
+                _resp += chunk
+            probe_sock.close()
+            if _resp and json.loads(_resp.splitlines()[0]).get("ok"):
+                logger.info("Shared memory service already running; exiting 0.")
+                return
+    except Exception:
+        pass  # no/stale endpoint -> we are the one true instance
+
     service = MemoryService(home)
     token = secrets.token_urlsafe(32)
     server = _ThreadingTCPServer(("127.0.0.1", port), _RequestHandler)
     server.auth_token = token
     server.memory_service = service
     service.server = server
-    endpoint = endpoint_path(home)
-
-    # Single-instance guard: if another live service already owns the store,
-    # exit quietly instead of fighting it for the DuckDB file lock (which
-    # would wedge every client). Covers stolen-start-lock races.
-    try:
-        existing = json.loads(endpoint.read_text(encoding="utf-8"))
-        probe_sock = socket.create_connection(
-            (str(existing["host"]), int(existing["port"])), timeout=2.0
-        )
-        probe_sock.sendall((json.dumps({"token": str(existing["token"]), "method": "health"}) + "\n").encode("utf-8"))
-        _resp = b""
-        while b"\n" not in _resp:
-            chunk = probe_sock.recv(65536)
-            if not chunk:
-                break
-            _resp += chunk
-        probe_sock.close()
-        if _resp and json.loads(_resp.splitlines()[0]).get("ok"):
-            logger.warning("Shared memory service already running; exiting.")
-            server.server_close()
-            service.close()
-            return
-    except Exception:
-        pass  # no/stale endpoint -> we are the one true instance
 
     _write_endpoint(endpoint, int(server.server_address[1]), token)
 

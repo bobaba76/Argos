@@ -205,3 +205,73 @@ def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
             store._rpc.stop_service()
         finally:
             time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# #143: venv launcher exits 0 when service is already running
+# ---------------------------------------------------------------------------
+
+def test_serve_exits_cleanly_when_service_already_running(tmp_path):
+    """serve() should return immediately (exit 0) when a healthy service
+    is already running, WITHOUT constructing MemoryService (which opens the
+    DB). This prevents the venv launcher stub from crashing with exit 1
+    after spawning the base interpreter child.
+    """
+    from service_client import SharedMemoryStore
+
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        encoding="utf-8",
+    )
+    # Start the service via the client (auto-spawn).
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        assert store._rpc._healthy(), "Service should be running"
+
+        # Now call serve() directly — it should detect the running service
+        # and return immediately, without trying to open the DB.
+        from memory_service import serve
+        # If serve() tries to construct MemoryService, it will open the DB
+        # and hit the lock (the running service owns it). With the #143 fix,
+        # serve() probes the endpoint first and returns before DB init.
+        serve(tmp_path)  # should return, not raise
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# #147: get_status RPC for staleness detection
+# ---------------------------------------------------------------------------
+
+def test_get_status_returns_config_fingerprint(tmp_path):
+    """The get_status RPC should return a config fingerprint that can be
+    compared against the on-disk config to detect staleness.
+    """
+    from service_client import SharedMemoryStore
+
+    config = {"local_embedding_model": "nonexistent-model-xyz"}
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps(config), encoding="utf-8",
+    )
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        status = store._rpc._request({"method": "get_status"})
+        assert isinstance(status, dict)
+        assert "config_hash" in status, (
+            f"get_status should return config_hash; got keys: {list(status.keys())}"
+        )
+        assert "pid" in status, (
+            f"get_status should return pid; got keys: {list(status.keys())}"
+        )
+        # The config hash should be non-empty.
+        assert status["config_hash"], (
+            f"config_hash should be non-empty; got: {status['config_hash']}"
+        )
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)

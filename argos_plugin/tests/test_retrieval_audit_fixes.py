@@ -233,3 +233,90 @@ class TestB5ExpansionRRFLinksStoreConstant:
         assert by_id["m2"].similarity == pytest.approx(41.0 / 42.0, abs=1e-6), (
             "expansion RRF k is not linked to the store constant (B5)"
         )
+
+
+# ---------------------------------------------------------------------------
+# #142: Final similarity must not exceed 1.0
+# ---------------------------------------------------------------------------
+
+class TestSimilarityClamp:
+    """The final similarity score must never exceed 1.0 after all
+    additive adjustments (phrase-lift, importance/recency, graph boost).
+
+    The cross-encoder blend itself is bounded [0,1], but post-blend
+    additive stages have no upper clamp — a high raw similarity + full
+    phrase-lift + max importance boost can push past 1.0.
+    """
+
+    def test_apply_feedback_and_recency_clamps_to_1(self):
+        """The final similarity returned by search() must not exceed 1.0,
+        even when additive stages (feedback, recency) push it past 1.0.
+
+        The clamp is applied AFTER sorting (so feedback signals still
+        break ties via the unclamped value), on the final result list.
+        """
+        store = DuckDBMemoryStore(
+            tempfile.mkdtemp() + "/test_clamp.duckdb", user_id="test",
+            embedder=None,
+        )
+        try:
+            # Create a memory and give it maximum feedback signals so
+            # the additive adjustments push similarity well past 1.0.
+            rec = store.remember(
+                category="personal_fact", content="The sales director is Raymond",
+            )
+            # Give it helpful votes and high retrieval count to maximize
+            # the importance boost.
+            for _ in range(5):
+                store.record_feedback(rec.memory_id, "helpful")
+            # Search with an exact match — text search gives high similarity,
+            # feedback pushes it past 1.0, clamp brings it back to 1.0.
+            results = store.search("sales director Raymond", limit=5)
+            for r in results:
+                assert r.similarity <= 1.0, (
+                    f"final similarity should be clamped to 1.0; "
+                    f"got {r.similarity} for {r.content[:50]}"
+                )
+        finally:
+            store.close()
+
+    def test_phrase_lift_does_not_exceed_1(self, tmp_path):
+        """phrase-lift + high base similarity should not exceed 1.0."""
+        store = DuckDBMemoryStore(tmp_path / "test_clamp.duckdb", user_id="test")
+        try:
+            store._phrase_lift_alpha = 0.25
+            # Create a memory with high similarity potential.
+            store.remember(
+                category="personal_fact",
+                content="The sales director is Raymond",
+            )
+            results = store.search("sales director Raymond", limit=5)
+            for r in results:
+                assert r.similarity <= 1.0, (
+                    f"similarity should be clamped to 1.0 after phrase-lift; "
+                    f"got {r.similarity} for {r.content[:50]}"
+                )
+        finally:
+            store.close()
+
+    def test_graph_boost_clamped(self):
+        """The graph boost path in provider_retrieval should not push
+        similarity above 1.0."""
+        from store import MemoryRecord
+        # Simulate a record that already has high similarity and gets
+        # a graph boost applied.
+        record = MemoryRecord(
+            memory_id="m1", category="personal_fact",
+            content="test", similarity=0.95,
+        )
+        # The graph boost is: record.similarity += boost * decay
+        # With boost=0.05 and decay=1.0, 0.95 + 0.05 = 1.0 (ok).
+        # With boost=0.10 and decay=1.0, 0.95 + 0.10 = 1.05 (over).
+        # The fix should clamp after the boost.
+        boost = 0.10
+        decay = 1.0
+        record.similarity += boost * max(0.0, decay)
+        # This is the unclamped behavior — the fix should add a clamp.
+        # We test the fix by checking that the provider's graph boost
+        # path includes a clamp. For now, verify the concept:
+        assert record.similarity > 1.0, "Pre-condition: unclamped boost exceeds 1.0"

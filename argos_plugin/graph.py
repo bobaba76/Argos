@@ -774,11 +774,24 @@ class KuzuGraphStore:
                     conn.execute(
                         "CREATE REL TABLE RelatesTo("
                         "FROM Entity TO Entity, "
-                        "relation_type STRING, attributes STRING, user_scope STRING)"
+                        "relation_type STRING, attributes STRING, user_scope STRING, "
+                        "memory_ids STRING[])"
                     )
                 except RuntimeError as e:
                     if not _is_already_exists_error(e):
                         logger.warning("Kuzu edge init issue: %s", e)
+                # G4: migrate existing DBs — add memory_ids column if it
+                # doesn't exist yet. The column mirrors the memory_ids list
+                # from the JSON attributes blob so remove_memory can use a
+                # native Cypher filter (list_contains) instead of a full
+                # edge-table scan + Python-side JSON parse.
+                try:
+                    conn.execute(
+                        "ALTER TABLE RelatesTo ADD memory_ids STRING[]"
+                    )
+                except RuntimeError as e:
+                    if not _is_already_exists_error(e):
+                        logger.debug("Kuzu memory_ids migration: %s", e)
 
             # Reuse the shared connection.
             self.database, self.conn, self._shared_conn_lock, ref_count = shared
@@ -937,15 +950,19 @@ class KuzuGraphStore:
                 merged.pop("quarantine_reason", None)
                 merged.pop("quarantined_at", None)
             attrs_json = json.dumps(merged)
+            # G4: also set the memory_ids column (mirrors the JSON list) so
+            # remove_memory can use list_contains instead of a full scan.
+            edge_memory_ids = memory_ids if memory_ids else []
             query = """
             MATCH (a:Entity {id: $source}), (b:Entity {id: $target})
             MERGE (a)-[r:RelatesTo {relation_type: $rel_type}]->(b)
-            ON MATCH SET r.attributes = $attrs, r.user_scope = $scope
-            ON CREATE SET r.attributes = $attrs, r.user_scope = $scope
+            ON MATCH SET r.attributes = $attrs, r.user_scope = $scope, r.memory_ids = $mids
+            ON CREATE SET r.attributes = $attrs, r.user_scope = $scope, r.memory_ids = $mids
             """
             self.conn.execute(query, parameters={
                 "source": source_id, "target": target_id,
                 "rel_type": relation_type, "attrs": attrs_json, "scope": scope,
+                "mids": edge_memory_ids,
             })
 
     def add_relationship(
@@ -1064,33 +1081,21 @@ class KuzuGraphStore:
         memory_node = self._internal_id(f"memory:{memory_id}")
         changed = False
         with self._shared_conn_lock:
-            # Targeted query for edges where the memory_node is a direct
-            # endpoint (about_user, mentions) — O(degree) instead of O(edges).
-            # Then scan remaining edges for memory_id in the JSON attributes
-            # (entity-to-entity edges that carry evidence). The full scan is
-            # still needed because memory_id lives in a JSON blob (issue #11),
-            # but the targeted query handles the common case efficiently.
+            # G4: use the memory_ids column for a targeted query instead of
+            # a full edge-table scan. The column mirrors the memory_ids list
+            # from the JSON attributes blob, enabling a native Cypher filter
+            # via list_contains. We also include direct edges (where the
+            # memory_node is an endpoint) in the same query.
             result = self.conn.execute(
                 """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
                    WHERE a.id = $memory_node OR b.id = $memory_node
+                      OR list_contains(r.memory_ids, $mid)
                    RETURN a.id, r.relation_type, b.id, r.attributes""",
-                parameters={"memory_node": memory_node},
+                parameters={"memory_node": memory_node, "mid": memory_id},
             )
-            direct_edges = []
+            edges = []
             while result.has_next():
-                direct_edges.append(result.get_next())
-            # Full scan for edges that reference the memory_id in their
-            # attributes but don't directly involve the memory_node.
-            result = self.conn.execute(
-                """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-                   WHERE a.id <> $memory_node AND b.id <> $memory_node
-                   RETURN a.id, r.relation_type, b.id, r.attributes""",
-                parameters={"memory_node": memory_node},
-            )
-            other_edges = []
-            while result.has_next():
-                other_edges.append(result.get_next())
-            edges = direct_edges + other_edges
+                edges.append(result.get_next())
             for source, relation, target, raw_attrs in edges:
                 try:
                     attrs = json.loads(raw_attrs) if raw_attrs else {}
@@ -1112,13 +1117,15 @@ class KuzuGraphStore:
                         attrs.pop("memory_id", None)
                     attrs["status"] = "quarantined"
                     attrs["quarantine_reason"] = "memory evidence removed"
+                # G4: update both the JSON attributes and the memory_ids column.
                 self.conn.execute(
                     """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
                        WHERE r.relation_type = $relation
-                       SET r.attributes = $attrs""",
+                       SET r.attributes = $attrs, r.memory_ids = $mids""",
                     parameters={
                         "source": source, "target": target,
                         "relation": relation, "attrs": json.dumps(attrs),
+                        "mids": remaining,
                     },
                 )
                 changed = True
@@ -1659,6 +1666,13 @@ class KuzuGraphStore:
         # OR, but correct for traversal/PPR where we walk from known
         # in-scope nodes: both endpoints of a legitimate edge should be
         # in the same scope.
+        # G6: bound the result set with a LIMIT proportional to the input
+        # size so high-degree hubs don't produce unbounded result sets.
+        # 50 edges per input node is generous for PPR/traversal (frontiers
+        # are already capped at 40-50 at call sites) while preventing a
+        # single hub from flooding the adjacency dict.
+        edge_limit = max(50, len(node_ids) * 50)
+        params["edge_limit"] = edge_limit
         query = f"""
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
         WHERE (a.id IN [{ph_list}] OR b.id IN [{ph_list}])
@@ -1667,6 +1681,7 @@ class KuzuGraphStore:
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
                b.attributes AS target_attrs, r.attributes AS relation_attrs
+        LIMIT $edge_limit
         """
         with self._shared_conn_lock:
             # #76: consume results inside the lock.
@@ -1718,6 +1733,47 @@ class KuzuGraphStore:
                     return {"id": self._external_id(row[0]), "entity_type": row[1], "attributes": attrs}
         return None
 
+    def _query_nodes_for_ids(
+        self, node_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fetch multiple nodes by exact id match in a single query.
+
+        G5: batch equivalent of _query_node's exact-match path. Returns a
+        dict mapping external id → node dict for all visible matches.
+        Unlike _query_node, this does NOT do fuzzy substring matching —
+        the BFS already has the exact internal ids from edge endpoints.
+        """
+        if not node_ids:
+            return {}
+        internal_ids = [self._internal_id(nid) for nid in node_ids]
+        params = {"scope": self.user_id}
+        placeholders = []
+        for i, nid in enumerate(internal_ids):
+            params[f"id{i}"] = str(nid)
+            placeholders.append(f"$id{i}")
+        ph_list = ", ".join(placeholders)
+        query = f"""
+        MATCH (n:Entity)
+        WHERE n.id IN [{ph_list}] AND n.user_scope = $scope
+        RETURN n.id, n.entity_type, n.attributes
+        """
+        with self._shared_conn_lock:
+            # #76: consume results inside the lock.
+            results = self.conn.execute(query, parameters=params)
+            rows = []
+            while results.has_next():
+                rows.append(results.get_next())
+        nodes: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            attrs = self._parse_attributes(row[2])
+            if not self._visible_attributes(attrs):
+                continue
+            ext_id = self._external_id(str(row[0]))
+            nodes[ext_id] = {
+                "id": ext_id, "entity_type": row[1], "attributes": attrs,
+            }
+        return nodes
+
     def traverse_graph(
         self,
         entity_id: str,
@@ -1765,19 +1821,26 @@ class KuzuGraphStore:
                 break
             edges = self._query_edges_for_nodes(frontier)
             next_frontier: List[str] = []
+            # G5: collect newly discovered endpoints and batch-fetch them
+            # in one query instead of per-node _query_node calls.
+            new_endpoints: List[str] = []
             for edge in edges:
                 key = (edge["source"], edge["relation"], edge["target"])
                 if key not in selected_keys and len(selected_edges) < limit:
                     selected_keys.add(key)
                     selected_edges.append(edge)
                 for endpoint in (edge["source"], edge["target"]):
-                    if endpoint not in node_data:
-                        # Fetch node details for newly discovered nodes.
-                        node = self._query_node(endpoint)
-                        if node and len(node_data) < limit:
-                            node_data[endpoint] = node
-                            distances[endpoint] = hop + 1
-                            next_frontier.append(endpoint)
+                    if endpoint not in node_data and endpoint not in new_endpoints:
+                        new_endpoints.append(endpoint)
+            # Batch-fetch all newly discovered nodes in one lock acquisition.
+            if new_endpoints:
+                batch_nodes = self._query_nodes_for_ids(new_endpoints)
+                for ep in new_endpoints:
+                    node = batch_nodes.get(ep)
+                    if node and len(node_data) < limit:
+                        node_data[ep] = node
+                        distances[ep] = hop + 1
+                        next_frontier.append(ep)
             frontier = next_frontier
 
         selected_nodes = [node_data[n] for n in distances if n in node_data]

@@ -1331,12 +1331,20 @@ class StoreWriteMixin:
                         grounding=candidate.get("grounding"),
                     )
                     # Mark the old memory's payload as non-conflicting too.
+                    # D8: add valid_to IS NULL + user_scope guards (#78-style)
+                    # — the old_memory_id comes from the candidate's payload
+                    # and may be stale (already superseded) or point at another
+                    # tenant's record. Without these guards this is the only
+                    # resolve_conflict path that can write to a superseded or
+                    # cross-tenant record.
                     if old_memory_id:
                         try:
                             old_payload_row = self.connection.execute(
                                 """SELECT payload FROM memory_records
-                                   WHERE memory_id = ?""",
-                                [old_memory_id],
+                                   WHERE memory_id = ?
+                                     AND valid_to IS NULL
+                                     AND (user_scope IS NULL OR user_scope = ?)""",
+                                [old_memory_id, self.user_id],
                             ).fetchone()
                             if old_payload_row and old_payload_row[0]:
                                 old_payload = json.loads(old_payload_row[0])
@@ -1347,17 +1355,31 @@ class StoreWriteMixin:
                                 self.connection.execute(
                                     """UPDATE memory_records
                                        SET payload = ?, updated_at = ?
-                                       WHERE memory_id = ?""",
-                                    [json.dumps(old_payload), now, old_memory_id],
+                                       WHERE memory_id = ?
+                                         AND valid_to IS NULL
+                                         AND (user_scope IS NULL OR user_scope = ?)""",
+                                    [json.dumps(old_payload), now, old_memory_id,
+                                     self.user_id],
+                                )
+                            else:
+                                logger.warning(
+                                    "resolve_conflict keep_both: old_memory_id "
+                                    "%s is not current/in-scope — payload not "
+                                    "modified",
+                                    old_memory_id,
                                 )
                         except Exception as exc:
                             logger.debug("keep_both old payload update failed: %s", exc)
+                    # B7: mirror keep_new's #79 fix — when remember() returns
+                    # None (dedup/tombstone/rejection block), the candidate
+                    # must NOT be marked 'approved' with no memory behind it.
+                    keep_both_status = "approved" if memory is not None else "deduplicated"
                     self.connection.execute(
                         """UPDATE memory_candidates
-                           SET status = 'approved', updated_at = ?, reviewed_at = ?,
+                           SET status = ?, updated_at = ?, reviewed_at = ?,
                                review_reason = ?
                            WHERE candidate_id = ?""",
-                        [now, now,
+                        [keep_both_status, now, now,
                          f"conflict_resolved:keep_both ({reason})".strip(),
                          candidate_id],
                     )
@@ -1475,21 +1497,43 @@ class StoreWriteMixin:
                                 "is not current/in-scope — supersede skipped",
                                 old_memory_id,
                             )
-                    # Reject the original candidate (it's been replaced by
-                    # the reconciliation).
-                    self.connection.execute(
-                        """UPDATE memory_candidates
-                           SET status = 'rejected', updated_at = ?, reviewed_at = ?,
-                               review_reason = ?
-                           WHERE candidate_id = ?""",
-                        [now, now,
-                         f"conflict_resolved:manual ({reason})".strip(),
-                         candidate_id],
-                    )
-                    self.record_rejection(
-                        candidate["category"], payload,
-                        reason=f"conflict_resolved:manual ({reason})"[:200],
-                    )
+                    # B8: when remember() returns None (dedup/tombstone/
+                    # rejection block), the reconciliation failed to create
+                    # a memory. Do NOT reject the candidate or record a
+                    # rejection-ledger entry — that would permanently burn
+                    # the candidate and block paraphrased retries via the
+                    # one-way ladder. Instead, mark it pending_user_confirmation
+                    # so the user can retry with different reconciliation
+                    # content.
+                    if memory is None:
+                        self.connection.execute(
+                            """UPDATE memory_candidates
+                               SET status = 'pending_user_confirmation',
+                                   updated_at = ?, reviewed_at = ?,
+                                   review_reason = ?
+                               WHERE candidate_id = ?""",
+                            [now, now,
+                             (f"conflict_resolved:manual failed — "
+                              f"reconciliation content was deduped/blocked; "
+                              f"retry with different content ({reason})").strip(),
+                             candidate_id],
+                        )
+                    else:
+                        # Reconciliation succeeded — reject the original
+                        # candidate (it's been replaced by the reconciliation).
+                        self.connection.execute(
+                            """UPDATE memory_candidates
+                               SET status = 'rejected', updated_at = ?, reviewed_at = ?,
+                                   review_reason = ?
+                               WHERE candidate_id = ?""",
+                            [now, now,
+                             f"conflict_resolved:manual ({reason})".strip(),
+                             candidate_id],
+                        )
+                        self.record_rejection(
+                            candidate["category"], payload,
+                            reason=f"conflict_resolved:manual ({reason})"[:200],
+                        )
 
                 self.connection.execute("COMMIT")
             except Exception:
@@ -1784,18 +1828,36 @@ class StoreWriteMixin:
         return True
 
     def restore_memory(self, memory_id: str) -> bool:
-        """Restore a quarantined memory to active retrieval."""
+        """Restore a quarantined memory to active retrieval.
+
+        B9: if the record is a non-head version (valid_to is set — e.g. a
+        middle version quarantined by delete_memory), restoring it to
+        status='active' creates an inconsistent state: the retrieval filter
+        (valid_to IS NULL) still hides it, but the status field says active.
+        Log a warning so the inconsistency is visible to diagnostics
+        (memory_why_not, memory_tombstones) rather than silent.
+        """
         now = self._now()
         with self._lock:
             assert self.connection is not None
-            check = self.connection.execute(
-                """SELECT COUNT(*) FROM memory_records
+            # B9: fetch valid_to alongside the existence check so we can
+            # warn about non-head restores.
+            row = self.connection.execute(
+                """SELECT valid_to FROM memory_records
                    WHERE memory_id = ?
                      AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
-            if not check or check[0] == 0:
+            if not row:
                 return False
+            if row[0] is not None:
+                logger.warning(
+                    "restore_memory: %s is a non-head version (valid_to is "
+                    "set) — restoring to status='active' but the retrieval "
+                    "filter (valid_to IS NULL) will still hide it; promote "
+                    "to head or clear valid_to to make it retrievable",
+                    memory_id,
+                )
             self.connection.execute(
                 """UPDATE memory_records
                    SET status = 'active', quarantine_reason = NULL,

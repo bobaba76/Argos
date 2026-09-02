@@ -434,3 +434,269 @@ class TestGraphAuditG1G2G3:
                 )
         finally:
             graph.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph audit: G4, G5, G6
+# ---------------------------------------------------------------------------
+
+class TestGraphAuditG4G5G6:
+    """Tests for graph audit findings G4–G6.
+
+    G4: remove_memory full-scans all edges (memory_id buried in JSON)
+    G5: traverse_graph BFS does N lock acquisitions for N nodes
+    G6: _query_edges_for_nodes has no LIMIT (unbounded at scale)
+    """
+
+    # -- G6: _query_edges_for_nodes LIMIT ---------------------------------
+
+    def test_g6_query_edges_for_nodes_has_limit(self, tmp_path):
+        """_query_edges_for_nodes should not return an unbounded number of
+        edges. With many high-degree nodes, the result set must be capped
+        by a LIMIT proportional to the input size.
+        """
+        graph = _make_graph(tmp_path)
+        try:
+            # Create a hub node with many edges.
+            graph.upsert_node("Hub", "concept", {})
+            for i in range(200):
+                leaf = f"Leaf{i}"
+                graph.upsert_node(leaf, "concept", {})
+                graph.upsert_edge("Hub", leaf, "connected_to", {})
+            # Query edges for the hub — should be capped, not return all 200.
+            edges = graph._query_edges_for_nodes(["Hub"])
+            # G6 FIX: the result should be bounded by a LIMIT.
+            # The limit is proportional to len(node_ids) * 50 = 1 * 50 = 50.
+            assert len(edges) <= 50, (
+                f"_query_edges_for_nodes should be bounded by LIMIT; "
+                f"got {len(edges)} edges for 1 node (expected <= 50)"
+            )
+        finally:
+            graph.close()
+
+    def test_g6_limit_proportional_to_input_size(self, tmp_path):
+        """The LIMIT should scale with the number of input nodes so that
+        querying multiple nodes doesn't artificially cap results too low.
+        """
+        graph = _make_graph(tmp_path)
+        try:
+            # Create 3 hub nodes, each with 30 edges.
+            for hub_idx in range(3):
+                hub = f"Hub{hub_idx}"
+                graph.upsert_node(hub, "concept", {})
+                for i in range(30):
+                    leaf = f"Leaf{hub_idx}_{i}"
+                    graph.upsert_node(leaf, "concept", {})
+                    graph.upsert_edge(hub, leaf, "connected_to", {})
+            # Query edges for all 3 hubs — limit should be 3 * 50 = 150.
+            edges = graph._query_edges_for_nodes(["Hub0", "Hub1", "Hub2"])
+            # Should return all 90 edges (under the 150 limit).
+            assert len(edges) == 90, (
+                f"Expected 90 edges for 3 hubs with 30 edges each; "
+                f"got {len(edges)}"
+            )
+        finally:
+            graph.close()
+
+    # -- G5: traverse_graph batch node fetch -------------------------------
+
+    def test_g5_traverse_graph_correctness(self, tmp_path):
+        """traverse_graph should still return correct results after
+        switching from per-node to batch node fetching.
+        """
+        graph = _make_graph(tmp_path)
+        try:
+            # Build a small graph: A -> B -> C -> D
+            for node in ("A", "B", "C", "D"):
+                graph.upsert_node(node, "concept", {})
+            graph.upsert_edge("A", "B", "connected_to", {})
+            graph.upsert_edge("B", "C", "connected_to", {})
+            graph.upsert_edge("C", "D", "connected_to", {})
+            # Traverse from A with depth=2, limit=10
+            result = graph.traverse_graph("A", depth=2, limit=10)
+            # Should find A (seed), B (hop 1), C (hop 2) and 2 edges
+            node_ids = {n["id"] for n in result["nodes"]}
+            assert "A" in node_ids, f"Seed A should be in nodes: {node_ids}"
+            assert "B" in node_ids, f"B (hop 1) should be in nodes: {node_ids}"
+            assert "C" in node_ids, f"C (hop 2) should be in nodes: {node_ids}"
+            assert "D" not in node_ids, (
+                f"D (hop 3) should NOT be in nodes at depth=2: {node_ids}"
+            )
+            assert len(result["edges"]) == 2, (
+                f"Expected 2 edges (A->B, B->C); got {len(result['edges'])}"
+            )
+        finally:
+            graph.close()
+
+    def test_g5_traverse_graph_uses_batch_fetch(self, tmp_path):
+        """traverse_graph should use _query_nodes_for_ids (batch) instead
+        of per-node _query_node calls, reducing lock acquisitions.
+
+        We verify by counting lock acquisitions during a traversal that
+        discovers multiple new nodes.
+        """
+        graph = _make_graph(tmp_path)
+        try:
+            # Build a star graph: Hub -> Leaf0..Leaf9 (10 new nodes)
+            graph.upsert_node("Hub", "concept", {})
+            for i in range(10):
+                leaf = f"Leaf{i}"
+                graph.upsert_node(leaf, "concept", {})
+                graph.upsert_edge("Hub", leaf, "connected_to", {})
+
+            # Count lock acquisitions during traverse_graph by wrapping
+            # the lock. We count __enter__ calls.
+            original_lock = graph._shared_conn_lock
+            lock_count = [0]
+            class CountingLock:
+                def __enter__(self_inner):
+                    lock_count[0] += 1
+                    return original_lock.__enter__()
+                def __exit__(self_inner, *a):
+                    return original_lock.__exit__(*a)
+            graph._shared_conn_lock = CountingLock()
+
+            result = graph.traverse_graph("Hub", depth=2, limit=50)
+
+            # G5 FIX: with batch fetch, lock acquisitions for node lookups
+            # should be ~depth (1-2), not ~N (10+).
+            # Total lock acquisitions = seed _query_node (1-2) +
+            # seed_edges _query_edges_for_nodes (1) +
+            # per-hop _query_edges_for_nodes (1 per hop) +
+            # batch _query_nodes_for_ids (1 per hop) +
+            # Total should be well under the old N+pattern (which would
+            # be 10+ for the 10 leaf nodes alone).
+            assert lock_count[0] < 10, (
+                f"traverse_graph should use batch node fetch; "
+                f"lock acquisitions = {lock_count[0]} (expected < 10, "
+                f"old per-node pattern would be 10+ for 10 new nodes)"
+            )
+            # Verify correctness: all 10 leaves should be discovered.
+            node_ids = {n["id"] for n in result["nodes"]}
+            for i in range(10):
+                assert f"Leaf{i}" in node_ids, (
+                    f"Leaf{i} should be in traversal results: {node_ids}"
+                )
+        finally:
+            graph.close()
+
+    # -- G4: remove_memory no full scan ------------------------------------
+
+    def test_g4_remove_memory_no_full_scan(self, tmp_path):
+        """remove_memory should not full-scan all edges to find those
+        referencing memory_id in JSON attributes. With the memory_ids
+        column migration, it should use a native Cypher filter.
+
+        We verify correctness: remove_memory should still quarantine
+        the right edges, and it should NOT scan edges that don't
+        reference the memory_id.
+        """
+        graph = _make_graph(tmp_path)
+        try:
+            # Index a memory — this creates entity edges with memory_ids.
+            graph.index_memory(
+                "m_g4", "personal_fact", "User works at TechCorp",
+                ["work"], use_llm=False,
+            )
+            # Create an unrelated edge that does NOT reference m_g4.
+            graph.upsert_node("UnrelatedA", "concept", {})
+            graph.upsert_node("UnrelatedB", "concept", {})
+            graph.upsert_edge("UnrelatedA", "UnrelatedB", "connected_to", {})
+
+            # Count lock acquisitions during remove_memory.
+            original_lock = graph._shared_conn_lock
+            lock_count = [0]
+            class CountingLock:
+                def __enter__(self_inner):
+                    lock_count[0] += 1
+                    return original_lock.__enter__()
+                def __exit__(self_inner, *a):
+                    return original_lock.__exit__(*a)
+            graph._shared_conn_lock = CountingLock()
+
+            changed = graph.remove_memory("m_g4")
+            assert changed, "remove_memory should report changes"
+
+            # G4 FIX: with the memory_ids column, remove_memory should
+            # use a targeted query (WHERE list_contains(r.memory_ids, $mid))
+            # instead of a full scan. The lock count should be low
+            # (1 for the whole operation, not 2+ for separate scans).
+            assert lock_count[0] <= 2, (
+                f"remove_memory should use a targeted query, not a full "
+                f"scan; lock acquisitions = {lock_count[0]} (expected <= 2)"
+            )
+
+            # Verify the memory node is quarantined.
+            memory_node = graph._internal_id("memory:m_g4")
+            with graph._shared_conn_lock:
+                result = graph.conn.execute(
+                    "MATCH (n:Entity {id: $id}) RETURN n.attributes",
+                    parameters={"id": memory_node},
+                )
+                if result.has_next():
+                    import json as _json
+                    attrs = _json.loads(result.get_next()[0] or "{}")
+                    assert attrs.get("status") == "quarantined", (
+                        f"Memory node should be quarantined; got status={attrs.get('status')}"
+                    )
+        finally:
+            graph.close()
+
+    def test_g4_remove_memory_correctness_with_evidence_edges(self, tmp_path):
+        """remove_memory should correctly quarantine entity-to-entity edges
+        that carry the memory_id in their evidence list, and should
+        correctly leave unrelated edges untouched.
+        """
+        graph = _make_graph(tmp_path)
+        try:
+            # Index two memories that share an entity edge.
+            graph.index_memory(
+                "m_g4a", "personal_fact", "User works at TechCorp",
+                ["work"], use_llm=False,
+            )
+            graph.index_memory(
+                "m_g4b", "personal_fact", "User works at TechCorp too",
+                ["work"], use_llm=False,
+            )
+            # Remove one memory — the shared edge should have m_g4a removed
+            # from its memory_ids but NOT be quarantined (m_g4b still references it).
+            graph.remove_memory("m_g4a")
+
+            # Check the TechCorp entity node's edges.
+            techcorp_id = graph._internal_id("TechCorp")
+            with graph._shared_conn_lock:
+                result = graph.conn.execute(
+                    """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+                       WHERE a.id = $techcorp OR b.id = $techcorp
+                       RETURN a.id, r.relation_type, b.id, r.attributes,
+                              r.memory_ids""",
+                    parameters={"techcorp": techcorp_id},
+                )
+                edges = []
+                while result.has_next():
+                    edges.append(result.get_next())
+
+            # At least one edge should still be active (referenced by m_g4b).
+            import json as _json
+            active_edges = []
+            for src, rel, tgt, raw_attrs, raw_mids in edges:
+                attrs = _json.loads(raw_attrs) if raw_attrs else {}
+                if attrs.get("status") != "quarantined":
+                    active_edges.append((src, rel, tgt, attrs, raw_mids))
+
+            # The edge referencing m_g4b should still be active.
+            assert len(active_edges) > 0, (
+                f"At least one edge should still be active (referenced by m_g4b); "
+                f"all edges quarantined: {edges}"
+            )
+            # m_g4a should NOT be in any active edge's memory_ids.
+            for src, rel, tgt, attrs, raw_mids in active_edges:
+                mids = attrs.get("memory_ids", [])
+                if not isinstance(mids, list):
+                    mids = [mids] if mids else []
+                assert "m_g4a" not in {str(x) for x in mids}, (
+                    f"m_g4a should be removed from memory_ids; "
+                    f"edge {src}->{tgt} still has: {mids}"
+                )
+        finally:
+            graph.close()

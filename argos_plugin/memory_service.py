@@ -7,6 +7,7 @@ client opens the database files directly.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
@@ -229,7 +230,7 @@ class _Tenant:
 
 def _parse_tenants(
     config: dict, home: Path, embedder, reranker,
-) -> tuple[dict, dict, bool]:
+) -> tuple[dict, dict, bool, dict, bool]:
     """Build the tenant registry from ``hybrid_memory.json`` (#49).
 
     With a ``tenants`` map, each entry is a cell: its own database + graph
@@ -238,7 +239,7 @@ def _parse_tenants(
     shape), the global config IS the ``default`` tenant — fully backward
     compatible.
 
-    Returns ``(tenants, user_tenant_map, strict_routing)``:
+    Returns ``(tenants, user_tenant_map, strict_routing, credential_map, credential_mode)``:
 
     - ``tenants``: name -> _Tenant
     - ``user_tenant_map``: user_id -> tenant name, built from optional
@@ -250,6 +251,13 @@ def _parse_tenants(
       against tenant spoofing by any local process that holds the endpoint
       token). When False, the legacy fallback-to-default behavior is
       preserved (backward compat) with a startup warning.
+    - ``credential_map``: token_hash -> (tenant_name, user_id), built from
+      optional per-tenant ``credentials`` lists (#129). The server derives
+      identity from the credential, not from a client-supplied user_id.
+    - ``credential_mode``: True if any tenant declared credentials. When
+      True, the service is in multi-user/hosted mode — credentials are
+      required and client-supplied user_id is ignored/validated. When
+      False, trusted-local mode (legacy single endpoint token).
     """
     tenants_map = config.get("tenants")
     if not isinstance(tenants_map, dict) or not tenants_map:
@@ -257,6 +265,8 @@ def _parse_tenants(
     tenants: dict = {}
     user_tenant_map: dict = {}
     strict_routing = False
+    credential_map: dict = {}  # token_hash -> (tenant_name, user_id)
+    credential_mode = False
     for name, entry in tenants_map.items():
         entry = entry if isinstance(entry, dict) else {}
         overlay = entry.get("config") if isinstance(entry.get("config"), dict) else {}
@@ -288,7 +298,34 @@ def _parse_tenants(
                     )
                 user_tenant_map[uid_s] = name
             strict_routing = True
-    return tenants, user_tenant_map, strict_routing
+        # Optional per-tenant credentials (#129): each credential binds a
+        # token to a user_id within this tenant. The server derives
+        # identity from the credential — a client-supplied user_id is
+        # validated against the credential's user_id, not trusted.
+        creds = entry.get("credentials")
+        if isinstance(creds, list):
+            for cred in creds:
+                if not isinstance(cred, dict):
+                    continue
+                token = str(cred.get("token", ""))
+                cred_user = str(cred.get("user_id", ""))
+                if not token or not cred_user:
+                    continue
+                # Hash the token so we never store raw tokens in memory
+                # longer than needed. The lookup uses hmac.compare_digest
+                # against the hash.
+                token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                if token_hash in credential_map:
+                    existing_tenant, existing_user = credential_map[token_hash]
+                    if existing_tenant != name or existing_user != cred_user:
+                        raise ValueError(
+                            f"credential conflict: token appears in both "
+                            f"tenant {existing_tenant!r} (user {existing_user!r}) "
+                            f"and tenant {name!r} (user {cred_user!r})"
+                        )
+                credential_map[token_hash] = (name, cred_user)
+                credential_mode = True
+    return tenants, user_tenant_map, strict_routing, credential_map, credential_mode
 
 
 class MemoryService:
@@ -320,17 +357,28 @@ class MemoryService:
             except Exception as exc:
                 logger.warning("Reranker unavailable in shared service: %s", exc)
         # Tenant registry (#49): per-tenant stores/graphs behind one service.
-        # _parse_tenants also returns the user_id→tenant allowlist and
-        # strict-routing flag (#87).
+        # _parse_tenants also returns the user_id→tenant allowlist,
+        # strict-routing flag (#87), credential map, and credential mode
+        # (#129).
         (
             self._tenants,
             self._user_tenant_map,
             self._strict_routing,
+            self._credential_map,
+            self._credential_mode,
         ) = _parse_tenants(config, home, self.embedder, reranker)
-        if self._strict_routing:
+        if self._credential_mode:
+            logger.info(
+                "Credential mode enabled (#129): %d credential(s) across "
+                "%d tenant(s). Server derives identity from credentials; "
+                "client-supplied user_id is validated, not trusted.",
+                len(self._credential_map), len(self._tenants),
+            )
+        elif self._strict_routing:
             logger.info(
                 "Strict tenant routing enabled (#87): %d user_id(s) allowlisted "
-                "across %d tenant(s)",
+                "across %d tenant(s). Trusted-local mode — any local process "
+                "with the endpoint token can spoof any allowlisted user_id.",
                 len(self._user_tenant_map), len(self._tenants),
             )
         elif len(self._tenants) > 1:
@@ -338,7 +386,7 @@ class MemoryService:
                 "Multi-tenant config without allowed_user_ids (#87): any local "
                 "process with the endpoint token can spoof any user_id and access "
                 "any tenant. Add 'allowed_user_ids' to each tenant entry to "
-                "enable strict routing."
+                "enable strict routing, or add 'credentials' for multi-user mode."
             )
         # Backward-compat aliases: the DEFAULT tenant's handles. Anything
         # that referenced self.store/self.graph before still works.
@@ -671,7 +719,6 @@ class MemoryService:
             # #147: return a config fingerprint + runtime info so clients
             # can detect staleness (service running old config/code vs disk).
             # #127: include per-tenant policy summaries.
-            import hashlib
             config = _load_config(self.home)
             config_str = json.dumps(config, sort_keys=True)
             config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()[:16]
@@ -697,6 +744,8 @@ class MemoryService:
                 ),
                 "tenant_count": len(self._tenants),
                 "strict_routing": self._strict_routing,
+                "auth_mode": "multi-user" if self._credential_mode else "trusted-local",
+                "credential_count": len(self._credential_map),
                 "tenant_policies": tenant_policies,
                 "tenant_acl_status": tenant_acl_status,
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
@@ -715,19 +764,96 @@ class MemoryService:
             # Service-coordinated backup: the service is the sole DB writer,
             # so CHECKPOINT + EXPORT is safe and cross-platform.  No
             # component/method split — this is a top-level service command.
-            return self._backup(request.get("args") or {})
+            # #129: In credential mode, the backup is scoped to the
+            # credential's tenant — a credential for tenant A cannot
+            # back up tenant B.
+            backup_args = dict(request.get("args") or {})
+            if self._credential_mode:
+                credential = str(request.get("credential") or "")
+                if not credential:
+                    raise PermissionError(
+                        "Credential required for backup in multi-user mode"
+                    )
+                cred_hash = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+                matched = None
+                for stored_hash, (cred_tenant, cred_user) in self._credential_map.items():
+                    if hmac.compare_digest(cred_hash, stored_hash):
+                        matched = (cred_tenant, cred_user)
+                        break
+                if matched is None:
+                    raise PermissionError(
+                        "Authentication failed: invalid or revoked credential"
+                    )
+                cred_tenant, _cred_user = matched
+                # Force the backup to the credential's tenant.
+                backup_args["tenant"] = cred_tenant
+            return self._backup(backup_args)
 
         component = request.get("component")
         method = request.get("method")
         args = request.get("args") or {}
-        user_id = str(request.get("user_id") or "default_user")
+        # #129: Identity resolution. In credential mode (multi-user/hosted),
+        # the server derives identity from the credential token — a client-
+        # supplied user_id is validated against the credential's bound
+        # user_id, not trusted. In trusted-local mode (legacy), the client
+        # supplies user_id as before.
+        credential = str(request.get("credential") or "")
+        if self._credential_mode:
+            if not credential:
+                raise PermissionError(
+                    "Credential required: service is in multi-user mode. "
+                    "Provide a 'credential' field with a valid tenant credential token."
+                )
+            cred_hash = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+            # Constant-time lookup: compare against all stored hashes.
+            matched = None
+            for stored_hash, (cred_tenant, cred_user) in self._credential_map.items():
+                if hmac.compare_digest(cred_hash, stored_hash):
+                    matched = (cred_tenant, cred_user)
+                    break
+            if matched is None:
+                # Stale or revoked credential — reject without revealing
+                # whether the token existed.
+                logger.warning(
+                    "Authentication failed: invalid or revoked credential "
+                    "(no secrets logged)"
+                )
+                raise PermissionError(
+                    "Authentication failed: invalid or revoked credential"
+                )
+            cred_tenant, cred_user = matched
+            # The server-derived user_id is authoritative. If the client
+            # also supplied a user_id, it must match — otherwise it's a
+            # spoofing attempt.
+            client_user_id = str(request.get("user_id") or "")
+            if client_user_id and client_user_id != cred_user:
+                logger.warning(
+                    "Identity mismatch: credential bound to user %r but "
+                    "request claims user %r (tenant %r, no secrets logged)",
+                    cred_user, client_user_id, cred_tenant,
+                )
+                raise PermissionError(
+                    "Identity mismatch: credential does not match request user_id"
+                )
+            user_id = cred_user
+            # In credential mode, the tenant is derived from the credential,
+            # not from the user_tenant_map. This prevents a credential for
+            # tenant A from accessing tenant B.
+            tenant = self._tenants.get(cred_tenant)
+            if tenant is None:
+                raise PermissionError(
+                    f"Credential references unknown tenant {cred_tenant!r}"
+                )
+        else:
+            # Trusted-local mode (legacy): client supplies user_id.
+            user_id = str(request.get("user_id") or "default_user")
+            # Tenant routing (#49): user_id -> tenant cell. In strict mode
+            # (#87), unknown user_ids are rejected instead of falling back
+            # to default — prevents tenant spoofing by any local process
+            # that holds the endpoint token.
+            tenant = self._resolve_tenant(user_id)
         if component not in {"store", "graph"} or not isinstance(method, str):
             raise ValueError("Invalid service request")
-        # Tenant routing (#49): user_id -> tenant cell. In strict mode
-        # (#87), unknown user_ids are rejected instead of falling back to
-        # default — prevents tenant spoofing by any local process that
-        # holds the endpoint token.
-        tenant = self._resolve_tenant(user_id)
         t0 = time.monotonic()
         # Per-tenant locks (#20 + #49): store and graph calls run
         # concurrently, and one tenant's long operation never blocks

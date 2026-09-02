@@ -196,28 +196,28 @@ class TestTenantPolicyIsolation:
     def test_two_tenants_have_opposing_review_modes(self, tmp_path):
         """The two tenants have different review_mode values."""
         config = self._make_config()
-        tenants, user_map, strict = _parse_tenants(config, tmp_path, None, None)
+        tenants, user_map, strict, _cred_map, _cred_mode = _parse_tenants(config, tmp_path, None, None)
         assert tenants["restrictive"].policy.review_mode == "confirm"
         assert tenants["permissive"].policy.review_mode == "auto"
 
     def test_two_tenants_have_different_injection_caps(self, tmp_path):
         """The two tenants have different max_injected_items."""
         config = self._make_config()
-        tenants, _, _ = _parse_tenants(config, tmp_path, None, None)
+        tenants, _, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert tenants["restrictive"].policy.max_injected_items == 3
         assert tenants["permissive"].policy.max_injected_items == 15
 
     def test_two_tenants_have_different_local_only(self, tmp_path):
         """The restrictive tenant has local_only=True, permissive has False."""
         config = self._make_config()
-        tenants, _, _ = _parse_tenants(config, tmp_path, None, None)
+        tenants, _, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert tenants["restrictive"].policy.local_only is True
         assert tenants["permissive"].policy.local_only is False
 
     def test_two_tenants_have_different_external_source_policy(self, tmp_path):
         """The restrictive tenant requires confirmation, permissive doesn't."""
         config = self._make_config()
-        tenants, _, _ = _parse_tenants(config, tmp_path, None, None)
+        tenants, _, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert tenants["restrictive"].policy.external_sources_require_confirmation is True
         assert tenants["permissive"].policy.external_sources_require_confirmation is False
 
@@ -225,20 +225,20 @@ class TestTenantPolicyIsolation:
         """The store's external_sources_require_confirmation matches the
         tenant policy."""
         config = self._make_config()
-        tenants, _, _ = _parse_tenants(config, tmp_path, None, None)
+        tenants, _, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert tenants["restrictive"].store.external_sources_require_confirmation is True
         assert tenants["permissive"].store.external_sources_require_confirmation is False
 
     def test_strict_routing_enabled_with_allowed_user_ids(self, tmp_path):
         """With allowed_user_ids on both tenants, strict routing is enabled."""
         config = self._make_config()
-        _, _, strict = _parse_tenants(config, tmp_path, None, None)
+        _, _, strict, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert strict is True
 
     def test_user_tenant_map_correct(self, tmp_path):
         """The user_tenant_map maps each user to their tenant."""
         config = self._make_config()
-        _, user_map, _ = _parse_tenants(config, tmp_path, None, None)
+        _, user_map, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert user_map["user-restrictive"] == "restrictive"
         assert user_map["user-permissive"] == "permissive"
 
@@ -442,7 +442,7 @@ class TestBackwardCompat:
         """A config without 'tenants' gets a single 'default' tenant with
         default policy."""
         config = {"max_injected_items": "7"}
-        tenants, _, strict = _parse_tenants(config, tmp_path, None, None)
+        tenants, _, strict, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert "default" in tenants
         assert tenants["default"].policy.review_mode == "confirm"
         assert tenants["default"].policy.max_injected_items == 7
@@ -451,5 +451,5 @@ class TestBackwardCompat:
     def test_single_tenant_local_only(self, tmp_path):
         """A single-tenant config with local_only works."""
         config = {"local_only": "true"}
-        tenants, _, _ = _parse_tenants(config, tmp_path, None, None)
+        tenants, _, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert tenants["default"].policy.local_only is True

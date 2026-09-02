@@ -655,3 +655,331 @@ class TestWritePathAuditB7B9D8:
         finally:
             store.close()
 
+
+# ---------------------------------------------------------------------------
+# Write-path audit: D5, D6, D7
+# ---------------------------------------------------------------------------
+
+class TestWritePathAuditD5D6D7:
+    """Tests for write-path audit findings D5, D6, D7.
+
+    D5: update_memory supersede UPDATE missing valid_to IS NULL guard
+    B6: update_memory TOCTOU — head resolved outside lock
+    D6: _find_conflicting_active_value full-scans all active records, no LIMIT
+    D7: save_candidate dedup is exact-match only (weaker than remember())
+    """
+
+    def _make_store(self, tmp_path, db_name="test_audit.duckdb"):
+        from store import DuckDBMemoryStore
+        store = DuckDBMemoryStore(tmp_path / db_name, user_id="test_user")
+        return store
+
+    # -- D5: supersede UPDATE valid_to IS NULL guard ----------------------
+
+    def test_d5_supersede_update_does_not_touch_already_superseded(self, tmp_path):
+        """The supersede UPDATE in update_memory must guard with
+        AND valid_to IS NULL so it doesn't overwrite an already-superseded
+        record's superseded_by.
+
+        Simulates the race: m1 is superseded by m2 (another thread), then
+        update_memory(m1) tries to supersede m1 again. Without the guard,
+        m1.superseded_by would be overwritten, orphaning m2.
+        """
+        store = self._make_store(tmp_path, "test_d5.duckdb")
+        try:
+            m1 = store.remember(
+                category="personal_fact", content="I live in Paris",
+            )
+            # Simulate another thread superseding m1 with m2.
+            m2_id = "mem-race-winner"
+            now = store._now()
+            with store._lock:
+                store.connection.execute(
+                    """UPDATE memory_records
+                       SET valid_to = ?, superseded_by = ?, updated_at = ?
+                       WHERE memory_id = ? AND valid_to IS NULL""",
+                    [now, m2_id, now, m1.memory_id],
+                )
+                store.connection.execute(
+                    """INSERT INTO memory_records
+                       (memory_id, category, content, tags, payload, created_at,
+                        updated_at, expires_at, embedding, status, source,
+                        confidence, durability, scope, project_id, user_scope,
+                        namespace, client_scope, doc_class, source_doc_id,
+                        source_loc, extraction_method, extracted_at,
+                        verified_state, verified_at, retrieval_count,
+                        helpful_count, dismissed_count, valid_from, valid_to,
+                        superseded_by)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'active',
+                               'manual', 0.5, 'durable', 'profile', NULL,
+                               'test_user', 'conversation', NULL, NULL, NULL,
+                               NULL, NULL, NULL, 'current', NULL, 0, 0, 0,
+                               ?, NULL, NULL)""",
+                    [m2_id, "personal_fact", "I live in London", "[]",
+                     "{}", now, now, now],
+                )
+            # Now call update_memory on m1. The chain-fork guard walks
+            # m1 → m2 (current head) and resolves head = m2.
+            # The supersede UPDATE should target m2, NOT m1.
+            # D5 FIX: even if the UPDATE somehow targets m1, the
+            # valid_to IS NULL guard prevents overwriting m1's superseded_by.
+            result = store.update_memory(m1.memory_id, content="I live in Berlin")
+            # m1's superseded_by should still be m2_id (not overwritten).
+            with store._lock:
+                m1_row = store.connection.execute(
+                    "SELECT superseded_by FROM memory_records WHERE memory_id = ?",
+                    [m1.memory_id],
+                ).fetchone()
+            assert m1_row[0] == m2_id, (
+                f"m1.superseded_by should still be {m2_id} (not overwritten "
+                f"by the race); got {m1_row[0]}"
+            )
+        finally:
+            store.close()
+
+    # -- B6: TOCTOU — no double current head after race -------------------
+
+    def test_b6_toctou_no_double_current_head(self, tmp_path):
+        """If the head is superseded between resolution and the transaction,
+        update_memory must not leave a dangling second current head.
+
+        Simulates the race by monkey-patching the embedder to supersede m1
+        during the embed call (which runs between head resolution and the
+        transaction, outside the lock).
+        """
+        store = self._make_store(tmp_path, "test_b6.duckdb")
+        try:
+            m1 = store.remember(
+                category="personal_fact", content="I live in Paris",
+            )
+            original_embed = None
+            if store.embedder and hasattr(store.embedder, "embed"):
+                original_embed = store.embedder.embed
+
+            def racing_embed(text):
+                # Simulate another thread superseding m1 during the embed
+                # call — this runs outside the lock, in the race window
+                # between head resolution and the transaction.
+                m2_id = "mem-race-winner"
+                now = store._now()
+                with store._lock:
+                    store.connection.execute(
+                        """UPDATE memory_records
+                           SET valid_to = ?, superseded_by = ?, updated_at = ?
+                           WHERE memory_id = ? AND valid_to IS NULL""",
+                        [now, m2_id, now, m1.memory_id],
+                    )
+                    store.connection.execute(
+                        """INSERT INTO memory_records
+                           (memory_id, category, content, tags, payload,
+                            created_at, updated_at, expires_at, embedding,
+                            status, source, confidence, durability, scope,
+                            project_id, user_scope, namespace, client_scope,
+                            doc_class, source_doc_id, source_loc,
+                            extraction_method, extracted_at, verified_state,
+                            verified_at, retrieval_count, helpful_count,
+                            dismissed_count, valid_from, valid_to,
+                            superseded_by)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'active',
+                                   'manual', 0.5, 'durable', 'profile', NULL,
+                                   'test_user', 'conversation', NULL, NULL,
+                                   NULL, NULL, NULL, NULL, 'current', NULL, 0,
+                                   0, 0, ?, NULL, NULL)""",
+                        [m2_id, "personal_fact", "I live in London", "[]",
+                         "{}", now, now, now],
+                    )
+                if original_embed:
+                    return original_embed(text)
+                return []
+
+            _real_conn = None
+            if store.embedder:
+                store.embedder.embed = racing_embed
+            else:
+                # No embedder — inject the race after head resolution by
+                # wrapping the connection in a proxy whose execute()
+                # intercepts the first INSERT (the new version). DuckDB
+                # >=1.5 makes DuckDBPyConnection.execute a read-only
+                # attribute, so we swap the whole connection object on
+                # the store (a plain reassignable Python attribute) and
+                # restore it after the race window closes.
+                _real_conn = store.connection
+                _race_done = [False]
+
+                class _RacingConnectionProxy:
+                    __slots__ = ("_real",)
+
+                    def __init__(self, real):
+                        self._real = real
+
+                    def execute(self, sql, parameters=None, *a, **kw):
+                        if not _race_done[0] and sql.strip().upper().startswith("INSERT INTO MEMORY_RECORDS"):
+                            _race_done[0] = True
+                            m2_id = "mem-race-winner"
+                            now = store._now()
+                            _real_conn.execute(
+                                """UPDATE memory_records
+                                   SET valid_to = ?, superseded_by = ?, updated_at = ?
+                                   WHERE memory_id = ? AND valid_to IS NULL""",
+                                [now, m2_id, now, m1.memory_id],
+                            )
+                            _real_conn.execute(
+                                """INSERT INTO memory_records
+                                   (memory_id, category, content, tags, payload,
+                                    created_at, updated_at, expires_at, embedding,
+                                    status, source, confidence, durability, scope,
+                                    project_id, user_scope, namespace,
+                                    client_scope, doc_class, source_doc_id,
+                                    source_loc, extraction_method, extracted_at,
+                                    verified_state, verified_at, retrieval_count,
+                                    helpful_count, dismissed_count, valid_from,
+                                    valid_to, superseded_by)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL,
+                                           'active', 'manual', 0.5, 'durable',
+                                           'profile', NULL, 'test_user',
+                                           'conversation', NULL, NULL, NULL, NULL,
+                                           NULL, NULL, 'current', NULL, 0, 0, 0,
+                                           ?, NULL, NULL)""",
+                                [m2_id, "personal_fact", "I live in London", "[]",
+                                 "{}", now, now, now],
+                            )
+                        return _real_conn.execute(sql, parameters, *a, **kw)
+
+                    def __getattr__(self, name):
+                        return getattr(self._real, name)
+
+                store.connection = _RacingConnectionProxy(_real_conn)
+
+            result = store.update_memory(m1.memory_id, content="I live in Berlin")
+            # Restore the real connection so the post-race assertions
+            # (and store.close()) hit DuckDB directly, not the proxy.
+            if _real_conn is not None:
+                store.connection = _real_conn
+            # B6 FIX: there should be only ONE current head.
+            with store._lock:
+                current = store.connection.execute(
+                    """SELECT memory_id FROM memory_records
+                       WHERE valid_to IS NULL
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [store.user_id],
+                ).fetchall()
+            assert len(current) == 1, (
+                f"Expected exactly 1 current head after TOCTOU race, "
+                f"got {len(current)}: {[r[0] for r in current]}"
+            )
+        finally:
+            store.close()
+
+    # -- D6: _find_conflicting_active_value pre-filter + LIMIT ------------
+
+    def test_d6_pre_filter_does_not_miss_conflicts(self, tmp_path):
+        """The SQL pre-filter on subject token must not cause false negatives
+        — a real conflict must still be found even when many unrelated
+        records exist.
+        """
+        store = self._make_store(tmp_path, "test_d6_correctness.duckdb")
+        try:
+            # Old fact: salary $449
+            store.remember(
+                category="personal_fact",
+                content="My salary is $449 per day",
+            )
+            # Unrelated records that should be filtered out by the pre-filter
+            for i in range(20):
+                store.remember(
+                    category="context_note",
+                    content=f"The weather in city {i} is sunny with 1{i} degrees",
+                )
+            # Transition statement that conflicts with the salary record
+            conflict = store._find_conflicting_active_value(
+                "I switched to a salary of $500 per day",
+                "personal_fact",
+            )
+            assert conflict is not None, (
+                "Pre-filter should not prevent finding the real conflict "
+                "with the salary record"
+            )
+            assert conflict[2] == "500", f"Expected new value 500, got {conflict[2]}"
+            assert conflict[3] == "449", f"Expected old value 449, got {conflict[3]}"
+        finally:
+            store.close()
+
+    def test_d6_limit_does_not_break_conflict_detection(self, tmp_path):
+        """The LIMIT on the SQL query must not prevent finding conflicts
+        when many matching records exist.
+        """
+        store = self._make_store(tmp_path, "test_d6_limit.duckdb")
+        try:
+            # Create many records with the same subject token but different values
+            for i in range(60):
+                store.remember(
+                    category="personal_fact",
+                    content=f"My salary is ${100 + i} per day",
+                )
+            # The conflict should be found even with LIMIT 50
+            conflict = store._find_conflicting_active_value(
+                "I switched to a salary of $500 per day",
+                "personal_fact",
+            )
+            assert conflict is not None, (
+                "LIMIT should not prevent finding a conflict when many "
+                "matching records exist"
+            )
+        finally:
+            store.close()
+
+    # -- D7: save_candidate substring-overlap dedup -----------------------
+
+    def test_d7_paraphrased_candidate_is_deduped(self, tmp_path):
+        """A candidate that is a substring-near-duplicate of an existing
+        pending candidate (same category, >20 chars, ≥0.8 overlap ratio)
+        should be deduped, not just exact matches.
+        """
+        store = self._make_store(tmp_path, "test_d7_dedup.duckdb")
+        try:
+            # First candidate
+            cand1 = store.save_candidate(
+                category="personal_fact",
+                content="I use 500 rows in my database for the production system",
+            )
+            assert cand1 is not None, "First candidate should be saved"
+            # Paraphrased candidate — same meaning, different text but
+            # substring containment with high overlap ratio.
+            # "I use 500 rows in my database for the production system"
+            # vs "I use 500 rows in my database for the production system today"
+            # — the latter contains the former, overlap ratio is very high.
+            cand2 = store.save_candidate(
+                category="personal_fact",
+                content="I use 500 rows in my database for the production system today",
+            )
+            # D7 FIX: cand2 should be deduped (None) because it's a
+            # substring-near-duplicate of cand1.
+            assert cand2 is None, (
+                "Paraphrased candidate with high substring overlap should "
+                "be deduped, not saved as a new pending candidate"
+            )
+        finally:
+            store.close()
+
+    def test_d7_genuinely_different_candidate_not_deduped(self, tmp_path):
+        """A genuinely different candidate in the same category should NOT
+        be deduped by the substring-overlap check.
+        """
+        store = self._make_store(tmp_path, "test_d7_different.duckdb")
+        try:
+            cand1 = store.save_candidate(
+                category="personal_fact",
+                content="I use 500 rows in my database for the production system",
+            )
+            assert cand1 is not None
+            # Genuinely different — different subject, different value
+            cand2 = store.save_candidate(
+                category="personal_fact",
+                content="I switched to using Python 3.12 for all new projects",
+            )
+            assert cand2 is not None, (
+                "Genuinely different candidate should NOT be deduped"
+            )
+        finally:
+            store.close()
+

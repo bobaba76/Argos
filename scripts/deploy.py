@@ -102,10 +102,24 @@ def _is_backup_artifact(name: str) -> bool:
 
 
 def source_files(source: Path) -> List[Path]:
-    """Runtime files in the source dir (top-level *.py + plugin.yaml)."""
+    """Runtime files in the source dir (top-level *.py + plugin.yaml +
+    extractor_patterns/*.json data files).
+
+    Subdirectories are NOT synced recursively — only the explicitly-listed
+    data subdirs (extractor_patterns/) are included. This keeps the sync
+    scoped to runtime files while ensuring pattern packs ship live
+    (Hermes flagged that en.json was never deployed, making the E1
+    fallback path the only live code path).
+    """
     files = []
     for p in sorted(source.iterdir()):
         if not p.is_file():
+            # Sync known data subdirs (not recursive — one level only).
+            if p.is_dir() and p.name == "extractor_patterns":
+                for jp in sorted(p.iterdir()):
+                    if jp.is_file() and jp.name.endswith(".json"):
+                        # Store with relative path for target-side sync.
+                        files.append(jp)
             continue
         if p.name in EXCLUDED_SOURCE_FILES or _is_backfill(p.name):
             continue
@@ -114,18 +128,36 @@ def source_files(source: Path) -> List[Path]:
     return files
 
 
+def _rel_key(path: Path, base: Path) -> str:
+    """Relative path from *base* as a forward-slash string (stable key
+    across platforms). Used as the diff/copy identity so files in
+    subdirectories (extractor_patterns/en.json) don't collide with
+    top-level files."""
+    try:
+        return path.relative_to(base).as_posix()
+    except ValueError:
+        return path.name
+
+
 def target_scope(target: Path) -> List[Path]:
     """Files in the target dir that deploy.py may compare/copy/prune.
 
     Also skips dev-utility names and backfill scripts: per SYNC_HANDOFF.md
     these are legacy leftovers in the live install ("leave them alone,
     they're harmless") and are not part of the deployable runtime set.
+
+    Includes the extractor_patterns/ data subdir if present (mirrors
+    source_files).
     """
     if not target.exists():
         return []
     files = []
     for p in sorted(target.iterdir()):
         if not p.is_file():
+            if p.is_dir() and p.name == "extractor_patterns":
+                for jp in sorted(p.iterdir()):
+                    if jp.is_file() and jp.name.endswith(".json"):
+                        files.append(jp)
             continue
         if p.name in EXCLUDED_TARGET_NAMES or _is_backup_artifact(p.name):
             continue
@@ -184,9 +216,13 @@ def append_state(path: Path, entry: Dict) -> None:
 # --- Diff ------------------------------------------------------------------
 
 def diff_files(source: Path, target: Path) -> Dict[str, List[str]]:
-    """Return {changed, new, removed, unchanged} file name lists."""
-    src_map = {p.name: sha256(p) for p in source_files(source)}
-    tgt_map = {p.name: sha256(p) for p in target_scope(target)}
+    """Return {changed, new, removed, unchanged} file name lists.
+
+    Keys are relative paths (forward-slash) so subdirectory files like
+    ``extractor_patterns/en.json`` are tracked distinctly.
+    """
+    src_map = {_rel_key(p, source): sha256(p) for p in source_files(source)}
+    tgt_map = {_rel_key(p, target): sha256(p) for p in target_scope(target)}
     changed, new, removed, unchanged = [], [], [], []
     for name in sorted(src_map):
         if name in tgt_map:
@@ -264,13 +300,15 @@ def copy_mode(
         return 0
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    src_map = {p.name: p for p in source_files(source)}
+    src_map = {_rel_key(p, source): p for p in source_files(source)}
     copied: List[Dict[str, str]] = []
 
     print(f"=== deploy copy ({ts}) ===")
     for name in to_copy:
         src = src_map[name]
         dst = target / name
+        # Ensure target subdirectory exists (e.g. extractor_patterns/).
+        dst.parent.mkdir(parents=True, exist_ok=True)
         # Backup before overwrite.
         if dst.exists():
             bak = target / f"{name}.bak-{ts}"

@@ -115,13 +115,39 @@ def _load_pattern_pack(locale: str = "en") -> tuple[Dict[str, "re.Pattern"], Dic
         logger.warning("Pattern pack %s not loaded (%s); using inline defaults", path, exc)
         return _inline_pattern_defaults()
 
-    patterns: Dict[str, "re.Pattern"] = {}
-    for name, spec in raw.get("patterns", {}).items():
-        patterns[name] = re.compile(spec["pattern"], _compile_flags(spec.get("flags", [])))
-    lexicons: Dict[str, frozenset] = {}
-    for name, entries in raw.get("lexicons", {}).items():
-        lexicons[name] = frozenset(entries)
-    return patterns, lexicons
+    # E1: wrap pattern compilation + lexicon loading in try/except so a
+    # malformed pack (invalid regex, missing key, bad lexicon type) falls
+    # back to inline defaults instead of crashing the module import.
+    # Blast radius of a crash: provider_session.py imports the extractor
+    # inside try/except ImportError -- but re.error/KeyError/TypeError are
+    # NOT ImportError, so they propagate and kill the provider import ->
+    # the memory provider silently never loads.
+    try:
+        patterns: Dict[str, "re.Pattern"] = {}
+        for name, spec in raw.get("patterns", {}).items():
+            patterns[name] = re.compile(spec["pattern"], _compile_flags(spec.get("flags", [])))
+        lexicons: Dict[str, frozenset] = {}
+        for name, entries in raw.get("lexicons", {}).items():
+            lexicons[name] = frozenset(entries)
+
+        # Validate that all required keys are present. A partial pack
+        # (missing a pattern or lexicon referenced by key at module level)
+        # would crash with KeyError -- fall back instead.
+        inline_p, inline_l = _inline_pattern_defaults()
+        for key in inline_p:
+            if key not in patterns:
+                raise KeyError(f"pattern pack missing required pattern: {key}")
+        for key in inline_l:
+            if key not in lexicons:
+                raise KeyError(f"pattern pack missing required lexicon: {key}")
+
+        return patterns, lexicons
+    except Exception as exc:
+        logger.warning(
+            "Pattern pack %s has malformed patterns/lexicons (%s); "
+            "using inline defaults", path, exc,
+        )
+        return _inline_pattern_defaults()
 
 
 def _inline_pattern_defaults() -> tuple[Dict[str, "re.Pattern"], Dict[str, frozenset]]:
@@ -131,12 +157,16 @@ def _inline_pattern_defaults() -> tuple[Dict[str, "re.Pattern"], Dict[str, froze
         "IDENTITY_RE": re.compile(r'\b(?:i\s+am|i\'m)\s+(?:a\s+|an\s+)?(.+?)(?:\.|$)', re.IGNORECASE),
         "HAVE_USE_RE": re.compile(r'\b(?:i\s+(?:have|own|use|take|\'ve\s+got|\'m\s+using))\s+(.+?)(?:\.|$)', re.IGNORECASE),
         "WORK_RE": re.compile(r'\b(?:i\s+work\s+(?:at|for|with)|i\'m\s+(?:working\s+at|employed\s+at))\s+(.+?)(?:\.|$)', re.IGNORECASE),
-        "PREFERENCE_RE": re.compile(r'\b(?:i\s+(?:prefer|like|love|hate|enjoy|dislike|can\'t\s+stand|don\'t\s+like|don\'t\s+enjoy)|i\'d\s+(?:rather|prefer)|i\'m\s+(?:a\s+fan\s+of|not\s+a\s+fan\s+of|into|keen\s+on))\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        # PREFERENCE_RE and EVENT_RE are NOT here — they are built
+        # dynamically by _build_preference_re() / _build_event_re() to
+        # support runtime verb extension (#136). Do not add them to the
+        # JSON pack or inline defaults — they are dead config that
+        # misleads editors into thinking they're changing behavior.
         "ASSISTANT_DIRECTIVE_RE": re.compile(r'\b(?:(?:always|never)\s+(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}|(?:do\s+not|don\'t)\s+(?:ever\s+|please\s+|just\s+|always\s+)?(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\b[^.!?]{0,200}|call\s+me\s+[^.!?]{1,200}|stop\s+(?:doing|being|using|saying)\b[^.!?]{0,200})', re.IGNORECASE),
         "HABIT_RE": re.compile(r'\b(?:i\s+(?:always|never|usually|typically|generally|rarely|often))\s+(.+?)(?:\.|$)', re.IGNORECASE),
         "GOAL_RE": re.compile(r'\b(?:i\'m\s+working\s+on|i\s+want\s+to|i\'m\s+trying\s+to|i\'m\s+going\s+to|i\s+need\s+to|i\'m\s+planning\s+to|i\'m\s+learning|i\'m\s+studying)\s+(.+?)(?:\.|$)', re.IGNORECASE),
         "SWITCH_RE": re.compile(r'\b(?:i\s+(?:switched|moved|migrated|transitioned)\s+from\s+(.+?)\s+to\s+(.+?))(?:\.|$)', re.IGNORECASE),
-        "EVENT_RE": re.compile(r'\bi\s+(started|began|stopped|quit|resumed|finished|completed|launched)\s+(.+?)(?:\.|$)', re.IGNORECASE),
+        # EVENT_RE: built dynamically by _build_event_re() — see comment above.
         "INSIGHT_RE": re.compile(r'\b(?:i\s+(?:tend\s+to|struggle\s+with|realized|noticed|found\s+that|learned\s+that)|i\'ve\s+been\s+noticing|i\s+think\s+i|i\s+feel\s+like\s+i)\s+(.+?)(?:\.|$)', re.IGNORECASE),
         "RELATIONSHIP_RE": re.compile(r'\b([A-Z][a-z]+)\s+is\s+(?:my|the)\s+(\w+(?:\s+\w+)?)\b'),
         "MY_X_IS_RE": re.compile(r'\bmy\s+(\w+(?:\s+\w+)?)\s+is\s+(.+?)(?:\.|$)', re.IGNORECASE),
@@ -1314,12 +1344,15 @@ def _extract_from_turn_impl(
         llm_facts = _extract_facts_llm(user_content, model=llm_model, provider=llm_provider)
         if llm_facts:
             # Dedup LLM facts against regex facts by content similarity.
+            # E2: update existing_contents inside the loop so LLM facts
+            # are deduped against other LLM facts, not just regex facts.
             existing_contents = [f["content"].lower() for f in facts]
             for lf in llm_facts:
                 lf_lower = lf["content"].lower()
-                # Skip if an existing regex fact is a near-duplicate.
+                # Skip if an existing fact (regex or LLM) is a near-duplicate.
                 if not any(_text_overlap(lf_lower, ec) for ec in existing_contents):
                     facts.append(lf)
+                    existing_contents.append(lf_lower)  # E2: update dedup set
 
     # Filter only irrecoverably malformed candidates here. Other quality flags
     # travel with the proposal so a reviewer can make an informed decision.

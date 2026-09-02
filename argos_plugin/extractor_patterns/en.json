@@ -18,12 +18,6 @@
         "IGNORECASE"
       ]
     },
-    "PREFERENCE_RE": {
-      "pattern": "\\b(?:i\\s+(?:prefer|like|love|hate|enjoy|dislike|can\\'t\\s+stand|don\\'t\\s+like|don\\'t\\s+enjoy)|i\\'d\\s+(?:rather|prefer)|i\\'m\\s+(?:a\\s+fan\\s+of|not\\s+a\\s+fan\\s+of|into|keen\\s+on))\\s+(.+?)(?:\\.|$)",
-      "flags": [
-        "IGNORECASE"
-      ]
-    },
     "ASSISTANT_DIRECTIVE_RE": {
       "pattern": "\\b(?:(?:always|never)\\s+(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|(?:do\\s+not|don\\'t)\\s+(?:ever\\s+|please\\s+|just\\s+|always\\s+)?(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|call\\s+me\\s+[^.!?]{1,200}|stop\\s+(?:doing|being|using|saying)\\b[^.!?]{0,200})",
       "flags": [
@@ -44,12 +38,6 @@
     },
     "SWITCH_RE": {
       "pattern": "\\b(?:i\\s+(?:switched|moved|migrated|transitioned)\\s+from\\s+(.+?)\\s+to\\s+(.+?))(?:\\.|$)",
-      "flags": [
-        "IGNORECASE"
-      ]
-    },
-    "EVENT_RE": {
-      "pattern": "\\bi\\s+(started|began|stopped|quit|resumed|finished|completed|launched)\\s+(.+?)(?:\\.|$)",
       "flags": [
         "IGNORECASE"
       ]

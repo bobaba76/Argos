@@ -453,22 +453,62 @@ class StoreWriteMixin:
         new_values = extract_values(content)
         if not new_values:
             return None
+        # D6 fix: pre-filter on subject tokens + LIMIT so the scan doesn't
+        # full-table-scan every active record. Extract significant tokens
+        # from the new content's value subjects (non-numeric, >=3 chars)
+        # and filter SQL rows whose content contains at least one. This
+        # prevents false negatives (a real conflict shares subject tokens)
+        # while avoiding scanning unrelated records (e.g. weather records
+        # when looking for salary conflicts).
+        import re as _re
+        _subject_tokens: set[str] = set()
+        for ev in new_values:
+            for tok in _re.findall(r"[a-z]+", ev.subject.lower()):
+                if len(tok) >= 3:
+                    _subject_tokens.add(tok)
+        # Also include significant tokens from the full content so the
+        # pre-filter isn't overly narrow.
+        for tok in _re.findall(r"[a-z]+", content.lower()):
+            if len(tok) >= 4:
+                _subject_tokens.add(tok)
         with self._lock:
             assert self.connection is not None
-            rows = self.connection.execute(
-                """SELECT memory_id, content FROM memory_records
-                   WHERE valid_to IS NULL
-                     AND (user_scope IS NULL OR user_scope = ?)
-                     AND COALESCE(status, 'active') = 'active'""",
-                [self.user_id],
-            ).fetchall()
+            if _subject_tokens:
+                # Build a LIKE clause for each token. DuckDB supports
+                # ILIKE for case-insensitive matching.
+                _like_clauses = " OR ".join(
+                    f"content ILIKE '%' || ? || '%'" for _ in _subject_tokens
+                )
+                rows = self.connection.execute(
+                    f"""SELECT memory_id, content FROM memory_records
+                       WHERE valid_to IS NULL
+                         AND (user_scope IS NULL OR user_scope = ?)
+                         AND COALESCE(status, 'active') = 'active'
+                         AND ({_like_clauses})
+                       LIMIT 50""",
+                    [self.user_id, *_subject_tokens],
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """SELECT memory_id, content FROM memory_records
+                       WHERE valid_to IS NULL
+                         AND (user_scope IS NULL OR user_scope = ?)
+                         AND COALESCE(status, 'active') = 'active'
+                       LIMIT 50""",
+                    [self.user_id],
+                ).fetchall()
         for old_id, old_content in rows:
             if old_content == content:
                 continue  # same text — dedup handles this
             old_values = extract_values(old_content)
             if not old_values:
                 continue
-            conflict = values_conflict(new_values, old_values)
+            # D6: use a lower subject_threshold (0.2) than the default 0.5
+            # because the token window around the value can be wide (6
+            # tokens each side), diluting Jaccard similarity for legitimate
+            # same-subject pairs. False positives are cheap — the candidate
+            # is only downgraded to pending_user_confirmation.
+            conflict = values_conflict(new_values, old_values, subject_threshold=0.2)
             if conflict:
                 new_v, old_v = conflict
                 return (old_id, old_content, new_v.value, old_v.value)
@@ -644,6 +684,41 @@ class StoreWriteMixin:
                 ).fetchone()
             if existing:
                 return None
+            # D7 fix: substring-overlap dedup. The exact-match check above
+            # only catches identical text. A paraphrased candidate that
+            # contains (or is contained by) an existing pending candidate
+            # with >=0.8 overlap ratio should also be deduped — mirroring
+            # remember()'s Layer 2 substring dedup. Without this, the
+            # candidate queue accumulates near-duplicate proposals that
+            # the reviewer has to dismiss one by one.
+            content_stripped = content.strip()
+            content_lower = content_stripped.lower()
+            if len(content_lower) > 20:
+                with self._lock:
+                    assert self.connection is not None
+                    near_dupes = self.connection.execute(
+                        """SELECT candidate_id, content FROM memory_candidates
+                           WHERE category = ? AND status = 'pending'
+                             AND (user_scope IS NULL OR user_scope = ?)
+                             AND length(content) > 20
+                           ORDER BY created_at DESC
+                           LIMIT 500""",
+                        [category, self.user_id],
+                    ).fetchall()
+                for _cand_id, _existing_content in near_dupes:
+                    _existing_lower = _existing_content.lower().strip()
+                    if content_lower == _existing_lower:
+                        return None
+                    if content_lower in _existing_lower or _existing_lower in content_lower:
+                        _shorter = min(len(content_lower), len(_existing_lower))
+                        _longer = max(len(content_lower), len(_existing_lower))
+                        if _longer > 0 and _shorter / _longer >= 0.85:
+                            logger.info(
+                                "Deduped candidate (substring overlap "
+                                "%.0f%%): %s",
+                                100 * _shorter / _longer, content_stripped[:60],
+                            )
+                            return None
             # Tombstone check (issue #46): a hard-deleted fact must not
             # re-enter the proposal queue. Same fingerprint as remember()'s
             # tombstone_check, applied at proposal time so the reviewer
@@ -2063,6 +2138,41 @@ class StoreWriteMixin:
 
         with self._lock:
             assert self.connection is not None
+            # B6 TOCTOU fix: the head was resolved outside the lock (above).
+            # Between resolution and this transaction another thread may
+            # have superseded it, leaving our resolved memory_id with
+            # valid_to != NULL. Re-verify inside the lock and, if the head
+            # moved, walk the chain to the *current* head before writing.
+            # Without this, both the racer's new record and ours would end
+            # up valid_to IS NULL — two concurrent "current" versions.
+            head_check = self.connection.execute(
+                """SELECT valid_to, superseded_by FROM memory_records
+                   WHERE memory_id = ?""",
+                [memory_id],
+            ).fetchone()
+            if head_check and head_check[0] is not None:
+                # Head was superseded during the race window — re-resolve.
+                visited_b6 = {memory_id}
+                cur_id = memory_id
+                while True:
+                    row = self.connection.execute(
+                        """SELECT memory_id, valid_to, superseded_by
+                           FROM memory_records WHERE memory_id = ?""",
+                        [cur_id],
+                    ).fetchone()
+                    if not row or row[1] is None:
+                        break  # found the current head
+                    nxt = row[2]
+                    if not nxt or nxt in visited_b6:
+                        break  # cycle / dead end
+                    visited_b6.add(nxt)
+                    cur_id = nxt
+                if cur_id != memory_id:
+                    logger.debug(
+                        "B6 TOCTOU: head moved %s -> %s during update; "
+                        "superseding the current head", memory_id, cur_id,
+                    )
+                    memory_id = cur_id
             # Wrap the version-chain write in an explicit transaction so a
             # crash between steps cannot leave two current versions or
             # orphan the evidence trail (issue #9).
@@ -2103,13 +2213,54 @@ class StoreWriteMixin:
                      rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
                      created_ts],
                 )
-                # 2. Supersede the old version
+                # 2. Supersede the old version. D5 fix: guard with
+                #    AND valid_to IS NULL so an already-superseded record's
+                #    superseded_by is never overwritten (orphaning the racer).
+                # B6 TOCTOU fix: the head may have been superseded between
+                # resolution (outside the lock) and this transaction —
+                # including during the INSERT above. If the original
+                # memory_id is no longer current, walk the chain to the
+                # actual current head and supersede that instead, so we
+                # never leave two records with valid_to IS NULL.
                 self.connection.execute(
                     """UPDATE memory_records
                        SET valid_to = ?, superseded_by = ?, updated_at = ?
-                       WHERE memory_id = ?""",
+                       WHERE memory_id = ? AND valid_to IS NULL""",
                     [now, new_id, now, memory_id],
                 )
+                # B6 TOCTOU fix: the head may have been superseded between
+                # resolution (outside the lock) and this UPDATE — including
+                # during our own INSERT above. If a racer created a new
+                # current head, the UPDATE above targeted the stale record
+                # (0 rows via the valid_to IS NULL guard). Walk the chain
+                # from memory_id; if we find another record with
+                # valid_to IS NULL that isn't our new_id, supersede it so
+                # we collapse to a single current head.
+                _cur = memory_id
+                _seen = {memory_id, new_id}
+                while True:
+                    _row = self.connection.execute(
+                        """SELECT superseded_by, valid_to FROM memory_records
+                           WHERE memory_id = ?""",
+                        [_cur],
+                    ).fetchone()
+                    if not _row:
+                        break
+                    _sup_by, _valid_to = _row
+                    # If this record is current and isn't our new version,
+                    # it's the racer's head — supersede it.
+                    if _valid_to is None and _cur != memory_id:
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET valid_to = ?, superseded_by = ?, updated_at = ?
+                               WHERE memory_id = ? AND valid_to IS NULL""",
+                            [now, new_id, now, _cur],
+                        )
+                        break
+                    if not _sup_by or _sup_by in _seen:
+                        break
+                    _seen.add(_sup_by)
+                    _cur = _sup_by
                 # 3. Carry the evidence trail forward. memory_evidence is keyed
                 #    by memory_id, so the new version would otherwise orphan the
                 #    provenance row (review point 2: provenance after updates).

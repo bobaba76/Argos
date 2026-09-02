@@ -1,7 +1,7 @@
 # Spec 5 — Doc-fact namespace: domain separation for document-sourced facts
 
-Status: **APPROVED 2026-08-30** (design complete; implementation folded into the
-god-file refactor window — see Decisions below).
+Status: **IMPLEMENTED 2026-09-01** (batch-12, #67 — `namespace_partition.py`,
+commit `62d85d6`). The APPROVED/parked text below is historical.
 
 ## Problem
 

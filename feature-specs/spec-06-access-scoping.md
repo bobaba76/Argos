@@ -1,7 +1,8 @@
 # Spec 6 — Access scoping: per-user, per-client access control inside a practice tenant
 
-Status: **APPROVED 2026-08-30** (design + decisions signed off; implementation
-parked behind Cells (#49) and spec-05 (#67) — see Decisions below).
+Status: **IMPLEMENTED 2026-09-01** (batch-12, #69 — `access_scoping.py`
+per-user/per-client ACL + audit, commits `e020a80`/`351b73f`). The
+APPROVED/parked text below is historical.
 
 ## Problem
 

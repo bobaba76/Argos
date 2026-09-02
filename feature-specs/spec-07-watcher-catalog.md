@@ -1,9 +1,8 @@
 # Spec 7 — The watcher: document catalog, extraction & freshness
 
-Status: **APPROVED 2026-08-30** (design + decisions signed off after review
-amendments; implementation parked in the Cells window — see Decisions). On
-implementation this spec **closes #68** (D4 trust/freshness activation) and
-**#70** (audit seed).
+Status: **IMPLEMENTED 2026-09-01** (batch-12, #71 — `watcher.py`, commits
+`93d7fab`/`57c25ba`; closes #68, #70). The APPROVED/parked text below is
+historical.
 
 ## Problem
 

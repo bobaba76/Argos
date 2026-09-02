@@ -495,10 +495,25 @@ class TestSentenceSplitter:
         from extractor import _split_sentences
         assert _split_sentences("   \t\n  ") == []
 
-    def test_newlines_collapsed_to_spaces(self):
+    def test_newlines_preserve_line_boundaries(self):
+        """Newlines are hard sentence boundaries, not collapsed to spaces
+        (#133). Two unpunctuated lines stay as two separate sentences
+        instead of merging into one cross-line run."""
         from extractor import _split_sentences
-        result = _split_sentences("I like tea.\nI hate coffee.")
-        assert result == ["I like tea.", "I hate coffee."]
+        # Punctuated lines: each line splits on its own terminator.
+        assert _split_sentences("I like tea.\nI hate coffee.") == [
+            "I like tea.", "I hate coffee."
+        ]
+        # Unpunctuated lines: previously collapsed to one sentence
+        # ("I use Vim I prefer dark mode"), now kept as two.
+        assert _split_sentences("I use Vim\nI prefer dark mode") == [
+            "I use Vim", "I prefer dark mode",
+        ]
+        # A blank line is a hard boundary too — it never merges the
+        # surrounding lines (#133 open question, resolved yes).
+        assert _split_sentences("I like tea.\n\nI hate coffee.") == [
+            "I like tea.", "I hate coffee.",
+        ]
 
     def test_multiple_spaces_collapsed(self):
         from extractor import _split_sentences
@@ -519,13 +534,17 @@ class TestSentenceSplitter:
         assert result == ["I like tea.", "I hate coffee."]
 
     def test_abbreviation_not_split(self):
-        """The simple splitter does NOT handle abbreviations (Mr., Dr.) —
-        this test documents that behavior so a future improvement is a
-        deliberate change, not a silent regression."""
+        """Abbreviation-aware splitting (#135): fragments split at an
+        abbreviation (Dr., Mr., Inc., Ltd.) are rejoined, so "I met Dr.
+        Smith. He is nice." stays as two sentences, not three."""
         from extractor import _split_sentences
         result = _split_sentences("I met Dr. Smith. He is nice.")
-        # The splitter splits after "Dr." — documented behavior.
-        assert "I met Dr." in result
+        # "Dr." no longer splits the sentence — the title fragment rejoins.
+        assert result == ["I met Dr. Smith.", "He is nice."]
+        # Business suffixes rejoin too, including a double suffix.
+        assert _split_sentences("I work at Pty. Ltd. with my team.") == [
+            "I work at Pty. Ltd. with my team.",
+        ]
 
 
 # ---------------------------------------------------------------------------

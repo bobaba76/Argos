@@ -719,11 +719,17 @@ class StoreRetrievalMixin:
 
     @staticmethod
     def _p2c_overlap(a: str, b: str) -> float:
-        """Token Jaccard similarity between two content strings (casefolded)."""
+        """Token Jaccard similarity between two content strings (tokenized).
+
+        Uses the shared _tokenize() (regex word-boundary, punctuation-
+        aware) so overlap is consistent with the rest of the pipeline —
+        "Cape Town." and "Cape Town" are the same token set here, not
+        different ones (audit B3).
+        """
         if not a or not b:
             return 0.0
-        sa = set(a.casefold().split())
-        sb = set(b.casefold().split())
+        sa = set(_tokenize(a))
+        sb = set(_tokenize(b))
         if not sa or not sb:
             return 0.0
         inter = len(sa & sb)
@@ -1049,6 +1055,13 @@ class StoreRetrievalMixin:
         else:
             return []
 
+        # Preserve raw similarity (PRE-reranker, pre-importance) for gates
+        # that need pure retrieval strength (e.g. the query-expansion
+        # trigger). Saved before the cross-encoder blend so a reranker lift
+        # cannot mask a weak bi-encoder retrieval (audit B1).
+        for r in fused:
+            r.raw_similarity = r.similarity
+
         # Cross-encoder re-ranking: re-score the top N candidates with
         # full bidirectional attention. The cross-encoder score is blended
         # with the existing RRF similarity (not replacing it) so we keep
@@ -1075,8 +1088,9 @@ class StoreRetrievalMixin:
 
         # Preserve raw similarity (pre-importance) for gates that need
         # pure retrieval strength (e.g. query expansion trigger).
-        for r in fused:
-            r.raw_similarity = r.similarity
+        # NOTE: the authoritative raw capture happens BEFORE the reranker
+        # block (see above); this comment block is intentionally empty.
+        # Phrase-lift and importance below mutate similarity only.
 
         # Exact-phrase lift (optional, default off): reward contiguous
         # query bigrams present verbatim in the memory, which the unigram-
@@ -1280,9 +1294,10 @@ class StoreRetrievalMixin:
                                 AND (user_scope IS NULL OR user_scope = ?)
                                 {scope_sql}
                                 AND list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) > ?
+                              ORDER BY list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) DESC
                                LIMIT 1""",
                             [category, self.user_id, *scope_params,
-                             vec_text, self._DEDUP_SIMILARITY_THRESHOLD],
+                             vec_text, self._DEDUP_SIMILARITY_THRESHOLD, vec_text],
                         ).fetchone()
                         if result:
                             return result[0], "semantic"

@@ -53,6 +53,14 @@ ARMS = {
                    "graph_retrieval_boost": "0.0"},
     "llm_graph": {"graph_aware_retrieval": "true",
                   "graph_retrieval_boost": "0.0"},
+    # #139: A/B whether BFS graph traversal earns its keep in retrieval
+    # ranking. Baseline defaults to graph_traversal_enabled=false (provider
+    # default); this arm turns it on with the production-default boost
+    # (0.60) and depth (2). Compares MRR / nDCG@k / Recall@k vs baseline.
+    "traversal_on": {"graph_aware_retrieval": "true",
+                     "graph_traversal_enabled": "true",
+                     "graph_traversal_depth": "2",
+                     "graph_traversal_boost": "0.60"},
 }
 
 

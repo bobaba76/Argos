@@ -30,6 +30,10 @@ except ImportError:  # provider_retrieval.py imported as a top-level module
         _freshness_marker_for,
         _neutralize_markup,
     )
+try:
+    from .store_retrieval import StoreRetrievalMixin as _StoreRetrievalMixin
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from store_retrieval import StoreRetrievalMixin as _StoreRetrievalMixin
 
 logger = logging.getLogger(__name__)
 
@@ -187,8 +191,10 @@ class ProviderRetrievalMixin:
         for r in original_results:
             all_results[r.memory_id] = r
 
-        # RRF: original results get rank-based scores
-        rrf_k = 20  # lowered from 60 to sharpen relevance discrimination
+        # RRF: original results get rank-based scores.
+        # k is linked to the store's _RRF_K so tuning the fusion constant
+        # can never silently desync the expansion merge (audit B5).
+        rrf_k = _StoreRetrievalMixin._RRF_K
         rrf_scores: dict[str, float] = {}
         for rank, r in enumerate(original_results):
             rrf_scores[r.memory_id] = 1.0 / (rrf_k + rank + 1)
@@ -689,11 +695,18 @@ class ProviderRetrievalMixin:
                         if query_emb and getattr(record, "embedding", None):
                             try:
                                 import math
-                                dot = sum(a * b for a, b in zip(query_emb, record.embedding))
-                                norm_q = math.sqrt(sum(a * a for a in query_emb))
-                                norm_r = math.sqrt(sum(b * b for b in record.embedding))
-                                if norm_q > 0 and norm_r > 0:
-                                    sim = dot / (norm_q * norm_r)
+                                if len(query_emb) != len(record.embedding):
+                                    # Dimension mismatch (e.g. leftover rows
+                                    # from a previous embedding model): zip()
+                                    # would silently truncate and produce a
+                                    # wrong-but-plausible cosine (audit B2).
+                                    sim = 0.0
+                                else:
+                                    dot = sum(a * b for a, b in zip(query_emb, record.embedding))
+                                    norm_q = math.sqrt(sum(a * a for a in query_emb))
+                                    norm_r = math.sqrt(sum(b * b for b in record.embedding))
+                                    if norm_q > 0 and norm_r > 0:
+                                        sim = dot / (norm_q * norm_r)
                             except Exception:
                                 sim = 0.0
                         elif hasattr(record, "similarity"):

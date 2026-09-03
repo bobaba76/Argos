@@ -734,7 +734,7 @@ class ProviderCoreMixin:
         # subject (differing values, or one asserting a rule vs a later
         # discontinuation/scoping), inject an explicit conflict note so the
         # answerer surfaces the disagreement instead of smoothing it.
-        self._conflict_surfacing_enabled = _flag(self._config, "conflict_surfacing", "false")
+        self._conflict_surfacing_enabled = _flag(self._config, "conflict_surfacing", "true")
         try:
             self._graph_ppr_boost = max(
                 0.0, min(float(self._config.get("graph_ppr_boost", 0.0)), 1.0)

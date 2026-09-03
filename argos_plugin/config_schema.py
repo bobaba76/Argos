@@ -190,7 +190,7 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             key="conflict_surfacing",
             label="Conflict surfacing",
             kind=KIND_BOOL,
-            default="false",
+            default="true",
             description="When retrieved records conflict on the same subject (differing values, or one asserting a rule vs a later discontinuation/scoping), inject an explicit conflict note into the answer context instead of letting the answerer smooth them into one answer.",
             group="Retrieval",
         ),

@@ -280,7 +280,10 @@ class LocalEmbedder:
                 )
                 model = SentenceTransformer(resolved, local_files_only=use_local_only)
                 # Probe dimension with a dummy encode.
-                test = model.encode(["dimension probe"], normalize_embeddings=True)
+                test = model.encode(
+                    ["dimension probe"], normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
                 dim = len(test[0])
                 # Store in shared cache.
                 with _SHARED_LOCK:
@@ -339,7 +342,9 @@ class LocalEmbedder:
             return []
         model = shared[0]
         try:
-            vec = model.encode([prepared], normalize_embeddings=True)
+            vec = model.encode(
+                [prepared], normalize_embeddings=True, show_progress_bar=False,
+            )
             result = [float(x) for x in vec[0]]
             if is_query:
                 with _QUERY_EMBED_LOCK:
@@ -366,7 +371,9 @@ class LocalEmbedder:
         model = shared[0]
         prepared = [self._prepare_text(t, is_query) for t in texts]
         try:
-            vecs = model.encode(prepared, normalize_embeddings=True)
+            vecs = model.encode(
+                prepared, normalize_embeddings=True, show_progress_bar=False,
+            )
             return [[float(x) for x in v] for v in vecs]
         except Exception as e:
             logger.debug("Batch embedding failed: %s", e)

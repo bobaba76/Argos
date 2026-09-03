@@ -930,7 +930,7 @@ class ProviderRetrievalMixin:
                                     filter_records_by_access,
                                 )
                             results, _denied = filter_records_by_access(
-                                results, acl, self.user_id,
+                                results, acl, self._user_id,
                             )
                     except Exception:
                         pass  # access filter must never break injection

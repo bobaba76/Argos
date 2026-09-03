@@ -1665,6 +1665,11 @@ class KuzuGraphStore:
         visibility guard remains in Python because it inspects a JSON
         attribute field that Kuzu cannot filter natively.
 
+        #197: ACL filtering is applied post-query using the same
+        filter_graph_neighbours logic as traverse_graph. Without this,
+        a user with a restricted client_scope mask can see graph entities
+        from other client scopes within the same tenant.
+
         Architecture note (issue #11): Kùzu is deliberately used as a
         derived re-ranker / adjacency store at current personal-store scale
         (~1k nodes). Entity and relation attributes live in a single opaque
@@ -1705,18 +1710,46 @@ class KuzuGraphStore:
             rows = []
             while results.has_next():
                 rows.append(results.get_next())
+
+        # #197: Build node dicts from edge endpoints so we can apply
+        # filter_graph_neighbours (which expects nodes + edges). The
+        # source_attrs and target_attrs are already in the row — we
+        # just need to surface them as node attributes for the filter.
+        node_map: Dict[str, Dict[str, Any]] = {}
         edges: List[Dict[str, Any]] = []
         for row in rows:
             if not all(self._visible_attributes(value) for value in row[5:8]):
                 continue
+            src_id = self._external_id(row[0])
+            tgt_id = self._external_id(row[3])
+            src_attrs = self._parse_attributes(row[5])
+            tgt_attrs = self._parse_attributes(row[6])
+            # Register nodes for ACL filtering.
+            if src_id not in node_map:
+                node_map[src_id] = {"id": src_id, "attributes": src_attrs}
+            if tgt_id not in node_map:
+                node_map[tgt_id] = {"id": tgt_id, "attributes": tgt_attrs}
             edges.append({
-                "source": self._external_id(row[0]), "source_type": row[1],
-                "relation": row[2], "target": self._external_id(row[3]),
+                "source": src_id, "source_type": row[1],
+                "relation": row[2], "target": tgt_id,
                 "target_type": row[4],
                 "attributes": self._parse_attributes(row[7]),
             })
             if len(edges) >= limit:
                 break
+
+        # #197: Apply ACL filtering — same pattern as traverse_graph.
+        acl = getattr(self, "_acl_config", None)
+        if acl is not None and not acl.is_open_store:
+            try:
+                from .access_scoping import filter_graph_neighbours
+            except ImportError:
+                from access_scoping import filter_graph_neighbours
+            nodes_list = list(node_map.values())
+            _filtered_nodes, edges, _dropped = filter_graph_neighbours(
+                nodes_list, edges, acl, self.user_id,
+            )
+
         return edges
 
     def _query_edges_for_nodes(

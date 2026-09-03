@@ -329,6 +329,7 @@ class ProviderCoreMixin:
         self._graph_traversal_enabled: bool = False
         self._graph_traversal_depth: int = 2
         self._graph_traversal_boost: float = 0.0
+        self._conflict_surfacing_enabled: bool = False
         # Personalized PageRank diffusion (issue #37): eval-first graph
         # retrieval arm. PPR replaces traversal with diffusion — seed the
         # graph with query-entity weights, diffuse via power iteration.
@@ -728,6 +729,16 @@ class ProviderCoreMixin:
             )
         except (TypeError, ValueError):
             self._graph_ppr_damping = 0.5
+        # Read-side conflict surfacing (eval-first, default OFF): when the
+        # injected set contains two active records that conflict on the same
+        # subject (differing values, or one asserting a rule vs a later
+        # discontinuation/scoping), inject an explicit conflict note so the
+        # answerer surfaces the disagreement instead of smoothing it.
+        conflict_surf = self._config.get("conflict_surfacing", "false")
+        self._conflict_surfacing_enabled = (
+            conflict_surf.lower() in ("true", "1", "yes")
+            if isinstance(conflict_surf, str) else bool(conflict_surf)
+        )
         try:
             self._graph_ppr_boost = max(
                 0.0, min(float(self._config.get("graph_ppr_boost", 0.0)), 1.0)

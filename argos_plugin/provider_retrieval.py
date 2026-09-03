@@ -5,10 +5,17 @@ neutral: no renames, no fixes). Consts are imported from provider_core.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List
+
+try:
+    from .store_common import MemoryRecord as _MemoryRecord
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from store_common import MemoryRecord as _MemoryRecord
 
 try:
     from .provider_core import (
@@ -35,7 +42,56 @@ try:
 except ImportError:  # provider_retrieval.py imported as a top-level module
     from store_retrieval import StoreRetrievalMixin as _StoreRetrievalMixin
 
+try:
+    from .value_extractor import extract_values, values_conflict
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from value_extractor import extract_values, values_conflict
+
 logger = logging.getLogger(__name__)
+
+# -- Read-side conflict surfacing (config-gated, default OFF) ----------------
+# When the injected set contains two ACTIVE records that conflict on the same
+# subject, append an explicit conflict note to the context so the answerer
+# surfaces the disagreement instead of smoothing two eras into one answer.
+# Two triggers, both LLM-free and deterministic:
+#   1. value conflict  -> values_conflict() (same subject + same unit + diff value)
+#   2. discontinuation -> the records share a significant token AND at least one
+#      record marks the rule/feature as stopped/removed/scoped (the poster's
+#      "workaround documented an incident" class).
+_CONFLICT_MARKERS = (
+    "stopped", "ended", "ending", "discontinu", "retired", "removed",
+    "scrapped", "closed", "reverted", "cancelled", "cancelled", "no longer",
+    "no current", "disbanded", "scoped to", "limited to", "only in",
+    "was retired", "was scrapped", "was removed", "was discontinued",
+    "was reverted", "program ended", "period removed",
+)
+_CONFLICT_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
+    "with", "is", "are", "was", "were", "we", "they", "it", "our", "your",
+    "this", "that", "now", "get", "gets", "use", "used", "do", "does", "by",
+}
+_CONFLICT_SUBJECT_MIN_TOKENS = 1   # shared significant tokens required
+_CONFLICT_MAX_NOTES = 2            # cap annotations to bound injection bloat
+
+
+def _conflict_significant_tokens(text: str) -> set:
+    toks = {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(t) >= 4 and t not in _CONFLICT_STOPWORDS}
+    # also keep 3-char numeric-ish tokens ("v3", "10gb") — drop bare short words
+    toks |= {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+             if len(t) >= 3 and any(ch.isdigit() for ch in t)}
+    return toks
+
+
+def _has_discontinuation_marker(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _CONFLICT_MARKERS)
+
+
+def _conflict_shared_subject(a: str, b: str) -> bool:
+    """True if two records share a significant token (same subject)."""
+    sa, sb = _conflict_significant_tokens(a), _conflict_significant_tokens(b)
+    return bool(sa & sb)
 
 
 class ProviderRetrievalMixin:
@@ -790,8 +846,95 @@ class ProviderRetrievalMixin:
                 self._graph_retrieval_failures, exc,
             )
         final_results = results[:limit]
+        if getattr(self, "_conflict_surfacing_enabled", False):
+            try:
+                notes = self._conflict_annotations(final_results)
+                if notes:
+                    final_results = notes + final_results
+            except Exception as exc:  # noqa: BLE001 — surfacing must never break retrieval
+                logger.warning("Conflict surfacing failed (fail-soft): %s", exc)
         self._record_injected(final_results)
         return final_results
+
+    def _conflict_annotations(
+        self, records: List[Any], max_notes: int = _CONFLICT_MAX_NOTES,
+    ) -> List[Any]:
+        """Return conflict-note records for unlinked conflicting pairs in *records*.
+
+        Triggers (LLM-free, deterministic):
+          1. ``values_conflict`` — same subject, same unit, different value
+             (the 27/8 unlinked stale-number class).
+          2. shared significant token + discontinuation/scoping marker on either
+             side (the poster's "rule stopped / workaround reverted" class).
+
+        A note is only emitted for pairs where BOTH members are in the injected
+        set, so it never pulls new records into context. The note states both
+        facts with dates and the resolution rule ("later replacement = current;
+        discontinued/scoped = no current policy") so the answerer surfaces the
+        disagreement instead of smoothing two eras into one answer.
+        """
+        notes: List[Any] = []
+        flagged = set()
+        now = datetime.now(timezone.utc).isoformat()
+        n = len(records)
+        for i in range(n):
+            if len(notes) >= max_notes:
+                break
+            for j in range(i + 1, n):
+                if len(notes) >= max_notes:
+                    break
+                ri, rj = records[i], records[j]
+                a, b = ri.content or "", rj.content or ""
+                if not a or not b or a == b:
+                    continue
+                if (ri.valid_to is not None and ri.valid_to) or (
+                        rj.valid_to is not None and rj.valid_to):
+                    continue  # only active-vs-active unlinked pairs
+                reason = None
+                if values_conflict(
+                    extract_values(a), extract_values(b), subject_threshold=0.2,
+                ):
+                    reason = "differing values"
+                elif (
+                    _conflict_shared_subject(a, b)
+                    and (_has_discontinuation_marker(a) or _has_discontinuation_marker(b))
+                ):
+                    reason = "one record says it was discontinued, removed, or is scoped elsewhere"
+                if not reason:
+                    continue
+                key = tuple(sorted((ri.memory_id, rj.memory_id)))
+                if key in flagged:
+                    continue
+                flagged.add(key)
+                if (ri.created_at or "") <= (rj.created_at or ""):
+                    older, newer = ri, rj
+                else:
+                    older, newer = rj, ri
+                da = (older.created_at or "")[:10]
+                db = (newer.created_at or "")[:10]
+                sa = (older.content or "")[:70].replace("\n", " ")
+                sb = (newer.content or "")[:70].replace("\n", " ")
+                note = (
+                    f"CONFLICT NOTE: two retrieved records disagree ({reason}): "
+                    f"\"{sa}\" ({da}) vs \"{sb}\" ({db}). Neither is recorded as "
+                    "superseding the other. If the later record states a replacement "
+                    "value or rule, treat it as current. If it says the rule/feature "
+                    "was discontinued, removed, or is scoped elsewhere, there is NO "
+                    "current policy — say so rather than presenting the older "
+                    "statement as current."
+                )[:360]
+                notes.append(_MemoryRecord(
+                    memory_id="conflictnote-"
+                              + hashlib.md5((ri.memory_id + rj.memory_id).encode()).hexdigest()[:8],
+                    category="system_note",
+                    content=note,
+                    created_at=now,
+                    similarity=max(
+                        getattr(ri, "similarity", 0.0) or 0.0,
+                        getattr(rj, "similarity", 0.0) or 0.0,
+                    ),
+                ))
+        return notes
 
     # -- prefetch (auto-inject context before each turn) ---------------------
 

@@ -33,6 +33,54 @@ logger = logging.getLogger(__name__)
 # 5s is the max we can add to a search before it feels broken to the user.
 _LLM_TIMEOUT = 5.0
 
+
+def _extract_balanced_array(text: str) -> Optional[str]:
+    """Extract the first balanced JSON array from *text*.
+
+    Scans for ``[`` and tracks bracket depth (respecting string literals
+    and escapes) to find its matching ``]``. If the extracted substring
+    is not valid JSON, continues scanning from the next ``[``. This
+    replaces the old greedy ``\\[.*\\]`` regex which could match from a
+    stray ``[`` in explanatory text all the way to the last ``]`` (#179).
+    """
+    pos = 0
+    while True:
+        start = text.find("[", pos)
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        end = None
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+        if end is None:
+            return None
+        candidate = text[start:end]
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            # Not valid JSON — try the next [.
+            pos = start + 1
+
 # Cache TTL in seconds (1 hour). Prevents re-calling the LLM for the same query.
 _CACHE_TTL = 3600
 
@@ -247,15 +295,23 @@ class QueryExpander:
 
     def _parse_response(self, response: str) -> List[str]:
         """Parse the LLM response into a list of sub-queries."""
-        # Try to extract a JSON array from the response
         text = response.strip()
-        # Find the JSON array in the response. Use greedy match to get
-        # the full array (non-greedy would stop at the first ]).
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
+        # #179: Strip markdown code fences (```json ... ```) before parsing,
+        # matching the pattern in distillation.py.
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text).strip()
+        # #179: Extract the JSON array using balanced bracket scanning
+        # instead of a greedy regex. A greedy \[.*\] matches from the
+        # first [ to the last ], which fails if the model emits a stray ]
+        # in explanatory text before the array. Non-greedy \[.*?\] stops
+        # at the first ], which fails for nested arrays. Balanced scan
+        # finds the first [ and its matching ].
+        json_str = _extract_balanced_array(text)
+        if json_str is None:
             return []
         try:
-            parsed = json.loads(match.group(0))
+            parsed = json.loads(json_str)
         except json.JSONDecodeError:
             return []
 

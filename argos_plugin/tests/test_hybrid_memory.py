@@ -3072,6 +3072,48 @@ class TestMemoryUpdateProviderPath:
         assert expander._parse_response("[invalid") == []
         assert expander._parse_response('{"not": "an array"}') == []
 
+    def test_query_expander_strips_markdown_fences(self):
+        """#179: _parse_response strips ```json ... ``` fences before
+        parsing, matching the pattern in distillation.py."""
+        from query_expander import QueryExpander
+        expander = QueryExpander(similarity_floor=0.3)
+        result = expander._parse_response(
+            '```json\n["alpha query", "beta query"]\n```'
+        )
+        assert result == ["alpha query", "beta query"]
+
+    def test_query_expander_strips_bare_markdown_fences(self):
+        """#179: _parse_response strips ``` ... ``` fences (no json tag)."""
+        from query_expander import QueryExpander
+        expander = QueryExpander(similarity_floor=0.3)
+        result = expander._parse_response(
+            '```\n["alpha query", "beta query"]\n```'
+        )
+        assert result == ["alpha query", "beta query"]
+
+    def test_query_expander_stray_bracket_before_array(self):
+        """#179: A stray ] in explanatory text before the JSON array
+        must not break parsing. The old greedy \\[.*\\] regex would match
+        from the first [ to the last ], potentially swallowing the stray
+        text and failing json.loads."""
+        from query_expander import QueryExpander
+        expander = QueryExpander(similarity_floor=0.3)
+        result = expander._parse_response(
+            'I will expand [see notes] the query:\n'
+            '["pricelist Excel", "work anxiety boss"]'
+        )
+        assert result == ["pricelist Excel", "work anxiety boss"]
+
+    def test_query_expander_nested_array_in_strings(self):
+        """#179: Brackets inside string literals must not confuse the
+        balanced bracket scanner."""
+        from query_expander import QueryExpander
+        expander = QueryExpander(similarity_floor=0.3)
+        result = expander._parse_response(
+            '["query about [brackets]", "normal query"]'
+        )
+        assert result == ["query about [brackets]", "normal query"]
+
     def test_context_aware_retrieval_enriches_referential_query(self):
         """A query with pronouns should be enriched with recent context."""
         self._stub_hermes_runtime()

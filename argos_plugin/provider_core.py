@@ -130,6 +130,7 @@ _AUTO_EXTRACT_PAUSE_MARKER = "argos.auto_extract.paused"
 _config_cache: dict | None = None
 _config_cache_mtime: float = 0.0
 _config_cache_path: str = ""
+_config_cache_lock = threading.Lock()
 
 
 def _load_config_cached() -> dict | None:
@@ -146,8 +147,9 @@ def _load_config_cached() -> dict | None:
         mtime = config_path.stat().st_mtime if config_path.exists() else 0.0
     except OSError:
         mtime = 0.0
-    if _config_cache is not None and path_str == _config_cache_path and mtime == _config_cache_mtime:
-        return _config_cache
+    with _config_cache_lock:
+        if _config_cache is not None and path_str == _config_cache_path and mtime == _config_cache_mtime:
+            return _config_cache
     return None
 
 
@@ -164,9 +166,10 @@ def _store_config_cache(cfg: dict) -> None:
         mtime = config_path.stat().st_mtime if config_path.exists() else 0.0
     except OSError:
         mtime = 0.0
-    _config_cache = cfg
-    _config_cache_mtime = mtime
-    _config_cache_path = str(config_path)
+    with _config_cache_lock:
+        _config_cache = cfg
+        _config_cache_mtime = mtime
+        _config_cache_path = str(config_path)
 
 
 def _load_config(hermes_home: str | None = None) -> dict:
@@ -208,7 +211,7 @@ def _load_config(hermes_home: str | None = None) -> dict:
         "graph_traversal_enabled": "true",
         "graph_traversal_depth": "2",
         "graph_traversal_boost": "0.60",
-        "chain_unfold": "auto",
+        "chain_unfold": "off",
         "chain_unfold_min_similarity": "0.30",
         "chain_max_versions": "3",
         "chain_max_inject": "150",
@@ -540,7 +543,7 @@ class ProviderCoreMixin:
             {
                 "key": "graph_traversal_enabled",
                 "description": "Enable traversal-based retrieval: walk typed relations from query seed entities (hop-weighted BFS) and inject graph-only candidates under the similarity floor",
-                "default": "false",
+                "default": "true",
                 "choices": ["true", "false"],
                 "required": False,
             },
@@ -655,11 +658,7 @@ class ProviderCoreMixin:
         # Stale-pending review sweep: re-review proposals stranded in
         # `pending` after a failed/rate-limited reviewer call, so a rate-limit
         # hiccup no longer condemns a proposal to sit unreviewed forever.
-        stale_sweep = self._config.get("stale_review_sweep_enabled", "true")
-        self._stale_review_sweep_enabled = (
-            stale_sweep.lower() in ("true", "1", "yes")
-            if isinstance(stale_sweep, str) else bool(stale_sweep)
-        )
+        self._stale_review_sweep_enabled = _flag(self._config, "stale_review_sweep_enabled", "true")
         try:
             self._stale_review_interval_min = max(
                 1, int(self._config.get("stale_review_interval_min", 15))
@@ -678,33 +677,21 @@ class ProviderCoreMixin:
             )
         except (TypeError, ValueError):
             self._stale_review_max_batch = 25
-        graph_aware = self._config.get("graph_aware_retrieval", "true")
-        self._graph_aware_retrieval = (
-            graph_aware.lower() in ("true", "1", "yes")
-            if isinstance(graph_aware, str) else bool(graph_aware)
-        )
+        self._graph_aware_retrieval = _flag(self._config, "graph_aware_retrieval", "true")
         try:
             self._graph_retrieval_boost = max(
                 0.0, min(float(self._config.get("graph_retrieval_boost", 0.05)), 0.5)
             )
         except (TypeError, ValueError):
             self._graph_retrieval_boost = 0.05
-        graph_inject = self._config.get("graph_inject_candidates", "false")
-        self._graph_inject_candidates = (
-            graph_inject.lower() in ("true", "1", "yes")
-            if isinstance(graph_inject, str) else bool(graph_inject)
-        )
+        self._graph_inject_candidates = _flag(self._config, "graph_inject_candidates", "false")
         try:
             self._graph_boost_min_similarity = max(
                 0.0, min(float(self._config.get("graph_boost_min_similarity", 0.15)), 1.0)
             )
         except (TypeError, ValueError):
             self._graph_boost_min_similarity = 0.15
-        graph_trav = self._config.get("graph_traversal_enabled", "false")
-        self._graph_traversal_enabled = (
-            graph_trav.lower() in ("true", "1", "yes")
-            if isinstance(graph_trav, str) else bool(graph_trav)
-        )
+        self._graph_traversal_enabled = _flag(self._config, "graph_traversal_enabled", "true")
         try:
             self._graph_traversal_depth = max(
                 1, min(int(self._config.get("graph_traversal_depth", 2)), 4)
@@ -718,11 +705,7 @@ class ProviderCoreMixin:
         except (TypeError, ValueError):
             self._graph_traversal_boost = 0.0
         # PPR config (issue #37).
-        graph_ppr = self._config.get("graph_ppr_enabled", "false")
-        self._graph_ppr_enabled = (
-            graph_ppr.lower() in ("true", "1", "yes")
-            if isinstance(graph_ppr, str) else bool(graph_ppr)
-        )
+        self._graph_ppr_enabled = _flag(self._config, "graph_ppr_enabled", "false")
         try:
             self._graph_ppr_damping = max(
                 0.0, min(float(self._config.get("graph_ppr_damping", 0.5)), 1.0)
@@ -734,11 +717,7 @@ class ProviderCoreMixin:
         # subject (differing values, or one asserting a rule vs a later
         # discontinuation/scoping), inject an explicit conflict note so the
         # answerer surfaces the disagreement instead of smoothing it.
-        conflict_surf = self._config.get("conflict_surfacing", "false")
-        self._conflict_surfacing_enabled = (
-            conflict_surf.lower() in ("true", "1", "yes")
-            if isinstance(conflict_surf, str) else bool(conflict_surf)
-        )
+        self._conflict_surfacing_enabled = _flag(self._config, "conflict_surfacing", "false")
         try:
             self._graph_ppr_boost = max(
                 0.0, min(float(self._config.get("graph_ppr_boost", 0.0)), 1.0)
@@ -751,11 +730,7 @@ class ProviderCoreMixin:
             )
         except (TypeError, ValueError):
             self._alias_expansion_boost = 0.7
-        consolidation_enabled = self._config.get("consolidation_enabled", "false")
-        self._consolidation_enabled = (
-            consolidation_enabled.lower() in ("true", "1", "yes")
-            if isinstance(consolidation_enabled, str) else bool(consolidation_enabled)
-        )
+        self._consolidation_enabled = _flag(self._config, "consolidation_enabled", "false")
         try:
             self._consolidation_min_age_days = max(
                 1, int(self._config.get("consolidation_min_age_days", 30))
@@ -782,26 +757,18 @@ class ProviderCoreMixin:
         except (TypeError, ValueError):
             self._duplicate_semantic_max_pairs = 20000
         # Reranker config
-        reranker_enabled = self._config.get("reranker_enabled", "true")
-        self._reranker_enabled = (
-            reranker_enabled.lower() in ("true", "1", "yes")
-            if isinstance(reranker_enabled, str) else bool(reranker_enabled)
-        )
+        self._reranker_enabled = _flag(self._config, "reranker_enabled", "false")
         self._reranker_model = str(
             self._config.get("reranker_model", "BAAI/bge-reranker-base")
         )
         try:
             self._reranker_top_n = max(
-                5, min(int(self._config.get("reranker_top_n", 20)), 100)
+                5, min(int(self._config.get("reranker_top_n", 10)), 100)
             )
         except (TypeError, ValueError):
-            self._reranker_top_n = 20
+            self._reranker_top_n = 10
         # Context-aware retrieval config
-        ctx_aware = self._config.get("context_aware_retrieval", "true")
-        self._context_aware_retrieval = (
-            ctx_aware.lower() in ("true", "1", "yes")
-            if isinstance(ctx_aware, str) else bool(ctx_aware)
-        )
+        self._context_aware_retrieval = _flag(self._config, "context_aware_retrieval", "true")
         # Exact-phrase lift config (default on? off? read global toggle).
         # alpha 0.0 disables; ~0.25 is the measured sweet spot.
         try:
@@ -829,11 +796,7 @@ class ProviderCoreMixin:
         except (TypeError, ValueError):
             self._context_max_chars = 500
         # Query expansion config
-        qe_enabled = self._config.get("query_expansion_enabled", "true")
-        self._query_expansion_enabled = (
-            qe_enabled.lower() in ("true", "1", "yes")
-            if isinstance(qe_enabled, str) else bool(qe_enabled)
-        )
+        self._query_expansion_enabled = _flag(self._config, "query_expansion_enabled", "true")
         try:
             self._query_expansion_similarity_floor = float(
                 self._config.get("query_expansion_similarity_floor", "0.3")
@@ -861,11 +824,7 @@ class ProviderCoreMixin:
         self._data_residency = str(
             self._config.get("data_residency", "cloud")).strip()
         # Expiry config (Spec 1): TTL tiers / best-before dates.
-        expiry_enabled = self._config.get("expiry_enabled", "false")
-        self._expiry_enabled = (
-            expiry_enabled.lower() in ("true", "1", "yes")
-            if isinstance(expiry_enabled, str) else bool(expiry_enabled)
-        )
+        self._expiry_enabled = _flag(self._config, "expiry_enabled", "false")
         # Parse the TTL map (JSON object of category→days). Fail-soft:
         # fall back to the default on bad input, log a warning.
         default_ttl = '{"context_note":30,"event":180,"goal":180}'
@@ -889,20 +848,12 @@ class ProviderCoreMixin:
             )
         except (TypeError, ValueError):
             self._expiry_default_days = 90
-        expiry_suggest = self._config.get("expiry_auto_suggest", "false")
-        self._expiry_auto_suggest = (
-            expiry_suggest.lower() in ("true", "1", "yes")
-            if isinstance(expiry_suggest, str) else bool(expiry_suggest)
-        )
+        self._expiry_auto_suggest = _flag(self._config, "expiry_auto_suggest", "false")
         # Push expiry config to the store so remember() uses the right TTL map.
         # (Moved after store creation — issue #29: these blocks were dead code
         # when run before the store exists during initialize.)
         # Distillation config (P4.2)
-        distillation_enabled = self._config.get("distillation_enabled", "false")
-        self._distillation_enabled = (
-            distillation_enabled.lower() in ("true", "1", "yes")
-            if isinstance(distillation_enabled, str) else bool(distillation_enabled)
-        )
+        self._distillation_enabled = _flag(self._config, "distillation_enabled", "false")
         try:
             self._distillation_min_new_records = max(
                 1, int(self._config.get("distillation_min_new_records", 20))
@@ -928,33 +879,21 @@ class ProviderCoreMixin:
         except (TypeError, ValueError):
             self._distillation_max_calls = 10
         # Lifecycle config (P5.1, #6)
-        archive_enabled = self._config.get("archive_enabled", "false")
-        self._archive_enabled = (
-            archive_enabled.lower() in ("true", "1", "yes")
-            if isinstance(archive_enabled, str) else bool(archive_enabled)
-        )
+        self._archive_enabled = _flag(self._config, "archive_enabled", "false")
         try:
             self._archive_after_days = max(
                 1, int(self._config.get("archive_after_days", 180))
             )
         except (TypeError, ValueError):
             self._archive_after_days = 180
-        forget_enabled = self._config.get("forget_enabled", "false")
-        self._forget_enabled = (
-            forget_enabled.lower() in ("true", "1", "yes")
-            if isinstance(forget_enabled, str) else bool(forget_enabled)
-        )
+        self._forget_enabled = _flag(self._config, "forget_enabled", "false")
         try:
             self._forget_after_days = max(
                 1, int(self._config.get("forget_after_days", 365))
             )
         except (TypeError, ValueError):
             self._forget_after_days = 365
-        rollup_enabled = self._config.get("rollup_enabled", "false")
-        self._rollup_enabled = (
-            rollup_enabled.lower() in ("true", "1", "yes")
-            if isinstance(rollup_enabled, str) else bool(rollup_enabled)
-        )
+        self._rollup_enabled = _flag(self._config, "rollup_enabled", "false")
         try:
             self._rollup_interval_days = max(
                 1, int(self._config.get("rollup_interval_days", 30))
@@ -1000,19 +939,6 @@ class ProviderCoreMixin:
             self._config.get("scale_warn_records", 5000)
         )
         # (Scale threshold push moved after store creation — issue #29.)
-
-        # Entity aliases: load from config (JSON mapping) into the store.
-        aliases_json = str(self._config.get("entity_aliases", "")).strip()
-        if aliases_json and self._store:
-            try:
-                alias_map = json.loads(aliases_json)
-                if isinstance(alias_map, dict):
-                    for alias, canonical in alias_map.items():
-                        if isinstance(canonical, str):
-                            self._store.add_alias(alias, canonical)
-                    logger.info("Loaded %d entity aliases from config", len(alias_map))
-            except (json.JSONDecodeError, Exception) as exc:
-                logger.warning("Failed to parse entity_aliases config: %s", exc)
 
         # Role words: load user-configured words into the graph module so
         # _is_role_word() includes them. Defaults (therapist, accountant,
@@ -1150,6 +1076,38 @@ class ProviderCoreMixin:
             self._store.expiry_default_days = self._expiry_default_days
         except Exception:
             pass
+
+        # Entity aliases: load from config (JSON mapping) into the store.
+        # Must run AFTER store creation — issue #29 class bug: this block
+        # was before self._store was assigned, so the `if aliases_json and
+        # self._store:` guard was always False (dead code).
+        aliases_json = str(self._config.get("entity_aliases", "")).strip()
+        if aliases_json and self._store:
+            try:
+                alias_map = json.loads(aliases_json)
+                if isinstance(alias_map, dict):
+                    for alias, canonical in alias_map.items():
+                        if isinstance(canonical, str):
+                            self._store.add_alias(alias, canonical)
+                    logger.info("Loaded %d entity aliases from config", len(alias_map))
+            except Exception as exc:
+                logger.warning("Failed to parse entity_aliases config: %s", exc)
+
+        # #203: Load ACL config on the provider so the prefetch
+        # defence-in-depth re-validation in provider_retrieval.py fires.
+        # memory_service.py sets _acl_config on the store and graph, but
+        # the provider object (which runs prefetch) was never wired — the
+        # ACL branch was dormant in the live path. Load from the same
+        # config dict the service uses (self._config["acl"]).
+        try:
+            from .access_scoping import ACLConfig
+        except ImportError:
+            from access_scoping import ACLConfig
+        acl_data = self._config.get("acl")
+        if isinstance(acl_data, dict):
+            self._acl_config = ACLConfig.from_dict(acl_data)
+        else:
+            self._acl_config = ACLConfig()  # open store (backward compatible)
         try:
             self._store.set_scale_thresholds(
                 self._scale_warn_latency_ms, self._scale_warn_records

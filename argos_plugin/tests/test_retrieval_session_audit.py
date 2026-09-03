@@ -188,3 +188,184 @@ def test_acl_filter_in_prefetch_open_store_no_filter(tmp_path):
     assert "Beta Inc" in result
 
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# #203 — provider._acl_config never set by initialize(); the prefetch
+#        defence-in-depth re-validation was dormant in the live path.
+# ---------------------------------------------------------------------------
+
+
+def test_initialize_wires_acl_config_from_config_file(tmp_path):
+    """#203: initialize() must load ACLConfig from the config file and set
+    self._acl_config on the provider. Without this, the prefetch ACL
+    re-validation in provider_retrieval.py is dormant (acl is None)."""
+    _stub_hermes_runtime()
+
+    try:
+        import argos_plugin
+    except ModuleNotFoundError:
+        import argos as argos_plugin
+
+    # Write a config file with ACL data.
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    config_path = home / "hybrid_memory.json"
+    config_path.write_text(json.dumps({
+        "storage_mode": "direct",
+        "acl": {
+            "enforcement_on": True,
+            "roles": {
+                "acme_staff": {"client_scopes": ["acme"]},
+            },
+            "user_roles": {
+                "alice": "acme_staff",
+            },
+        },
+    }), encoding="utf-8")
+
+    # Minimal valid DuckDB file (no records needed for init).
+    from store import DuckDBMemoryStore
+    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
+
+    provider = argos_plugin.ArgosProvider()
+    provider.initialize(
+        session_id="test",
+        hermes_home=str(home),
+        platform="cli",
+        user_id="alice",
+    )
+
+    # The provider must have _acl_config set from the config file.
+    assert hasattr(provider, "_acl_config"), \
+        "initialize() must set _acl_config on the provider"
+    assert provider._acl_config is not None, \
+        "_acl_config must not be None after initialize()"
+    assert not provider._acl_config.is_open_store, \
+        f"ACL config should have enforcement_on=True, got open store: {provider._acl_config.__dict__}"
+    # Alice's mask should be ["acme"].
+    mask = provider._acl_config.allow_mask("alice")
+    assert mask is not None and "acme" in mask, \
+        f"Alice should have acme in her mask, got: {mask}"
+
+
+def test_initialize_no_acl_config_defaults_to_open_store(tmp_path):
+    """#203: Without an 'acl' key in the config, initialize() should set
+    _acl_config to an open-store ACLConfig (backward compatible)."""
+    _stub_hermes_runtime()
+
+    try:
+        import argos_plugin
+    except ModuleNotFoundError:
+        import argos as argos_plugin
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    config_path = home / "hybrid_memory.json"
+    config_path.write_text(json.dumps({
+        "storage_mode": "direct",
+    }), encoding="utf-8")
+
+    from store import DuckDBMemoryStore
+    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
+
+    provider = argos_plugin.ArgosProvider()
+    provider.initialize(
+        session_id="test",
+        hermes_home=str(home),
+        platform="cli",
+        user_id="alice",
+    )
+
+    assert hasattr(provider, "_acl_config"), \
+        "initialize() must set _acl_config even when no acl key exists"
+    assert provider._acl_config.is_open_store, \
+        f"Without acl config, should be open store: {provider._acl_config.__dict__}"
+
+
+def test_prefetch_acl_filter_works_after_initialize(tmp_path):
+    """#203: End-to-end: initialize() with ACL config → prefetch hides
+    out-of-scope content. This proves the provider's ACL is live without
+    manually setting _acl_config.
+
+    Uses _search_memories + the ACL filter directly (instead of prefetch,
+    which has a 3-second thread timeout that can be flaky in test envs
+    when the embedding model loads slowly). The ACL filter code path is
+    the same — we're just calling it synchronously.
+    """
+    _stub_hermes_runtime()
+
+    from store import DuckDBMemoryStore
+    from access_scoping import filter_records_by_access
+    try:
+        import argos_plugin
+    except ModuleNotFoundError:
+        import argos as argos_plugin
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    config_path = home / "hybrid_memory.json"
+    config_path.write_text(json.dumps({
+        "storage_mode": "direct",
+        "acl": {
+            "enforcement_on": True,
+            "roles": {
+                "acme_staff": {"client_scopes": ["acme"]},
+            },
+            "user_roles": {
+                "alice": "acme_staff",
+            },
+        },
+    }), encoding="utf-8")
+
+    # Create the store and add records with different client_scopes.
+    store = DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice")
+    store.remember(
+        category="personal_fact",
+        content="Acme Corp revenue is $5M",
+        client_scope="acme",
+    )
+    store.remember(
+        category="personal_fact",
+        content="Beta Inc revenue is $3M",
+        client_scope="beta",
+    )
+    store.close()
+
+    # Initialize the provider — this should load the ACL config.
+    provider = argos_plugin.ArgosProvider()
+    provider.initialize(
+        session_id="test",
+        hermes_home=str(home),
+        platform="cli",
+        user_id="alice",
+    )
+
+    # The provider must have _acl_config set.
+    assert provider._acl_config is not None
+    assert not provider._acl_config.is_open_store
+
+    # Search returns both records (store-level search has no ACL filter
+    # in direct mode — that's the service's job).
+    results = provider._search_memories("revenue", limit=10)
+    contents = [r.content for r in results]
+    assert "Acme Corp revenue is $5M" in contents, \
+        f"Store search should find acme memory: {contents}"
+    assert "Beta Inc revenue is $3M" in contents, \
+        f"Store search should find beta memory: {contents}"
+
+    # Apply the same ACL filter the prefetch path uses (line 1065-1077
+    # of provider_retrieval.py). With the fix, provider._acl_config is
+    # set, so the filter runs and hides the beta-scope memory.
+    acl = getattr(provider, "_acl_config", None)
+    assert acl is not None and not acl.is_open_store, \
+        "provider._acl_config must be set and enforced after initialize()"
+    filtered, denied = filter_records_by_access(results, acl, provider._user_id)
+    filtered_contents = [r.content for r in filtered]
+    assert "Acme Corp revenue is $5M" in filtered_contents, \
+        f"Alice should see her own acme-scope memory: {filtered_contents}"
+    assert "Beta Inc revenue is $3M" not in filtered_contents, (
+        f"Alice should NOT see beta-scope memory — the ACL filter is "
+        f"dormant (provider._acl_config not set by initialize): {filtered_contents}"
+    )
+    assert denied == 1, f"Expected 1 denied record, got {denied}"

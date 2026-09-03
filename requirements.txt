@@ -6,5 +6,19 @@ sentence-transformers==5.6.1
 pandas==2.2.3
 winsdk==1.0.0b10; sys_platform == "win32"
 
+# REST server (rest_server.py) — FastAPI + uvicorn + pydantic.
+fastapi==0.133.1
+uvicorn==0.41.0
+pydantic==2.13.4
+
+# Document extraction (watcher.py) — PDF, Excel, Word.
+PyPDF2==3.0.1
+openpyxl==3.1.5
+python-docx==1.2.0
+
+# Config parsing (hermes_location.py, hermes_weather.py).
+PyYAML==6.0.3
+
 # Test runner (README: python -m pytest hybrid_memory_plugin/tests/ -v)
 pytest==9.1.1
+pytest-xdist==3.8.0

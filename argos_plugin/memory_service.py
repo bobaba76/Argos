@@ -696,11 +696,6 @@ class MemoryService:
             acl = getattr(store, "_acl_config", None)
             if acl is not None and not acl.is_open_store:
                 # Only wheel users (principals) may export the audit log.
-                mask = acl.allow_mask(user_id)
-                if mask is not set() and mask is not None:
-                    # Non-wheel user (mask is a finite set, not None).
-                    # But we need to check if they're wheel specifically.
-                    pass
                 role = acl.role_for(user_id)
                 if role is None:
                     raise PermissionError(

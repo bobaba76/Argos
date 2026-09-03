@@ -188,13 +188,8 @@ class StoreMaintenanceMixin:
             conditions.append("created_at >= ?")
             params.append(since)
         if tags:
-            # DuckDB list_contains checks if a tag is in the tags array.
-            placeholders = ", ".join(["?" for _ in tags])
-            conditions.append(f"EXISTS (SELECT 1 FROM range(0, list_length(tags)) AS i WHERE list_contains(tags, i, t) IN ({placeholders}))")
-            # Simpler: use OR of list_contains per tag.
-            # Actually DuckDB's list_contains is: list_contains(list, value)
-            # Let's use the simpler approach.
-            conditions = conditions[:-1]  # remove the complex one
+            # DuckDB's list_contains is: list_contains(list, value).
+            # Use OR of list_contains per tag.
             tag_conditions = " OR ".join(["list_contains(tags, ?)" for _ in tags])
             conditions.append(f"({tag_conditions})")
             params.extend(tags)
@@ -622,28 +617,34 @@ class StoreMaintenanceMixin:
 
         # Expiry reporting (Spec 1): count expired and expiring-soon rows.
         # These are filtered from retrieval but never auto-deleted.
+        # Scoped to this user — a multi-tenant store must not count other
+        # tenants' expired records.
         expired_count = 0
         expiring_soon_count = 0
         now_iso = now.isoformat()
         soon_iso = (now + timedelta(days=7)).isoformat()
         try:
-            expired_count = int(self.connection.execute(
-                """SELECT COUNT(*) FROM memory_records
-                   WHERE COALESCE(status, 'active') = 'active'
-                     AND valid_to IS NULL
-                     AND expires_at IS NOT NULL
-                     AND expires_at <= ?""",
-                [now_iso],
-            ).fetchone()[0])
-            expiring_soon_count = int(self.connection.execute(
-                """SELECT COUNT(*) FROM memory_records
-                   WHERE COALESCE(status, 'active') = 'active'
-                     AND valid_to IS NULL
-                     AND expires_at IS NOT NULL
-                     AND expires_at > ?
-                     AND expires_at <= ?""",
-                [now_iso, soon_iso],
-            ).fetchone()[0])
+            with self._lock:
+                assert self.connection is not None
+                expired_count = int(self.connection.execute(
+                    """SELECT COUNT(*) FROM memory_records
+                       WHERE COALESCE(status, 'active') = 'active'
+                         AND valid_to IS NULL
+                         AND expires_at IS NOT NULL
+                         AND expires_at <= ?
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [now_iso, self.user_id],
+                ).fetchone()[0])
+                expiring_soon_count = int(self.connection.execute(
+                    """SELECT COUNT(*) FROM memory_records
+                       WHERE COALESCE(status, 'active') = 'active'
+                         AND valid_to IS NULL
+                         AND expires_at IS NOT NULL
+                         AND expires_at > ?
+                         AND expires_at <= ?
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [now_iso, soon_iso, self.user_id],
+                ).fetchone()[0])
         except Exception as exc:
             logger.debug("Expiry count query failed: %s", exc)
 
@@ -920,7 +921,7 @@ class StoreMaintenanceMixin:
             for memory_id in archived_ids:
                 self.connection.execute(
                     "UPDATE memory_records SET tier = 'archived', updated_at = ? "
-                    "WHERE memory_id = ?",
+                    "WHERE memory_id = ? AND COALESCE(tier, 'active') = 'active'",
                     [now.isoformat(), memory_id],
                 )
         if archived_ids:
@@ -941,8 +942,9 @@ class StoreMaintenanceMixin:
         with self._lock:
             assert self.connection is not None
             row = self.connection.execute(
-                "SELECT tier FROM memory_records WHERE memory_id = ?",
-                [memory_id],
+                "SELECT tier FROM memory_records WHERE memory_id = ?"
+                " AND (user_scope IS NULL OR user_scope = ?)",
+                [memory_id, self.user_id],
             ).fetchone()
             if not row:
                 return False
@@ -950,8 +952,8 @@ class StoreMaintenanceMixin:
                 return False
             self.connection.execute(
                 "UPDATE memory_records SET tier = 'active', updated_at = ? "
-                "WHERE memory_id = ?",
-                [self._now(), memory_id],
+                "WHERE memory_id = ? AND (user_scope IS NULL OR user_scope = ?)",
+                [self._now(), memory_id, self.user_id],
             )
         logger.debug("Revived archived record %s", memory_id)
         return True
@@ -991,14 +993,16 @@ class StoreMaintenanceMixin:
             ).fetchall()
             forgotten_ids = [r[0] for r in rows]
         quarantined = 0
+        quarantined_ids: List[str] = []
         for memory_id in forgotten_ids:
             if self.quarantine_memory(memory_id, "forgotten: stale zero-value drift (P5.1)"):
                 quarantined += 1
+                quarantined_ids.append(memory_id)
         if quarantined:
             logger.info("Forgot %d stale records (P5.1 quarantine)", quarantined)
         return {
             "forgotten_count": quarantined,
-            "forgotten_ids": forgotten_ids[:quarantined],
+            "forgotten_ids": quarantined_ids,
             "forget_after_days": forget_after_days,
         }
 

@@ -2466,6 +2466,97 @@ class TestKuzuGraph:
         graph_alice.close()
         graph_bob.close()
 
+    def test_search_graph_filters_cross_client_scope_via_acl(self, tmp_path):
+        """#197: search_graph must apply ACL filtering (filter_graph_neighbours)
+        so a user with a restricted client_scope mask cannot see graph entities
+        from other client scopes within the same tenant."""
+        from graph import KuzuGraphStore
+        from access_scoping import ACLConfig
+
+        graph = KuzuGraphStore(tmp_path / "acl_kuzu", user_id="alice")
+        graph.upsert_node("AcmeProject", "project", {"client_scope": "acme"})
+        graph.upsert_node("BetaProject", "project", {"client_scope": "beta"})
+        graph.upsert_node("SharedDirector", "person", {"client_scope": "acme"})
+        graph.upsert_edge("AcmeProject", "SharedDirector", "owned_by")
+        graph.upsert_edge("AcmeProject", "BetaProject", "linked_to")
+        graph._acl_config = ACLConfig(
+            roles={"staff": {"client_scopes": ["acme"], "wheel": False}},
+            user_roles={"alice": "staff"},
+            enforcement_on=True,
+        )
+        results = graph.search_graph("Project", limit=50)
+        targets = {e.get("target", "") for e in results}
+        sources = {e.get("source", "") for e in results}
+        assert "AcmeProject" in sources or "AcmeProject" in targets, \
+            "acme entity should be visible"
+        assert "BetaProject" not in targets, \
+            f"ACL leak: search_graph returned beta entity to acme-only user: {results}"
+        assert "BetaProject" not in sources, \
+            f"ACL leak: search_graph returned beta entity to acme-only user: {results}"
+        acme_edges = [e for e in results
+                      if e.get("source") == "AcmeProject" and e.get("target") == "SharedDirector"]
+        assert len(acme_edges) == 1, \
+            f"acme-internal edge should survive ACL filter: {results}"
+        graph.close()
+
+    def test_search_graph_no_acl_config_returns_all(self, tmp_path):
+        """#197: Without an ACL config, search_graph returns all edges."""
+        from graph import KuzuGraphStore
+
+        graph = KuzuGraphStore(tmp_path / "no_acl_kuzu", user_id="alice")
+        graph.upsert_node("AcmeProject", "project", {"client_scope": "acme"})
+        graph.upsert_node("BetaProject", "project", {"client_scope": "beta"})
+        graph.upsert_edge("AcmeProject", "BetaProject", "linked_to")
+        results = graph.search_graph("Project", limit=50)
+        targets = {e.get("target", "") for e in results}
+        assert "BetaProject" in targets, \
+            f"Without ACL config, all edges should be returned: {results}"
+        graph.close()
+
+    def test_search_graph_open_store_acl_returns_all(self, tmp_path):
+        """#197: Open store ACL returns all edges (backward compatible)."""
+        from graph import KuzuGraphStore
+        from access_scoping import ACLConfig
+
+        graph = KuzuGraphStore(tmp_path / "open_acl_kuzu", user_id="alice")
+        graph.upsert_node("AcmeProject", "project", {"client_scope": "acme"})
+        graph.upsert_node("BetaProject", "project", {"client_scope": "beta"})
+        graph.upsert_edge("AcmeProject", "BetaProject", "linked_to")
+        graph._acl_config = ACLConfig()
+        results = graph.search_graph("Project", limit=50)
+        targets = {e.get("target", "") for e in results}
+        assert "BetaProject" in targets, \
+            f"Open store should return all edges: {results}"
+        graph.close()
+
+    def test_memory_ids_for_query_inherits_acl_filter(self, tmp_path):
+        """#197: memory_ids_for_query calls search_graph internally, so it
+        inherits the ACL filter."""
+        from graph import KuzuGraphStore
+        from access_scoping import ACLConfig
+
+        graph = KuzuGraphStore(tmp_path / "memids_acl_kuzu", user_id="alice")
+        graph.upsert_node("AcmeDoc", "document", {"client_scope": "acme"})
+        graph.upsert_node("AcmeAuthor", "person", {"client_scope": "acme"})
+        graph.upsert_edge("AcmeDoc", "AcmeAuthor", "authored_by", {
+            "memory_ids": ["mem-acme-1"],
+        })
+        graph.upsert_node("BetaDoc", "document", {"client_scope": "beta"})
+        graph.upsert_edge("AcmeDoc", "BetaDoc", "related_to", {
+            "memory_ids": ["mem-beta-1"],
+        })
+        graph._acl_config = ACLConfig(
+            roles={"staff": {"client_scopes": ["acme"], "wheel": False}},
+            user_roles={"alice": "staff"},
+            enforcement_on=True,
+        )
+        mem_ids = graph.memory_ids_for_query("Doc", limit=50)
+        assert "mem-acme-1" in mem_ids, \
+            f"acme memory should be visible: {mem_ids}"
+        assert "mem-beta-1" not in mem_ids, \
+            f"ACL leak: beta memory surfaced to acme-only user: {mem_ids}"
+        graph.close()
+
     def test_graph_query_returns_memory_evidence(self, tmp_path):
         from graph import KuzuGraphStore
 

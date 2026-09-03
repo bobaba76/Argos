@@ -228,6 +228,56 @@ class _Tenant:
                         self.graph.close()
 
 
+# -- #130: Tenant config validation -----------------------------------------
+
+import re as _re
+
+_TENANT_NAME_RE = _re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def _validate_tenant_name(name: str) -> None:
+    """Validate a tenant name: alphanumeric + _-, 1-64 chars, no path chars."""
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Invalid tenant name: {name!r} (must be non-empty)")
+    if not _TENANT_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid tenant name: {name!r} (must be alphanumeric, _, or -, "
+            f"1-64 chars, start with alphanumeric)"
+        )
+
+
+def _validate_tenant_path(path: str, tenant_name: str, field: str) -> None:
+    """Validate a tenant database/graph path: relative, no traversal."""
+    if not path:
+        raise ValueError(f"Tenant {tenant_name!r}: {field} is empty")
+    p = Path(path)
+    # Must be relative (no absolute paths). On Windows, Path.is_absolute()
+    # requires a drive letter, so also check for leading / or \.
+    if p.is_absolute() or path.startswith("/") or path.startswith("\\"):
+        raise ValueError(
+            f"Tenant {tenant_name!r}: {field}={path!r} must be relative to home, "
+            f"not absolute"
+        )
+    # No path traversal — no .. components.
+    parts = p.parts
+    if ".." in parts:
+        raise ValueError(
+            f"Tenant {tenant_name!r}: {field}={path!r} contains '..' "
+            f"(path traversal not allowed)"
+        )
+    # No Windows drive letters or UNC paths.
+    if len(path) >= 2 and path[1] == ":":
+        raise ValueError(
+            f"Tenant {tenant_name!r}: {field}={path!r} contains a drive letter "
+            f"(must be relative to home)"
+        )
+    if path.startswith("\\\\") or path.startswith("//"):
+        raise ValueError(
+            f"Tenant {tenant_name!r}: {field}={path!r} is a UNC path "
+            f"(must be relative to home)"
+        )
+
+
 def _parse_tenants(
     config: dict, home: Path, embedder, reranker,
 ) -> tuple[dict, dict, bool, dict, bool]:
@@ -267,8 +317,13 @@ def _parse_tenants(
     strict_routing = False
     credential_map: dict = {}  # token_hash -> (tenant_name, user_id)
     credential_mode = False
+    # #130: Track database/graph paths to detect collisions across tenants.
+    seen_db_paths: dict = {}  # db_filename -> tenant_name
+    seen_graph_paths: dict = {}  # graph_dirname -> tenant_name
     for name, entry in tenants_map.items():
         entry = entry if isinstance(entry, dict) else {}
+        # #130: Validate tenant name — must be a safe identifier.
+        _validate_tenant_name(name)
         overlay = entry.get("config") if isinstance(entry.get("config"), dict) else {}
         merged = dict(config)
         merged.update(overlay)
@@ -279,6 +334,28 @@ def _parse_tenants(
         merged["graph_dirname"] = entry.get(
             "graph_dirname", config.get("graph_dirname", "hybrid_memory_kuzu")
         )
+        # #130: Validate paths — no path traversal, no cross-tenant
+        # collisions. Paths must be relative to home (no absolute, no ..).
+        _validate_tenant_path(
+            str(merged["database_filename"]), name, "database_filename",
+        )
+        _validate_tenant_path(
+            str(merged["graph_dirname"]), name, "graph_dirname",
+        )
+        if merged["database_filename"] in seen_db_paths:
+            raise ValueError(
+                f"database_filename collision: {merged['database_filename']!r} "
+                f"used by both tenant {seen_db_paths[merged['database_filename']]!r} "
+                f"and {name!r}"
+            )
+        seen_db_paths[merged["database_filename"]] = name
+        if merged["graph_dirname"] in seen_graph_paths:
+            raise ValueError(
+                f"graph_dirname collision: {merged['graph_dirname']!r} "
+                f"used by both tenant {seen_graph_paths[merged['graph_dirname']]!r} "
+                f"and {name!r}"
+            )
+        seen_graph_paths[merged["graph_dirname"]] = name
         # Default tenant keeps the historical "default_user" scope (#49
         # review): the startup hygiene sweep and any direct store/graph
         # calls must see the data default clients write.
@@ -735,6 +812,26 @@ class MemoryService:
                 }
                 for name, t in self._tenants.items()
             }
+            # #130: Per-tenant cell info — resolved paths, identity mode.
+            # No secrets or personal data leaked.
+            tenant_cells = {
+                name: {
+                    "is_default": name == self._default_tenant,
+                    "database_path": str(t.config.get("database_filename", "")),
+                    "graph_path": str(t.config.get("graph_dirname", "")),
+                    "user_count": len([
+                        u for u, tn in self._user_tenant_map.items()
+                        if tn == name
+                    ]),
+                    "credential_count": sum(
+                        1 for _h, (tn, _u) in self._credential_map.items()
+                        if tn == name
+                    ),
+                    "acl_enforcement": t.acl.enforcement_on,
+                    "review_mode": t.policy.review_mode,
+                }
+                for name, t in self._tenants.items()
+            }
             return {
                 "status": "ok",
                 "pid": os.getpid(),
@@ -748,6 +845,8 @@ class MemoryService:
                 "credential_count": len(self._credential_map),
                 "tenant_policies": tenant_policies,
                 "tenant_acl_status": tenant_acl_status,
+                "tenant_cells": tenant_cells,
+                "default_tenant": self._default_tenant,
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
                 "lock_wait_count": self._lock_wait_count,
             }
@@ -870,15 +969,22 @@ class MemoryService:
         """Service-coordinated backup via EXPORT DATABASE (FORMAT PARQUET).
 
         Per-tenant (#49): pass ``tenant`` in args to back up a specific
-        cell; the default is the default tenant's store. Whole-file EXPORT
-        is cell-scoped by construction.
+        cell. #130: The tenant must be explicitly specified — no silent
+        fallback to default for administrative operations. If the tenant
+        is not found, raise ValueError (do not silently use default).
         """
         if __package__:
             from .backup import backup_store, list_snapshots
         else:
             from backup import backup_store, list_snapshots
         tenant_name = str(args.get("tenant") or self._default_tenant)
-        tenant = self._tenants.get(tenant_name) or self._tenants[self._default_tenant]
+        # #130: No silent fallback to default for unknown tenants.
+        tenant = self._tenants.get(tenant_name)
+        if tenant is None:
+            raise ValueError(
+                f"Backup target tenant {tenant_name!r} not found. "
+                f"Available: {list(self._tenants.keys())}"
+            )
         # Resolve dst_root from config or default to <home>/backups/memory.
         config = _load_config(self.home)
         backup_cfg = config.get("backup", {}) if isinstance(config.get("backup"), dict) else {}

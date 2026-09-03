@@ -1129,8 +1129,11 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
 
     try:
         text = response.choices[0].message.content
-    except (AttributeError, IndexError, KeyError):
-        return []
+    except (AttributeError, IndexError, KeyError, TypeError):
+        # #172: Some Hermes builds return a plain string instead of an
+        # OpenAI-style response object. Fall back to str(response) so
+        # valid JSON strings are not silently dropped.
+        text = response if isinstance(response, str) else ""
 
     if not text or not text.strip():
         return []

@@ -19,7 +19,7 @@
       ]
     },
     "ASSISTANT_DIRECTIVE_RE": {
-      "pattern": "\\b(?:(?:always|never)\\s+(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|(?:do\\s+not|don\\'t)\\s+(?:ever\\s+|please\\s+|just\\s+|always\\s+)?(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|call\\s+me\\s+[^.!?]{1,200}|stop\\s+(?:doing|being|using|saying)\\b[^.!?]{0,200})",
+      "pattern": "(?<!\\bi\\s)(?<!\\bi\\'\\s)\\b(?:(?:always|never)\\s+(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|(?:do\\s+not|don\\'t)\\s+(?:ever\\s+|please\\s+|just\\s+|always\\s+)?(?:give|say|use|respond|reply|write|speak|talk|call|address|refer|summarise|summarize|explain|include|mention|answer)\\b[^.!?]{0,200}|call\\s+me\\s+[^.!?]{1,200}|stop\\s+(?:doing|being|using|saying)\\b[^.!?]{0,200})",
       "flags": [
         "IGNORECASE"
       ]
@@ -43,7 +43,7 @@
       ]
     },
     "INSIGHT_RE": {
-      "pattern": "\\b(?:i\\s+(?:tend\\s+to|struggle\\s+with|realized|noticed|found\\s+that|learned\\s+that)|i\\'ve\\s+been\\s+noticing|i\\s+think\\s+i|i\\s+feel\\s+like\\s+i)\\s+(.+?)(?:\\.|$)",
+      "pattern": "\\b(?:i\\s+(?:just\\s+|now\\s+)?(?:tend\\s+to|struggle\\s+with|realized|noticed|found\\s+that|learned\\s+that)|i\\'ve\\s+been\\s+noticing|i\\s+think\\s+i|i\\s+feel\\s+like\\s+i)\\s+(.+?)(?:\\.|$)",
       "flags": [
         "IGNORECASE"
       ]

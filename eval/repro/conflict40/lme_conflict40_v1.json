@@ -1,0 +1,1059 @@
+[
+ {
+  "question_id": "c12d0172",
+  "question_type": "conflict-stale",
+  "question": "What does the contractor charge per day?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "R1,350 per day",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/15 (Mon) 10:00",
+   "2026/07/02 (Thu) 11:00",
+   "2026/07/20 (Mon) 09:30",
+   "2026/08/25 (Tue) 16:10"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Contractors charge R1,200 per day for this project."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Let's review the sprint board and the open items."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll pull the board. The completion rate looks good this week."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Let's review the sprint board and the open items."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll pull the board. The completion rate looks good this week."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The contractor day rate is R1,350."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "7260c2ca",
+  "question_type": "conflict-stale",
+  "question": "What is the current early-payment discount?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "1.5%",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/10 (Wed) 15:00",
+   "2026/08/20 (Thu) 12:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "The early payment discount is 2% for invoices paid within 10 days."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The early payment discount is 1.5%."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "8088740c",
+  "question_type": "conflict-stale",
+  "question": "What's our model's retrieval benchmark score?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "89.8",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/05 (Fri) 09:00",
+   "2026/06/30 (Tue) 14:00",
+   "2026/08/18 (Tue) 11:30"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Our model scores 82.2 on the retrieval benchmark."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Let's review the sprint board and the open items."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll pull the board. The completion rate looks good this week."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The model's retrieval benchmark score is 89.8."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "94977bef",
+  "question_type": "conflict-stale",
+  "question": "What is the password expiry for staff accounts?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "60 days",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/07/01 (Wed) 08:30",
+   "2026/08/22 (Sat) 10:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Password expiry is 90 days for staff accounts."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Password expiry is 60 days now."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "e911816a",
+  "question_type": "conflict-stale",
+  "question": "What is the approval threshold for purchases?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "R75,000",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/07/05 (Sun) 12:00",
+   "2026/08/24 (Mon) 09:15"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The approval threshold is R50,000 for purchases."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Approval threshold is R75,000."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "5fe921b6",
+  "question_type": "conflict-stale",
+  "question": "Which Postgres version runs in production?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Postgres 16",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/20 (Sat) 17:00",
+   "2026/08/19 (Wed) 13:40"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "We run Postgres 14 in production."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Production runs Postgres 16."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "37490ebf",
+  "question_type": "conflict-stale",
+  "question": "Who is the account manager for the Northwind account?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Priya",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/25 (Thu) 10:20",
+   "2026/07/15 (Wed) 09:00",
+   "2026/08/21 (Fri) 15:50"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Thandi is the account manager for Northwind."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Let's review the sprint board and the open items."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll pull the board. The completion rate looks good this week."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The account manager for Northwind is Priya."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "d1289e97",
+  "question_type": "conflict-stale",
+  "question": "Where is the platform hosted?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Azure",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/12 (Fri) 11:00",
+   "2026/08/26 (Wed) 08:45"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Hosting is on AWS."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Hosting is on Azure."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "998d87e4",
+  "question_type": "conflict-stale",
+  "question": "What time is the daily stand-up?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "8:30",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/07/08 (Wed) 09:05",
+   "2026/08/25 (Tue) 08:35"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Stand-ups are at 9am."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The stand-up is at 8:30."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "e93fb90e",
+  "question_type": "conflict-stale",
+  "question": "Which tool do we track work in?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Linear",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/18 (Thu) 13:00",
+   "2026/07/22 (Wed) 10:00",
+   "2026/08/20 (Thu) 14:25"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "We track work in Jira."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Let's review the sprint board and the open items."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll pull the board. The completion rate looks good this week."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Work is tracked in Linear."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "7ebd2776",
+  "question_type": "conflict-stale",
+  "question": "What is the credit limit for the Atlas account?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "R250,000",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/28 (Sun) 16:00",
+   "2026/08/23 (Sun) 11:10"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "The Atlas account credit limit is R100,000."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Atlas credit limit is R250,000."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "275c241e",
+  "question_type": "conflict-stale",
+  "question": "Which API version is live?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "v3",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/07/10 (Fri) 09:30",
+   "2026/08/27 (Thu) 10:05"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "We run API v2."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The API version is 3."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "1da68e4c",
+  "question_type": "conflict-stale",
+  "question": "What is the licence fee?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "$700 per month",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/22 (Mon) 14:00",
+   "2026/08/28 (Fri) 09:50"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "The licence fee is $500 per month."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Licence fee is $700 per month."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "0e25b13e",
+  "question_type": "conflict-stale",
+  "question": "What are the support hours?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "7am to 6pm",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/07/14 (Tue) 10:00",
+   "2026/08/26 (Wed) 12:30"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Support hours are 8 to 5."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Support hours are 7 to 6."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "b8c0cdb5",
+  "question_type": "conflict-stale",
+  "question": "Where is the team based?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Johannesburg",
+  "expectation": "current_value",
+  "haystack_dates": [
+   "2026/06/08 (Mon) 08:00",
+   "2026/07/18 (Sat) 15:00",
+   "2026/08/24 (Mon) 09:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The team is based in Cape Town."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Let's review the sprint board and the open items."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll pull the board. The completion rate looks good this week."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The team is based in Johannesburg."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "bb086013",
+  "question_type": "conflict-no-policy",
+  "question": "How are invoices validated now?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 OCR validation was stopped with no replacement.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/05/20 (Wed) 10:00",
+   "2026/08/10 (Mon) 16:20"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "We'll validate all invoices with OCR going forward."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "We stopped OCR validation on invoices."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "86bcda12",
+  "question_type": "conflict-no-policy",
+  "question": "Do expense claims need pre-approval?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 pre-approval was stopped with no replacement rule.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/02 (Tue) 09:00",
+   "2026/08/12 (Wed) 11:35"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Expense claims need pre-approval before submission."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Expense pre-approval has been stopped."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "a598e726",
+  "question_type": "conflict-no-policy",
+  "question": "Which pipeline runs the nightly builds?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the nightly build pipeline was retired.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/05/28 (Thu) 14:00",
+   "2026/08/11 (Tue) 10:45"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "We use the nightly build pipeline for releases."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The nightly build pipeline was retired."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "28fe8339",
+  "question_type": "conflict-no-policy",
+  "question": "What storage allowance do beta users get?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the beta program ended.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/05 (Fri) 12:00",
+   "2026/08/15 (Sat) 09:20"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Beta users get 10GB of storage."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The beta program ended."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "27116931",
+  "question_type": "conflict-no-policy",
+  "question": "Can clients upload files via FTP?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 FTP uploads were discontinued.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/11 (Thu) 08:30",
+   "2026/08/17 (Mon) 15:10"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "Clients can upload files via FTP."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "FTP uploads were discontinued."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "fbca3147",
+  "question_type": "conflict-no-policy",
+  "question": "Who handles on-call escalations now?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the SRE on-call rotation was disbanded.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/16 (Tue) 11:00",
+   "2026/08/14 (Fri) 13:25"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "On-call escalations go to the SRE team."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The SRE on-call rotation was disbanded."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "63a8ce82",
+  "question_type": "conflict-no-policy",
+  "question": "How long is the trial period for new clients?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the trial period was removed.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/19 (Fri) 10:30",
+   "2026/08/18 (Tue) 14:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "New clients get a 30-day trial period."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The trial period was removed."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "e5b8ccd3",
+  "question_type": "conflict-no-policy",
+  "question": "What time does the Durban office open?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the Durban office closed.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/24 (Wed) 09:00",
+   "2026/08/16 (Sun) 12:40"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The Durban office opens at 7am."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The Durban office closed."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "fa3b9759",
+  "question_type": "conflict-no-policy",
+  "question": "Do bulk orders get a discount?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the bulk discount was scrapped.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/26 (Fri) 15:00",
+   "2026/08/19 (Wed) 10:15"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "Orders over 100 units get 10% off."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The bulk discount was scrapped."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "122906a6",
+  "question_type": "conflict-no-policy",
+  "question": "Should agents disable the cache during incidents?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the cache workaround was reverted and was never a policy.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/07/03 (Fri) 13:00",
+   "2026/08/21 (Fri) 16:30"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "During the outage we disabled the cache to keep the site up."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The cache workaround was reverted after the incident."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "288796c6",
+  "question_type": "conflict-no-policy",
+  "question": "How often are invoices filed?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 the filing rule is scoped to the UK only.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/08/10 (Mon) 10:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "In the UK, invoices are filed quarterly."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "9d83858b",
+  "question_type": "conflict-no-policy",
+  "question": "When does the data migration run?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "No current policy \u2014 nightly migrations stopped and the schedule is being redesigned.",
+  "expectation": "abstain",
+  "haystack_dates": [
+   "2026/06/29 (Mon) 23:00",
+   "2026/08/20 (Thu) 08:55"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "We migrate data nightly at midnight."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Nightly migrations stopped; the schedule is being redesigned."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "798189e6",
+  "question_type": "conflict-authority",
+  "question": "An agent is asked to apply the 8% salary band increase. Approve it?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 only the compensation committee can change salary bands, and the proposal is unapproved.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/06 (Mon) 10:00",
+   "2026/08/13 (Thu) 14:20"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "Only the compensation committee can change salary bands."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "A proposal to raise the bands by 8% is under discussion."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "9c289af1",
+  "question_type": "conflict-authority",
+  "question": "Can the support team update prices?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 pricing changes require board sign-off.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/09 (Thu) 09:30",
+   "2026/08/14 (Fri) 11:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Pricing changes require board sign-off."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Support suggested updating the price list."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "3b0ef78c",
+  "question_type": "conflict-authority",
+  "question": "An agent rotated a client API key. Is that allowed?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 API keys can only be rotated by the security admin.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/16 (Thu) 15:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "API keys can only be rotated by the security admin."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "e97aab8a",
+  "question_type": "conflict-authority",
+  "question": "Should an agent use the new onboarding checklist?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 the new checklist is a draft pending the QA lead's approval; the approved one stands.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/06/14 (Sun) 10:00",
+   "2026/08/05 (Wed) 13:15",
+   "2026/08/06 (Thu) 09:40"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "The current onboarding checklist is the one approved in January."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The new onboarding checklist is a draft, pending the QA lead's approval."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "The onboarding checklist must be approved by the QA lead before use."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "0497ef48",
+  "question_type": "conflict-authority",
+  "question": "What is the data retention period?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "90 days \u2014 REV B is the approved version; REV C is only a draft.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/02/20 (Fri) 11:00",
+   "2026/08/09 (Sun) 16:45"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "REV B of the data-retention policy (approved February) sets retention at 90 days."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "REV C of the data-retention policy is a draft; it changes retention to 30 days."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "7ebbecba",
+  "question_type": "conflict-authority",
+  "question": "Should we update the European prices with the US team's list?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 European pricing is set by the EU team only.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/12 (Sun) 12:00",
+   "2026/08/15 (Sat) 10:30"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "European pricing is set by the EU team only."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "The US team posted a new EU price list."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "2d204974",
+  "question_type": "conflict-authority",
+  "question": "Can support change the SLA?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 SLA changes require the client's written approval.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/21 (Tue) 08:30",
+   "2026/08/16 (Sun) 15:10"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Changes to the SLA require the client's written approval."
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "Support proposed improving the SLA."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "2d35182a",
+  "question_type": "conflict-authority",
+  "question": "An agent confirmed a user's data-deletion request. Is that valid?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 only the DPO can approve data-subject deletion requests.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/25 (Sat) 09:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "Only the DPO can approve data-subject deletion requests."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "e3b7bf0b",
+  "question_type": "conflict-authority",
+  "question": "An agent scheduled a maintenance window. Is that allowed?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 maintenance windows can only be scheduled by the ops lead.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/07/29 (Wed) 14:30"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Maintenance windows can only be scheduled by the ops lead."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "e244f27d",
+  "question_type": "conflict-authority",
+  "question": "An agent granted a new hire production access. Is that valid?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Refuse \u2014 production access is granted only by the engineering manager.",
+  "expectation": "refuse",
+  "haystack_dates": [
+   "2026/08/02 (Sun) 10:15"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "Production access is granted only by the engineering manager."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "84af2fbc",
+  "question_type": "conflict-control",
+  "question": "When was the company founded?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "2011",
+  "expectation": "fact",
+  "haystack_dates": [
+   "2026/08/01 (Sat) 10:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The company was founded in 2011."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "ae9b8718",
+  "question_type": "conflict-control",
+  "question": "What is the approval threshold for purchases?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "R50,000",
+  "expectation": "fact",
+  "haystack_dates": [
+   "2026/08/02 (Sun) 11:00"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "The approval threshold is R50,000 for purchases."
+    }
+   ]
+  ]
+ },
+ {
+  "question_id": "508a9fac",
+  "question_type": "conflict-control",
+  "question": "How often does the product ship?",
+  "question_date": "2026/09/01 (Tue) 09:00",
+  "answer": "Weekly",
+  "expectation": "fact",
+  "haystack_dates": [
+   "2026/08/03 (Mon) 09:30"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "assistant",
+     "content": "The product ships weekly."
+    }
+   ]
+  ]
+ }
+]

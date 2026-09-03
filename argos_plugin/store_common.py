@@ -50,13 +50,6 @@ except ImportError:
 
 
 
-try:
-    import numpy as np
-except ImportError:
-    np = None  # semantic dedup falls back to skip if numpy unavailable
-
-
-
 # --- prompt-injection / hidden-content hardening (2026-08-27) ---------------
 # Stored memory is later replayed verbatim into prompts (auto-injection and
 # memory_search results). Content that mimics instructions must not enter the

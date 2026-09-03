@@ -34,7 +34,7 @@ class _FakeModel:
     def __init__(self, *args, **kwargs):
         self.calls = 0
 
-    def encode(self, texts, normalize_embeddings=True):
+    def encode(self, texts, normalize_embeddings=True, show_progress_bar=None):
         self.calls += 1
         # Deterministic 4-dim vector derived from the text so distinct
         # texts get distinct (non-zero) vectors.

@@ -2723,6 +2723,58 @@ class TestExtractor:
         facts = extract_from_turn("I am tired and hungry right now.", "", use_llm_fallback=False)
         assert len(facts) == 0, f"Should not extract transient states, got {facts}"
 
+    def test_insight_re_matches_just_modifier(self):
+        """#170: INSIGHT_RE must match 'I just realized...' and 'I now
+        noticed...' — the optional just/now modifier was missing."""
+        from extractor import extract_from_turn
+        facts = extract_from_turn(
+            "I just realized I work better in the morning.",
+            "", use_llm_fallback=False,
+        )
+        assert len(facts) >= 1, f"Expected insight extraction, got {facts}"
+        assert any("realized" in f.get("content", "").lower() or "morning" in f.get("content", "").lower()
+                   for f in facts), f"Expected 'realized/morning' insight, got {facts}"
+
+    def test_assistant_directive_does_not_fire_on_first_person(self):
+        """#171: 'I always use Vim' should be a habit, not an assistant
+        directive. The first-person lookbehind prevents the directive
+        regex from matching."""
+        from extractor import extract_from_turn
+        facts = extract_from_turn(
+            "I always use Vim as my editor.",
+            "", use_llm_fallback=False,
+        )
+        assert len(facts) >= 1, f"Expected extraction, got {facts}"
+        # Should NOT be categorized as a directive.
+        assert not any(f.get("category") == "directive" for f in facts), \
+            f"'I always use Vim' should not be a directive, got {facts}"
+
+    def test_llm_fallback_handles_plain_string_response(self):
+        """#172: The LLM fallback must handle plain-string responses,
+        not just OpenAI-style response objects."""
+        from unittest.mock import patch
+        from extractor import _extract_facts_llm
+        json_response = '[{"category": "preference", "content": "I like tea"}]'
+        long_content = "I like tea and coffee every morning and I also enjoy hiking on weekends"
+        with patch("agent.auxiliary_client.call_llm", return_value=json_response):
+            facts = _extract_facts_llm(long_content)
+        assert len(facts) >= 1, f"Expected plain-string response parsed, got {facts}"
+        assert any("tea" in f.get("content", "") for f in facts), \
+            f"Expected 'tea' in extracted facts, got {facts}"
+
+    def test_value_extractor_is_now_transition(self):
+        """#173: 'is now'/'are now' must trigger value-supersession
+        detection."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from value_extractor import _TRANSITION_VERBS
+        assert _TRANSITION_VERBS.search("My salary is now $500"), \
+            "'is now' should be a transition verb"
+        assert _TRANSITION_VERBS.search("The costs are now higher"), \
+            "'are now' should be a transition verb"
+        assert not _TRANSITION_VERBS.search("My salary is $500"), \
+            "'is' without 'now' should not be a transition"
+
 
 class TestStorageRouting:
     def test_local_surfaces_use_primary_store(self):

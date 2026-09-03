@@ -445,3 +445,119 @@ class TestConfigLoading:
         assert fields["rollup_enabled"].group == "Lifecycle"
         assert fields["rollup_interval_days"].group == "Lifecycle"
         assert fields["rollup_max_records_per_run"].group == "Lifecycle"
+
+
+# ---------------------------------------------------------------------------
+# Maintenance audit M1 — forget_stale_records returns wrong IDs
+# ---------------------------------------------------------------------------
+
+
+class TestMaintenanceAudit:
+    """Audit fixes for store_maintenance.py."""
+
+    def test_forget_stale_records_returns_correct_ids_on_partial_failure(self, tmp_path):
+        """M1: forgotten_ids must only include IDs that were actually
+        quarantined, not the first N from the selected list."""
+        store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="alice")
+        # Create 3 old context_notes.
+        recs = []
+        for i in range(3):
+            rec = store.remember(
+                category="context_note", content=f"old forgotten note {i}"
+            )
+            recs.append(rec)
+            old_ts = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+            store.connection.execute(
+                "UPDATE memory_records SET created_at = ? WHERE memory_id = ?",
+                [old_ts, rec.memory_id],
+            )
+        # Make the second record disappear between SELECT and quarantine
+        # by deleting it before forget_stale_records runs the quarantine loop.
+        # We patch quarantine_memory to fail for the second record.
+        original_quarantine = store.quarantine_memory
+        call_count = [0]
+
+        def selective_quarantine(memory_id, reason):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                # Simulate the record being gone (race with delete_memory).
+                return False
+            return original_quarantine(memory_id, reason)
+
+        store.quarantine_memory = selective_quarantine
+        report = store.forget_stale_records(forget_after_days=365)
+        store.quarantine_memory = original_quarantine
+
+        assert report["forgotten_count"] == 2, (
+            f"Expected 2 quarantined, got {report['forgotten_count']}"
+        )
+        # The returned IDs must be the ones that were ACTUALLY quarantined,
+        # not just the first 2 from the list.
+        quarantined_ids = set(report["forgotten_ids"])
+        assert len(quarantined_ids) == 2
+        # The second record (which failed) must NOT be in the list.
+        assert recs[1].memory_id not in quarantined_ids
+        # The first and third records (which succeeded) must be in the list.
+        assert recs[0].memory_id in quarantined_ids
+        assert recs[2].memory_id in quarantined_ids
+        store.close()
+
+    def test_revive_record_respects_user_scope(self, tmp_path):
+        """M3: revive_record must not allow cross-tenant revival.
+        User B cannot revive user A's archived record."""
+        store_a = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="alice")
+        rec = store_a.remember(category="context_note", content="alice's note")
+        store_a.connection.execute(
+            "UPDATE memory_records SET tier = 'archived' WHERE memory_id = ?",
+            [rec.memory_id],
+        )
+        # Open the same DB as a different user.
+        store_b = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="bob")
+        # Bob should NOT be able to revive Alice's archived record.
+        result = store_b.revive_record(rec.memory_id)
+        assert result is False, (
+            "revive_record must reject cross-tenant revival"
+        )
+        # Verify the record is still archived.
+        row = store_a.connection.execute(
+            "SELECT tier FROM memory_records WHERE memory_id = ?",
+            [rec.memory_id],
+        ).fetchone()
+        assert row[0] == "archived"
+        store_a.close()
+        store_b.close()
+
+    def test_consolidate_expired_count_scoped_to_user(self, tmp_path):
+        """M2: consolidate's expired_count must only count the current
+        user's expired records, not all tenants."""
+        store_a = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="alice")
+        # Alice has one expired record.
+        rec_a = store_a.remember(
+            category="context_note", content="alice's expired note"
+        )
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+        past_expiry = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        store_a.connection.execute(
+            "UPDATE memory_records SET created_at = ?, expires_at = ? "
+            "WHERE memory_id = ?",
+            [old_ts, past_expiry, rec_a.memory_id],
+        )
+        # Bob has two expired records.
+        store_b = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="bob")
+        for i in range(2):
+            rec_b = store_b.remember(
+                category="context_note", content=f"bob's expired note {i}"
+            )
+            store_b.connection.execute(
+                "UPDATE memory_records SET created_at = ?, expires_at = ? "
+                "WHERE memory_id = ?",
+                [old_ts, past_expiry, rec_b.memory_id],
+            )
+        # Alice's consolidate should report 1 expired, not 3.
+        report = store_a.consolidate(dry_run=True)
+        assert report["expired_count"] == 1, (
+            f"Expected 1 expired for alice, got {report['expired_count']} "
+            "(cross-tenant count leak)"
+        )
+        store_a.close()
+        store_b.close()

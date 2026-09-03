@@ -14,9 +14,11 @@ else:
 
 _SENSITIVE_RE = re.compile(
     r"\b(?:financial|salary|password|secret|private|personal|confidential|"
-    r"sensitive|classified|internal|restricted|proprietary|"
-    r"wife|husband|partner|girlfriend|boyfriend|age|birthday|location|lives\s+in|"
-    r"works?\s+(?:at|for)|job|identity|name)\b",
+    r"sensitive|classified|internal\s+(?:memo|document|policy|report|email|communication)|restricted|proprietary|"
+    r"wife|husband|girlfriend|boyfriend|business\s+partner|romantic\s+partner|my\s+partner\b|"
+    r"age|birthday|location|lives\s+in|"
+    r"works?\s+(?:at|for)|job\s+(?:title|loss|application|offer|search|hunt|interview)|identity|"
+    r"(?:my|his|her|their|your|our)\s+name\b|name\s+(?:is|was|are)\b)\b",
     re.IGNORECASE,
 )
 

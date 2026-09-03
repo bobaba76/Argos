@@ -308,3 +308,85 @@ def test_low_confidence_approve_becomes_confirmation(monkeypatch):
         "evidence_text": "I like tea.",
     })
     assert result["decision"] == "pending_user_confirmation"
+
+
+# ---------------------------------------------------------------------------
+# #184 — _SENSITIVE_RE over-matches common words (internal, partner, job, name)
+# ---------------------------------------------------------------------------
+
+def test_sensitive_re_does_not_match_benign_internal():
+    """#184: bare 'internal' in non-sensitive contexts should not flag."""
+    from reviewer import is_sensitive_candidate
+    assert not is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "I read about internal medicine for my studies",
+    })
+    assert not is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "The internal combustion engine is fascinating",
+    })
+
+
+def test_sensitive_re_matches_internal_memo():
+    """#184: 'internal memo' / 'internal document' should still flag."""
+    from reviewer import is_sensitive_candidate
+    assert is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "I saw an internal memo about layoffs",
+    })
+
+
+def test_sensitive_re_does_not_match_benign_partner():
+    """#184: 'project partner' / 'business partner' (non-romantic) should
+    not flag via bare 'partner'. 'business partner' is explicitly matched
+    but 'project partner' should not be."""
+    from reviewer import is_sensitive_candidate
+    assert not is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "My project partner reviewed the code",
+    })
+
+
+def test_sensitive_re_matches_my_partner():
+    """#184: 'my partner' (romantic sense) should still flag."""
+    from reviewer import is_sensitive_candidate
+    assert is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "My partner is visiting this weekend",
+    })
+
+
+def test_sensitive_re_does_not_match_benign_job():
+    """#184: 'job scheduling' / 'job queue' should not flag."""
+    from reviewer import is_sensitive_candidate
+    assert not is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "The job queue is full and job scheduling is slow",
+    })
+
+
+def test_sensitive_re_matches_job_title():
+    """#184: 'job title' / 'job loss' should still flag."""
+    from reviewer import is_sensitive_candidate
+    assert is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "My job title is Senior Engineer",
+    })
+
+
+def test_sensitive_re_does_not_match_benign_name():
+    """#184: 'name the file' should not flag as sensitive."""
+    from reviewer import is_sensitive_candidate
+    assert not is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "I need to name the file output.txt",
+    })
+
+
+def test_sensitive_re_matches_possessive_name():
+    """#184: 'her name is' / 'my name is' should still flag."""
+    from reviewer import is_sensitive_candidate
+    assert is_sensitive_candidate({
+        "category": "personal_fact",
+        "content": "Her name is Alice and she lives nearby",
+    })

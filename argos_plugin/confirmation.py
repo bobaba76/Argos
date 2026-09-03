@@ -69,3 +69,29 @@ def build_confirmation_block(candidates: Iterable[dict[str, Any]]) -> str:
         "If the user confirms, approve exactly this candidate ID. If they decline, "
         "reject it. If they are ambiguous, ask again rather than saving it."
     )
+
+
+def choose_confirmation_block(
+    candidates: Iterable[dict[str, Any]],
+    already_surfaced: Iterable[str] = (),
+) -> tuple[str, str | None]:
+    """Pick the next pending confirmation worth surfacing and render it.
+
+    Guarded surfacing (#99 rework, 3/9): reviewer-failure outcomes are
+    never surfaced (they belong in a machine review queue, not a
+    "should this be saved?" prompt), a candidate that was already
+    surfaced is never shown again, and only ONE candidate is returned
+    per call — a single turn can never dump the whole backlog.
+
+    Returns ``(block, candidate_id)``; block is ``""`` and candidate_id
+    ``None`` when there is nothing left to surface.
+    """
+    seen = {str(x).strip() for x in (already_surfaced or ()) if str(x).strip()}
+    for c in candidates or ():
+        cid = str(c.get("candidate_id", "")).strip()
+        if not cid or cid in seen:
+            continue
+        if not is_genuine_confirmation(c):
+            continue
+        return build_confirmation_block([c]), cid
+    return "", None

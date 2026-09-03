@@ -490,6 +490,13 @@ class ProviderCoreMixin:
                 "required": False,
             },
             {
+                "key": "confirmation_surfacing",
+                "description": "Surface pending user-confirmation proposals in prefetched context: one per turn, genuine needs only, never re-asks a candidate (ledger persists across restarts)",
+                "default": "true",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
                 "key": "stale_review_sweep_enabled",
                 "description": "Periodically re-review memory proposals stranded in 'pending' (e.g. after a failed/rate-limited reviewer call)",
                 "default": "true",
@@ -646,6 +653,16 @@ class ProviderCoreMixin:
         self._llm_fallback = _flag(self._config, "llm_fallback", "true")
         self._extraction_shadow_diff = _flag(self._config, "extraction_shadow_diff", "false")
         self._auto_review = _flag(self._config, "auto_review", "true")
+        # Guarded confirmation surfacing (#99 rework, 3/9): surface one
+        # pending user-confirmation per non-trivial turn, genuine needs
+        # only, never re-ask a candidate (ledger in system_state).
+        self._confirmation_surfacing = _flag(
+            self._config, "confirmation_surfacing", "true"
+        )
+        logger.info(
+            "Confirmation surfacing %s (guarded: one per turn, genuine-only, no re-asks)",
+            "enabled" if self._confirmation_surfacing else "disabled",
+        )
         # Extraction-time dedupe: proposals whose embedding cosine against an
         # active memory clears this threshold are skipped entirely (no
         # candidate emitted). 1.0 disables semantic dedupe.

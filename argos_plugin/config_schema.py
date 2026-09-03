@@ -102,6 +102,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="confirmation_surfacing",
+            label="Surface confirmations",
+            kind=KIND_BOOL,
+            default="true",
+            description="Ask the user about pending memory proposals in-session (one per turn).",
+            info="Surfaces one genuine pending proposal per non-trivial turn so confirmations are acted on instead of piling up unseen. Reviewer-failure outcomes are never surfaced, and a proposal is never asked about twice (ledger survives restarts).",
+            inline=True,
+            group="Extraction",
+        ),
+        ProviderField(
             key="stale_review_sweep_enabled",
             label="Stale-pending sweep",
             kind=KIND_BOOL,

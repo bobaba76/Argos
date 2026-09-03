@@ -6,6 +6,7 @@ neutral: no renames, no fixes). Consts are imported from provider_core.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -16,6 +17,11 @@ try:
     from .store_common import MemoryRecord as _MemoryRecord
 except ImportError:  # provider_retrieval.py imported as a top-level module
     from store_common import MemoryRecord as _MemoryRecord
+
+try:
+    from .confirmation import choose_confirmation_block
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from confirmation import choose_confirmation_block
 
 try:
     from .provider_core import (
@@ -936,6 +942,38 @@ class ProviderRetrievalMixin:
                 ))
         return notes
 
+    # -- confirmation surfacing ledger ----------------------------------
+    # Persisted in the store's system_state KV so a candidate is surfaced
+    # at most once across provider restarts (the #99 failure mode was
+    # re-asking the same candidate every turn, forever).
+
+    def _surfaced_confirmation_ids(self) -> set:
+        try:
+            raw = (
+                self._store.get_state("surfaced_confirmation_ids")
+                if self._store
+                else None
+            )
+            if raw:
+                _ids = json.loads(raw)
+                if isinstance(_ids, list):
+                    return {str(x) for x in _ids}
+        except Exception:
+            pass
+        return set()
+
+    def _mark_surfaced_confirmation(self, candidate_id: str | None) -> None:
+        if not candidate_id or self._store is None:
+            return
+        try:
+            _ids = self._surfaced_confirmation_ids()
+            _ids.add(str(candidate_id))
+            self._store.set_state(
+                "surfaced_confirmation_ids", json.dumps(sorted(_ids))
+            )
+        except Exception:
+            pass
+
     # -- prefetch (auto-inject context before each turn) ---------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -972,14 +1010,35 @@ class ProviderRetrievalMixin:
             sections = []
             body = ""
             try:
-                # Confirmation injection removed (#99): the prefetch path no
-                # longer prepends an arbitrary pending_user_confirmation
-                # candidate to every turn. Confirmations are surfaced only
-                # through the explicit memory_candidate_review tool or a
-                # dedicated confirmation surface, so an unrelated pending
-                # candidate cannot interrupt ordinary turns indefinitely.
-                # build_confirmation_block remains available for any future
-                # explicit confirmation surface.
+                # Guarded confirmation surfacing (#99 rework, 3/9): surface
+                # ONE pending user-confirmation per turn — genuine needs
+                # only (reviewer failures are never "should this be saved?"
+                # prompts), never re-surface a candidate already shown
+                # (ledger persisted in system_state, survives restarts),
+                # and only on non-trivial turns (the trivial gate above
+                # returns first). The candidate stays pending until the
+                # user acts through memory_candidate_review — this block
+                # only prompts the model to ask. Fail-soft: any store
+                # hiccup skips surfacing, never retrieval.
+                if getattr(self, "_confirmation_surfacing", False):
+                    try:
+                        _cands = self._store.list_candidates(
+                            status="pending_user_confirmation", limit=10
+                        )
+                        _block, _surfaced_id = choose_confirmation_block(
+                            _cands, self._surfaced_confirmation_ids()
+                        )
+                        if _block:
+                            sections.append(_block)
+                            self._mark_surfaced_confirmation(_surfaced_id)
+                            logger.info(
+                                "Surfaced confirmation candidate %s (guarded surfacing)",
+                                _surfaced_id,
+                            )
+                    except Exception as _exc:
+                        logger.debug(
+                            "Confirmation surfacing skipped (fail-soft): %s", _exc
+                        )
 
                 # History-at-current-time (#3): on historical queries
                 # ("where did I use to live"), widen retrieval to closed

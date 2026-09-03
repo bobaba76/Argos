@@ -462,9 +462,13 @@ class ProviderSessionMixin:
             # suggestion is logged but NOT auto-applied — the user confirms
             # via memory_update(expires_at=...) before it sticks. This keeps
             # the confirm-first invariant: no silent lifecycle changes.
+            # The decision_map converts "approve" to "reviewed_approved"
+            # (the ceiling for auto-review — "approved" is reserved for the
+            # agent-facing confirmation tool). Check "reviewed_approved",
+            # not "approved", or the suggestion never fires.
             if (
                 self._expiry_auto_suggest
-                and final_status == "approved"
+                and final_status == "reviewed_approved"
                 and result
                 and result.get("memory")
             ):

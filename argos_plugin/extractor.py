@@ -1129,8 +1129,9 @@ def _extract_facts_llm(user_content: str, *, model: str = "", provider: str = ""
 
     try:
         text = response.choices[0].message.content
-    except (AttributeError, IndexError, KeyError):
-        return []
+    except (AttributeError, IndexError, KeyError, TypeError):
+        # Some call_llm implementations return a plain string.
+        text = response if isinstance(response, str) else ""
 
     if not text or not text.strip():
         return []

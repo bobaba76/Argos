@@ -1688,7 +1688,7 @@ class KuzuGraphStore:
         # supports toLower() in Cypher.
         query = """
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        WHERE (a.user_scope = $scope OR b.user_scope = $scope)
+        WHERE a.user_scope = $scope AND b.user_scope = $scope
           AND (toLower(a.id) CONTAINS $term OR toLower(b.id) CONTAINS $term)
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,

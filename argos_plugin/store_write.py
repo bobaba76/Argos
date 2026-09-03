@@ -2215,15 +2215,16 @@ class StoreWriteMixin:
                         source_doc_id, source_loc, extraction_method, extracted_at,
                         verified_state, verified_at,
                         retrieval_count, helpful_count, dismissed_count,
-                        valid_from, valid_to, superseded_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                        valid_from, valid_to, superseded_by,
+                        provenance_origin, grounding)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
                     [new_id, rec.category, new_content, new_tags,
                      json.dumps(new_payload), created_ts, now,
                      effective_expires,
                      new_emb if new_emb else None,
                      rec.status, rec.source, rec.confidence, rec.durability, rec.scope,
                      rec.project_id,
-                     rec.payload.get("user_scope"),
+                     getattr(rec, "user_scope", None) or rec.payload.get("user_scope"),
                      getattr(rec, "namespace", "conversation") or "conversation",
                      getattr(rec, "client_scope", None),
                      getattr(rec, "doc_class", None),
@@ -2234,7 +2235,9 @@ class StoreWriteMixin:
                      getattr(rec, "verified_state", "current") or "current",
                      getattr(rec, "verified_at", None),
                      rec.retrieval_count, rec.helpful_count, rec.dismissed_count,
-                     created_ts],
+                     created_ts,
+                     getattr(rec, "provenance_origin", "internal") or "internal",
+                     getattr(rec, "grounding", "observed") or "observed"],
                 )
                 # 2. Supersede the old version. D5 fix: guard with
                 #    AND valid_to IS NULL so an already-superseded record's

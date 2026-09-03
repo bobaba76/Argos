@@ -249,6 +249,10 @@ class QueryExpander:
         """Parse the LLM response into a list of sub-queries."""
         # Try to extract a JSON array from the response
         text = response.strip()
+        # Strip markdown code fences if present.
+        if text.startswith("```"):
+            text = re.sub(r'^```(?:json)?\s*', '', text)
+            text = re.sub(r'\s*```$', '', text).strip()
         # Find the JSON array in the response. Use greedy match to get
         # the full array (non-greedy would stop at the first ]).
         match = re.search(r'\[.*\]', text, re.DOTALL)

@@ -2,9 +2,13 @@ name: argos
 version: 1.0.0
 description: "Argos — local-first shared memory service — one canonical DuckDB + Kùzu relationship graph with local sentence-transformers embeddings. Automatic extraction creates reviewable proposals; works across personal, work, tech, health, relationship, and goal contexts."
 pip_dependencies:
-  - duckdb
-  - kuzu
-  - sentence-transformers
+  - duckdb==1.5.5
+  - kuzu==0.11.3
+  - sentence-transformers==5.6.1
+  - pandas==2.2.3
+  - fastapi==0.133.1
+  - uvicorn==0.41.0
+  - pydantic==2.13.4
 requires_env: []
 hooks:
   - on_turn_start

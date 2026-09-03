@@ -361,6 +361,7 @@ class TestStrictTenantRouting:
                 },
                 "other": {
                     "database_filename": "other.duckdb",
+                    "graph_dirname": "other_kuzu",
                     "allowed_user_ids": ["shared-user"],
                 },
             },

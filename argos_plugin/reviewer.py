@@ -108,17 +108,21 @@ def suggest_expiry(
                 return (now + timedelta(days=days)).isoformat()
         except (ValueError, KeyError):
             pass
-    # Rule 3: explicit fixed date.
+    # Rule 3: explicit fixed date. A past date is rejected (fall through to
+    # the TTL fallback) — a past expires_at would make the memory invisible
+    # immediately. The suggestion is not auto-applied, but returning a past
+    # date is still a bad suggestion, so we drop it.
     m = _EXPIRY_FIXED_RE.search(content)
     if m:
         try:
             day = int(m.group(1))
             month = _MONTH_NUM[m.group(2).lower()]
             year = int(m.group(3)) if m.group(3) else now.year
-            # End of that day, UTC.
-            return datetime(
+            candidate_dt = datetime(
                 year, month, day, 23, 59, 59, tzinfo=timezone.utc
-            ).isoformat()
+            )
+            if candidate_dt > now:
+                return candidate_dt.isoformat()
         except (ValueError, KeyError):
             pass
     # Rule 4: category TTL map.
@@ -152,14 +156,27 @@ def _parse_json_response(response: Any) -> dict | None:
     if not text or not text.strip():
         return None
     text = text.strip()
+    # Strip a single pair of leading/trailing markdown code fences.
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
+    # Try a direct parse first (the common case: pure JSON or fenced JSON).
     try:
         value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # Fallback: the LLM may have wrapped the JSON in conversational prose
+    # ("Here is my review:\n{...}\nLet me know."). Extract the first
+    # balanced {...} object via the JSON decoder's raw_decode.
+    start = text.find("{")
+    if start == -1:
+        return None
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text[start:])
+        return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
         return None
-    return value if isinstance(value, dict) else None
 
 
 def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", provider: str = "") -> Dict[str, Any]:
@@ -234,9 +251,20 @@ def review_candidate_with_llm(candidate: Dict[str, Any], *, model: str = "", pro
                 "review_model": "inbound_security_unavailable",
             }
         else:
-            scan_result = scan_inbound_text(
-                evidence or str(candidate.get("content") or "")
-            )
+            try:
+                scan_result = scan_inbound_text(
+                    evidence or str(candidate.get("content") or "")
+                )
+            except Exception as exc:
+                # Fail closed: a scanner crash must not propagate — route
+                # the external candidate to a human rather than proceeding
+                # without the security gate.
+                return {
+                    "decision": "pending_user_confirmation",
+                    "confidence": 0.99,
+                    "reason": f"Inbound security scan raised: {exc}; external-source memory requires human confirmation.",
+                    "review_model": "inbound_security_error",
+                }
         if scan_result is not None and scan_result.blocked:
             return {
                 "decision": "pending_user_confirmation",

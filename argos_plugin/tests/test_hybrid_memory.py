@@ -2357,6 +2357,51 @@ class TestKuzuGraph:
         graph_alice.close()
         graph_bob.close()
 
+    def test_search_graph_rejects_cross_scope_edge(self, tmp_path):
+        """#176: search_graph must use AND for scope filter, not OR.
+
+        A corrupted cross-scope edge (one endpoint in alice, one in bob)
+        must NOT leak to either scope's search_graph results. The OR
+        filter would return the edge to whichever scope matches one side;
+        the AND filter correctly requires both endpoints in scope.
+        """
+        from graph import KuzuGraphStore
+
+        graph_alice = KuzuGraphStore(tmp_path / "cross_scope_kuzu", user_id="alice")
+        graph_bob = KuzuGraphStore(tmp_path / "cross_scope_kuzu", user_id="bob")
+        # Normal in-scope edges.
+        graph_alice.add_relationship("Alice", "person", "knows", "Alex", "person")
+        graph_bob.add_relationship("Bob", "person", "knows", "Carol", "person")
+        # Inject a cross-scope edge directly via the raw connection.
+        # This simulates corruption or manual edit — both endpoints
+        # have different user_scope values.
+        with graph_alice._shared_conn_lock:
+            graph_alice.conn.execute(
+                "CREATE (a:Entity {id: 'CrossLeak', entity_type: 'person', "
+                "user_scope: 'alice', attributes: ''})-[r:RelatesTo "
+                "{relation_type: 'knows', attributes: ''}]->"
+                "(b:Entity {id: 'BobSecret', entity_type: 'person', "
+                "user_scope: 'bob', attributes: ''})"
+            )
+        # Alice's search_graph must NOT return the cross-scope edge
+        # (BobSecret is in bob's scope, not alice's).
+        alice_results = graph_alice.search_graph("CrossLeak", limit=50)
+        alice_targets = {e.get("target", "") for e in alice_results}
+        assert "BobSecret" not in alice_targets, (
+            "search_graph OR-filter leak: alice sees bob's entity via "
+            "cross-scope edge"
+        )
+        # Bob's search_graph must NOT return it either (CrossLeak is in
+        # alice's scope).
+        bob_results = graph_bob.search_graph("BobSecret", limit=50)
+        bob_sources = {e.get("source", "") for e in bob_results}
+        assert "CrossLeak" not in bob_sources, (
+            "search_graph OR-filter leak: bob sees alice's entity via "
+            "cross-scope edge"
+        )
+        graph_alice.close()
+        graph_bob.close()
+
     def test_graph_query_returns_memory_evidence(self, tmp_path):
         from graph import KuzuGraphStore
 

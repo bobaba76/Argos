@@ -419,6 +419,70 @@ class TestDuckDBStore:
             f"retrieval_count not carried forward: got {updated.retrieval_count}"
         store.close()
 
+    def test_update_memory_preserves_provenance_and_grounding(self, tmp_path):
+        """#174: update_memory must carry provenance_origin and grounding
+        from the old record to the new version. Without this, an
+        external/ingested memory gets silently downgraded to
+        internal/observed on edit — trust taint is lost."""
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
+        # Save an external-origin memory with inferred grounding.
+        rec = store.remember(
+            category="personal_fact",
+            content="User read an article about Python 3.13",
+            provenance_origin="external",
+            grounding="inferred",
+        )
+        assert rec is not None
+        assert rec.provenance_origin == "external"
+        assert rec.grounding == "inferred"
+
+        # Update the content — the new version must preserve trust taint.
+        updated = store.update_memory(
+            rec.memory_id, content="User read an article about Python 3.14",
+        )
+        assert updated is not None
+        assert updated.provenance_origin == "external", (
+            f"provenance_origin lost on update: got {updated.provenance_origin!r}, "
+            f"expected 'external'"
+        )
+        assert updated.grounding == "inferred", (
+            f"grounding lost on update: got {updated.grounding!r}, "
+            f"expected 'inferred'"
+        )
+        store.close()
+
+    def test_update_memory_preserves_user_scope_from_record(self, tmp_path):
+        """#175: update_memory must derive user_scope from the record's
+        user_scope field, not payload.get('user_scope'). A record
+        created without user_scope in payload must not get NULL scope
+        on update."""
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="alice")
+        rec = store.remember(category="personal_fact", content="Alice likes tea")
+        assert rec is not None
+        assert rec.user_scope == "alice"
+
+        # Simulate an older record where payload doesn't have user_scope.
+        # We do this by directly updating the payload to remove user_scope.
+        store.connection.execute(
+            "UPDATE memory_records SET payload = '{}' WHERE memory_id = ?",
+            [rec.memory_id],
+        )
+
+        # Now update_memory — it should use rec.user_scope, not payload.
+        updated = store.update_memory(
+            rec.memory_id, content="Alice likes coffee",
+        )
+        assert updated is not None
+        assert updated.user_scope == "alice", (
+            f"user_scope lost on update: got {updated.user_scope!r}, "
+            f"expected 'alice'"
+        )
+        store.close()
+
     def test_update_memory_can_set_expiry(self, tmp_path):
         """update_memory(expires_at=...) must create a new version whose
         expires_at is the new value, and the expired version must be

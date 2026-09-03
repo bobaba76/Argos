@@ -390,3 +390,110 @@ def test_sensitive_re_matches_possessive_name():
         "category": "personal_fact",
         "content": "Her name is Alice and she lives nearby",
     })
+
+# Reviewer audit R2 — suggest_expiry must not return a past fixed date
+# ---------------------------------------------------------------------------
+
+def test_suggest_expiry_rejects_past_fixed_date():
+    """An explicit fixed date in the past must NOT be returned as the
+    suggested expiry — a past expires_at would make the memory invisible
+    immediately. Fall through to the category TTL fallback instead."""
+    from datetime import datetime, timezone
+    from reviewer import suggest_expiry
+
+    # "until 15 Dec 2020" is in the past relative to any test run.
+    result = suggest_expiry({
+        "category": "context_note",
+        "content": "Reminder: report due until 15 Dec 2020",
+    })
+    assert result is not None, "Should fall through to TTL fallback, not return None"
+    # The fallback must be a future date, not 2020-12-15.
+    parsed = datetime.fromisoformat(result)
+    assert parsed > datetime.now(timezone.utc), (
+        f"suggest_expiry returned a past date {result}; should fall through to TTL"
+    )
+
+
+def test_suggest_expiry_future_fixed_date_used_directly():
+    """A future fixed date is used as-is (sanity check — R2 only rejects past)."""
+    from datetime import datetime, timezone
+    from reviewer import suggest_expiry
+
+    result = suggest_expiry({
+        "category": "context_note",
+        "content": "Project deadline until 15 Dec 2099",
+    })
+    assert result is not None
+    parsed = datetime.fromisoformat(result)
+    assert parsed.year == 2099
+
+
+# ---------------------------------------------------------------------------
+# Reviewer audit R4 — _parse_json_response extracts JSON embedded in prose
+# ---------------------------------------------------------------------------
+
+def test_parse_json_response_extracts_json_after_prose():
+    """If the LLM wraps its JSON in conversational prose
+    ("Here is my review:\\n```json {...} ```\\nLet me know."), the parser
+    must still extract the JSON object, not return None."""
+    from reviewer import _parse_json_response
+
+    body = 'Here is my review:\n```json\n{"decision": "approve", "confidence": 0.9}\n```\nLet me know.'
+    result = _parse_json_response(_Resp(body))
+    assert result is not None
+    assert result["decision"] == "approve"
+
+
+def test_parse_json_response_extracts_bare_json_in_prose():
+    """JSON embedded in prose without any code fence must also be extracted."""
+    from reviewer import _parse_json_response
+
+    body = 'Sure! {"decision": "reject", "confidence": 0.8, "reason": "no"} Hope that helps.'
+    result = _parse_json_response(_Resp(body))
+    assert result is not None
+    assert result["decision"] == "reject"
+
+
+# ---------------------------------------------------------------------------
+# Reviewer audit R5 — scan_inbound_text raising must fail closed, not crash
+# ---------------------------------------------------------------------------
+
+def test_reviewer_scan_inbound_text_raise_fails_closed(monkeypatch):
+    """If scan_inbound_text raises (e.g. corrupted scanner state), the
+    reviewer must route the external candidate to pending_user_confirmation,
+    not propagate the exception."""
+    import sys
+    import types
+
+    from reviewer import review_candidate_with_llm
+
+    # Egress gate must pass so we reach the external-source gate.
+    _fake_egress = types.ModuleType("egress")
+    _fake_egress.gate = lambda kind, text="", cfg=None: True
+    monkeypatch.setitem(sys.modules, "egress", _fake_egress)
+
+    # Poison inbound_security so scan_inbound_text raises when called.
+    _fake_inbound = types.ModuleType("inbound_security")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("scanner corrupted")
+
+    _fake_inbound.scan_inbound_text = _boom
+    # The reviewer imports via `from .inbound_security import ...` when
+    # __package__ is set (it is, under pytest). We need to inject the
+    # module under the name the reviewer uses.
+    import argos_plugin.reviewer as _rev_mod
+    # Ensure the reviewer's __package__ path resolves to our fake.
+    monkeypatch.setitem(sys.modules, "argos_plugin.inbound_security", _fake_inbound)
+    monkeypatch.setitem(sys.modules, "inbound_security", _fake_inbound)
+
+    result = review_candidate_with_llm({
+        "category": "context_note",
+        "content": "User mentioned a deadline",
+        "payload": {"external_source": "email"},
+        "evidence_text": "Reminder from my colleague about the deadline.",
+    })
+    assert result["decision"] == "pending_user_confirmation", (
+        f"Scanner exception must fail closed, got {result['decision']}"
+    )
+    assert "inbound" in result["review_model"].lower() or "scan" in result["reason"].lower()

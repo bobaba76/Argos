@@ -1120,6 +1120,12 @@ class ProviderRetrievalMixin:
                     # deny: excluded content never appears. The audit row is
                     # written by the store's search wrapper; this is the
                     # defence-in-depth re-validation on the injected set.
+                    # AS2: fail-closed on exception — if the filter crashes,
+                    # return empty results (not all results). Silently
+                    # passing all results is the wrong default for a security
+                    # filter.
+                    # AS7: write an audit row when the prefetch filter denies
+                    # content that the store wrapper didn't catch.
                     try:
                         acl = getattr(self, "_acl_config", None)
                         if acl is not None and not acl.is_open_store:
@@ -1134,8 +1140,29 @@ class ProviderRetrievalMixin:
                             results, _denied = filter_records_by_access(
                                 results, acl, self._user_id,
                             )
+                            # AS7: audit denied content from the prefetch
+                            # defence-in-depth path.
+                            if _denied > 0:
+                                try:
+                                    self._store.write_access_audit(
+                                        user_id=self._user_id,
+                                        query_text="(prefetch_acl_filter)",
+                                        granted_count=len(results),
+                                        denied_count=_denied,
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "AS7: failed to write prefetch ACL "
+                                        "audit row (denied=%d)", _denied,
+                                    )
                     except Exception:
-                        pass  # access filter must never break injection
+                        # AS2: fail-closed — a security filter crash must
+                        # not pass all results unfiltered.
+                        logger.warning(
+                            "AS2: prefetch ACL filter crashed — failing "
+                            "closed (no results injected this turn)"
+                        )
+                        results = []
                     # Spec-05 (#67): presence-aware namespace partition.
                     # Split the injection budget between conversation-sourced
                     # and document-sourced memories so a flood of doc-facts

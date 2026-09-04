@@ -105,15 +105,53 @@ class ACLConfig:
             or (deny_lists is not None and not isinstance(deny_lists, dict))
             or not isinstance(data.get("enforcement_on", False), bool)
         )
+        # AS3: validate that each role's client_scopes is a list of strings.
+        # A string "acme" instead of ["acme"] would produce set("acme") =
+        # {'a','c','m','e'} — corrupted mask, denied own scope.
+        if isinstance(roles, dict):
+            for role_name, role_def in roles.items():
+                if isinstance(role_def, dict):
+                    cs = role_def.get("client_scopes")
+                    if cs is not None:
+                        if isinstance(cs, str):
+                            logger.warning(
+                                "ACL role %r has client_scopes as a string %r, "
+                                "not a list — wrapping in a list (AS3)",
+                                role_name, cs,
+                            )
+                            role_def["client_scopes"] = [cs]
+                        elif not isinstance(cs, list) or not all(
+                            isinstance(s, str) for s in cs
+                        ):
+                            bad = True
         if bad:
             logger.warning("ACL config structurally invalid — defaulting to open store (parse_error)")
             return cls(parse_error=True)
-        return cls(
+        config = cls(
             roles=data.get("roles") or {},
             user_roles=data.get("user_roles") or {},
             deny_lists=data.get("deny_lists") or {},
             enforcement_on=bool(data.get("enforcement_on", False)),
         )
+        # AS4: warn on dangling user_roles references to non-existent roles.
+        for uid, role_name in config.user_roles.items():
+            if role_name not in config.roles:
+                logger.warning(
+                    "ACL user_roles: user %r assigned to role %r which does "
+                    "not exist in roles config — user will be deny-all (AS4)",
+                    uid, role_name,
+                )
+        # AS5: warn on empty deny entries (wildcard deny footgun).
+        for key, entries in config.deny_lists.items():
+            for entry in entries:
+                if not entry.get("client_scope") and not entry.get("doc_class"):
+                    logger.warning(
+                        "ACL deny_lists: entry for %r has no client_scope or "
+                        "doc_class — this denies ALL content for that scope "
+                        "(AS5): %r",
+                        key, entry,
+                    )
+        return config
 
     @property
     def is_open_store(self) -> bool:
@@ -184,13 +222,14 @@ class ACLConfig:
         client_scope: str | None,
         doc_class: str | None,
     ) -> bool:
-        """Full mask evaluation: deny > allow > wheel.
+        """Full mask evaluation: deny > practice-internal > allow > wheel.
 
         Returns True if the user may see a record with the given
-        client_scope and doc_class. Precedence:
+        client_scope and doc_class. Precedence (AS6 — corrected to match
+        the actual code order):
         1. Deny list — if matched, False (hidden, logged).
-        2. Allow mask — if client_scope not in mask, False.
-        3. Practice-internal — principals-only (wheel), staff denied.
+        2. Practice-internal — principals-only (wheel), staff denied.
+        3. Allow mask — if client_scope not in mask, False.
         4. Default: allowed.
         """
         if self.is_open_store:
@@ -254,36 +293,48 @@ def filter_graph_neighbours(
     Client B must not surface B's facts through the relationship graph
     when the user only has A in their mask.
 
-    Nodes and edges carrying a client_scope outside the user's mask are
-    dropped. Returns (filtered_nodes, filtered_edges, dropped_count).
+    Uses ``config.can_see()`` (AS1) so deny lists, practice-internal
+    doc_class, and the allow mask are all enforced consistently — the
+    same gate as ``filter_records_by_access``. Nodes without an ``id``
+    field are skipped (AS8) — they can't be safely tracked and could
+    share the empty-string ID, making all of them visible if one is.
+
+    Returns (filtered_nodes, filtered_edges, dropped_count).
     """
     if config.is_open_store:
         return nodes, edges, 0
+    # AS1: use can_see() for full deny-list + doc_class + mask check.
+    # Do NOT early-return for wheel (mask is None) — deny lists must
+    # still be enforced even for wheel users.
     mask = config.allow_mask(user_id)
-    # mask is None = wheel = see everything.
-    if mask is None:
-        return nodes, edges, 0
 
-    def _node_cs(node: Dict[str, Any]) -> str | None:
-        attrs = node.get("attributes") or {}
-        return attrs.get("client_scope")
+    def _node_attrs(node: Dict[str, Any]) -> Dict[str, Any]:
+        return node.get("attributes") or {}
 
     # Determine which nodes are visible.
     visible_node_ids: Set[str] = set()
     dropped = 0
     for node in nodes:
-        cs = _node_cs(node)
-        # NULL client_scope = global; visible inside any client query.
-        if cs is None or cs in mask:
-            visible_node_ids.add(node.get("id", ""))
+        # AS8: skip nodes without an id field — they can't be safely
+        # tracked and sharing "" would make all id-less nodes visible.
+        node_id = node.get("id")
+        if not node_id:
+            dropped += 1
+            continue
+        attrs = _node_attrs(node)
+        cs = attrs.get("client_scope")
+        dc = attrs.get("doc_class")
+        # AS1: use can_see() for full deny-list + doc_class + mask check.
+        if config.can_see(user_id, client_scope=cs, doc_class=dc):
+            visible_node_ids.add(node_id)
         else:
             dropped += 1
 
-    filtered_nodes = [n for n in nodes if n.get("id", "") in visible_node_ids]
+    filtered_nodes = [n for n in nodes if n.get("id") in visible_node_ids]
     # Drop edges where either endpoint was filtered out.
     filtered_edges = [
         e for e in edges
-        if e.get("source", "") in visible_node_ids
-        and e.get("target", "") in visible_node_ids
+        if e.get("source") in visible_node_ids
+        and e.get("target") in visible_node_ids
     ]
     return filtered_nodes, filtered_edges, dropped

@@ -6,7 +6,9 @@ validated set is recorded here (commit this file when the set freezes).
 
 | Date | Gold sha256 | Snapshot id | Approved | Rejected |
 |------|-------------|-------------|----------|----------|
-| 2026-08-26 | `f274be0528d271e335d22ece8cf0a58d14db607632cac46d1ed8373b3e6ee89c` | `20260826_170626_224920_4d612e0f` | 995 | 5 |
+| 2026-08-26 | `6dcf560f4adeac072d16bb841f203c5f6d5e784158ffa5cdf7fcc99820f7d3b9` | `20260826_170626_224920_4d612e0f` | 995 | 5 |
+
+> NOTE (2026-09-03): sha re-recorded under `build_gold._SHA_KEYS` = `(memory_id, category, query, template, layout_family)` after #112 added `layout_family` (1/9, `d73c66e`). `gold_v1.jsonl` bytes unchanged (mtime 2026-08-26) — old sha `f274be05…` was the pre-#112 hasher's output for the same file.
 
 Set: 1000 probes sampled from the active store (1227 active at freeze),
 template-generated, deterministic seed 42. Recall windows are near-saturated

@@ -675,7 +675,7 @@ class StoreWriteMixin:
                     from .inbound_security import scan_inbound_text
                 else:
                     from inbound_security import scan_inbound_text
-                _scan = scan_inbound_text(content)
+                _scan = scan_inbound_text(evidence_text or content)
                 if _scan.blocked:
                     candidate_status = "quarantined"
                     quarantine_reason = (

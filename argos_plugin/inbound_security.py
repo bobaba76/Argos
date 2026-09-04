@@ -36,6 +36,33 @@ from typing import List, Set
 # false positives here are cheap (→ human review), false negatives are not.
 _NEG = r"(?:do\s+not|don'?t|dont|do\s+n['\u2019]?t)"  # "do not" / "don't"
 
+# ---------------------------------------------------------------------------
+# Confusable homoglyph mapping (IS2)
+# ---------------------------------------------------------------------------
+# NFKD decomposition only handles compatibility characters (fullwidth,
+# superscript), NOT cross-script confusables (Cyrillic 'а' → Latin 'a').
+# This table covers the most common Cyrillic and Greek confusables that
+# look like ASCII letters. Source: Unicode confusables.txt (curated subset
+# for the security scanner's ASCII keyword patterns).
+_CONFUSABLES: dict[str, str] = {}
+for _src, _dst in [
+    # Cyrillic → Latin
+    ("а", "a"), ("е", "e"), ("о", "o"), ("р", "p"), ("с", "c"),
+    ("у", "y"), ("х", "x"), ("А", "A"), ("В", "B"), ("Е", "E"),
+    ("К", "K"), ("М", "M"), ("Н", "H"), ("О", "O"), ("Р", "P"),
+    ("С", "C"), ("Т", "T"), ("Х", "X"), ("і", "i"), ("І", "I"),
+    ("ј", "j"), ("Ј", "J"), ("ѕ", "s"), ("Ѕ", "S"),
+    # Greek → Latin
+    ("α", "a"), ("β", "b"), ("ε", "e"), ("ζ", "z"), ("η", "h"),
+    ("θ", "0"), ("ι", "i"), ("κ", "k"), ("ν", "v"), ("ο", "o"),
+    ("ρ", "p"), ("τ", "t"), ("υ", "u"), ("χ", "x"), ("ω", "w"),
+    ("Α", "A"), ("Β", "B"), ("Ε", "E"), ("Ζ", "Z"), ("Η", "H"),
+    ("Ι", "I"), ("Κ", "K"), ("Μ", "M"), ("Ν", "N"), ("Ο", "O"),
+    ("Ρ", "P"), ("Τ", "T"), ("Υ", "Y"), ("Χ", "X"),
+]:
+    _CONFUSABLES[_src] = _dst
+_CONFUSABLE_TABLE = str.maketrans(_CONFUSABLES)
+
 _PATTERNS: List[tuple] = [
     # ---- instruction-override / roleplay injections ----------------------
     ("injection_override", "ignore_previous_instructions",
@@ -81,7 +108,7 @@ _PATTERNS: List[tuple] = [
     ("memory_mutation", "final_approved",
      r"final\s+approved"),
     ("memory_mutation", "from_now_on",
-     r"from\s+now\s+on"),
+     r"from\s+now\s+on[,\s]+(?:this|the\s+above|all|every)\s+(?:is|are|applies?|rules?|polic(?:y|ies)|guidelines?|instructions?|directives?)"),
     ("memory_mutation", "overrides_previous",
      r"(?:this|that|the\s+above)\s+overrides?|overrides?\s+(?:all|any|previous)"),
     ("memory_mutation", "remove_suppression",
@@ -92,11 +119,11 @@ _PATTERNS: List[tuple] = [
      r"(?:new\s+)?(?:price|pricing|rates?)\s+(?:list|change|update|effective)"),
     # ---- SQL / web injection ----------------------------------------------
     ("sql_code", "sql_select",
-     r"select\s+\*?\s*from"),
+     r"select\s+\*?\s*from\s+(?!the\b|a\b|an\b|my\b|your\b|his\b|her\b|our\b|their\b|this\b|that\b|these\b|those\b|all\b|some\b|any\b|each\b|every\b)\w+"),
     ("sql_code", "sql_drop",
      r"drop\s+table"),
     ("sql_code", "sql_delete",
-     r"delete\s+from"),
+     r"delete\s+from\s+(?!the\b|a\b|an\b|my\b|your\b|his\b|her\b|our\b|their\b|this\b|that\b|these\b|those\b|all\b|some\b|any\b|each\b|every\b)\w+"),
     ("sql_code", "sql_union",
      r"union\s+select"),
     ("web_code", "script_tag",
@@ -142,16 +169,26 @@ def _normalize_for_scan(text: str) -> str:
        obfuscation technique that hides patterns from regex. This runs
        FIRST so that entity-encoded zero-width characters (e.g.
        ``&#8203;``, ``&#x200b;``, ``&ZeroWidthSpace;``) are decoded
-       before the zero-width strip in step 2 (#75).
-    2. Strip zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
-       — attackers insert these between keywords to break regex matches
-       while keeping the text visually identical. Running AFTER
-       html.unescape catches entity-encoded zero-width chars (#75).
-    3. Normalize homoglyphs via NFKD decomposition — converts lookalike
-       Unicode characters to their ASCII equivalents (e.g. Cyrillic 'а'
-       to Latin 'a') so patterns match regardless of the input script.
-    4. Collapse whitespace — multiple spaces/tabs between words can
-       break patterns that expect single spaces.
+       before the zero-width replacement in step 2 (#75).
+    2. Replace zero-width characters (U+200B, U+200C, U+200D, U+FEFF)
+       with a SPACE (IS1) -- attackers insert these between keywords to
+       break regex matches while keeping the text visually identical.
+       Replacing with space (not stripping to nothing) ensures that
+       ``ignore\\u200bprevious`` -> ``ignore previous`` -> matches.
+       Running AFTER html.unescape catches entity-encoded zero-width
+       chars (#75). The whitespace collapse in step 5 cleans up any
+       double spaces this may introduce.
+    3. Map confusable homoglyphs (IS2) -- NFKD alone does NOT decompose
+       cross-script confusables (Cyrillic 'a' stays U+0430, not Latin
+       'a' U+0061). A curated mapping table translates the most common
+       Cyrillic/Greek lookalike characters to their ASCII equivalents
+       BEFORE NFKD runs, so patterns match regardless of the input
+       script.
+    4. NFKD normalization -- decomposes compatibility characters
+       (fullwidth, superscript) that the confusable table doesn't cover.
+    5. Collapse whitespace -- multiple spaces/tabs between words can
+       break patterns that expect single spaces. Also cleans up the
+       double spaces introduced by zero-width -> space replacement.
 
     This keeps the zero-LLM property: the normalization is deterministic
     and cheap. The original text is preserved for the snippet; only the
@@ -163,11 +200,17 @@ def _normalize_for_scan(text: str) -> str:
     # Must run before zero-width strip so entity-encoded zero-width
     # chars (&#8203; &#x200b; &ZeroWidthSpace;) are caught (#75).
     result = html.unescape(text)
-    # 2. Strip zero-width characters (now catches entity-decoded ones).
-    result = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", result)
-    # 3. NFKD normalization: decompose homoglyphs to ASCII equivalents.
+    # 2. Replace zero-width characters with a space (IS1, #75).
+    # Replacing with space (not stripping) ensures "ignore\u200bprevious"
+    # becomes "ignore previous" (matches) instead of "ignoreprevious" (no match).
+    result = re.sub(r"[\u200B\u200C\u200D\uFEFF]", " ", result)
+    # 3. Map confusable homoglyphs to ASCII (IS2).
+    # NFKD alone does NOT decompose cross-script confusables (Cyrillic 'a'
+    # stays U+0430). This table handles the common Cyrillic/Greek lookalikes.
+    result = result.translate(_CONFUSABLE_TABLE)
+    # 4. NFKD normalization: decompose compatibility characters (fullwidth, etc.).
     result = unicodedata.normalize("NFKD", result)
-    # 4. Collapse whitespace (but preserve structure for snippet extraction).
+    # 5. Collapse whitespace (cleans up double spaces from zero-width replacement).
     result = re.sub(r"[ \t]+", " ", result)
     return result
 
@@ -198,17 +241,18 @@ def scan_inbound_text(text: str) -> ScanResult:
 
 
 def scan_inbound_or_raise(text: str, *, content_label: str = "content") -> ScanResult:
-    """Ingestion-time enforcement (#19): scan external content at the boundary.
+    """Ingestion-time enforcement helper (#19): scan external content at the boundary.
 
     Unlike ``scan_inbound_text`` (which just returns a result), this function
-    is called at ingestion time when content is tagged as external/untrusted.
-    If the scan blocks, it raises ``InboundSecurityError`` so the caller can
+    raises ``InboundSecurityError`` if the scan blocks, so the caller can
     refuse the write — the content never enters the store.
 
-    Callers (importers, feed handlers, ``remember()``, ``save_candidate()``)
-    should call this when ``external_source`` is True or when the content
-    arrives from an untrusted channel. The scanner is a gate, not a judge:
-    a BLOCKED verdict means "refuse the write and route to a human".
+    **Usage note (IS5):** The production store paths (``remember()``,
+    ``save_candidate()``) call ``scan_inbound_text`` directly and handle
+    the blocked result themselves (refuse vs. quarantine). This helper is
+    available for importers and feed handlers that prefer the raise-on-
+    block pattern. It is not dead code — it is an alternative API for
+    callers that want exception-based enforcement rather than result-based.
 
     Args:
         text: The inbound content to scan.

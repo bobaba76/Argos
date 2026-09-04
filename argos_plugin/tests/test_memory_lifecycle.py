@@ -500,7 +500,123 @@ class TestMaintenanceAudit:
         # The first and third records (which succeeded) must be in the list.
         assert recs[0].memory_id in quarantined_ids
         assert recs[2].memory_id in quarantined_ids
+
+
+# ---------------------------------------------------------------------------
+# D3-D6: Rollup audit fixes (#204)
+# ---------------------------------------------------------------------------
+
+class TestRollupAuditFixes:
+    """Regression tests for issue #204: distillation/rollup audit fixes."""
+
+    def test_d3_call_llm_uses_messages_kwarg(self, tmp_path):
+        """D3: call_llm should be called with messages=[...] kwarg, not
+        a positional prompt arg. If the signature is wrong, rollup
+        silently never runs (caught by try/except → 'llm_error')."""
+        store = DuckDBMemoryStore(tmp_path / "test_d3.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i} for rollup")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps([
+                    {"content": "Test insight", "category": "insight", "confidence": 0.8},
+                ])
+            ))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            report = run_rollup(store, interval_days=30, max_records_per_run=15)
+        # If D3 is fixed, the call should succeed (not 'llm_error').
+        assert report["ran"], f"Expected ran=True, got skipped={report.get('skipped')}"
+        assert report["llm_calls"] == 1
+        # Verify call_llm was called with messages kwarg, not positional.
+        call_args = mock_call.call_args
+        assert "messages" in call_args.kwargs, (
+            "call_llm should be called with messages= kwarg (D3)"
+        )
+        assert call_args.kwargs["messages"][0]["role"] == "user"
         store.close()
+
+    def test_d4_egress_gate_checked(self, tmp_path):
+        """D4: rollup should check the egress gate before making an LLM
+        call. In local_only mode, the gate should refuse."""
+        store = DuckDBMemoryStore(tmp_path / "test_d4.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        from rollup import run_rollup
+        # Mock the egress gate to return False (blocked).
+        with patch("egress.gate", return_value=False):
+            report = run_rollup(store, interval_days=30, max_records_per_run=15)
+        assert not report["ran"]
+        assert report["skipped"] == "egress_gate"
+        store.close()
+
+    def test_d5_evidence_text_passed_to_save_candidate(self, tmp_path):
+        """D5: save_candidate should receive evidence_text containing
+        the source records' content (provenance for the review pipeline)."""
+        store = DuckDBMemoryStore(tmp_path / "test_d5.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"unique content {i} for evidence")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps([
+                    {"content": "Test insight with evidence", "category": "insight", "confidence": 0.8},
+                ])
+            ))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        # Patch save_candidate to capture the evidence_text kwarg.
+        original_save = store.save_candidate
+        captured_evidence = []
+        def capture_save(*args, **kwargs):
+            captured_evidence.append(kwargs.get("evidence_text", ""))
+            return original_save(*args, **kwargs)
+        store.save_candidate = capture_save
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            report = run_rollup(store, interval_days=30, max_records_per_run=15)
+        assert report["ran"]
+        assert report["proposals_emitted"] == 1
+        # evidence_text should have been passed and contain source content.
+        assert len(captured_evidence) == 1
+        assert captured_evidence[0], "evidence_text should not be empty"
+        assert "unique content" in captured_evidence[0], (
+            "evidence_text should contain source record content (D5)"
+        )
+        store.close()
+
+    def test_d6_fenced_json_parsed(self, tmp_path):
+        """D6: _parse_rollup_response should strip code fences before
+        parsing. Fenced JSON should parse successfully."""
+        from rollup import _parse_rollup_response
+        fenced = '```json\n[{"content": "test", "category": "insight", "confidence": 0.8}]\n```'
+        proposals = _parse_rollup_response(fenced)
+        assert len(proposals) == 1
+        assert proposals[0]["content"] == "test"
+
+    def test_d6_prose_wrapped_json_parsed(self):
+        """D6: prose-wrapped JSON should parse via the fallback extractor."""
+        from rollup import _parse_rollup_response
+        prose_wrapped = (
+            'Here is the JSON: [{"content": "test", "category": "insight", "confidence": 0.8}] Done.'
+        )
+        proposals = _parse_rollup_response(prose_wrapped)
+        assert len(proposals) == 1
+        assert proposals[0]["content"] == "test"
+
+    def test_d6_pure_json_parsed(self):
+        """D6: pure JSON (no fences, no prose) should parse successfully."""
+        from rollup import _parse_rollup_response
+        pure = '[{"content": "test", "category": "insight", "confidence": 0.8}]'
+        proposals = _parse_rollup_response(pure)
+        assert len(proposals) == 1
+
+    def test_d6_empty_response_returns_empty(self):
+        """D6: empty content should return empty list."""
+        from rollup import _parse_rollup_response
+        assert _parse_rollup_response("") == []
+        assert _parse_rollup_response(None) == []
 
     def test_revive_record_respects_user_scope(self, tmp_path):
         """M3: revive_record must not allow cross-tenant revival.

@@ -272,7 +272,13 @@ def _build_high_signal_prompt(records: List[Any]) -> str:
 
 
 def _parse_distill_response(response: Any) -> Optional[Dict[str, Any]]:
-    """Parse the LLM response into a dict, or None if invalid."""
+    """Parse the LLM response into a dict, or None if invalid.
+
+    D2: strips code fences and handles prose-wrapped JSON (same class as
+    R4 in reviewer and D6 in rollup). The old code only stripped fences
+    at the start/end; if the LLM returned ``Here is the JSON: {...} Done.``,
+    parsing would fail.
+    """
     try:
         text = response.choices[0].message.content
     except (AttributeError, IndexError, KeyError, TypeError):
@@ -280,13 +286,23 @@ def _parse_distill_response(response: Any) -> Optional[Dict[str, Any]]:
     if not text or not text.strip():
         return None
     text = text.strip()
+    # Strip a single pair of leading/trailing markdown code fences.
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
+    # Try a direct parse first (the common case).
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
-        return None
+        # D2: fallback — extract the first balanced {...} object via
+        # the JSON decoder's raw_decode (handles prose-wrapped JSON).
+        start = text.find("{")
+        if start == -1:
+            return None
+        try:
+            value, _end = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
     if not isinstance(value, dict):
         return None
     # Validate expected keys.
@@ -658,11 +674,27 @@ def run_distillation(
                             proposals_emitted += 1
 
     # -- Advance run state (only on completion) ----------------------------
-    # If every single LLM call failed (run_failed_completely), do NOT
+    # D1: If every single LLM call failed (run_failed_completely), do NOT
     # advance — the next clean session end retries the same records.
+    # BUT: if no LLM calls were made because there was no work to do
+    # (multi_clusters empty AND high_signal < 2), that is NOT a failure —
+    # the run completed successfully with nothing to distill. Advance the
+    # run state so the next session end doesn't retry the same records
+    # in an infinite "nothing to distill but keep trying" loop.
     if run_failed_completely and llm_calls == 0:
-        report["reason"] = "all_llm_calls_failed"
-        return report
+        # D1: distinguish "all calls failed" from "no calls needed".
+        no_work_found = len(multi_clusters) == 0
+        high_signal = _load_high_signal_records(store, limit=20)
+        if no_work_found and len(high_signal) < 2:
+            # No clusters to distill AND no high-signal records — the run
+            # completed successfully with nothing to do. Advance state.
+            logger.debug(
+                "Distillation: no work found (0 multi-clusters, <2 high-signal) "
+                "— advancing run state to avoid infinite retry loop (D1)"
+            )
+        else:
+            report["reason"] = "all_llm_calls_failed"
+            return report
 
     records_processed = len(records)
     _advance_run_state(store, records_processed)

@@ -505,3 +505,227 @@ class TestStoreDocClass:
         results = store.search("weather", limit=10)
         assert len(results) == 1
         assert results[0].content == "Public fact about the weather"
+
+
+# ---------------------------------------------------------------------------
+# AS1: Graph filter uses can_see() (deny lists + doc_class)
+# ---------------------------------------------------------------------------
+
+class TestGraphFilterCanSee:
+    """AS1: filter_graph_neighbours must enforce deny lists and
+    practice-internal doc_class, not just the allow mask."""
+
+    def test_deny_list_enforced_in_graph(self):
+        """A user with a deny entry on 'acme' must not see acme-scoped
+        graph nodes, even though 'acme' is in their allow mask."""
+        config = ACLConfig(
+            roles={"staff": {"client_scopes": ["acme"]}},
+            user_roles={"bob": "staff"},
+            deny_lists={"bob": [{"client_scope": "acme"}]},
+            enforcement_on=True,
+        )
+        nodes = [{"id": "n1", "attributes": {"client_scope": "acme"}}]
+        edges = []
+        filtered, _, dropped = filter_graph_neighbours(nodes, edges, config, "bob")
+        assert len(filtered) == 0
+        assert dropped == 1
+
+    def test_practice_internal_hidden_from_staff_in_graph(self):
+        """A staff user must not see practice-internal graph nodes."""
+        config = ACLConfig(
+            roles={"staff": {"client_scopes": ["acme"]}},
+            user_roles={"bob": "staff"},
+            enforcement_on=True,
+        )
+        nodes = [
+            {"id": "n1", "attributes": {"client_scope": "acme", "doc_class": "invoice"}},
+            {"id": "n2", "attributes": {"client_scope": "acme", "doc_class": PRACTICE_INTERNAL}},
+        ]
+        edges = []
+        filtered, _, dropped = filter_graph_neighbours(nodes, edges, config, "bob")
+        ids = {n["id"] for n in filtered}
+        assert "n1" in ids
+        assert "n2" not in ids
+        assert dropped == 1
+
+    def test_wheel_sees_practice_internal_in_graph(self):
+        """A wheel (principal) user sees practice-internal graph nodes."""
+        config = ACLConfig(
+            roles={"principal": {"wheel": True}},
+            user_roles={"alice": "principal"},
+            enforcement_on=True,
+        )
+        nodes = [
+            {"id": "n1", "attributes": {"client_scope": "acme", "doc_class": PRACTICE_INTERNAL}},
+        ]
+        edges = []
+        filtered, _, dropped = filter_graph_neighbours(nodes, edges, config, "alice")
+        assert len(filtered) == 1
+        assert dropped == 0
+
+    def test_deny_list_respected_over_wheel_in_graph(self):
+        """A wheel user with a deny entry still can't see denied nodes."""
+        config = ACLConfig(
+            roles={"principal": {"wheel": True}},
+            user_roles={"alice": "principal"},
+            deny_lists={"alice": [{"client_scope": "beta"}]},
+            enforcement_on=True,
+        )
+        nodes = [
+            {"id": "n1", "attributes": {"client_scope": "acme"}},
+            {"id": "n2", "attributes": {"client_scope": "beta"}},
+        ]
+        edges = []
+        filtered, _, dropped = filter_graph_neighbours(nodes, edges, config, "alice")
+        ids = {n["id"] for n in filtered}
+        assert "n1" in ids
+        assert "n2" not in ids
+        assert dropped == 1
+
+
+# ---------------------------------------------------------------------------
+# AS3: client_scopes string-instead-of-list validation
+# ---------------------------------------------------------------------------
+
+class TestClientScopesValidation:
+    """AS3: a string client_scopes must be wrapped in a list, not
+    silently corrupted into single-character set entries."""
+
+    def test_string_client_scopes_wrapped(self):
+        """A string 'acme' should be wrapped to ['acme'], not set('acme')."""
+        config = ACLConfig.from_dict({
+            "roles": {"staff": {"client_scopes": "acme"}},
+            "user_roles": {"bob": "staff"},
+            "enforcement_on": True,
+        })
+        mask = config.allow_mask("bob")
+        assert "acme" in mask
+        assert "a" not in mask
+        assert "c" not in mask
+        assert config.can_see("bob", client_scope="acme", doc_class=None)
+
+    def test_list_client_scopes_unchanged(self):
+        """A proper list should pass through unchanged."""
+        config = ACLConfig.from_dict({
+            "roles": {"staff": {"client_scopes": ["acme", "beta"]}},
+            "user_roles": {"bob": "staff"},
+            "enforcement_on": True,
+        })
+        mask = config.allow_mask("bob")
+        assert mask == {"acme", "beta"}
+
+    def test_non_string_elements_rejected(self):
+        """client_scopes with non-string elements should be parse_error."""
+        config = ACLConfig.from_dict({
+            "roles": {"staff": {"client_scopes": [1, 2, 3]}},
+            "user_roles": {"bob": "staff"},
+            "enforcement_on": True,
+        })
+        assert config.parse_error is True
+
+
+# ---------------------------------------------------------------------------
+# AS4: Dangling user_roles warning
+# ---------------------------------------------------------------------------
+
+class TestDanglingUserRoles:
+    """AS4: a user assigned to a non-existent role should produce a
+    warning log (the user is correctly deny-all, but silently)."""
+
+    def test_dangling_role_warned(self, caplog):
+        """from_dict should log a warning for dangling role references."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="argos_plugin.access_scoping"):
+            ACLConfig.from_dict({
+                "roles": {"staff": {"client_scopes": ["acme"]}},
+                "user_roles": {"bob": "nonexistent_role"},
+                "enforcement_on": True,
+            })
+        assert any("nonexistent_role" in r.message for r in caplog.records)
+
+    def test_valid_role_no_warning(self, caplog):
+        """Valid role assignments should not produce warnings."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="argos_plugin.access_scoping"):
+            ACLConfig.from_dict({
+                "roles": {"staff": {"client_scopes": ["acme"]}},
+                "user_roles": {"bob": "staff"},
+                "enforcement_on": True,
+            })
+        assert not any("does not exist" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# AS5: Empty deny entry warning
+# ---------------------------------------------------------------------------
+
+class TestEmptyDenyEntry:
+    """AS5: a deny entry with no fields (wildcard deny) should produce
+    a warning log."""
+
+    def test_empty_deny_entry_warned(self, caplog):
+        """from_dict should warn when a deny entry has no fields."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="argos_plugin.access_scoping"):
+            ACLConfig.from_dict({
+                "roles": {"staff": {"client_scopes": ["acme"]}},
+                "user_roles": {"bob": "staff"},
+                "deny_lists": {"bob": [{}]},
+                "enforcement_on": True,
+            })
+        assert any("denies ALL" in r.message for r in caplog.records)
+
+    def test_specific_deny_entry_no_warning(self, caplog):
+        """A deny entry with fields should not produce the wildcard warning."""
+        import logging
+        with caplog.at_level(logging.WARNING, logger="argos_plugin.access_scoping"):
+            ACLConfig.from_dict({
+                "roles": {"staff": {"client_scopes": ["acme"]}},
+                "user_roles": {"bob": "staff"},
+                "deny_lists": {"bob": [{"client_scope": "acme"}]},
+                "enforcement_on": True,
+            })
+        assert not any("denies ALL" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# AS8: Nodes without id field
+# ---------------------------------------------------------------------------
+
+class TestNodesWithoutId:
+    """AS8: nodes without an 'id' field should be skipped (not treated
+    as sharing the empty-string ID)."""
+
+    def test_node_without_id_dropped(self):
+        """A node without an 'id' field should be dropped, not visible."""
+        config = ACLConfig(
+            roles={"staff": {"client_scopes": ["acme"]}},
+            user_roles={"bob": "staff"},
+            enforcement_on=True,
+        )
+        nodes = [
+            {"id": "n1", "attributes": {"client_scope": "acme"}},
+            {"attributes": {"client_scope": "acme"}},  # no id
+        ]
+        edges = []
+        filtered, _, dropped = filter_graph_neighbours(nodes, edges, config, "bob")
+        ids = [n.get("id") for n in filtered]
+        assert "n1" in ids
+        assert None not in ids
+        assert dropped == 1
+
+    def test_all_nodes_without_id_dropped(self):
+        """All nodes without ids should be dropped (not all visible via '')."""
+        config = ACLConfig(
+            roles={"staff": {"client_scopes": ["acme"]}},
+            user_roles={"bob": "staff"},
+            enforcement_on=True,
+        )
+        nodes = [
+            {"attributes": {"client_scope": "acme"}},
+            {"attributes": {"client_scope": "acme"}},
+        ]
+        edges = []
+        filtered, _, dropped = filter_graph_neighbours(nodes, edges, config, "bob")
+        assert len(filtered) == 0
+        assert dropped == 2

@@ -19,10 +19,45 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_json_fences(text: str) -> str:
+    """Strip markdown code fences and surrounding prose from LLM JSON output.
+
+    Handles three cases (D6 — same class as R4 in reviewer and D2 in
+    distillation):
+    1. Fenced JSON: ``\\`\\`\\`json [...] \\`\\`\\```` → stripped.
+    2. Pure JSON: ``[...]`` → unchanged.
+    3. Prose-wrapped JSON: ``Here is the JSON: [...]`` → extracts the
+       first balanced ``[...]`` block via the JSON decoder's raw_decode.
+    """
+    if not text or not text.strip():
+        return ""
+    text = text.strip()
+    # Strip a single pair of leading/trailing markdown code fences.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    # Try a direct parse first (the common case).
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+    # Fallback: extract the first balanced [...] block.
+    start = text.find("[")
+    if start == -1:
+        return text  # let the caller's json.loads fail naturally
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text[start:])
+        return json.dumps(value)
+    except json.JSONDecodeError:
+        return text
 
 _STATE_KEY_LAST_RUN = "rollup_last_run"
 _STATE_KEY_LAST_COUNT = "rollup_last_count"
@@ -113,11 +148,16 @@ def _build_rollup_prompt(records: List[Any]) -> str:
 
 
 def _parse_rollup_response(content: str) -> List[Dict[str, Any]]:
-    """Parse the LLM response into a list of proposal dicts."""
+    """Parse the LLM response into a list of proposal dicts.
+
+    D6: strips code fences and prose wrapping before parsing (same class
+    as R4 in reviewer and D2 in distillation).
+    """
     if not content:
         return []
+    stripped = _strip_json_fences(content)
     try:
-        data = json.loads(content)
+        data = json.loads(stripped)
         if not isinstance(data, list):
             return []
         proposals = []
@@ -161,6 +201,18 @@ def run_rollup(
         "skipped": None,
     }
 
+    # D4: egress gate — refuse in local_only mode (same as distillation).
+    try:
+        from egress import gate as _egress_gate
+    except ImportError:
+        try:
+            from .egress import gate as _egress_gate
+        except ImportError:
+            _egress_gate = None
+    if _egress_gate is not None and not _egress_gate("memory_rollup", ""):
+        report["skipped"] = "egress_gate"
+        return report
+
     # Cooldown gate.
     if _is_within_cooldown(store, interval_days):
         report["skipped"] = "cooldown"
@@ -180,11 +232,21 @@ def run_rollup(
 
     prompt = _build_rollup_prompt(records)
     try:
+        # D3: use the same call_llm signature as distillation/reviewer —
+        # messages=[...] kwarg, not a positional prompt arg. The old
+        # call_llm(prompt, model=..., ...) would either raise TypeError
+        # (caught by try/except → "llm_error" → rollup silently never runs)
+        # or pass the prompt as the wrong parameter.
         response = call_llm(
-            prompt,
-            model=llm_model,
-            provider=llm_provider,
             task="memory_rollup",
+            messages=[
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=500,
+            timeout=30.0,
+            model=llm_model or None,
+            provider=llm_provider or None,
         )
     except Exception as exc:
         logger.debug("rollup: LLM call failed: %s", exc)
@@ -203,6 +265,11 @@ def run_rollup(
 
     proposals = _parse_rollup_response(content)
 
+    # D5: build evidence text from source records for provenance.
+    evidence_text = " | ".join(
+        (getattr(r, "content", "") or "")[:200] for r in records[:20]
+    )[:2000]
+
     # Emit proposals through the standard review pipeline.
     emitted = 0
     for prop in proposals:
@@ -220,6 +287,7 @@ def run_rollup(
                 confidence=prop.get("confidence", 0.7),
                 durability="durable",
                 scope="profile",
+                evidence_text=evidence_text,
             )
             emitted += 1
         except Exception as exc:

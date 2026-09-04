@@ -714,3 +714,99 @@ class TestContradictionValidation:
             {"a_id": "mem-a", "b_id": ""}, src) is False
         assert _valid_contradiction("not a dict", src) is False
         assert _valid_contradiction({}, src) is False
+
+
+# ---------------------------------------------------------------------------
+# D1: Run state advances when no work found (no infinite retry loop)
+# ---------------------------------------------------------------------------
+
+class TestD1NoWorkRunStateAdvance:
+    """D1: when there are no multi-clusters AND <2 high-signal records,
+    the run state must advance (not return 'all_llm_calls_failed') to
+    avoid an infinite 'nothing to distill but keep trying' loop.
+    """
+
+    def test_no_work_advances_run_state(self, store):
+        """A run with all singletons and no high-signal records should
+        advance last_run (not return all_llm_calls_failed)."""
+        from distillation import run_distillation, _get_last_run
+        # Seed distinct records (all singletons, no multi-clusters).
+        _seed_distinct_records(store, n=25)
+        # Mock LLM that returns an empty valid response (in case any
+        # multi-clusters are found by the deterministic embedder).
+        empty_response = _make_mock_response(
+            json.dumps({"insights": [], "guardrails": [], "contradictions": []})
+        )
+        mock_call = MagicMock(return_value=empty_response)
+        with patch("distillation._get_llm_client", return_value=mock_call), \
+             patch("distillation._load_high_signal_records", return_value=[]):
+            report = run_distillation(store, min_new_records=20, cooldown_hours=0)
+        # The run should complete (not fail with all_llm_calls_failed).
+        assert report["ran"] is True, (
+            f"Expected ran=True (no work found should advance state), "
+            f"got reason={report.get('reason')}"
+        )
+        # Run state must have advanced.
+        assert _get_last_run(store) is not None
+
+    def test_all_calls_failed_does_not_advance(self, store):
+        """When LLM calls are attempted but all fail, run state must NOT
+        advance (retry on next session end)."""
+        from distillation import run_distillation, _get_last_run
+        # Seed related records (will form multi-clusters → LLM calls).
+        _seed_related_records(store, n=25)
+        # Mock LLM that always raises.
+        mock_call = MagicMock(side_effect=RuntimeError("LLM down"))
+        with patch("distillation._get_llm_client", return_value=mock_call):
+            report = run_distillation(store, min_new_records=20, cooldown_hours=0)
+        assert report["ran"] is False
+        assert report["reason"] == "all_llm_calls_failed"
+        # Run state must NOT have advanced.
+        assert _get_last_run(store) is None
+
+
+# ---------------------------------------------------------------------------
+# D2: _parse_distill_response handles prose-wrapped JSON
+# ---------------------------------------------------------------------------
+
+class TestD2ProseWrappedJson:
+    """D2: _parse_distill_response should handle LLM output wrapped in
+    conversational prose (same class as R4 in reviewer)."""
+
+    def test_prose_wrapped_json_parsed(self):
+        """'Here is the JSON: {...} Done.' should parse successfully."""
+        from distillation import _parse_distill_response
+        response = _make_mock_response(
+            'Here is the JSON: {"insights": [{"text": "test"}], "guardrails": [], "contradictions": []} Done.'
+        )
+        parsed = _parse_distill_response(response)
+        assert parsed is not None
+        assert len(parsed["insights"]) == 1
+        assert parsed["insights"][0]["text"] == "test"
+
+    def test_fenced_json_parsed(self):
+        """Fenced JSON (```json ... ```) should parse successfully."""
+        from distillation import _parse_distill_response
+        response = _make_mock_response(
+            '```json\n{"insights": [], "guardrails": [], "contradictions": []}\n```'
+        )
+        parsed = _parse_distill_response(response)
+        assert parsed is not None
+        assert parsed["insights"] == []
+
+    def test_pure_json_parsed(self):
+        """Pure JSON (no fences, no prose) should parse successfully."""
+        from distillation import _parse_distill_response
+        response = _make_mock_response(
+            '{"insights": [{"text": "pure"}], "guardrails": [], "contradictions": []}'
+        )
+        parsed = _parse_distill_response(response)
+        assert parsed is not None
+        assert parsed["insights"][0]["text"] == "pure"
+
+    def test_garbage_returns_none(self):
+        """Non-JSON text should return None."""
+        from distillation import _parse_distill_response
+        response = _make_mock_response("this is not json at all")
+        parsed = _parse_distill_response(response)
+        assert parsed is None

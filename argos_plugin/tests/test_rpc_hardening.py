@@ -268,3 +268,106 @@ class TestServerLocks:
                 store._rpc.stop_service()
             finally:
                 time.sleep(0.5)
+
+
+# ---------------------------------------------------------------------------
+# SC1-SC6: Service client audit fixes (#218)
+# ---------------------------------------------------------------------------
+
+class TestSC1ResponseSizeLimit:
+    """SC1: the client must cap total response bytes to prevent unbounded
+    memory consumption from a malicious or buggy server."""
+
+    def test_max_response_bytes_constant_exists(self):
+        """The _MAX_RESPONSE_BYTES constant should be defined."""
+        assert hasattr(service_client, "_MAX_RESPONSE_BYTES")
+        assert service_client._MAX_RESPONSE_BYTES > 0
+        # Should be at least 1MB (generous for any legitimate response).
+        assert service_client._MAX_RESPONSE_BYTES >= 1024 * 1024
+
+    def test_response_size_cap_raises(self, tmp_path):
+        """A response exceeding _MAX_RESPONSE_BYTES should raise
+        SharedMemoryServiceError with error_class='ResponseTooLarge'."""
+        from unittest.mock import MagicMock, patch
+        large_chunk = b"x" * (service_client._MAX_RESPONSE_BYTES + 1)
+
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_conn.recv = MagicMock(side_effect=[large_chunk, b""])
+
+        rpc = service_client._SharedRPC.__new__(service_client._SharedRPC)
+        rpc.home = tmp_path
+        rpc._default_user_id = "test"
+        rpc._scope = threading.local()
+
+        with patch("service_client._read_endpoint", return_value={
+            "host": "127.0.0.1", "port": 9999, "token": "test",
+        }), patch("socket.create_connection", return_value=mock_conn):
+            with pytest.raises(service_client.SharedMemoryServiceError) as excinfo:
+                rpc._request_once({"method": "test"}, timeout=5.0)
+        assert excinfo.value.error_class == "ResponseTooLarge"
+
+
+class TestSC2EndpointPermissions:
+    """SC2: the endpoint file should be restricted to owner-only on POSIX."""
+
+    def test_endpoint_file_permissions_restricted(self, tmp_path):
+        """_write_endpoint should chmod the file to 0o600 on POSIX."""
+        import os
+        path = tmp_path / "endpoint.json"
+        memory_service._write_endpoint(path, port=12345, token="secret")
+        assert path.exists()
+        if sys.platform != "win32":
+            mode = os.stat(path).st_mode & 0o777
+            assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
+
+
+class TestSC5MutableDefaults:
+    """SC5: _record_from_dict should not share mutable default objects."""
+
+    def test_tags_default_is_new_list(self):
+        """Missing tags should produce a new empty list, not a shared default."""
+        r1 = service_client._record_from_dict({"memory_id": "m1", "content": "a"})
+        r2 = service_client._record_from_dict({"memory_id": "m2", "content": "b"})
+        assert r1.tags == []
+        assert r2.tags == []
+        r1.tags.append("test")
+        assert r2.tags == [], "Mutable default shared between records (SC5)"
+
+    def test_payload_default_is_new_dict(self):
+        """Missing payload should produce a new empty dict, not a shared default."""
+        r1 = service_client._record_from_dict({"memory_id": "m1", "content": "a"})
+        r2 = service_client._record_from_dict({"memory_id": "m2", "content": "b"})
+        assert r1.payload == {}
+        assert r2.payload == {}
+        r1.payload["key"] = "value"
+        assert r2.payload == {}, "Mutable default shared between records (SC5)"
+
+    def test_tags_falsy_value_gets_new_list(self):
+        """A falsy tags value (None) should produce a new empty list."""
+        r = service_client._record_from_dict({
+            "memory_id": "m1", "content": "a", "tags": None,
+        })
+        assert r.tags == []
+
+    def test_payload_falsy_value_gets_new_dict(self):
+        """A falsy payload value (None) should produce a new empty dict."""
+        r = service_client._record_from_dict({
+            "memory_id": "m1", "content": "a", "payload": None,
+        })
+        assert r.payload == {}
+
+
+class TestSC6CloseIsNoOp:
+    """SC6: close() should be a no-op for the shared service client."""
+
+    def test_shared_memory_store_close_returns_none(self):
+        """SharedMemoryStore.close() should return None (no-op)."""
+        store = service_client.SharedMemoryStore.__new__(service_client.SharedMemoryStore)
+        assert store.close() is None
+
+    def test_shared_graph_store_close_returns_none(self):
+        """SharedGraphStore.close() should return None (no-op)."""
+        store = service_client.SharedGraphStore.__new__(service_client.SharedGraphStore)
+        assert store.close() is None

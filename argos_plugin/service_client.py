@@ -28,10 +28,24 @@ _START_TIMEOUT = 30.0
 # ANY method (no duplicate-write risk). Timeouts are NOT retried (the
 # server may have processed the request).
 _RETRY_BACKOFF_S = 0.5
+# SC1: cap total response bytes to prevent unbounded memory consumption
+# from a malicious or buggy server. 64MB is generous for any legitimate
+# response (search results, candidates, graph traversals) while preventing
+# a runaway server from exhausting client memory.
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 def _pid_alive(pid: int) -> bool:
-    """Best-effort PID liveness check. Windows-safe (no os.kill signal 0)."""
+    """Best-effort PID liveness check. Windows-safe (no os.kill signal 0).
+
+    SC3: On Windows, ``GetExitCodeProcess`` returns ``STILL_ACTIVE = 259``
+    for a running process. If a process exits with exit code 259, this
+    function incorrectly reports it as alive. This is a very rare edge
+    case (a process would have to exit with code 259). The 90-second
+    stale-lock timeout (``_START_LOCK_STALE_SECS``) is the fallback:
+    even if ``_pid_alive`` incorrectly reports alive, the lock will be
+    considered stale after 90 seconds regardless.
+    """
     if pid <= 0:
         return False
     try:
@@ -64,7 +78,15 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _start_lock_is_stale(lock_path: Path) -> bool:
-    """True when the lock holder is provably gone (dead PID) or ancient."""
+    """True when the lock holder is provably gone (dead PID) or ancient.
+
+    SC4: If ``_pid_alive`` returns False for a process that's actually
+    alive but not responding to ``OpenProcess`` (Windows) or
+    ``os.kill(pid, 0)`` (POSIX), the lock is considered stale and a
+    second service may be started. This is safe because the single-
+    instance guard in ``memory_service.serve`` probes the port and exits
+    cleanly if a service is already running — the duplicate does no harm.
+    """
     try:
         info = json.loads(lock_path.read_text(encoding="utf-8").strip() or "{}")
         pid = int(info.get("pid", 0))
@@ -112,8 +134,10 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
         memory_id=value.get("memory_id", ""),
         category=value.get("category", "context_note"),
         content=value.get("content", ""),
-        tags=value.get("tags", []),
-        payload=value.get("payload", {}),
+        # SC5: use `or []` / `or {}` to avoid sharing the same mutable
+        # default object across calls when the key is missing or falsy.
+        tags=value.get("tags") or [],
+        payload=value.get("payload") or {},
         created_at=value.get("created_at"),
         updated_at=value.get("updated_at"),
         expires_at=value.get("expires_at"),
@@ -200,10 +224,19 @@ class _SharedRPC:
                 connection.settimeout(timeout)
                 connection.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
                 chunks = []
+                total_read = 0
                 while True:
                     chunk = connection.recv(65536)
                     if not chunk:
                         break
+                    total_read += len(chunk)
+                    # SC1: cap total response bytes to prevent unbounded
+                    # memory consumption from a malicious or buggy server.
+                    if total_read > _MAX_RESPONSE_BYTES:
+                        raise SharedMemoryServiceError(
+                            f"shared memory service response exceeded {_MAX_RESPONSE_BYTES} bytes",
+                            error_class="ResponseTooLarge",
+                        )
                     chunks.append(chunk)
                     if b"\n" in chunk:
                         break
@@ -601,6 +634,11 @@ class SharedMemoryStore:
         ]
 
     def close(self) -> None:
+        """SC6: No-op for the shared service client.
+
+        ``_SharedRPC`` doesn't hold persistent connections — each request
+        opens and closes a socket. There are no resources to release.
+        """
         return None
 
     # -- entity aliases -------------------------------------------------------
@@ -706,4 +744,5 @@ class SharedGraphStore:
         return (int(result[0]), int(result[1]))
 
     def close(self) -> None:
+        """SC6: No-op — see SharedMemoryStore.close."""
         return None

@@ -97,15 +97,35 @@ def run_watcher_pass(
         return counts
 
     catalog = _build_catalog_index(store)
+    # WT2: check stop event before the scan (avoids a long scan on shutdown).
+    if stop_event is not None and stop_event.is_set():
+        logger.debug("watcher: pass interrupted by stop event before scan")
+        return counts
     try:
         result = scan_pass(roots, catalog)
     except Exception as exc:
         logger.debug("watcher: scan_pass failed: %s", exc)
         return counts
 
+    # WT2: check stop event after the scan, before catalog mutations.
+    if stop_event is not None and stop_event.is_set():
+        logger.debug("watcher: pass interrupted by stop event after scan")
+        return counts
+
     # Catalog pass: upsert new/changed/moved, tombstone deleted.
+    # WT2: cap catalog updates per pass to avoid long-running passes.
+    _MAX_CATALOG_UPDATES_PER_PASS = 500
+    _catalog_updates = 0
     for bucket in ("new", "changed", "moved"):
         for info in result.get(bucket, []):
+            if _catalog_updates >= _MAX_CATALOG_UPDATES_PER_PASS:
+                logger.debug("watcher: catalog update cap (%d) reached",
+                             _MAX_CATALOG_UPDATES_PER_PASS)
+                break
+            # WT2: check stop event between catalog upserts.
+            if stop_event is not None and stop_event.is_set():
+                logger.debug("watcher: pass interrupted by stop event during catalog")
+                break
             try:
                 store.upsert_catalog_entry(
                     file_id=info["file_id"],
@@ -116,19 +136,32 @@ def run_watcher_pass(
                     layout_family=info.get("layout_family"),
                 )
                 counts[bucket] += 1
+                _catalog_updates += 1
             except Exception as exc:
                 logger.debug("watcher: upsert failed for %s: %s",
                              info.get("path", "?"), exc)
+        if _catalog_updates >= _MAX_CATALOG_UPDATES_PER_PASS:
+            break
 
     counts["unchanged"] = len(result.get("unchanged", []))
 
-    for info in result.get("deleted", []):
-        try:
-            store.tombstone_catalog_entry(file_id=info["file_id"])
-            counts["deleted"] += 1
-        except Exception as exc:
-            logger.debug("watcher: tombstone failed for %s: %s",
-                         info.get("file_id", "?"), exc)
+    # WT2: check stop event before tombstone pass.
+    if stop_event is not None and stop_event.is_set():
+        logger.debug("watcher: pass interrupted by stop event before tombstones")
+    else:
+        for info in result.get("deleted", []):
+            if _catalog_updates >= _MAX_CATALOG_UPDATES_PER_PASS:
+                break
+            if stop_event is not None and stop_event.is_set():
+                logger.debug("watcher: pass interrupted by stop event during tombstones")
+                break
+            try:
+                store.tombstone_catalog_entry(file_id=info["file_id"])
+                counts["deleted"] += 1
+                _catalog_updates += 1
+            except Exception as exc:
+                logger.debug("watcher: tombstone failed for %s: %s",
+                             info.get("file_id", "?"), exc)
 
     # Extraction pass: hot docs only (new + changed). The extract_hash
     # gate in the store ensures unchanged files are not re-extracted.

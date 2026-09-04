@@ -157,6 +157,125 @@ class TestWT2StopResponsiveness:
         # Should be capped at 20 (not all 50).
         assert call_count[0] <= 20
 
+    def test_stop_event_aborts_before_scan(self):
+        """WT2: if stop_event is already set when the pass starts, the
+        scan is skipped entirely (no catalog upserts, no extraction)."""
+        from watcher_thread import run_watcher_pass
+
+        upserts = []
+
+        class FakeStore:
+            def upsert_catalog_entry(self, **kwargs):
+                upserts.append(kwargs)
+            def tombstone_catalog_entry(self, **kwargs):
+                pass
+            def save_candidate(self, **kwargs):
+                pass
+
+        stop_event = threading.Event()
+        stop_event.set()  # already stopped before pass starts
+
+        import watcher as w_mod
+        orig_scan = w_mod.scan_pass
+        scan_called = [False]
+        def fake_scan(roots, catalog):
+            scan_called[0] = True
+            return {"new": [], "changed": [], "moved": [], "deleted": [], "unchanged": []}
+        w_mod.scan_pass = fake_scan
+        try:
+            counts = run_watcher_pass(FakeStore(), ["/tmp"], stop_event=stop_event)
+        finally:
+            w_mod.scan_pass = orig_scan
+
+        # Scan should not have been called.
+        assert scan_called[0] is False
+        # No upserts should have happened.
+        assert len(upserts) == 0
+
+    def test_stop_event_aborts_during_catalog_upserts(self):
+        """WT2: stop_event set during catalog upserts aborts the loop."""
+        from watcher_thread import run_watcher_pass
+
+        upserts = []
+
+        class FakeStore:
+            def upsert_catalog_entry(self, **kwargs):
+                upserts.append(kwargs)
+            def tombstone_catalog_entry(self, **kwargs):
+                pass
+            def save_candidate(self, **kwargs):
+                pass
+
+        stop_event = threading.Event()
+        docs = [{"path": f"/d{i}", "doc_type": "txt", "file_id": str(i),
+                 "size": 100, "mtime": 0} for i in range(10)]
+
+        import watcher as w_mod
+        orig_scan = w_mod.scan_pass
+        orig_extract = w_mod.extract_facts_from_doc
+        def fake_scan(roots, catalog):
+            return {"new": docs, "changed": [], "moved": [], "deleted": [], "unchanged": []}
+        def fake_extract(path, doc_type, **kwargs):
+            return [], "h", "llm", "text"
+        w_mod.scan_pass = fake_scan
+        w_mod.extract_facts_from_doc = fake_extract
+
+        # Set stop_event after 3 upserts.
+        original_upsert = FakeStore.upsert_catalog_entry
+        def counting_upsert(self, **kwargs):
+            upserts.append(kwargs)
+            if len(upserts) >= 3:
+                stop_event.set()
+        FakeStore.upsert_catalog_entry = counting_upsert
+
+        try:
+            counts = run_watcher_pass(FakeStore(), ["/tmp"], stop_event=stop_event)
+        finally:
+            w_mod.scan_pass = orig_scan
+            w_mod.extract_facts_from_doc = orig_extract
+            FakeStore.upsert_catalog_entry = original_upsert
+
+        # Should not have processed all 10 upserts.
+        assert len(upserts) < 10
+
+    def test_max_catalog_updates_cap(self):
+        """WT2: no more than _MAX_CATALOG_UPDATES_PER_PASS (500) catalog
+        upserts+tombstones per pass."""
+        from watcher_thread import run_watcher_pass
+
+        upserts = []
+
+        class FakeStore:
+            def upsert_catalog_entry(self, **kwargs):
+                upserts.append(kwargs)
+            def tombstone_catalog_entry(self, **kwargs):
+                pass
+            def save_candidate(self, **kwargs):
+                pass
+
+        # 600 new docs + 600 deleted — should cap at 500 total.
+        docs = [{"path": f"/d{i}", "doc_type": "txt", "file_id": str(i),
+                 "size": 100, "mtime": 0} for i in range(600)]
+        deleted = [{"file_id": f"del-{i}"} for i in range(600)]
+
+        import watcher as w_mod
+        orig_scan = w_mod.scan_pass
+        orig_extract = w_mod.extract_facts_from_doc
+        def fake_scan(roots, catalog):
+            return {"new": docs, "changed": [], "moved": [], "deleted": deleted, "unchanged": []}
+        def fake_extract(path, doc_type, **kwargs):
+            return [], "h", "llm", "text"
+        w_mod.scan_pass = fake_scan
+        w_mod.extract_facts_from_doc = fake_extract
+        try:
+            counts = run_watcher_pass(FakeStore(), ["/tmp"])
+        finally:
+            w_mod.scan_pass = orig_scan
+            w_mod.extract_facts_from_doc = orig_extract
+
+        # Total upserts should be capped at 500.
+        assert len(upserts) <= 500
+
 
 # ---------------------------------------------------------------------------
 # WT3 -- egress fail-closed

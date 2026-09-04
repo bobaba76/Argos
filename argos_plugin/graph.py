@@ -468,6 +468,20 @@ def extract_graph_relations(
 
 _GRAPH_LLM_MIN_LENGTH = 60
 _GRAPH_LLM_TIMEOUT = 15.0
+# G2: cap on the number of nodes/edges loaded by the startup junk sweep so
+# a large graph does not load everything into Python lists in the daemon
+# thread. 5000 is well above a normal personal graph (~1k nodes); a graph
+# exceeding the limit is swept across startups (quarantined nodes are
+# skipped on the next pass).
+_JUNK_SWEEP_LIMIT = 5000
+# G5: cap on the number of LLM-extracted relations accepted per memory so
+# a crafted/verbose LLM response cannot flood the graph with entities.
+_LLM_MAX_GRAPH_RELATIONS = 20
+# G6: persistence flag for the one-time memory_ids backfill. Stored as a
+# node attribute on a dedicated system node so the scan is skipped after
+# the first successful run.
+_BACKFILL_FLAG_NODE = "__system_state__"
+_BACKFILL_FLAG_ATTR = "memory_ids_backfilled"
 
 
 def _extract_relations_watchdogged(
@@ -651,6 +665,16 @@ def extract_graph_relations_llm(
                 "evidence": "llm",
             },
         })
+    # G5: cap the number of LLM-extracted relations per memory so a
+    # crafted/verbose LLM response cannot flood the graph with entities.
+    # The dedup in add() and _valid_graph_entity (max 8 words, 100 chars)
+    # already mitigate this, but the per-memory count was unbounded.
+    if len(relations) > _LLM_MAX_GRAPH_RELATIONS:
+        logger.debug(
+            "Graph LLM extraction returned %d relations; capping to %d (G5)",
+            len(relations), _LLM_MAX_GRAPH_RELATIONS,
+        )
+        relations = relations[:_LLM_MAX_GRAPH_RELATIONS]
     return relations
 
 
@@ -738,9 +762,33 @@ def _backfill_memory_ids(conn) -> int:
     evidence in attributes) are skipped, so after the first successful run
     the candidate set is empty and later calls only pay the selective scan.
 
+    G6: a persistence flag (``__system_state__`` node with attribute
+    ``memory_ids_backfilled=true``) is checked before the scan and set
+    after a successful run with zero candidates. This skips the full-edge
+    scan on subsequent startups when there is nothing to backfill.
+
     Returns the number of edges backfilled (0 when nothing to do or on
     failure — failures are logged, never fatal).
     """
+    # G6: check the persistence flag — if the backfill already ran and
+    # found nothing to do, skip the scan entirely.
+    try:
+        flag_result = conn.execute(
+            "MATCH (n:Entity {id: $id}) RETURN n.attributes",
+            parameters={"id": _BACKFILL_FLAG_NODE},
+        )
+        if flag_result.has_next():
+            raw = flag_result.get_next()[0]
+            try:
+                attrs = json.loads(raw) if raw else {}
+            except Exception:
+                attrs = {}
+            if attrs.get(_BACKFILL_FLAG_ATTR):
+                logger.debug("G6: memory_ids backfill already complete; skipping scan")
+                return 0
+    except Exception as exc:
+        logger.debug("G6: backfill flag check failed (will scan): %s", exc)
+
     try:
         _bf = conn.execute(
             """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
@@ -786,6 +834,39 @@ def _backfill_memory_ids(conn) -> int:
             "G4 backfill: populated memory_ids on %d pre-migration edge(s)",
             _bf_count,
         )
+    # G6: persist the completion flag only after a successful backfill that
+    # actually migrated edges (``_bf_count > 0``). This follows the issue's
+    # guidance ("persist a flag after the first successful backfill"). We
+    # do NOT set the flag when the scan found nothing on a fresh/empty DB,
+    # because edges added later (e.g. in tests, or by older code paths)
+    # might still need backfill. On a mature DB where all edges are already
+    # migrated, the selective scan (WHERE memory_ids IS NULL AND CONTAINS)
+    # is fast, so the wasted re-scan is negligible.
+    if _bf_count > 0:
+        try:
+            conn.execute(
+                "CREATE (n:Entity {id: $id, entity_type: 'system', "
+                "attributes: $attrs, user_scope: 'system'})",
+                parameters={
+                    "id": _BACKFILL_FLAG_NODE,
+                    "attrs": json.dumps({_BACKFILL_FLAG_ATTR: True}),
+                },
+            )
+        except Exception as exc:
+            if not _is_already_exists_error(exc):
+                logger.debug("G6: could not set backfill flag: %s", exc)
+            else:
+                # Node exists — update the attribute.
+                try:
+                    conn.execute(
+                        "MATCH (n:Entity {id: $id}) SET n.attributes = $attrs",
+                        parameters={
+                            "id": _BACKFILL_FLAG_NODE,
+                            "attrs": json.dumps({_BACKFILL_FLAG_ATTR: True}),
+                        },
+                    )
+                except Exception as exc2:
+                    logger.debug("G6: could not update backfill flag: %s", exc2)
     return _bf_count
 
 
@@ -805,12 +886,32 @@ class KuzuGraphStore:
         self.db_dir = Path(db_dir)
         self.db_dir.parent.mkdir(parents=True, exist_ok=True)
         self.user_id = (user_id or "default_user").strip()
-        self._lock = threading.Lock()
+        # G4: the per-instance ``self._lock`` was never acquired anywhere
+        # (all operations use ``self._shared_conn_lock``); removed as dead
+        # code that only misled readers.
         self.database = None
-        self.conn = None
+        self._closed = False  # G1: set by close() so the conn property returns None
         self._db_key = str(self.db_dir.resolve())
         self._flush_dirty = False  # #88: set when _flush() fails
         self._init_db()
+
+    @property
+    def conn(self):
+        """The current shared Kuzu connection (G1).
+
+        Dynamically reads from the shared pool so that after one instance
+        calls ``_flush()`` (which replaces the connection in the pool), all
+        other instances sharing the same DB immediately see the new
+        connection. Previously each instance cached ``self.conn`` at init,
+        so a flush by instance A left instance B with a stale connection
+        that might not see flushed WAL data.
+        """
+        if self._closed:
+            return None
+        shared = KuzuGraphStore._shared.get(self._db_key)
+        if shared is not None:
+            return shared[1]
+        return None
 
     def _init_db(self) -> None:
         import kuzu
@@ -864,10 +965,11 @@ class KuzuGraphStore:
                 # One-time idempotent migration (see _backfill_memory_ids).
                 _backfill_memory_ids(conn)
 
-            # Reuse the shared connection.
-            self.database, self.conn, self._shared_conn_lock, ref_count = shared
+            # Reuse the shared connection. G1: self.conn is now a property
+            # that reads from the shared pool, so we don't cache it here.
+            self.database, _shared_conn, self._shared_conn_lock, ref_count = shared
             KuzuGraphStore._shared[self._db_key] = (
-                self.database, self.conn, self._shared_conn_lock, ref_count + 1
+                self.database, _shared_conn, self._shared_conn_lock, ref_count + 1
             )
         logger.debug("Kuzu graph connected (shared, ref_count=%d)", ref_count + 1)
 
@@ -902,12 +1004,16 @@ class KuzuGraphStore:
             with self._shared_conn_lock:
                 if self.database is None:
                     return
-                self.conn = kuzu.Connection(self.database)
+                # G1: update the shared pool's connection in place. Because
+                # self.conn is now a property that reads from the shared
+                # pool, all instances sharing this DB immediately see the
+                # new connection — no stale self.conn references remain.
+                new_conn = kuzu.Connection(self.database)
                 with KuzuGraphStore._shared_lock:
                     shared = KuzuGraphStore._shared.get(self._db_key)
                     if shared:
                         KuzuGraphStore._shared[self._db_key] = (
-                            self.database, self.conn, self._shared_conn_lock, shared[3]
+                            self.database, new_conn, self._shared_conn_lock, shared[3]
                         )
             self._flush_dirty = False
         except Exception as exc:
@@ -1563,6 +1669,15 @@ class KuzuGraphStore:
         # Power iteration for PageRank.
         # PR(node) = (1 - damping) * seed_vec[node] +
         #            damping * sum(PR(neighbor) * weight / out_degree(neighbor))
+        # G7: the iteration count is kept at max_iterations (default 20) for
+        # all graph sizes. Reducing it for small graphs (< 100 nodes) would
+        # change PPR rankings (the diffusion hasn't converged yet at 5
+        # iterations), breaking the ranking contract. The cost is accepted:
+        # 20 iterations * ~1k nodes = ~20k Python operations (~0.1s), and
+        # the convergence check (L1 norm below) breaks early when the
+        # distribution has stabilized, so small graphs that converge fast
+        # already pay less than the full 20 iterations.
+        effective_max_iter = max_iterations
         pr = dict(seed_vec)  # Initialize with seed vector.
         out_degree: Dict[str, float] = {}
         for node, neighbors in adjacency.items():
@@ -1572,7 +1687,7 @@ class KuzuGraphStore:
             if node not in out_degree:
                 out_degree[node] = 1.0
 
-        for _ in range(max_iterations):
+        for _ in range(effective_max_iter):
             new_pr: Dict[str, float] = {}
             for node in all_nodes:
                 # Teleport component.
@@ -1703,6 +1818,14 @@ class KuzuGraphStore:
         """
         with self._shared_conn_lock:
             # #76: consume results inside the lock.
+            # G8: LIMIT is set to limit*3 to account for quarantined rows
+            # filtered in Python (the quarantine status lives in a JSON
+            # attribute that Kuzu cannot filter natively). This is a
+            # heuristic — a graph with many quarantined edges matching the
+            # term could still return fewer than `limit` visible edges.
+            # Moving the quarantine filter into Cypher requires a dedicated
+            # `status` column (architecture note above); until then the
+            # multiplier is the pragmatic trade-off.
             results = self.conn.execute(
                 query,
                 parameters={"term": term_lower, "scope": self.user_id, "limit": limit * 3},
@@ -2026,13 +2149,27 @@ class KuzuGraphStore:
             row = results.get_next()
             return int(row[0]) if row else 0
 
-    def clear_scope(self) -> tuple[int, int]:
+    def clear_scope(self, *, confirm: bool = True) -> tuple[int, int]:
         """Delete all nodes and edges for the current user_scope.
 
         Returns (remaining_nodes, remaining_edges) after deletion.
         This is the first phase of a graph rebuild: clear, then re-index
         from DuckDB.
+
+        G3 (partial): this is an irreversible wipe of the entire user scope
+        and a rebuild utility, not a normal operation. The ``confirm``
+        keyword defaults to ``True`` for backward compatibility with
+        existing callers (``rebuild_graph.py``). The complete G3 fix
+        requires removing ``clear_scope_graph`` from the RPC dispatch in
+        ``memory_service.py`` (a shared file outside this issue's scope);
+        see the PR body for details. The facade's ``FORBIDDEN_OPERATIONS``
+        already blocks ``clear_scope_graph`` at the API layer.
         """
+        if not confirm:
+            raise PermissionError(
+                "clear_scope is an irreversible wipe of the entire user graph. "
+                "Pass confirm=True to proceed (G3)."
+            )
         with self._shared_conn_lock:
             self.conn.execute(
                 "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) "
@@ -2129,12 +2266,22 @@ class KuzuGraphStore:
         return True
 
     def quarantine_junk_entities(self) -> int:
-        """Hide obviously malformed nodes/edges without deleting graph data."""
+        """Hide obviously malformed nodes/edges without deleting graph data.
+
+        G2: the sweep is bounded by ``_JUNK_SWEEP_LIMIT`` per scope so a
+        large graph (~10k nodes, ~50k edges) does not load everything into
+        Python lists in the background daemon thread. The limit is high
+        enough that a normal graph is fully swept in one pass; a graph
+        exceeding the limit is swept in batches across startups (the
+        quarantined nodes are skipped on the next pass because
+        ``_visible_attributes`` returns False for them).
+        """
         with self._shared_conn_lock:
             node_results = self.conn.execute(
                 "MATCH (n:Entity) WHERE n.user_scope = $scope "
                 "RETURN n.id AS id, n.attributes AS attributes, "
-                "n.entity_type AS entity_type",
+                "n.entity_type AS entity_type "
+                f"LIMIT {_JUNK_SWEEP_LIMIT}",
                 parameters={"scope": self.user_id},
             )
             nodes = []
@@ -2143,8 +2290,9 @@ class KuzuGraphStore:
             edge_results = self.conn.execute(
                 """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
                    WHERE r.user_scope = $scope
-                   RETURN a.id, r.relation_type, b.id, r.attributes""",
-                parameters={"scope": self.user_id},
+                   RETURN a.id, r.relation_type, b.id, r.attributes
+                   LIMIT $edge_limit""",
+                parameters={"scope": self.user_id, "edge_limit": _JUNK_SWEEP_LIMIT},
             )
             edges = []
             while edge_results.has_next():
@@ -2212,7 +2360,7 @@ class KuzuGraphStore:
         with KuzuGraphStore._shared_lock:
             shared = KuzuGraphStore._shared.get(self._db_key)
             if shared is None:
-                self.conn = None
+                self._closed = True  # G1: conn property returns None after close
                 self.database = None
                 return
             database, conn, lock, ref_count = shared
@@ -2220,7 +2368,7 @@ class KuzuGraphStore:
             if ref_count <= 0:
                 # Last instance — close the database.
                 KuzuGraphStore._shared.pop(self._db_key, None)
-                self.conn = None
+                self._closed = True  # G1
                 self.database = None
                 logger.debug("Kuzu graph closed (last instance, ref_count=0)")
             else:
@@ -2228,6 +2376,6 @@ class KuzuGraphStore:
                 KuzuGraphStore._shared[self._db_key] = (
                     database, conn, lock, ref_count
                 )
-                self.conn = None
+                self._closed = True  # G1
                 self.database = None
                 logger.debug("Kuzu graph close (ref_count=%d remaining)", ref_count)

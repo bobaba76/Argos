@@ -36,6 +36,12 @@ try:
 except ImportError:  # store_retrieval.py imported as a top-level module
     from retriever import DuckDBRetriever
 
+# #248: tuning constants consolidated in tuning.py
+try:
+    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM
+except ImportError:  # store_retrieval.py imported as a top-level module
+    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM
+
 logger = logging.getLogger(__name__)
 
 
@@ -255,7 +261,7 @@ class StoreRetrievalMixin:
                     if not tf:
                         continue
                     idf = math.log(1.0 + (n_docs - dfs[t] + 0.5) / (dfs[t] + 0.5))
-                    score += idf * (2.2 * tf / (tf + 0.75 * (dlen / avg_len)))
+                    score += idf * (BM25_K1 * tf / (tf + BM25_B * (dlen / avg_len)))
                 r.similarity = score
             top = max((r.similarity for r in out), default=0.0)
             if top > 0:
@@ -1147,13 +1153,11 @@ class StoreRetrievalMixin:
 
     # -- write operations -----------------------------------------------------
 
-    # Semantic dedup threshold: cosine similarity above this means "same fact".
-    _DEDUP_SIMILARITY_THRESHOLD = 0.85
-
-    # SR13: max valid embedding dimension. Embeddings with 0 dims or dims
-    # above this cap are rejected before SQL interpolation to prevent
-    # silent degradation of semantic search/dedup.
-    _MAX_EMBEDDING_DIM = 4096
+    # #248: tuning constants consolidated in tuning.py. Class attrs alias
+    # the module-level constants for backward compatibility with any code
+    # that references them via the class.
+    _DEDUP_SIMILARITY_THRESHOLD = DEDUP_SIMILARITY_THRESHOLD
+    _MAX_EMBEDDING_DIM = MAX_EMBEDDING_DIM
 
     def _content_exists(
         self, content: str, category: str,

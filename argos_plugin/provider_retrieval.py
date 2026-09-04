@@ -53,6 +53,20 @@ try:
 except ImportError:  # provider_retrieval.py imported as a top-level module
     from value_extractor import extract_values, values_conflict
 
+# #248: tuning constants consolidated in tuning.py
+try:
+    from .tuning import (
+        ALIAS_CACHE_TTL_SECONDS as _TUNING_ALIAS_CACHE_TTL,
+        GRAPH_CIRCUIT_BREAKER_THRESHOLD as _TUNING_CB_THRESHOLD,
+        GRAPH_CIRCUIT_BREAKER_COOLDOWN as _TUNING_CB_COOLDOWN,
+    )
+except ImportError:  # provider_retrieval.py imported as a top-level module
+    from tuning import (
+        ALIAS_CACHE_TTL_SECONDS as _TUNING_ALIAS_CACHE_TTL,
+        GRAPH_CIRCUIT_BREAKER_THRESHOLD as _TUNING_CB_THRESHOLD,
+        GRAPH_CIRCUIT_BREAKER_COOLDOWN as _TUNING_CB_COOLDOWN,
+    )
+
 logger = logging.getLogger(__name__)
 
 # -- #247: system prompt template (byte-stable for prompt caching) -----------
@@ -233,12 +247,13 @@ class ProviderRetrievalMixin:
     # changes (add_alias etc. can call _invalidate_alias_cache).
     _alias_cache: list = []
     _alias_cache_time: float = 0.0
-    _ALIAS_CACHE_TTL_SECONDS = 60.0
+    # #248: tuning constants from tuning.py
+    _ALIAS_CACHE_TTL_SECONDS = _TUNING_ALIAS_CACHE_TTL
     # PR10: circuit breaker for graph-aware retrieval. After N consecutive
     # failures, graph boosting is disabled for a cooldown period so a
     # persistent bug doesn't waste CPU and silently degrade every turn.
-    _GRAPH_CIRCUIT_BREAKER_THRESHOLD = 5
-    _GRAPH_CIRCUIT_BREAKER_COOLDOWN = 300.0  # 5 minutes
+    _GRAPH_CIRCUIT_BREAKER_THRESHOLD = _TUNING_CB_THRESHOLD
+    _GRAPH_CIRCUIT_BREAKER_COOLDOWN = _TUNING_CB_COOLDOWN
     _graph_retrieval_failures: int = 0
     _graph_retrieval_disabled_until: float = 0.0
 

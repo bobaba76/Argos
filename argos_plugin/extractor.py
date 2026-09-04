@@ -1034,6 +1034,14 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
 # facts instead of only the first priority-order match. The split is on
 # space-delimited whole words so substrings like "Android" are untouched.
 _CONJUNCTION_SPLIT_RE = re.compile(r"\s+(?:and|but|also)\s+", re.IGNORECASE)
+# EX7 fix: only split on a conjunction when the fragment AFTER it is an
+# independent first-person clause (starts with "I " as a subject pronoun).
+# This preserves compound objects ("I use Python and SQL" → one fact) while
+# still splitting true multi-fact sentences ("I work at Google and I prefer
+# Python" → two facts). Without this guard, "Python and SQL" is split into
+# "Python" and "SQL", and the second fragment ("SQL") has no first-person
+# subject so it produces no fact — the compound object is lost.
+_INDEPENDENT_CLAUSE_RE = re.compile(r"^I\s+", re.IGNORECASE)
 
 
 def _split_on_conjunctions(sentence: str) -> List[str]:
@@ -1044,9 +1052,33 @@ def _split_on_conjunctions(sentence: str) -> List[str]:
     fact downstream, so over-splitting is safe (no false positives, only
     potential extra true positives). Returns the original sentence as a
     single-element list if no conjunction is present.
+
+    EX7 fix: only split when the fragment AFTER the conjunction is an
+    independent first-person clause (starts with "I "). This preserves
+    compound objects ("I use Python and SQL" → one fact) while still
+    splitting true multi-fact sentences ("…and I prefer Python" → two).
     """
     parts = _CONJUNCTION_SPLIT_RE.split(sentence)
-    return [p.strip() for p in parts if p and p.strip()]
+    if len(parts) <= 1:
+        return [p.strip() for p in parts if p and p.strip()]
+    # EX7: walk the split parts and only yield a new clause when the
+    # fragment after a conjunction starts with "I " (independent clause).
+    # Otherwise, rejoin the conjunction and keep the compound object.
+    result: List[str] = [parts[0].strip()] if parts[0].strip() else []
+    i = 1
+    while i < len(parts):
+        fragment = parts[i].strip()
+        if fragment and _INDEPENDENT_CLAUSE_RE.match(fragment):
+            # Independent clause — split here.
+            result.append(fragment)
+        else:
+            # Compound object — rejoin with the previous clause via "and".
+            if result:
+                result[-1] = result[-1] + " and " + fragment
+            elif fragment:
+                result.append(fragment)
+        i += 1
+    return result
 
 
 def _extract_facts_regex(user_content: str) -> List[Dict[str, Any]]:

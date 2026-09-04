@@ -299,6 +299,49 @@ class TestEX7ConjunctionSplit:
         clauses = extractor._split_on_conjunctions("I use Android daily")
         assert clauses == ["I use Android daily"]
 
+    # EX7 fix: compound-object preservation tests
+
+    def test_compound_object_not_split(self):
+        """EX7 fix: 'I use Python and SQL' must NOT be split — the compound
+        object 'Python and SQL' must be preserved as one fact."""
+        import extractor
+        clauses = extractor._split_on_conjunctions("I use Python and SQL.")
+        assert clauses == ["I use Python and SQL."]
+
+    def test_compound_object_tea_coffee_not_split(self):
+        """EX7 fix: 'I like tea and coffee' must NOT be split."""
+        import extractor
+        clauses = extractor._split_on_conjunctions("I like tea and coffee.")
+        assert clauses == ["I like tea and coffee."]
+
+    def test_compound_object_google_apple_not_split(self):
+        """EX7 fix: 'I work at Google and Apple' must NOT be split."""
+        import extractor
+        clauses = extractor._split_on_conjunctions("I work at Google and Apple.")
+        assert clauses == ["I work at Google and Apple."]
+
+    def test_compound_object_yields_single_fact(self):
+        """EX7 fix: 'I use Python and SQL' yields ONE fact containing both,
+        not two separate facts."""
+        import extractor
+        facts = extractor._extract_facts_regex("I use Python and SQL.")
+        contents = [f["content"] for f in facts]
+        # Should be one fact containing both Python and SQL.
+        assert len(facts) == 1, f"Expected 1 fact, got {len(facts)}: {contents}"
+        assert "Python" in facts[0]["content"]
+        assert "SQL" in facts[0]["content"]
+
+    def test_independent_clause_still_splits(self):
+        """EX7 fix: 'I work at Google and I prefer Python' still splits into
+        two facts (the original intended case must keep passing)."""
+        import extractor
+        facts = extractor._extract_facts_regex(
+            "I work at Google and I prefer Python.",
+        )
+        contents = [f["content"] for f in facts]
+        assert any("Google" in c for c in contents)
+        assert any("Python" in c for c in contents)
+
 
 # ---------------------------------------------------------------------------
 # EX8 — junk-filter prefixes decoupled from format strings

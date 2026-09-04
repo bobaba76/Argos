@@ -1,0 +1,56 @@
+name: CI (change-scoped)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (changed files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Compute changed test files
+        id: changed
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # Changed test files (excluding known-env-dependent ones)
+          TESTS=$(git diff --name-only "$BASE" HEAD -- argos_plugin/tests/ | grep '\.py$' || true)
+          # Add test files matching changed source modules (e.g. store.py -> test_store*.py)
+          SRC=$(git diff --name-only "$BASE" HEAD -- argos_plugin/ | grep -v '/tests/' | sed 's|.*/||; s|\.py$||' | sort -u)
+          for m in $SRC; do
+            TESTS="$TESTS $(ls argos_plugin/tests/ 2>/dev/null | grep -i "${m}" | sed 's|^|argos_plugin/tests/|' || true)"
+          done
+          TESTS=$(echo "$TESTS" | tr ' ' '\n' | grep -vE 'test_popia_deployment|test_tenant_provisioning|test_temporal_injection|test_weather' | sort -u | tr '\n' ' ')
+          echo "TESTS=$TESTS" >> "$GITHUB_ENV"
+          echo "Running: ${TESTS:-<none - smoke only>}"
+
+      - name: Run relevant tests
+        run: |
+          if [ -n "$TESTS" ]; then
+            python -m pytest $TESTS -q --timeout 300 -p no:cacheprovider
+          else
+            echo "No test files affected — skipping pytest."
+          fi
+        env:
+          HF_HUB_OFFLINE: "1"
+          PYTHONPATH: "."

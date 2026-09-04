@@ -28,6 +28,7 @@ if __package__:
     from .store import DuckDBMemoryStore
     from .access_scoping import ACLConfig, filter_records_by_access
     from .config_validation import storage_name_error
+    from .config_model import MemoryConfig
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from embeddings import LocalEmbedder
@@ -35,6 +36,7 @@ else:
     from store import DuckDBMemoryStore
     from access_scoping import ACLConfig, filter_records_by_access
     from config_validation import storage_name_error
+    from config_model import MemoryConfig
 
 logger = logging.getLogger("argos.service")
 _ENDPOINT_NAME = "hybrid_memory_service.json"
@@ -96,12 +98,23 @@ def _load_config(home: Path) -> dict:
         return {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
+        if not isinstance(value, dict):
+            return {}
     except Exception as exc:
         # Log + return defaults — a malformed config must not be silently
         # ignored (matches provider_core._load_config's behaviour).
         logger.warning("malformed config %s: %s", path, exc)
         return {}
+    # #244: validate known keys via MemoryConfig.  Extra keys (tenants,
+    # backup, review_mode) are allowed here because memory_service has
+    # tenant-specific config that is not part of the global model.
+    known = set(MemoryConfig.model_fields.keys())
+    clean = {k: v for k, v in value.items() if k in known}
+    try:
+        MemoryConfig.model_validate(clean)
+    except Exception as exc:
+        logger.warning("config validation error in %s: %s", path, exc)
+    return value
 
 
 def endpoint_path(home: str | Path) -> Path:

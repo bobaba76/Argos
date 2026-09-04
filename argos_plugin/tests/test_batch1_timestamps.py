@@ -4,7 +4,7 @@ Covers:
 - #28 finding 1: P2C loop-counter swap — i/j not mutated mid-iteration
 - #28 finding 2: Naive created_at gets recency boost (not silently 0.0)
 - #28 finding 3: as_of validated as ISO-8601 (invalid → ignored with warning)
-- #33 finding 1: Mixed-project cluster uses _majority_project_id (not cluster[0])
+- #33 finding 1: Mixed-project cluster uses _unanimous_project_id (not cluster[0])
 - #33 finding 2: numpy fallback logs a warning
 - #33 finding 3: None created_at sorts as oldest (intentional, not accidental)
 """
@@ -249,54 +249,54 @@ class TestAsOfValidation:
 # ---------------------------------------------------------------------------
 
 class TestMixedProjectCluster:
-    """_majority_project_id should be used instead of cluster[0].project_id."""
+    """_unanimous_project_id should be used instead of cluster[0].project_id."""
 
-    def test_majority_project_id_unanimous(self):
+    def test_unanimous_project_id_unanimous(self):
         """When all records have the same project_id, return it."""
-        from distillation import _majority_project_id
+        from distillation import _unanimous_project_id
 
         class FakeRecord:
             def __init__(self, pid):
                 self.project_id = pid
 
         records = [FakeRecord("proj1"), FakeRecord("proj1"), FakeRecord("proj1")]
-        assert _majority_project_id(records) == "proj1"
+        assert _unanimous_project_id(records) == "proj1"
 
-    def test_majority_project_id_mixed(self):
+    def test_unanimous_project_id_mixed(self):
         """When records have different project_ids, return None (global)."""
-        from distillation import _majority_project_id
+        from distillation import _unanimous_project_id
 
         class FakeRecord:
             def __init__(self, pid):
                 self.project_id = pid
 
         records = [FakeRecord("proj1"), FakeRecord("proj2")]
-        assert _majority_project_id(records) is None
+        assert _unanimous_project_id(records) is None
 
-    def test_majority_project_id_all_none(self):
+    def test_unanimous_project_id_all_none(self):
         """When all records have None project_id, return None."""
-        from distillation import _majority_project_id
+        from distillation import _unanimous_project_id
 
         class FakeRecord:
             def __init__(self, pid):
                 self.project_id = pid
 
         records = [FakeRecord(None), FakeRecord(None)]
-        assert _majority_project_id(records) is None
+        assert _unanimous_project_id(records) is None
 
-    def test_majority_project_id_one_set_one_none(self):
+    def test_unanimous_project_id_one_set_one_none(self):
         """When one record has a project_id and another has None, return
         the set one only if it's unanimous among non-None values."""
-        from distillation import _majority_project_id
+        from distillation import _unanimous_project_id
 
         class FakeRecord:
             def __init__(self, pid):
                 self.project_id = pid
 
         records = [FakeRecord("proj1"), FakeRecord(None)]
-        # _majority_project_id only counts non-None project_ids.
+        # _unanimous_project_id only counts non-None project_ids.
         # If there's exactly one unique non-None project_id, return it.
-        assert _majority_project_id(records) == "proj1"
+        assert _unanimous_project_id(records) == "proj1"
 
 
 # ---------------------------------------------------------------------------

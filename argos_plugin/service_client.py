@@ -538,6 +538,19 @@ class SharedMemoryStore:
         ) or []
         return [_record_from_dict(value) for value in values]
 
+    def load_rollup_candidates(self, limit: int) -> list:
+        """Proxy for store.load_rollup_candidates (RU2)."""
+        values = self._rpc.call(
+            "store", "load_rollup_candidates", limit=limit,
+        ) or []
+        return [_record_from_dict(value) for value in values]
+
+    def count_rollup_candidates_since(self, since: str | None) -> int:
+        """Proxy for store.count_rollup_candidates_since (RU3 novelty gate)."""
+        return int(self._rpc.call(
+            "store", "count_rollup_candidates_since", since=since,
+        ) or 0)
+
     def list_candidates(self, **kwargs: Any) -> List[dict]:
         return self._rpc.call("store", "list_candidates", **kwargs) or []
 

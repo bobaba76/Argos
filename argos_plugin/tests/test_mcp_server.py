@@ -37,6 +37,8 @@ from mcp_server import (
     MCP_PROTOCOL_VERSION,
     TOOL_DEFINITIONS,
     TOOL_TO_OPERATION,
+    JSONRPC_INVALID_PARAMS,
+    JSONRPC_INVALID_REQUEST,
 )
 from store_common import MemoryRecord
 
@@ -94,8 +96,15 @@ def _make_server(
     store=None,
     allowed_ops=None,
     stdin_lines=None,
+    initialized: bool = True,
 ) -> tuple[MCPServer, io.StringIO, io.StringIO]:
-    """Build an MCP server with in-memory streams for testing."""
+    """Build an MCP server with in-memory streams for testing.
+
+    *initialized* defaults to True so existing tests that send initialize
+    → tools/list without an explicit notifications/initialized still work
+    (M8 gate is checked in _handle_line). Tests that need to verify the
+    pre-initialization gate should pass initialized=False.
+    """
     store = store or StubStore()
     facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
     auth = AuthContext(
@@ -111,6 +120,7 @@ def _make_server(
     stdout = io.StringIO()
     stderr = io.StringIO()
     server = MCPServer(facade, auth, stdin=stdin, stdout=stdout, stderr=stderr)
+    server._initialized = initialized  # M8: default initialized for existing tests
     return server, stdout, stderr
 
 
@@ -308,7 +318,9 @@ class TestIdentitySpoofViaAdapter:
     """Identity spoof attempts through the MCP adapter are rejected."""
 
     def test_search_with_spoofed_user_id_rejected(self):
-        """A tools/call with user_id in arguments is rejected by the facade."""
+        """A tools/call with user_id in arguments is rejected.
+        M2: now rejected at the schema level (additionalProperties: false)
+        before reaching the facade — JSONRPC_INVALID_PARAMS."""
         server, stdout, stderr = _make_server(stdin_lines=_send_messages(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
              "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
@@ -318,13 +330,13 @@ class TestIdentitySpoofViaAdapter:
         ))
         server.run()
         msgs = _parse_stdout(stdout)
-        result = msgs[1]["result"]
-        assert result["isError"] is True
-        error = result["structuredContent"]["error"]
-        assert error["code"] == "forbidden"
+        # M2: schema validation rejects user_id (not in search inputSchema).
+        assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
     def test_search_with_spoofed_tenant_rejected(self):
-        """A tools/call with tenant in arguments is rejected."""
+        """A tools/call with tenant in arguments is rejected.
+        M2: now rejected at the schema level (additionalProperties: false)
+        before reaching the facade — JSONRPC_INVALID_PARAMS."""
         server, stdout, stderr = _make_server(stdin_lines=_send_messages(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
              "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
@@ -334,10 +346,8 @@ class TestIdentitySpoofViaAdapter:
         ))
         server.run()
         msgs = _parse_stdout(stdout)
-        result = msgs[1]["result"]
-        assert result["isError"] is True
-        error = result["structuredContent"]["error"]
-        assert error["code"] == "forbidden"
+        # M2: schema validation rejects tenant (not in search inputSchema).
+        assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
 
 # ---------------------------------------------------------------------------
@@ -433,3 +443,236 @@ class TestToolAuthorization:
         # All read tools are present.
         names = {t["name"] for t in tools}
         assert "memory_search" in names
+
+
+# ---------------------------------------------------------------------------
+# M1-M10: MCP server audit fixes (#233)
+# ---------------------------------------------------------------------------
+
+class TestMCPServerAuditM:
+    """Regression tests for issue #233: MCP server audit M1-M10."""
+
+    # -- M1: idempotency_key only popped for memory_propose ------------------
+
+    def test_m1_idempotency_key_not_popped_for_search(self):
+        """M1: idempotency_key in a search call should be rejected by
+        schema validation (additionalProperties: false), not silently
+        dropped."""
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "memory_search",
+                        "arguments": {"query": "test", "idempotency_key": "key-1"}}},
+        ))
+        server.run()
+        msgs = _parse_stdout(stdout)
+        # Schema validation rejects idempotency_key (not in search schema).
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+    def test_m1_idempotency_key_popped_for_propose(self):
+        """M1: idempotency_key IS popped for memory_propose (it's in the
+        schema and required). The call should succeed."""
+        store = StubStore()
+        server, stdout, stderr = _make_server(
+            store=store,
+            stdin_lines=_send_messages(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "memory_propose",
+                            "arguments": {"content": "User likes tea",
+                                          "idempotency_key": "key-m1"}}},
+            ),
+        )
+        server.run()
+        msgs = _parse_stdout(stdout)
+        result = msgs[1]["result"]
+        assert result["isError"] is False
+        assert result["structuredContent"]["candidate_id"] is not None
+
+    # -- M2: schema validation before facade call ----------------------------
+
+    def test_m2_search_limit_above_max_rejected(self):
+        """M2: limit=999 (above schema maximum of 50) is rejected."""
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "memory_search",
+                        "arguments": {"query": "test", "limit": 999}}},
+        ))
+        server.run()
+        msgs = _parse_stdout(stdout)
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+    def test_m2_search_limit_zero_rejected(self):
+        """M2: limit=0 (below schema minimum of 1) is rejected."""
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "memory_search",
+                        "arguments": {"query": "test", "limit": 0}}},
+        ))
+        server.run()
+        msgs = _parse_stdout(stdout)
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+    def test_m2_search_missing_query_rejected(self):
+        """M2: missing required 'query' field is rejected."""
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "memory_search", "arguments": {"limit": 5}}},
+        ))
+        server.run()
+        msgs = _parse_stdout(stdout)
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+    def test_m2_propose_content_too_long_rejected(self):
+        """M2: content exceeding maxLength of 10000 is rejected."""
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "memory_propose",
+                        "arguments": {"content": "x" * 10001,
+                                      "idempotency_key": "key-long"}}},
+        ))
+        server.run()
+        msgs = _parse_stdout(stdout)
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_PARAMS
+
+    def test_m2_valid_search_passes_schema(self):
+        """M2: a valid search call passes schema validation and reaches
+        the facade."""
+        store = StubStore()
+        store.remember(category="personal_fact", content="hello world")
+        server, stdout, stderr = _make_server(
+            store=store,
+            stdin_lines=_send_messages(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "memory_search",
+                            "arguments": {"query": "hello", "limit": 10}}},
+            ),
+        )
+        server.run()
+        msgs = _parse_stdout(stdout)
+        assert msgs[1]["result"]["isError"] is False
+
+    # -- M4: protocol version warning ----------------------------------------
+
+    def test_m4_old_protocol_version_logs_warning(self, caplog):
+        """M4: a client requesting an older protocol version logs a warning."""
+        import logging
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2024-11-05", "capabilities": {}}},
+        ))
+        with caplog.at_level(logging.WARNING, logger="argos.mcp"):
+            server.run()
+        # A warning should be logged about the version mismatch.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) >= 1
+        assert "protocol" in warnings[0].message.lower()
+
+    def test_m4_matching_protocol_no_warning(self, caplog):
+        """M4: matching protocol version does not log a warning."""
+        import logging
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}}},
+        ))
+        with caplog.at_level(logging.WARNING, logger="argos.mcp"):
+            server.run()
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 0
+
+    # -- M6: BrokenPipeError in _send is caught ------------------------------
+
+    def test_m6_broken_pipe_does_not_crash(self):
+        """M6: a BrokenPipeError in _send is caught, not propagated."""
+        server, stdout, stderr = _make_server(stdin_lines=_send_messages(
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        ))
+        # Replace stdout with one that raises BrokenPipeError.
+        class BrokenStdout:
+            def write(self, data):
+                raise BrokenPipeError("broken pipe")
+            def flush(self):
+                pass
+        server._stdout = BrokenStdout()
+        # Should not raise — the run loop handles BrokenPipeError.
+        server.run()
+
+    # -- M8: _initialized gate on tools/list and tools/call ------------------
+
+    def test_m8_tools_list_before_initialized_rejected(self):
+        """M8: tools/list before notifications/initialized is rejected."""
+        server, stdout, stderr = _make_server(
+            initialized=False,
+            stdin_lines=_send_messages(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            ),
+        )
+        server.run()
+        msgs = _parse_stdout(stdout)
+        # initialize response is fine, tools/list is rejected.
+        assert msgs[0]["id"] == 1
+        assert "result" in msgs[0]
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_REQUEST
+
+    def test_m8_tools_call_before_initialized_rejected(self):
+        """M8: tools/call before notifications/initialized is rejected."""
+        server, stdout, stderr = _make_server(
+            initialized=False,
+            stdin_lines=_send_messages(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "memory_search", "arguments": {"query": "test"}}},
+            ),
+        )
+        server.run()
+        msgs = _parse_stdout(stdout)
+        assert msgs[1]["error"]["code"] == JSONRPC_INVALID_REQUEST
+
+    def test_m8_tools_list_after_initialized_succeeds(self):
+        """M8: tools/list after notifications/initialized works."""
+        server, stdout, stderr = _make_server(
+            initialized=False,
+            stdin_lines=_send_messages(
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            ),
+        )
+        server.run()
+        msgs = _parse_stdout(stdout)
+        # initialize response, then tools/list response (notification has no response).
+        assert msgs[0]["id"] == 1
+        assert msgs[1]["id"] == 2
+        assert "result" in msgs[1]
+        assert "tools" in msgs[1]["result"]
+
+    # -- M9: TOOL_DEFINITIONS is a tuple (immutable) -------------------------
+
+    def test_m9_tool_definitions_is_tuple(self):
+        """M9: TOOL_DEFINITIONS should be a tuple, not a list (immutable)."""
+        assert isinstance(TOOL_DEFINITIONS, tuple), (
+            f"TOOL_DEFINITIONS should be a tuple, got {type(TOOL_DEFINITIONS)}"
+        )
+
+    def test_m9_tool_definitions_cannot_be_mutated(self):
+        """M9: attempting to mutate TOOL_DEFINITIONS raises TypeError."""
+        with pytest.raises(TypeError):
+            TOOL_DEFINITIONS[0] = {}  # type: ignore
+        with pytest.raises(AttributeError):
+            TOOL_DEFINITIONS.append({})  # type: ignore

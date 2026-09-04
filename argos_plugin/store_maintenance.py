@@ -1140,6 +1140,53 @@ class StoreMaintenanceMixin:
         )
         return self._fetch_records(sql, [self.user_id, limit])
 
+    def load_rollup_candidates(self, limit: int) -> List[MemoryRecord]:
+        """Load the oldest active low-retrieval records for rollup (RU2).
+
+        Targets records beyond the rollup horizon: oldest first, active
+        tier, no feedback. These are the records whose long-horizon
+        patterns are most likely to benefit from compaction into profile
+        summaries. Unlike ``load_eligible_records``, this does NOT require
+        embeddings (rollup does not cluster) and orders ASC (oldest first).
+        """
+        sql = (
+            "SELECT * FROM memory_records WHERE "
+            "COALESCE(status, 'active') = 'active' "
+            "AND valid_to IS NULL "
+            "AND COALESCE(tier, 'active') = 'active' "
+            "AND (user_scope IS NULL OR user_scope = ?) "
+            "ORDER BY created_at ASC "
+            "LIMIT ?"
+        )
+        return self._fetch_records(sql, [self.user_id, limit])
+
+    def count_rollup_candidates_since(self, since: str | None) -> int:
+        """Count active records created since *since* for the rollup novelty
+        gate (RU3). Unlike ``count_eligible_since``, this does NOT require
+        embeddings — rollup does not cluster.
+        """
+        conditions = [
+            "COALESCE(status, 'active') = 'active'",
+            "valid_to IS NULL",
+            "COALESCE(tier, 'active') = 'active'",
+            "(user_scope IS NULL OR user_scope = ?)",
+        ]
+        params: list[Any] = [self.user_id]
+        if since:
+            conditions.append("created_at > ?")
+            params.append(since)
+        sql = (
+            "SELECT COUNT(*) FROM memory_records WHERE "
+            + " AND ".join(conditions)
+        )
+        try:
+            with self._lock:
+                assert self.connection is not None
+                row = self.connection.execute(sql, params).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
     # -- lifecycle ------------------------------------------------------------
 
     def backfill_null_embeddings(self, batch_size: int = 64) -> int:

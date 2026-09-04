@@ -107,8 +107,15 @@ def _make_server(
     store=None,
     allowed_ops=None,
     stdin_lines=None,
+    initialized: bool = True,
 ) -> tuple[MCPServer, io.StringIO, io.StringIO]:
-    """Build an MCP server with in-memory streams for testing."""
+    """Build an MCP server with in-memory streams for testing.
+
+    *initialized* defaults to True so existing tests that send initialize
+    → tools/list without an explicit notifications/initialized still work
+    (M8 gate is checked in _handle_line). Tests that need to verify the
+    pre-initialization gate should pass initialized=False.
+    """
     store = store or StubStore()
     facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
     auth = AuthContext(
@@ -124,6 +131,7 @@ def _make_server(
     stdout = io.StringIO()
     stderr = io.StringIO()
     server = MCPServer(facade, auth, stdin=stdin, stdout=stdout, stderr=stderr)
+    server._initialized = initialized  # M8: default initialized for existing tests
     return server, stdout, stderr
 
 
@@ -385,7 +393,9 @@ class TestProvenanceEnforcement:
     """The caller cannot set source, provenance_origin, or grounding."""
 
     def test_caller_cannot_set_source(self):
-        """Setting source=internal in the arguments is rejected."""
+        """Setting source=internal in the arguments is rejected.
+        M2: now rejected at the schema level (additionalProperties: false)
+        before reaching the facade — JSONRPC_INVALID_PARAMS."""
         store = StubStore()
         server, stdout, stderr = _make_server(
             store=store,
@@ -403,13 +413,12 @@ class TestProvenanceEnforcement:
         )
         server.run()
         msgs = _parse_stdout(stdout)
-        result = msgs[1]["result"]
-        assert result["isError"] is True
-        error = result["structuredContent"]["error"]
-        assert error["code"] == "forbidden"
+        # M2: schema validation rejects source (not in propose inputSchema).
+        assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
     def test_caller_cannot_set_provenance_origin(self):
-        """Setting provenance_origin=internal is rejected."""
+        """Setting provenance_origin=internal is rejected.
+        M2: now rejected at the schema level — JSONRPC_INVALID_PARAMS."""
         store = StubStore()
         server, stdout, stderr = _make_server(
             store=store,
@@ -427,14 +436,12 @@ class TestProvenanceEnforcement:
         )
         server.run()
         msgs = _parse_stdout(stdout)
-        result = msgs[1]["result"]
-        assert result["isError"] is True
-        error = result["structuredContent"]["error"]
-        assert error["code"] == "forbidden"
+        assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
     def test_caller_cannot_set_grounding(self):
         """Setting grounding=observed is rejected (caller may not claim
-        observed — that's server-set)."""
+        observed — that's server-set).
+        M2: now rejected at the schema level — JSONRPC_INVALID_PARAMS."""
         store = StubStore()
         server, stdout, stderr = _make_server(
             store=store,
@@ -452,10 +459,7 @@ class TestProvenanceEnforcement:
         )
         server.run()
         msgs = _parse_stdout(stdout)
-        result = msgs[1]["result"]
-        assert result["isError"] is True
-        error = result["structuredContent"]["error"]
-        assert error["code"] == "forbidden"
+        assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
     def test_server_sets_provenance_on_clean_candidate(self):
         """The facade sets source=api, provenance_origin=external on
@@ -541,7 +545,9 @@ class TestProposeToolListing:
         assert "user_scope" not in props
 
     def test_propose_call_without_idempotency_key_fails_validation(self):
-        """Calling memory_propose without an idempotency_key is rejected."""
+        """Calling memory_propose without an idempotency_key is rejected.
+        M2: now rejected at the schema level (idempotency_key is required)
+        before reaching the facade — JSONRPC_INVALID_PARAMS."""
         store = StubStore()
         server, stdout, stderr = _make_server(
             store=store,
@@ -555,15 +561,8 @@ class TestProposeToolListing:
         )
         server.run()
         msgs = _parse_stdout(stdout)
-        # Without idempotency_key, the facade still processes it (no key
-        # = no idempotency guarantee). The schema validation is at the
-        # MCP client level, not server level. The facade accepts it.
-        # This is correct behavior — the schema is advisory for the
-        # client, the facade is the enforcement boundary.
-        result = msgs[1]["result"]
-        # The facade should still create the candidate (no idempotency
-        # key means no replay protection, but the call succeeds).
-        assert result["isError"] is False
+        # M2: schema validation rejects missing required idempotency_key.
+        assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
     def test_deterministic_tool_ordering_with_propose(self):
         """Tools are still sorted by name with memory_propose included."""

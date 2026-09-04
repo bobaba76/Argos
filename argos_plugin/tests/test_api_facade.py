@@ -18,6 +18,8 @@ Spec tests covered:
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,7 +34,11 @@ from api_facade import (
     ArgosAPIFacade,
     AuthContext,
     FORBIDDEN_OPERATIONS,
+    IDEMPOTENCY_MAX_ENTRIES,
+    IDEMPOTENCY_TTL_SECONDS,
     IdempotencyRegistry,
+    MAX_PAYLOAD_BYTES,
+    MAX_TAGS,
     PUBLIC_OPERATIONS,
     READ_OPERATIONS,
 )
@@ -575,3 +581,296 @@ class TestInputValidation:
         with pytest.raises(APIError) as exc_info:
             facade.execute(ctx, "record_feedback", {"memory_id": "mem-1", "feedback": "invalid"})
         assert exc_info.value.code == "invalid_input"
+
+
+# ---------------------------------------------------------------------------
+# #222 API facade audit AF1-AF11
+# ---------------------------------------------------------------------------
+
+
+class TestAPIFacadeAudit222:
+    """Regression tests for issue #222: API facade audit AF1-AF11."""
+
+    # -- AF1: ACL scope enforcement on fetch ---------------------------------
+
+    def test_af1_fetch_out_of_scope_returns_not_found(self):
+        """AF1: fetching a memory outside the caller's project scope
+        returns not_found (not forbidden — don't leak existence)."""
+        store = StubStore()
+        rec = store.remember(content="secret project data")
+        rec.project_id = "proj-beta"
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        ctx.max_project_id = "proj-alpha"
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "fetch", {"memory_id": rec.memory_id})
+        assert exc_info.value.code == "not_found"
+
+    def test_af1_fetch_in_scope_succeeds(self):
+        """AF1: fetching a memory within the caller's scope succeeds."""
+        store = StubStore()
+        rec = store.remember(content="my project data")
+        rec.project_id = "proj-alpha"
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        ctx.max_project_id = "proj-alpha"
+        result = facade.execute(ctx, "fetch", {"memory_id": rec.memory_id})
+        assert result["memory_id"] == rec.memory_id
+
+    def test_af1_fetch_no_scope_restriction_passes(self):
+        """AF1: when max_project_id is None (v1 open scope), fetch works."""
+        store = StubStore()
+        rec = store.remember(content="any data")
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        # max_project_id and max_client_scope are None by default.
+        result = facade.execute(ctx, "fetch", {"memory_id": rec.memory_id})
+        assert result["memory_id"] == rec.memory_id
+
+    def test_af1_fetch_history_out_of_scope_returns_not_found(self):
+        """AF1: fetch_history on an out-of-scope memory returns not_found."""
+        store = StubStore()
+        rec = store.remember(content="secret history")
+        rec.project_id = "proj-beta"
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        ctx.max_project_id = "proj-alpha"
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "fetch_history", {"memory_id": rec.memory_id})
+        assert exc_info.value.code == "not_found"
+
+    def test_af1_fetch_history_in_scope_succeeds(self):
+        """AF1: fetch_history on an in-scope memory works."""
+        store = StubStore()
+        rec = store.remember(content="my history")
+        rec.project_id = "proj-alpha"
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        ctx.max_project_id = "proj-alpha"
+        result = facade.execute(ctx, "fetch_history", {"memory_id": rec.memory_id})
+        assert result["count"] >= 1
+
+    # -- AF2: scope check before recording feedback --------------------------
+
+    def test_af2_feedback_on_out_of_scope_memory_rejected(self):
+        """AF2: recording feedback on an out-of-scope memory is rejected."""
+        store = StubStore()
+        rec = store.remember(content="other user's memory")
+        rec.project_id = "proj-beta"
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        ctx.max_project_id = "proj-alpha"
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "record_feedback",
+                           {"memory_id": rec.memory_id, "feedback": "helpful"})
+        assert exc_info.value.code == "not_found"
+
+    def test_af2_feedback_on_in_scope_memory_succeeds(self):
+        """AF2: recording feedback on an in-scope memory works."""
+        store = StubStore()
+        rec = store.remember(content="my memory")
+        rec.project_id = "proj-alpha"
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        ctx.max_project_id = "proj-alpha"
+        result = facade.execute(ctx, "record_feedback",
+                                {"memory_id": rec.memory_id, "feedback": "helpful"})
+        assert result["feedback"] == "helpful"
+
+    def test_af2_feedback_on_nonexistent_memory_rejected(self):
+        """AF2: recording feedback on a nonexistent memory returns not_found."""
+        store = StubStore()
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "record_feedback",
+                           {"memory_id": "nonexistent", "feedback": "helpful"})
+        assert exc_info.value.code == "not_found"
+
+    # -- AF3: user_id passed to save_candidate -------------------------------
+
+    def test_af3_propose_passes_user_id(self):
+        """AF3: memory_propose passes ctx.user_id to save_candidate."""
+        store = StubStore()
+        facade = _make_facade(store)
+        ctx = _make_ctx(user_id="user-test-af3")
+        facade.execute(ctx, "memory_propose", {
+            "content": "User likes pizza",
+            "category": "preference",
+        })
+        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        assert len(save_calls) == 1
+        assert save_calls[0]["args"].get("user_id") == "user-test-af3"
+
+    # -- AF4: thread-safe IdempotencyRegistry --------------------------------
+
+    def test_af4_concurrent_same_key_one_wins(self):
+        """AF4: two concurrent threads with the same idempotency key —
+        only one should execute the mutation (the other gets a replay
+        or conflict)."""
+        registry = IdempotencyRegistry()
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            barrier.wait()
+            try:
+                is_replay, cached = registry.check("key-af4", "p", "op", "hash-1")
+                if not is_replay:
+                    # Simulate mutation.
+                    result = {"candidate_id": "c1"}
+                    registry.record("key-af4", "p", "op", "hash-1", result)
+                    results.append(("executed", result))
+                else:
+                    results.append(("replay", cached))
+            except APIError as e:
+                results.append(("conflict", e.code))
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        # Exactly one should execute, the other should replay.
+        executed = [r for r in results if r[0] == "executed"]
+        replayed = [r for r in results if r[0] == "replay"]
+        assert len(executed) == 1, f"Expected 1 execution, got {len(executed)}"
+        assert len(replayed) == 1, f"Expected 1 replay, got {len(replayed)}"
+
+    # -- AF5: TTL/eviction ---------------------------------------------------
+
+    def test_af5_ttl_eviction(self):
+        """AF5: entries older than TTL are evicted on next check."""
+        registry = IdempotencyRegistry(ttl_seconds=0.01)
+        registry.record("key-ttl", "p", "op", "hash-1", {"result": 1})
+        time.sleep(0.02)  # wait for TTL to expire
+        # After TTL, the key should be gone (treated as new).
+        is_replay, cached = registry.check("key-ttl", "p", "op", "hash-1")
+        assert is_replay is False
+        assert cached is None
+
+    def test_af5_max_entries_eviction(self):
+        """AF5: when max_entries is exceeded, oldest entries are evicted."""
+        registry = IdempotencyRegistry(max_entries=3)
+        for i in range(5):
+            registry.record(f"key-{i}", "p", "op", f"hash-{i}", {"i": i})
+        # Only the last 3 should remain.
+        assert len(registry._entries) == 3
+        assert "key-0" not in registry._entries
+        assert "key-1" not in registry._entries
+        assert "key-2" in registry._entries
+        assert "key-3" in registry._entries
+        assert "key-4" in registry._entries
+
+    def test_af5_constants_set(self):
+        """AF5: TTL and max entries constants are defined."""
+        assert IDEMPOTENCY_TTL_SECONDS == 24 * 3600
+        assert IDEMPOTENCY_MAX_ENTRIES == 10_000
+
+    # -- AF6: user_id passed to search via set_user_scope --------------------
+
+    def test_af6_search_sets_user_scope(self):
+        """AF6: search calls set_user_scope with ctx.user_id."""
+        store = StubStore()
+        store.remember(content="User likes apples")
+        scope_calls = []
+        def fake_set(uid):
+            scope_calls.append(uid)
+        store.set_user_scope = fake_set
+        facade = _make_facade(store)
+        ctx = _make_ctx(user_id="user-af6")
+        facade.execute(ctx, "search", {"query": "apples", "limit": 5})
+        assert "user-af6" in scope_calls, (
+            f"Expected set_user_scope('user-af6'), got {scope_calls}"
+        )
+
+    # -- AF7: tags/payload validation ----------------------------------------
+
+    def test_af7_tags_must_be_list(self):
+        """AF7: tags as a string is rejected."""
+        facade = _make_facade()
+        ctx = _make_ctx()
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "memory_propose", {
+                "content": "test", "category": "personal_fact", "tags": "not-a-list",
+            })
+        assert exc_info.value.code == "invalid_input"
+
+    def test_af7_tags_too_many_rejected(self):
+        """AF7: tags exceeding MAX_TAGS is rejected."""
+        facade = _make_facade()
+        ctx = _make_ctx()
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "memory_propose", {
+                "content": "test", "category": "personal_fact",
+                "tags": [f"tag-{i}" for i in range(MAX_TAGS + 1)],
+            })
+        assert exc_info.value.code == "request_too_large"
+
+    def test_af7_payload_must_be_dict(self):
+        """AF7: payload as a string is rejected."""
+        facade = _make_facade()
+        ctx = _make_ctx()
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "memory_propose", {
+                "content": "test", "category": "personal_fact", "payload": "not-a-dict",
+            })
+        assert exc_info.value.code == "invalid_input"
+
+    def test_af7_payload_too_large_rejected(self):
+        """AF7: payload exceeding MAX_PAYLOAD_BYTES is rejected."""
+        facade = _make_facade()
+        ctx = _make_ctx()
+        big_payload = {"key": "x" * (MAX_PAYLOAD_BYTES + 100)}
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "memory_propose", {
+                "content": "test", "category": "personal_fact", "payload": big_payload,
+            })
+        assert exc_info.value.code == "request_too_large"
+
+    def test_af7_valid_tags_and_payload_accepted(self):
+        """AF7: valid tags list and payload dict are accepted."""
+        store = StubStore()
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        result = facade.execute(ctx, "memory_propose", {
+            "content": "User likes tea",
+            "category": "preference",
+            "tags": ["beverage", "hot"],
+            "payload": {"source": "conversation"},
+        })
+        assert result["status"] == "pending"
+
+    # -- AF8: category validation --------------------------------------------
+
+    def test_af8_invalid_category_rejected(self):
+        """AF8: a category not in VALID_CATEGORIES is rejected."""
+        facade = _make_facade()
+        ctx = _make_ctx()
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "memory_propose", {
+                "content": "test", "category": "admin",
+            })
+        assert exc_info.value.code == "invalid_input"
+
+    def test_af8_valid_category_accepted(self):
+        """AF8: a valid category is accepted."""
+        store = StubStore()
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        result = facade.execute(ctx, "memory_propose", {
+            "content": "User has a goal to learn Python",
+            "category": "goal",
+        })
+        assert result["status"] == "pending"
+
+    def test_af8_default_category_valid(self):
+        """AF8: the default category (context_note) is valid."""
+        store = StubStore()
+        facade = _make_facade(store)
+        ctx = _make_ctx()
+        result = facade.execute(ctx, "memory_propose", {
+            "content": "Some context note",
+        })
+        assert result["status"] == "pending"

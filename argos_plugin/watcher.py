@@ -36,6 +36,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# W3/W4: cap CSV extraction text to bound memory. 1MB is generous for any
+# legitimate CSV document while preventing a multi-GB file from consuming
+# unbounded RAM.
+_MAX_CSV_TEXT_CHARS = 1 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # D1 — Stable doc identity: content hash, not path
 # ---------------------------------------------------------------------------
@@ -525,10 +530,27 @@ def extract_text_xlsx(path: str | Path) -> Tuple[str, List[str]]:
 
 
 def extract_text_csv(path: str | Path) -> str:
-    """Extract text from a CSV file. Returns the raw text content."""
+    """Extract text from a CSV file. Returns the text content as tab-joined rows.
+
+    W3: streams via ``csv.reader`` (row by row) instead of ``f.read()``
+    (entire file in memory). A large CSV (hundreds of MB–GB) would consume
+    that much RAM with ``f.read()``; streaming keeps memory bounded to
+    one row at a time. The output is capped at ``_MAX_CSV_TEXT_CHARS`` to
+    bound the extraction input (W4: callers don't need the entire file).
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        import csv as _csv
+        lines: List[str] = []
+        total = 0
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = _csv.reader(f)
+            for row in reader:
+                line = "\t".join(row)
+                lines.append(line)
+                total += len(line)
+                if total >= _MAX_CSV_TEXT_CHARS:
+                    break
+        return "\n".join(lines)
     except Exception as exc:
         logger.debug("CSV extraction failed for %s: %s", path, exc)
         return ""

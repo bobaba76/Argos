@@ -29,6 +29,7 @@ if __package__:
     from .access_scoping import ACLConfig, filter_records_by_access
     from .config_validation import storage_name_error
     from .config_model import MemoryConfig
+    from .store_protocol import _PROTOCOL_VERSION
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from embeddings import LocalEmbedder
@@ -37,6 +38,7 @@ else:
     from access_scoping import ACLConfig, filter_records_by_access
     from config_validation import storage_name_error
     from config_model import MemoryConfig
+    from store_protocol import _PROTOCOL_VERSION
 
 logger = logging.getLogger("argos.service")
 _ENDPOINT_NAME = "hybrid_memory_service.json"
@@ -1184,6 +1186,21 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 request = json.loads(raw.decode("utf-8"))
                 if not isinstance(request, dict):
                     raise ValueError("request must be an object")
+                # #246: wire protocol version check. Reject mismatched or
+                # missing versions with a structured VersionMismatch error
+                # (NOT a bare disconnect) so the client can self-heal.
+                client_v = request.get("v")
+                if client_v != _PROTOCOL_VERSION:
+                    self._write({
+                        "ok": False,
+                        "error": {
+                            "class": "VersionMismatch",
+                            "supported": [_PROTOCOL_VERSION],
+                            "received": client_v,
+                        },
+                        "error_class": "VersionMismatch",
+                    })
+                    return
                 token = str(request.pop("token", ""))
                 if not hmac.compare_digest(token, server.auth_token):
                     raise PermissionError("invalid service token")

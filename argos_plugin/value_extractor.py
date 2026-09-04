@@ -10,7 +10,7 @@ Supported value patterns:
 - Currency: "R$ 449", "$1,200", "€500"
 - Counts: "449 rows", "1,200 items"
 - Ratios: "449/500", "27/30"
-- Years: "2026", "born in 1990"
+- Years: "in 2026", "born in 1990" (a year needs a context word)
 - Ages: "age 35", "35 years old"
 
 The "subject" is the text surrounding the value — we extract a window of
@@ -46,8 +46,11 @@ _PERCENT_RE = re.compile(
 
 # Currency: "R$ 449", "$1,200.50", "€500", "£100", "¥1000"
 # Captures the symbol + amount.  Currency symbols: $, R$, €, £, ¥, ₹
+# The comma-grouped alternative requires at least one group so that a
+# plain run of digits ("$1000") falls through to \d+ instead of stopping
+# after three digits.
 _CURRENCY_RE = re.compile(
-    r"(R\$|US\$|\$|€|£|¥|₹)\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+    r"(R\$|US\$|\$|€|£|¥|₹)\s*((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)",
 )
 
 # Ratios: "449/500", "27/30"
@@ -62,14 +65,21 @@ _COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Years: "2026", "in 1990" — 4-digit numbers in 1900-2100 range
+# Years: "in 2026", "born in 1990", "since 2019", "year 2026" — 4-digit
+# numbers in 1900-2100 range, only when preceded by a year-context word.
+# A bare "2026" (or "2026 rows") is not a year.
 _YEAR_RE = re.compile(
-    r"\b(19\d{2}|20\d{2})\b",
+    r"\b(?:in|since|by|until|till|before|after|during|from|circa|year|"
+    r"early|mid|late|fy|q[1-4])\s+(19\d{2}|20\d{2})\b",
+    re.IGNORECASE,
 )
+_YEAR_RANGE_RE = re.compile(r"19\d{2}|20\d{2}")
+_YEAR_NOUN_RE = re.compile(r"years?\b", re.IGNORECASE)
 
-# Ages: "age 35", "35 years old", "is 35"
+# Ages: "age 35", "aged 35", "35 years old".  A bare "is 35" is not an
+# age ("temperature is 35 degrees").
 _AGE_RE = re.compile(
-    r"(?:age\s+|is\s+|aged\s+)(\d{1,3})\b|\b(\d{1,3})\s+years?\s+old\b",
+    r"\b(?:age|aged)\s+(\d{1,3})\b|\b(\d{1,3})\s+years?\s+old\b",
     re.IGNORECASE,
 )
 
@@ -96,17 +106,20 @@ def _token_window(text: str, start: int, end: int, tokens_each_side: int = 6) ->
 def extract_values(text: str) -> List[ExtractedValue]:
     """Extract all (subject, value, unit) triples from *text*.
 
-    Returns a list of ExtractedValue, one per match.  Empty list if no
-    numeric values are found.  The order is: percentages, currencies,
-    ratios, counts, years, ages — most specific first to avoid
+    Returns a list of ExtractedValue, one per distinct (value, unit).  Empty
+    list if no numeric values are found.  The order is: percentages,
+    currencies, ratios, ages, years, counts — most specific first to avoid
     double-counting (a percentage is also a count, but we want the
-    percentage interpretation).
+    percentage interpretation; "in 2026 rows" is a year, not a count).
+    A value that repeats in the text ("89.8%, up from 89.8%") is
+    reported once, at its first occurrence.
     """
     if not text or not text.strip():
         return []
 
     results: List[ExtractedValue] = []
     consumed_spans: List[tuple[int, int]] = []
+    seen: set[tuple[str, str]] = set()
 
     def _overlaps(start: int, end: int) -> bool:
         for cs, ce in consumed_spans:
@@ -117,6 +130,9 @@ def extract_values(text: str) -> List[ExtractedValue]:
     def _add(start: int, end: int, value: str, unit: str, raw: str) -> None:
         if _overlaps(start, end):
             return
+        if (value, unit) in seen:
+            return
+        seen.add((value, unit))
         subject = _token_window(text, start, end)
         results.append(ExtractedValue(
             subject=subject, value=value, unit=unit, raw=raw,
@@ -145,14 +161,18 @@ def extract_values(text: str) -> List[ExtractedValue]:
         if val:
             _add(m.start(), m.end(), val, "age", m.group(0))
 
-    # 5. Counts (number + noun)
+    # 5. Years (context word + 4-digit 1900-2100; before counts so that
+    #    "in 2026 rows" is not swallowed as a count of 2026)
+    for m in _YEAR_RE.finditer(text):
+        _add(m.start(1), m.end(1), m.group(1), "year", m.group(0))
+
+    # 6. Counts (number + noun).  "2026 years" (year-range number + "year(s)")
+    #    is neither a plausible count nor a dated year — skipped.
     for m in _COUNT_RE.finditer(text):
         num = m.group(1).replace(",", "")
+        if _YEAR_RANGE_RE.fullmatch(num) and _YEAR_NOUN_RE.match(m.group(2)):
+            continue
         _add(m.start(), m.start() + len(m.group(1)), num, "count", m.group(1))
-
-    # 6. Years (4-digit 1900-2100)
-    for m in _YEAR_RE.finditer(text):
-        _add(m.start(), m.end(), m.group(1), "year", m.group(0))
 
     return results
 
@@ -189,20 +209,20 @@ def values_conflict(
 
     Returns the first conflicting (new, old) pair, or None if no conflict.
     """
+    # Units are normalised (stripped + lower-cased) so "Percent" /
+    # "percent" / None don't masquerade as a unit change.  Different
+    # dimensions are incomparable quantities — not a supersession
+    # candidate (false-supersession class, #91) — so old values are
+    # bucketed by unit and only same-unit pairs are compared.
+    old_by_unit: dict[str, List[ExtractedValue]] = {}
+    for old_v in old_values:
+        old_by_unit.setdefault((old_v.unit or "").strip().lower(), []).append(old_v)
     for new_v in new_values:
-        for old_v in old_values:
-            if not subject_overlap(new_v.subject, old_v.subject, subject_threshold):
-                continue
-            # Units are normalised (stripped + lower-cased) so "Percent" /
-            # "percent" / None don't masquerade as a unit change.
-            new_unit = (new_v.unit or "").strip().lower()
-            old_unit = (old_v.unit or "").strip().lower()
-            if new_unit != old_unit:
-                # Different dimensions are incomparable quantities — not a
-                # supersession candidate (false-supersession class, #91).
-                continue
+        for old_v in old_by_unit.get((new_v.unit or "").strip().lower(), ()):
             if new_v.value == old_v.value:
                 continue  # same value + unit — idempotent
+            if not subject_overlap(new_v.subject, old_v.subject, subject_threshold):
+                continue
             # Same subject, same unit, different value — conflict
             return (new_v, old_v)
     return None
@@ -248,6 +268,11 @@ _TRANSITION_NEGATION = re.compile(
     r"haven['\u2019]?t\s+(?:switched|changed|moved|replaced|stopped|started)|"
     r"don['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
     r"doesn['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"won['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"(?:can['\u2019]?t|cannot)\s+(?:switch|change|move|replace|stop|start)|"
+    r"couldn['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"wouldn['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
+    r"shouldn['\u2019]?t\s+(?:switch|change|move|replace|stop|start)|"
     r"still\s+(?:use|uses|using|live|lives|work|works|drive|drives|take|takes|have|has)|"
     r"never\s+(?:switched|changed|moved|replaced|stopped|started)"
     r")\b",

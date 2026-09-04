@@ -228,3 +228,96 @@ class TestConfigFailSoft:
         assert c.chain_unfold == "always"
         c2 = MemoryConfig.model_validate({"chain_unfold": "banana"})
         assert c2.chain_unfold == "off"
+
+
+class TestLegacyKeysSurvival:
+    """#244 review blockers: router/backup keys must survive config load.
+
+    The live hybrid_memory.json carries keys declared in config_schema.py
+    that the model must represent. If these keys are missing from the model,
+    .get() returns None and the router is silently disabled.
+    """
+
+    def test_router_keys_in_model(self):
+        """All router_* keys from config_schema.py are model fields."""
+        from config_model import MemoryConfig
+        fields = set(MemoryConfig.model_fields.keys())
+        for key in ("router_enabled", "router_smart_model", "router_smart_provider",
+                     "router_default_model", "router_default_provider",
+                     "router_subcall_enabled", "router_temporal_threshold",
+                     "router_multihop_threshold"):
+            assert key in fields, f"{key} missing from MemoryConfig fields"
+
+    def test_backup_keys_in_model(self):
+        """All backup_* keys from config_schema.py are model fields."""
+        from config_model import MemoryConfig
+        fields = set(MemoryConfig.model_fields.keys())
+        for key in ("backup_enabled", "backup_dst_root", "backup_retention_snapshots"):
+            assert key in fields, f"{key} missing from MemoryConfig fields"
+
+    def test_router_values_survive_load(self):
+        """Router config values survive a round-trip through MemoryConfig."""
+        from config_model import MemoryConfig
+        c = MemoryConfig.model_validate({
+            "router_enabled": "true",
+            "router_smart_model": "deepseek/deepseek-v4-pro",
+            "router_smart_provider": "openrouter",
+            "router_default_model": "deepseek-v4-flash",
+            "router_default_provider": "opencode-go",
+            "router_subcall_enabled": "true",
+        })
+        assert c.router_enabled is True
+        assert c.router_smart_model == "deepseek/deepseek-v4-pro"
+        assert c.router_smart_provider == "openrouter"
+        assert c.router_default_model == "deepseek-v4-flash"
+        assert c.router_default_provider == "opencode-go"
+        assert c.router_subcall_enabled is True
+
+    def test_router_get_returns_configured_value(self):
+        """MemoryConfig.get() returns the configured router value, not None."""
+        from config_model import MemoryConfig
+        c = MemoryConfig.model_validate({"router_enabled": "true", "router_smart_model": "gpt-5"})
+        assert c.get("router_enabled") is True
+        assert c.get("router_smart_model") == "gpt-5"
+
+    def test_unknown_keys_do_not_wipe_config(self):
+        """#244 review blocker 1: unknown keys in the raw file must NOT
+        cause the whole config to revert to defaults.
+
+        provider_core._load_config filters raw keys to known model fields
+        before validation, so extra keys are logged + dropped, not fatal.
+        """
+        import json
+        import tempfile
+        from pathlib import Path
+        from provider_core import _load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "hybrid_memory.json"
+            # A realistic config with tuned values + unknown keys.
+            config_path.write_text(json.dumps({
+                "max_injected_items": 96,
+                "skip_retrieval_on_trivial": "true",
+                "injection_min_score": 0.3,
+                "router_enabled": "true",
+                "router_smart_model": "deepseek-v4-pro",
+                "some_future_key": "value",
+                "tenants": {"acme": {"review_mode": "auto"}},
+            }), encoding="utf-8")
+
+            cfg = _load_config(str(tmp))
+
+            # Tuned values must survive (NOT reverted to defaults).
+            assert cfg.max_injected_items == 96
+            assert cfg.skip_retrieval_on_trivial is True
+            assert cfg.injection_min_score == 0.3
+            assert cfg.router_enabled is True
+            assert cfg.router_smart_model == "deepseek-v4-pro"
+
+    def test_backup_nested_dict_survives(self):
+        """The backup key as a nested dict survives in the model."""
+        from config_model import MemoryConfig
+        c = MemoryConfig.model_validate({
+            "backup": {"dst_root": "/mnt/backup", "retention_snapshots": 10},
+        })
+        assert c.backup == {"dst_root": "/mnt/backup", "retention_snapshots": 10}

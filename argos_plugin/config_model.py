@@ -166,6 +166,29 @@ class MemoryConfig(BaseModel):
     entity_aliases: str = ""
     role_words: str = ""
 
+    # -- routing (intent router + ambient sub-call) ----------------------------
+    # These are declared in config_schema.py and read by intent_router.py
+    # and provider_ambient.py. They MUST be model fields so .get() returns
+    # the configured value instead of None (which would silently disable
+    # the router).
+    router_enabled: bool = False
+    router_smart_model: str = ""
+    router_smart_provider: str = ""
+    router_default_model: str = ""
+    router_default_provider: str = ""
+    router_subcall_enabled: bool = False
+    router_temporal_threshold: float = Field(0.5, ge=0.1, le=1.0)
+    router_multihop_threshold: float = Field(0.5, ge=0.1, le=1.0)
+
+    # -- backup (service-coordinated) ------------------------------------------
+    # Declared in config_schema.py; backup config is a nested dict in the
+    # live JSON (config.get("backup", {})). The scalar keys are kept as
+    # model fields for schema parity.
+    backup_enabled: bool = False
+    backup_dst_root: str = ""
+    backup_retention_snapshots: int = Field(6, ge=1, le=100)
+    backup: Optional[Dict[str, Any]] = None
+
     # -- ACL (optional, not in defaults dict) ----------------------------------
     acl: Optional[Dict[str, Any]] = None
 
@@ -191,6 +214,7 @@ class MemoryConfig(BaseModel):
         "distillation_enabled", "archive_enabled", "forget_enabled",
         "rollup_enabled", "local_only",
         "external_sources_require_confirmation",
+        "router_enabled", "router_subcall_enabled", "backup_enabled",
     })
 
     # Clamped int fields: {name: (lo, hi, default)}.
@@ -222,6 +246,7 @@ class MemoryConfig(BaseModel):
         "chain_max_inject": (1, 10000, 150),
         "chain_unfold_top_k": (1, 20, 3),
         "scale_warn_records": (1, 10000000, 5000),
+        "backup_retention_snapshots": (1, 100, 6),
     }
 
     # Clamped float fields: {name: (lo, hi, default)}.
@@ -240,6 +265,8 @@ class MemoryConfig(BaseModel):
         "chain_unfold_min_similarity": (0.0, 1.0, 0.30),
         "chain_unfold_arc_min_similarity": (0.0, 1.0, 0.15),
         "scale_warn_latency_ms": (0.0, 60000.0, 300.0),
+        "router_temporal_threshold": (0.1, 1.0, 0.5),
+        "router_multihop_threshold": (0.1, 1.0, 0.5),
     }
 
     # String fields that should be stripped.
@@ -248,6 +275,9 @@ class MemoryConfig(BaseModel):
         "extraction_llm_provider", "answering_llm_model",
         "answering_llm_provider", "deployment_mode", "data_residency",
         "evidence_retention", "reranker_model", "local_embedding_model",
+        "router_smart_model", "router_smart_provider",
+        "router_default_model", "router_default_provider",
+        "backup_dst_root",
     })
 
     @model_validator(mode="before")

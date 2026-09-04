@@ -229,11 +229,20 @@ def _load_config(hermes_home: str | None = None) -> MemoryConfig:
             # the user's config must not be silently swallowed (the old
             # `except: pass` made hybrid_memory.json a no-op with no signal).
             logger.warning("malformed config %s: %s", config_path, exc)
+    # #244 review blocker 1: filter raw to only known model fields before
+    # validation. extra="forbid" is meant to catch typos in code/tests,
+    # NOT to wipe the whole config when the live file has keys the model
+    # doesn't know about yet (e.g. tenant-specific keys, future schema
+    # additions). Unknown keys are logged but never cause a full revert.
+    _known = set(MemoryConfig.model_fields.keys())
+    unknown = {k for k in raw if k not in _known}
+    if unknown:
+        logger.warning("config %s: unknown keys ignored: %s", config_path, sorted(unknown))
+    clean = {k: v for k, v in raw.items() if k in _known}
     # Build the validated config object (fail-soft: the before-validator
-    # in MemoryConfig handles clamping and type coercion, so this should
-    # only raise on extra/forbid keys or storage_name validation).
+    # in MemoryConfig handles clamping and type coercion).
     try:
-        cfg = MemoryConfig.model_validate(raw)
+        cfg = MemoryConfig.model_validate(clean)
     except Exception as exc:
         logger.warning("config validation error in %s: %s; using defaults", config_path, exc)
         cfg = MemoryConfig()

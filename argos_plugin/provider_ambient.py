@@ -11,9 +11,9 @@ import traceback
 from pathlib import Path
 
 try:
-    from .provider_core import _active_user_id, _load_config
+    from .provider_core import _active_user_id, _load_config, _set_active_user_id
 except ImportError:  # provider_ambient.py imported as a top-level module
-    from provider_core import _active_user_id, _load_config
+    from provider_core import _active_user_id, _load_config, _set_active_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -262,11 +262,18 @@ def _build_temporal_hint(question: str) -> str:
 
 
 
-def _get_insight_store():
+def _get_insight_store(user_id: str | None = None):
     """Get the active memory store for insight queries.
 
     Returns the SharedMemoryStore if the service is running, otherwise
     falls back to a direct DuckDBMemoryStore. Returns None on failure.
+
+    PC5: *user_id* should be passed explicitly by callers that have
+    access to the provider instance (avoiding the module-level global
+    which is not multi-user safe). When *user_id* is None, falls back
+    to the ``_active_user_id`` global for backward compat with
+    module-level callers (slash commands, pre_llm_call hook) that
+    don't have provider access.
     """
     try:
         from service_client import SharedMemoryStore
@@ -275,7 +282,9 @@ def _get_insight_store():
             home = Path(get_hermes_home())
         except Exception:
             home = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
-        return SharedMemoryStore(home, user_id=_active_user_id)
+        # PC5: prefer explicit user_id, fall back to global for backward compat.
+        effective_uid = user_id if user_id is not None else _active_user_id
+        return SharedMemoryStore(home, user_id=effective_uid)
     except Exception:
         return None
 

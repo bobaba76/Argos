@@ -313,7 +313,25 @@ def _flag(cfg: dict, key: str, default: str = "false") -> bool:
 
 # Module-level user_id for module-level helpers (_get_insight_store, etc.)
 # that can't access the provider instance. Set during provider initialize.
+# PC5: guarded by _active_user_id_lock so concurrent initialize() calls
+# (multi-tenant) don't race on the read-modify-write. Callers that have
+# provider access should pass user_id explicitly to _get_insight_store
+# instead of relying on this global.
 _active_user_id: str = "default_user"
+_active_user_id_lock = threading.Lock()
+
+
+def _set_active_user_id(user_id: str) -> None:
+    """PC5: thread-safe setter for the module-level user_id global."""
+    global _active_user_id
+    with _active_user_id_lock:
+        _active_user_id = user_id
+
+
+def _get_active_user_id() -> str:
+    """PC5: thread-safe getter for the module-level user_id global."""
+    with _active_user_id_lock:
+        return _active_user_id
 
 
 
@@ -607,8 +625,8 @@ class ProviderCoreMixin:
         self._platform = kwargs.get("platform", "cli")
         self._agent_context = kwargs.get("agent_context", "primary")
         self._user_id = kwargs.get("user_id") or "default_user"
-        global _active_user_id
-        _active_user_id = self._user_id
+        # PC5: use the thread-safe setter instead of directly mutating the global.
+        _set_active_user_id(self._user_id)
         self._current_project_id = str(kwargs.get("project_id") or "").strip()
 
         self._config = _load_config(self._hermes_home)
@@ -1117,19 +1135,26 @@ class ProviderCoreMixin:
 
         # #203: Load ACL config on the provider so the prefetch
         # defence-in-depth re-validation in provider_retrieval.py fires.
-        # memory_service.py sets _acl_config on the store and graph, but
-        # the provider object (which runs prefetch) was never wired — the
-        # ACL branch was dormant in the live path. Load from the same
-        # config dict the service uses (self._config["acl"]).
+        # PC6: prefer the store's _acl_config (set by memory_service.py
+        # from the per-tenant config overlay) over loading independently
+        # from the global config. In multi-tenant deployments, the store's
+        # ACL may differ from the global config's ACL — using the store's
+        # ensures the prefetch filter applies the same ACL the store uses.
+        # Fall back to loading from config for the direct-store path where
+        # the store may not have _acl_config set yet.
         try:
             from .access_scoping import ACLConfig
         except ImportError:
             from access_scoping import ACLConfig
-        acl_data = self._config.get("acl")
-        if isinstance(acl_data, dict):
-            self._acl_config = ACLConfig.from_dict(acl_data)
+        store_acl = getattr(self._store, "_acl_config", None) if self._store else None
+        if store_acl is not None:
+            self._acl_config = store_acl
         else:
-            self._acl_config = ACLConfig()  # open store (backward compatible)
+            acl_data = self._config.get("acl")
+            if isinstance(acl_data, dict):
+                self._acl_config = ACLConfig.from_dict(acl_data)
+            else:
+                self._acl_config = ACLConfig()  # open store (backward compatible)
         try:
             self._store.set_scale_thresholds(
                 self._scale_warn_latency_ms, self._scale_warn_records

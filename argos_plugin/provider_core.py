@@ -892,7 +892,7 @@ class ProviderCoreMixin:
             self._config.get("extraction_llm_provider", "")).strip()
         # W6: watcher config (spec-07 wiring). No watcher config = zero
         # behaviour change — the thread is not started.
-        self._watcher_enabled = bool(self._config.get("watcher_enabled", False))
+        self._watcher_enabled = _flag(self._config, "watcher_enabled", "false")
         _roots = self._config.get("watcher_scan_roots", [])
         if isinstance(_roots, str):
             _roots = [r.strip() for r in _roots.split(",") if r.strip()]

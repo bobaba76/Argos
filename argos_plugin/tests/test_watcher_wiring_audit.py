@@ -114,6 +114,38 @@ class TestW6WatcherThread:
         assert "extraction_llm_model" in init_src
         assert "extraction_llm_provider" in init_src
 
+    def test_watcher_enabled_uses_flag_not_bool(self):
+        """W6: watcher_enabled is parsed via _flag(), not bool().
+
+        bool("false") is True in Python (non-empty string is truthy),
+        which would start the watcher even when config says disabled.
+        _flag() handles string "false" correctly.
+        """
+        from provider_core import ProviderCoreMixin, _flag
+        init_src = inspect.getsource(ProviderCoreMixin.initialize)
+        assert "_flag(" in init_src and "watcher_enabled" in init_src
+        assert "bool(self._config.get(\"watcher_enabled\"" not in init_src
+
+    def test_watcher_enabled_string_false_not_enabled(self):
+        """W6: config with watcher_enabled="false" (string form from saved
+        config) must NOT enable the watcher."""
+        from provider_core import _flag
+        # Simulate the config dict a user's saved config produces.
+        config = {"watcher_enabled": "false", "watcher_scan_roots": "~/Docs"}
+        assert _flag(config, "watcher_enabled", "false") is False
+
+    def test_watcher_enabled_string_true_enabled(self):
+        """W6: config with watcher_enabled="true" must enable the watcher."""
+        from provider_core import _flag
+        config = {"watcher_enabled": "true", "watcher_scan_roots": "~/Docs"}
+        assert _flag(config, "watcher_enabled", "false") is True
+
+    def test_watcher_enabled_missing_defaults_false(self):
+        """W6: missing watcher_enabled key defaults to False."""
+        from provider_core import _flag
+        config = {}
+        assert _flag(config, "watcher_enabled", "false") is False
+
 
 # ---------------------------------------------------------------------------
 # W3 — CSV extraction streams

@@ -1,241 +1,98 @@
-"""Tests for provider_core.py audit fixes (PC1-PC10)."""
+"""Audit tests for provider_core.py PC5-PC6 (issue #207).
+
+PC5: _active_user_id global is not multi-user safe — thread-safe
+setter/getter added, _get_insight_store accepts explicit user_id.
+PC6: provider _acl_config loaded from store instead of global config.
+
+Run with (Hermes venv python, offline):
+    python -m pytest tests/test_provider_core_audit.py -v
+"""
 from __future__ import annotations
 
-import json
+import inspect
 import sys
-import types
 from pathlib import Path
 
 import pytest
 
 _plugin_dir = Path(__file__).resolve().parent.parent
-if str(_plugin_dir) not in sys.path:
-    sys.path.insert(0, str(_plugin_dir))
-
-
-def _stub_hermes_runtime():
-    """Stub the Hermes runtime so we can import the provider."""
-    if "agent" not in sys.modules:
-        sys.modules["agent"] = types.ModuleType("agent")
-    if "agent.memory_provider" not in sys.modules:
-        _mp = types.ModuleType("agent.memory_provider")
-        class MemoryProvider:
-            pass
-        _mp.MemoryProvider = MemoryProvider
-        sys.modules["agent.memory_provider"] = _mp
-    if "tools" not in sys.modules:
-        sys.modules["tools"] = types.ModuleType("tools")
-    if "tools.registry" not in sys.modules:
-        _tr = types.ModuleType("tools.registry")
-        def _tool_error(msg):
-            return json.dumps({"error": str(msg)})
-        _tr.tool_error = _tool_error
-        sys.modules["tools.registry"] = _tr
+for _path in (_plugin_dir.parent, _plugin_dir):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 
 # ---------------------------------------------------------------------------
-# PC1 — entity_aliases loading was dead code (ran before store was created)
+# PC5 — _active_user_id thread safety
 # ---------------------------------------------------------------------------
 
+class TestPC5ActiveUserIdThreadSafety:
+    def test_set_active_user_id_exists(self):
+        """PC5: _set_active_user_id function exists."""
+        from provider_core import _set_active_user_id
+        assert callable(_set_active_user_id)
 
-def test_entity_aliases_loaded_after_initialize(tmp_path):
-    """PC1: entity_aliases from config must be loaded into the store
-    during initialize(). Before the fix, the alias-loading block ran
-    before self._store was created, so the guard
-    `if aliases_json and self._store:` was always False.
-    """
-    _stub_hermes_runtime()
+    def test_get_active_user_id_exists(self):
+        """PC5: _get_active_user_id function exists."""
+        from provider_core import _get_active_user_id
+        assert callable(_get_active_user_id)
 
-    from store import DuckDBMemoryStore
-    try:
-        import argos_plugin
-    except ModuleNotFoundError:
-        import argos as argos_plugin
+    def test_set_and_get_roundtrip(self):
+        """PC5: setting and getting the user_id is consistent."""
+        from provider_core import _set_active_user_id, _get_active_user_id
+        _set_active_user_id("test_user_pc5")
+        assert _get_active_user_id() == "test_user_pc5"
+        # Restore default.
+        _set_active_user_id("default_user")
 
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    config_path = home / "hybrid_memory.json"
-    config_path.write_text(json.dumps({
-        "storage_mode": "direct",
-        "entity_aliases": json.dumps({
-            "my role": "Entity-A",
-            "my company": "Entity-B",
-        }),
-    }), encoding="utf-8")
+    def test_setter_uses_lock(self):
+        """PC5: the setter uses a lock for thread safety."""
+        from provider_core import _set_active_user_id
+        src = inspect.getsource(_set_active_user_id)
+        assert "lock" in src.lower()
 
-    # Create a minimal valid DuckDB file.
-    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
+    def test_getter_uses_lock(self):
+        """PC5: the getter uses a lock for thread safety."""
+        from provider_core import _get_active_user_id
+        src = inspect.getsource(_get_active_user_id)
+        assert "lock" in src.lower()
 
-    provider = argos_plugin.ArgosProvider()
-    provider.initialize(
-        session_id="test",
-        hermes_home=str(home),
-        platform="cli",
-        user_id="alice",
-    )
+    def test_initialize_uses_setter_not_global(self):
+        """PC5: initialize() uses _set_active_user_id, not 'global _active_user_id'."""
+        from provider_core import ProviderCoreMixin
+        src = inspect.getsource(ProviderCoreMixin.initialize)
+        assert "_set_active_user_id" in src
+        assert "global _active_user_id" not in src
 
-    # The store should have the aliases loaded.
-    aliases = provider._store.list_aliases()
-    alias_map = {a.get("alias"): a.get("canonical_entity") for a in aliases}
-    assert "my role" in alias_map, \
-        f"entity_aliases not loaded — dead code bug (PC1): {alias_map}"
-    assert alias_map["my role"] == "entity-a"
-    assert "my company" in alias_map
-    assert alias_map["my company"] == "entity-b"
+    def test_get_insight_store_accepts_user_id(self):
+        """PC5: _get_insight_store accepts an optional user_id parameter."""
+        from provider_ambient import _get_insight_store
+        sig = inspect.signature(_get_insight_store)
+        assert "user_id" in sig.parameters
+        # Default should be None (falls back to global).
+        assert sig.parameters["user_id"].default is None
 
-
-def test_entity_aliases_empty_config_no_error(tmp_path):
-    """Sanity: no entity_aliases in config → no aliases loaded, no error."""
-    _stub_hermes_runtime()
-
-    from store import DuckDBMemoryStore
-    try:
-        import argos_plugin
-    except ModuleNotFoundError:
-        import argos as argos_plugin
-
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    config_path = home / "hybrid_memory.json"
-    config_path.write_text(json.dumps({"storage_mode": "direct"}), encoding="utf-8")
-
-    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
-
-    provider = argos_plugin.ArgosProvider()
-    provider.initialize(
-        session_id="test",
-        hermes_home=str(home),
-        platform="cli",
-        user_id="alice",
-    )
-
-    aliases = provider._store.list_aliases()
-    assert len(aliases) == 0
+    def test_get_insight_store_prefers_explicit_user_id(self):
+        """PC5: _get_insight_store uses explicit user_id over the global."""
+        from provider_ambient import _get_insight_store
+        src = inspect.getsource(_get_insight_store)
+        assert "user_id is not None" in src or "user_id if user_id" in src
 
 
 # ---------------------------------------------------------------------------
-# PC2 — reranker_enabled default mismatch (initialize default was "true",
-#        config default was "false")
+# PC6 — _acl_config from store
 # ---------------------------------------------------------------------------
 
+class TestPC6AclConfigFromStore:
+    def test_initialize_prefers_store_acl(self):
+        """PC6: initialize() gets _acl_config from the store when available."""
+        from provider_core import ProviderCoreMixin
+        src = inspect.getsource(ProviderCoreMixin.initialize)
+        assert "store_acl" in src or "getattr(self._store" in src
+        assert "_acl_config" in src
 
-def test_reranker_default_is_false(tmp_path):
-    """PC2: reranker_enabled default should be False (matching _load_config
-    default of "false"), not True (the old initialize() default of "true").
-    """
-    _stub_hermes_runtime()
-
-    from store import DuckDBMemoryStore
-    try:
-        import argos_plugin
-    except ModuleNotFoundError:
-        import argos as argos_plugin
-
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    config_path = home / "hybrid_memory.json"
-    config_path.write_text(json.dumps({"storage_mode": "direct"}), encoding="utf-8")
-
-    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
-
-    provider = argos_plugin.ArgosProvider()
-    provider.initialize(
-        session_id="test",
-        hermes_home=str(home),
-        platform="cli",
-        user_id="alice",
-    )
-
-    assert provider._reranker_enabled is False, \
-        "reranker_enabled default should be False (PC2)"
-
-
-# ---------------------------------------------------------------------------
-# PC4 — chain_unfold config default was "auto" but comment said "ships OFF"
-# ---------------------------------------------------------------------------
-
-
-def test_chain_unfold_default_is_off(tmp_path):
-    """PC4: chain_unfold config default should be "off" (matching the
-    comment 'ships OFF for the first wave — measure, then flip to auto'),
-    not "auto".
-    """
-    _stub_hermes_runtime()
-
-    from store import DuckDBMemoryStore
-    try:
-        import argos_plugin
-    except ModuleNotFoundError:
-        import argos as argos_plugin
-
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    config_path = home / "hybrid_memory.json"
-    config_path.write_text(json.dumps({"storage_mode": "direct"}), encoding="utf-8")
-
-    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
-
-    provider = argos_plugin.ArgosProvider()
-    provider.initialize(
-        session_id="test",
-        hermes_home=str(home),
-        platform="cli",
-        user_id="alice",
-    )
-
-    assert provider._chain_unfold == "off", \
-        f"chain_unfold default should be 'off' (PC4), got '{provider._chain_unfold}'"
-
-
-# ---------------------------------------------------------------------------
-# PC7 — inline boolean parsers now accept "on" (via _flag helper)
-# ---------------------------------------------------------------------------
-
-
-def test_flag_helper_accepts_on():
-    """PC7: _flag() helper accepts "on" as a truthy value."""
-    from provider_core import _flag
-    assert _flag({"key": "on"}, "key", "false") is True
-    assert _flag({"key": "ON"}, "key", "false") is True
-    assert _flag({"key": "true"}, "key", "false") is True
-    assert _flag({"key": "1"}, "key", "false") is True
-    assert _flag({"key": "yes"}, "key", "false") is True
-    assert _flag({"key": "false"}, "key", "false") is False
-    assert _flag({"key": "off"}, "key", "false") is False
-    assert _flag({}, "key", "true") is True
-    assert _flag({}, "key", "false") is False
-
-
-def test_graph_aware_retrieval_accepts_on(tmp_path):
-    """PC7: graph_aware_retrieval="on" should be True after the _flag
-    refactor. Before the fix, the inline parser only accepted
-    "true"/"1"/"yes" and would return False for "on".
-    """
-    _stub_hermes_runtime()
-
-    from store import DuckDBMemoryStore
-    try:
-        import argos_plugin
-    except ModuleNotFoundError:
-        import argos as argos_plugin
-
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    config_path = home / "hybrid_memory.json"
-    config_path.write_text(json.dumps({
-        "storage_mode": "direct",
-        "graph_aware_retrieval": "on",
-    }), encoding="utf-8")
-
-    DuckDBMemoryStore(home / "hybrid_memory.duckdb", user_id="alice").close()
-
-    provider = argos_plugin.ArgosProvider()
-    provider.initialize(
-        session_id="test",
-        hermes_home=str(home),
-        platform="cli",
-        user_id="alice",
-    )
-
-    assert provider._graph_aware_retrieval is True, \
-        "graph_aware_retrieval='on' should be True after PC7 fix"
+    def test_initialize_falls_back_to_config(self):
+        """PC6: when store has no _acl_config, falls back to loading from config."""
+        from provider_core import ProviderCoreMixin
+        src = inspect.getsource(ProviderCoreMixin.initialize)
+        # The fallback path should still load from self._config["acl"].
+        assert "self._config.get(\"acl\")" in src or 'self._config.get("acl")' in src

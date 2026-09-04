@@ -320,7 +320,8 @@ class TestReadiness:
         r = client.get("/v1/ready")
         assert r.status_code == 503
         assert r.json()["status"] == "not_ready"
-        assert r.json()["components"]["embedding"] == "loading"
+        # R5: component details are no longer exposed to unauthenticated callers.
+        assert "components" not in r.json()
 
     def test_not_ready_when_store_not_opened(self):
         client = _make_client(readiness_probe=lambda: {
@@ -344,7 +345,9 @@ class TestReadiness:
         })
         r = client.get("/v1/ready")
         assert r.status_code == 200
-        assert r.json()["graph"] == "degraded"
+        # R5: graph status is no longer exposed in the response body.
+        assert r.json()["status"] == "ok"
+        assert "graph" not in r.json()
 
     def test_liveness_independent_of_readiness(self):
         """Health (liveness) returns ok even when readiness is not ok."""

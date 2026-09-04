@@ -168,6 +168,24 @@ class _Tenant:
         self.policy = TenantPolicy(config)
         # The tenant name is the store's default scope; every request
         # re-scopes per user_id anyway (defense in depth).
+        # BK3: recover from a crashed restore before opening the store —
+        # if a previous restore crashed between swap steps, the live DB
+        # may be missing and the old DB is at .pre-restore.duckdb.
+        try:
+            if __package__:
+                from .backup import recover_from_failed_restore
+            else:
+                from backup import recover_from_failed_restore
+            if recover_from_failed_restore(home / db_name):
+                logger.warning(
+                    "Tenant %r: recovered live DB from a failed restore.",
+                    name,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Tenant %r: startup restore-recovery check failed: %s",
+                name, exc,
+            )
         self.store = DuckDBMemoryStore(
             home / db_name, user_id=self.default_scope,
             embedder=embedder, reranker=reranker,
@@ -967,11 +985,15 @@ class MemoryService:
         cell. #130: The tenant must be explicitly specified — no silent
         fallback to default for administrative operations. If the tenant
         is not found, raise ValueError (do not silently use default).
+
+        BK8: only the CHECKPOINT + EXPORT phase holds the store lock; the
+        verify + manifest + prune phase runs outside it so a large backup
+        doesn't block the tenant's reads/writes for its whole duration.
         """
         if __package__:
-            from .backup import backup_store, list_snapshots
+            from .backup import _export_for_backup, _finalize_backup, list_snapshots
         else:
-            from backup import backup_store, list_snapshots
+            from backup import _export_for_backup, _finalize_backup, list_snapshots
         tenant_name = str(args.get("tenant") or self._default_tenant)
         # #130: No silent fallback to default for unknown tenants.
         tenant = self._tenants.get(tenant_name)
@@ -990,13 +1012,20 @@ class MemoryService:
         retention = int(args.get("retention_snapshots", retention))
         if args.get("list"):
             return {"snapshots": list_snapshots(dst_root)}
+        # BK8: EXPORT under the store lock (needs the service's exclusive
+        # DB connection); verify + manifest + prune outside it.
         with tenant.store_lock:
-            manifest = backup_store(
+            snap, tables, counts, duckdb_version = _export_for_backup(
                 tenant.store.connection,
                 dst_root,
-                retention_snapshots=retention,
                 source_db_path=tenant.store.db_path,
             )
+        manifest = _finalize_backup(
+            snap, tables, counts, duckdb_version,
+            dst_root=dst_root,
+            retention_snapshots=retention,
+            source_db_path=tenant.store.db_path,
+        )
         manifest["tenant"] = tenant_name
         return manifest
 
@@ -1072,7 +1101,22 @@ def _write_endpoint(path: Path, port: int, token: str) -> None:
     }
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(payload), encoding="utf-8")
+    # SC2: restrict the endpoint file to owner-only on POSIX. The file
+    # contains the auth token — if world-readable, another user could
+    # read it and impersonate the client. On Windows, the default ACL
+    # already restricts access to the user's profile, so chmod is a
+    # no-op (Windows ignores POSIX permission bits).
+    try:
+        os.chmod(str(temp), 0o600)
+    except OSError:
+        pass
     os.replace(temp, path)
+    # Also restrict the final file (os.replace may preserve temp perms,
+    # but be explicit in case the target already existed with looser perms).
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
 
 
 def serve(home: Path, port: int = 0) -> None:

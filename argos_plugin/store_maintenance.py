@@ -245,12 +245,18 @@ class StoreMaintenanceMixin:
         except ImportError:
             from extractor import hard_quality_flags, quality_flags_for_fact
 
+        # SM3: add a LIMIT so a store with 10k+ active records doesn't
+        # load everything into Python at every session end. 1000 is well
+        # above the typical personal store (~1k records); larger stores
+        # are processed across multiple session ends.
+        _SM3_CLEANUP_LIMIT = 1000
         all_records = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE COALESCE(status, 'active') = 'active'
                  AND valid_to IS NULL
-                 AND (user_scope IS NULL OR user_scope = ?)""",
-            [self.user_id],
+                 AND (user_scope IS NULL OR user_scope = ?)
+               LIMIT ?""",
+            [self.user_id, _SM3_CLEANUP_LIMIT],
         )
         to_quarantine: Dict[str, str] = {}
         seen_content: Dict[tuple[str, str], str] = {}
@@ -267,7 +273,10 @@ class StoreMaintenanceMixin:
                 to_quarantine[rec.memory_id] = "; ".join(flags)
                 continue
 
-            fingerprint = rec.content.lower().strip()[:60]
+            # SM7: use a 120-char fingerprint (was 60) so records with
+            # identical content after char 60 but different first 60 chars
+            # are detected as near-duplicates.
+            fingerprint = rec.content.lower().strip()[:120]
             key = (rec.category, fingerprint)
             if key in seen_content:
                 existing_id = seen_content[key]
@@ -460,6 +469,9 @@ class StoreMaintenanceMixin:
                 )
                 keeper = member_records[0]
                 cluster_size = len(member_records)
+                # SM6: build an index map once so we don't call
+                # group_records.index() (O(n)) inside the loop.
+                _index_map = {r.memory_id: i for i, r in enumerate(group_records)}
                 for dup in member_records[1:]:
                     # Encode keeper link in the reason for audit trail.
                     reason = f"duplicate_semantic:keeper={keeper.memory_id}"
@@ -467,8 +479,8 @@ class StoreMaintenanceMixin:
                         dup, reason, keeper.memory_id,
                         cluster_size=cluster_size,
                         cosine=float(sim_matrix[
-                            group_records.index(dup),
-                            group_records.index(keeper),
+                            _index_map[dup.memory_id],
+                            _index_map[keeper.memory_id],
                         ]),
                     )
                     total_candidates += 1
@@ -567,12 +579,20 @@ class StoreMaintenanceMixin:
         by_category: Dict[str, List[MemoryRecord]] = {}
         for record in records:
             by_category.setdefault(record.category, []).append(record)
+        # SM4: cap the number of containment-dedup pairs per category so a
+        # category with 500 records doesn't do 124,750 comparisons. The
+        # semantic dedup already has a max_pairs guard; this matches it.
+        _SM4_MAX_CONTAINMENT_PAIRS = 5000
         for category_records in by_category.values():
+            _pair_count = 0
             for index, record in enumerate(category_records):
                 content = (record.content or "").strip().casefold()
                 if len(content) < 20:
                     continue
                 for other in category_records[index + 1:]:
+                    _pair_count += 1
+                    if _pair_count > _SM4_MAX_CONTAINMENT_PAIRS:
+                        break
                     other_content = (other.content or "").strip().casefold()
                     if len(other_content) < 20:
                         continue
@@ -583,6 +603,8 @@ class StoreMaintenanceMixin:
                     else:
                         duplicate, keeper = record, other
                     add_candidate(duplicate, "duplicate_containment", keeper.memory_id)
+                if _pair_count > _SM4_MAX_CONTAINMENT_PAIRS:
+                    break
 
         # Semantic dedup (P4.1): embedding-similarity near-duplicate detection.
         semantic_count = self._detect_semantic_duplicates(
@@ -703,9 +725,14 @@ class StoreMaintenanceMixin:
         - diagnostics: per-stage scores (vector_sim, text_score, etc.)
         """
         # 1. Fetch the expected memory.
+        # SM1: filter by user_scope so a user can't access another tenant's
+        # memory by passing its memory_id. Records with NULL user_scope are
+        # global and visible to all users.
         expected_rows = self._fetch_records(
-            """SELECT * FROM memory_records WHERE memory_id = ?""",
-            [expected_memory_id],
+            """SELECT * FROM memory_records
+               WHERE memory_id = ?
+                 AND (user_scope IS NULL OR user_scope = ?)""",
+            [expected_memory_id, self.user_id],
         )
         if not expected_rows:
             return {
@@ -921,7 +948,11 @@ class StoreMaintenanceMixin:
             for memory_id in archived_ids:
                 self.connection.execute(
                     "UPDATE memory_records SET tier = 'archived', updated_at = ? "
-                    "WHERE memory_id = ? AND COALESCE(tier, 'active') = 'active'",
+                    "WHERE memory_id = ? AND COALESCE(tier, 'active') = 'active'"
+                    # SM8: add valid_to IS NULL guard so a record
+                    # superseded between SELECT and UPDATE (TOCTOU)
+                    # doesn't get archived despite being superseded.
+                    " AND valid_to IS NULL",
                     [now.isoformat(), memory_id],
                 )
         if archived_ids:
@@ -994,6 +1025,11 @@ class StoreMaintenanceMixin:
             forgotten_ids = [r[0] for r in rows]
         quarantined = 0
         quarantined_ids: List[str] = []
+        # SM10: keep per-ID quarantine_memory calls (preserves partial-
+        # failure semantics — quarantine_memory may fail for a record that
+        # was deleted between SELECT and quarantine). The per-call lock
+        # acquisition is acceptable because forget_stale_records runs at
+        # session end, not on the hot path.
         for memory_id in forgotten_ids:
             if self.quarantine_memory(memory_id, "forgotten: stale zero-value drift (P5.1)"):
                 quarantined += 1
@@ -1043,8 +1079,28 @@ class StoreMaintenanceMixin:
 
     # -- system state KV (P4.2 distillation, future maintenance) -------------
 
+    # SM2/SM9: key allowlist for system_state. Only these keys may be
+    # read or written via get_state/set_state. This prevents a caller from
+    # corrupting internal state (e.g. overwriting distillation_last_run to
+    # force re-runs) or reading internal state to infer system activity.
+    _STATE_KEY_ALLOWLIST = frozenset({
+        "distillation_last_run",
+        "surfaced_confirmation_ids",
+        "rollup_last_run",
+        "distillation_cursor",
+        "rollup_cursor",
+        "last_session_end",
+        "last_cleanup_junk",
+    })
+
     def get_state(self, key: str) -> str | None:
-        """Read a value from the ``system_state`` KV table."""
+        """Read a value from the ``system_state`` KV table.
+
+        SM9: only keys in the allowlist may be read.
+        """
+        if key not in self._STATE_KEY_ALLOWLIST:
+            logger.warning("get_state: key %r not in allowlist (SM9)", key)
+            return None
         try:
             with self._lock:
                 assert self.connection is not None
@@ -1056,7 +1112,13 @@ class StoreMaintenanceMixin:
             return None
 
     def set_state(self, key: str, value: str) -> None:
-        """Write a value to the ``system_state`` KV table (upsert)."""
+        """Write a value to the ``system_state`` KV table (upsert).
+
+        SM2: only keys in the allowlist may be written.
+        """
+        if key not in self._STATE_KEY_ALLOWLIST:
+            logger.warning("set_state: key %r not in allowlist (SM2)", key)
+            return
         try:
             with self._lock:
                 assert self.connection is not None
@@ -1245,7 +1307,11 @@ class StoreMaintenanceMixin:
                     self.connection.execute(
                         "UPDATE memory_records SET embedding = ? "
                         "WHERE memory_id = ?"
-                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        " AND (user_scope IS NULL OR user_scope = ?)"
+                        # SM5: add valid_to IS NULL guard so a record
+                        # superseded between SELECT and UPDATE (TOCTOU)
+                        # doesn't get its embedding written.
+                        " AND valid_to IS NULL",
                         [vec, memory_id, self.user_id],
                     )
                     updated += 1

@@ -19,13 +19,16 @@ from typing import Any, Dict, List, Optional
 # PS10: validate memory_id is a UUID-like string before passing to store
 # methods. The store uses parameterized queries so no SQL injection, but
 # validation prevents an LLM from probing with arbitrary strings.
+# Accepts both standard UUID format (8-4-4-4-12) and the store's internal
+# format (mem-{32 hex chars} or cand-{32 hex chars}).
 _MEMORY_ID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    r"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|(?:mem|cand)-[0-9a-fA-F]{32})$"
 )
 
 
 def _valid_memory_id(memory_id: str) -> bool:
-    """PS10: return True if *memory_id* looks like a UUID."""
+    """PS10: return True if *memory_id* looks like a UUID or store ID."""
     if not memory_id or not isinstance(memory_id, str):
         return False
     return bool(_MEMORY_ID_RE.match(memory_id))

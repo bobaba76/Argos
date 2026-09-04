@@ -2988,15 +2988,15 @@ class TestMemoryUpdateProviderPath:
         provider, store = self._make_provider_with_keyword_only_store()
         result = provider.handle_tool_call(
             "memory_update",
-            {"memory_id": "mem-123", "content": "updated content", "tags": ["t1"]},
+            {"memory_id": "mem-" + "a" * 32, "content": "updated content", "tags": ["t1"]},
         )
         import json
         parsed = json.loads(result)
         assert parsed.get("status") == "updated"
-        assert parsed.get("memory_id") == "mem-123"
+        assert parsed.get("memory_id") == "mem-" + "a" * 32
         # memory_id reached the store as a keyword argument.
         assert store.last_kwargs is not None
-        assert store.last_kwargs.get("memory_id") == "mem-123"
+        assert store.last_kwargs.get("memory_id") == "mem-" + "a" * 32
         assert store.last_kwargs.get("content") == "updated content"
         assert store.last_kwargs.get("tags") == ["t1"]
 
@@ -4089,7 +4089,7 @@ class TestEvolutionChains:
         """memory_chain on a nonexistent ID returns an error."""
         provider, store, graph = self._make_provider(tmp_path)
         result = provider.handle_tool_call(
-            "memory_chain", {"memory_id": "mem-does-not-exist"},
+            "memory_chain", {"memory_id": "mem-" + "0" * 32},
         )
         import json as _json
         parsed = _json.loads(result)

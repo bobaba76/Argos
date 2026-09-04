@@ -793,13 +793,14 @@ def test_memory_update_provider_path_keyword():
 
     result = provider.handle_tool_call(
         "memory_update",
-        {"memory_id": "mem-123", "content": "updated content", "tags": ["t1"]},
+        {"memory_id": "mem-" + "a" * 32, "content": "updated content", "tags": ["t1"]},
     )
     parsed = _json.loads(result)
     assert parsed.get("status") == "updated", f"expected updated, got: {result}"
-    assert parsed.get("memory_id") == "mem-123"
+    _mid = "mem-" + "a" * 32
+    assert parsed.get("memory_id") == _mid
     assert store.last_kwargs is not None, "store.update_memory was never called"
-    assert store.last_kwargs.get("memory_id") == "mem-123", \
+    assert store.last_kwargs.get("memory_id") == _mid, \
         "memory_id must reach the store as a keyword argument"
     assert store.last_kwargs.get("content") == "updated content"
     print("  [PASS] memory_update_provider_path_keyword")

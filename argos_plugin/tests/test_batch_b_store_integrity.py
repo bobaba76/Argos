@@ -618,7 +618,7 @@ class TestStructuralGuardWired:
         session._expiry_enabled = False
 
         args = {
-            "memory_id": "mem-123",
+            "memory_id": "mem-" + "a" * 32,
             "content": "User lives in Springfield.",
         }
         session.handle_tool_call("memory_update", args)
@@ -648,7 +648,7 @@ class TestStructuralGuardWired:
         session._graph = None
         session._expiry_enabled = False
 
-        args = {"memory_id": "mem-123", "tags": ["new_tag"]}
+        args = {"memory_id": "mem-" + "a" * 32, "tags": ["new_tag"]}
         session.handle_tool_call("memory_update", args)
         # structural_guard should NOT be in kwargs (no content change).
         assert "structural_guard" not in captured or captured.get("structural_guard") is not True

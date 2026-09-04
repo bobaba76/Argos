@@ -345,6 +345,41 @@ class TestLegacyKeysSurvival:
             f"disable the feature that reads them."
         )
 
+    def test_t1b_internal_keys_allowlist(self):
+        """T1b: every model key NOT in the UI schema is a *declared* internal key.
+
+        The model is a superset of the schema by design (advanced/tuning knobs,
+        internal objects like acl/backup, operational knobs). But a model-only
+        key MUST be deliberately listed in MemoryConfig._INTERNAL_KEYS — this
+        test fails on any key that's neither in the schema nor on the allowlist,
+        so "hidden" keys cannot accrete silently.
+        """
+        import re
+        from pathlib import Path
+        from config_model import MemoryConfig
+
+        schema_path = Path(__file__).resolve().parent.parent / "config_schema.py"
+        schema_text = schema_path.read_text(encoding="utf-8")
+        schema_keys = set(re.findall(r'key="(\w+)"', schema_text))
+        model_keys = set(MemoryConfig.model_fields.keys())
+
+        model_only = model_keys - schema_keys
+        declared = set(MemoryConfig.internal_keys())
+
+        undeclared = model_only - declared
+        assert not undeclared, (
+            f"model-only keys not declared internal: {sorted(undeclared)}. "
+            f"Add each to MemoryConfig._INTERNAL_KEYS (with a reason) or add it "
+            f"to config_schema.py — no silent hidden-key accretion."
+        )
+        # Also: the allowlist must not list keys that are now actually in the schema
+        # (stale entries mean the "internal" classification drifted).
+        stale = declared & schema_keys
+        assert not stale, (
+            f"_INTERNAL_KEYS entries that are actually in the schema: {sorted(stale)}. "
+            f"Remove them from _INTERNAL_KEYS (they're UI-exposed now)."
+        )
+
     def test_t3_round_trip_router_keys_readable(self):
         """T3: every router_* key written to config is readable via .get().
 

@@ -14,6 +14,12 @@ from __future__ import annotations
 BM25_K1 = 2.2
 BM25_B = 0.75
 
+# -- Reciprocal Rank Fusion (store_retrieval._fuse_rrf) ----------------------
+# RRF_K is the smoothing constant in the RRF score: 1/(k + rank).
+# Lower k sharpens relevance discrimination (favors top ranks more).
+# Monkeypatched in tests (test_retrieval_audit_fixes.py:221-227).
+RRF_K = 20
+
 # -- Semantic dedup (store_retrieval._find_current_similar) ------------------
 # Cosine similarity above this means "same fact" — used to gate the
 # semantic dedup layer in save_candidate / ingest_versioned.

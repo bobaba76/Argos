@@ -43,6 +43,10 @@ class TestTuningConstantsExist:
         assert tuning.GRAPH_CIRCUIT_BREAKER_THRESHOLD == 5
         assert tuning.GRAPH_CIRCUIT_BREAKER_COOLDOWN == 300.0
 
+    def test_rrf_k(self):
+        import tuning
+        assert tuning.RRF_K == 20
+
 
 # ---------------------------------------------------------------------------
 # Code paths use the constants (no inline literals)
@@ -85,6 +89,12 @@ class TestCodeUsesTuningConstants:
         import tuning
         assert ProviderRetrievalMixin._GRAPH_CIRCUIT_BREAKER_THRESHOLD == tuning.GRAPH_CIRCUIT_BREAKER_THRESHOLD
         assert ProviderRetrievalMixin._GRAPH_CIRCUIT_BREAKER_COOLDOWN == tuning.GRAPH_CIRCUIT_BREAKER_COOLDOWN
+
+    def test_rrf_k_from_tuning(self):
+        """#248: _RRF_K references tuning.py (monkeypatched in tests via cls._RRF_K)."""
+        from store_retrieval import StoreRetrievalMixin
+        import tuning
+        assert StoreRetrievalMixin._RRF_K == tuning.RRF_K
 
     def test_store_retrieval_imports_tuning(self):
         """#248: store_retrieval.py imports from tuning.py."""

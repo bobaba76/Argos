@@ -125,6 +125,10 @@ def source_files(source: Path) -> List[Path]:
             continue
         if p.name.endswith(".py") or p.name == "plugin.yaml":
             files.append(p)
+        # #247: system prompt template must deploy alongside the .py files
+        # (loaded at runtime by _load_system_prompt in provider_retrieval.py).
+        elif p.name == "system_prompt_template.txt":
+            files.append(p)
     return files
 
 
@@ -166,6 +170,10 @@ def target_scope(target: Path) -> List[Path]:
         if p.name.startswith("test_"):
             continue  # legacy test leftovers in live; tests never sync
         if p.name.endswith(".py") or p.name == "plugin.yaml":
+            files.append(p)
+        # #247: system prompt template must deploy alongside the .py files
+        # (loaded at runtime by _load_system_prompt in provider_retrieval.py).
+        elif p.name == "system_prompt_template.txt":
             files.append(p)
     return files
 

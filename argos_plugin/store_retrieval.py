@@ -1346,8 +1346,17 @@ class StoreRetrievalMixin:
         Called on every query (granted_count > 0) and every deny
         (denied_count > 0, excluded=True). The audit log is
         practice-internal — principals-only read.
+
+        SC3: query_text is hashed (SHA-256, 16 chars) for privacy,
+        consistent with the facade's _hash_query. Raw queries are not
+        persisted in the durable store.
         """
+        import hashlib
         import uuid
+        # SC3: hash query_text instead of storing raw text.
+        _qt = query_text or ""
+        if _qt:
+            _qt = hashlib.sha256(_qt.encode("utf-8")).hexdigest()[:16]
         try:
             with self._lock:
                 assert self.connection is not None
@@ -1361,7 +1370,7 @@ class StoreRetrievalMixin:
                         self._now(),
                         tenant or "default",
                         user_id,
-                        (query_text or "")[:500],
+                        _qt,
                         int(granted_count),
                         int(denied_count),
                         denied_scopes,

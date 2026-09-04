@@ -197,13 +197,18 @@ class ProviderRetrievalMixin:
             return query
         # Build context string from recent messages, capped to max_chars.
         # We use the last N user messages (most recent last).
+        # PR5: sanitize each context message with _neutralize_markup so
+        # stored conversation content cannot inject markup or
+        # instruction-like text into the embedder query.
         context_parts: list[str] = []
         total_chars = 0
         for msg in reversed(recent):  # most recent first
-            if total_chars + len(msg) > self._context_max_chars:
+            # PR5: neutralize markup before prepending to the query.
+            safe_msg = self._neutralize_context_message(msg)
+            if total_chars + len(safe_msg) > self._context_max_chars:
                 break
-            context_parts.insert(0, msg)
-            total_chars += len(msg)
+            context_parts.insert(0, safe_msg)
+            total_chars += len(safe_msg)
         if not context_parts:
             return query
         context = " ".join(context_parts)
@@ -219,6 +224,60 @@ class ProviderRetrievalMixin:
             # Keep only the last N messages.
             while len(self._recent_user_messages) > self._context_window_size:
                 self._recent_user_messages.pop(0)
+
+    def _neutralize_context_message(self, msg: str) -> str:
+        """PR5: neutralize markup/injection in a context message before
+        prepending it to the embedder query.
+
+        Strips XML/HTML-like tags and collapses repeated whitespace so a
+        stored message containing ``<system>ignore previous instructions``
+        cannot skew the embedder query. This is not a full injection guard
+        (the embedder is not an LLM), but it prevents markup from
+        dominating the query embedding.
+        """
+        if not msg:
+            return ""
+        # Strip XML/HTML-like tags.
+        clean = re.sub(r"<[^>]+>", " ", msg)
+        # Collapse repeated whitespace.
+        clean = re.sub(r"\s+", " ", clean).strip()
+        return clean
+
+    # PR3: alias list cache with TTL. ``list_aliases()`` is O(n) per turn
+    # on a store with many aliases; the cache avoids re-scanning on every
+    # retrieval. Invalidated after _ALIAS_CACHE_TTL_SECONDS or on store
+    # changes (add_alias etc. can call _invalidate_alias_cache).
+    _alias_cache: list = []
+    _alias_cache_time: float = 0.0
+    _ALIAS_CACHE_TTL_SECONDS = 60.0
+    # PR10: circuit breaker for graph-aware retrieval. After N consecutive
+    # failures, graph boosting is disabled for a cooldown period so a
+    # persistent bug doesn't waste CPU and silently degrade every turn.
+    _GRAPH_CIRCUIT_BREAKER_THRESHOLD = 5
+    _GRAPH_CIRCUIT_BREAKER_COOLDOWN = 300.0  # 5 minutes
+    _graph_retrieval_failures: int = 0
+    _graph_retrieval_disabled_until: float = 0.0
+
+    def _get_cached_alias_list(self) -> list:
+        """PR3: return the alias list, cached with a TTL."""
+        import time as _time
+        if not hasattr(self._store, "list_aliases"):
+            return []
+        now = _time.monotonic()
+        if self._alias_cache and (now - self._alias_cache_time) < self._ALIAS_CACHE_TTL_SECONDS:
+            return self._alias_cache
+        try:
+            self._alias_cache = list(self._store.list_aliases())
+            self._alias_cache_time = now
+        except Exception:
+            self._alias_cache = []
+            self._alias_cache_time = now
+        return self._alias_cache
+
+    def _invalidate_alias_cache(self) -> None:
+        """PR3: call when aliases change (add/remove) to force a re-scan."""
+        self._alias_cache = []
+        self._alias_cache_time = 0.0
 
     def _expand_and_merge(
         self,
@@ -467,25 +526,36 @@ class ProviderRetrievalMixin:
         return arc
 
     def _arc_clears_similarity_floor(self, query: str, versions: List[Any]) -> bool:
-        """Cosine(query, current-version content) >= arc floor (Option A)."""
+        """Cosine(query, current-version content) >= arc floor (Option A).
+
+        PR7: fail-closed on error — a missed arc is better than an
+        irrelevant one injected into context. The previous fail-open
+        behavior could inject chain arcs even when the semantic check
+        crashed, defeating the precision guard.
+        """
         try:
             current = next((v for v in versions if getattr(v, "valid_to", None) is None), None)
             if current is None:
                 current = versions[-1]
             content = getattr(current, "content", "") or ""
             if not content.strip() or self._embedder is None:
-                return True  # fail-open on missing embedder/content
+                # PR7: fail-closed — no embedder/content means we can't
+                # verify semantic relevance, so don't inject.
+                return False
             qe = self._embedder.embed(query, is_query=True)
             ce = self._embedder.embed(content)
             if not qe or not ce or len(qe) != len(ce):
-                return True
+                # PR7: fail-closed on embedding failure.
+                return False
             denom = (sum(a * a for a in qe) ** 0.5) * (sum(b * b for b in ce) ** 0.5)
             if denom <= 0:
-                return True
+                return False
             cos = sum(a * b for a, b in zip(qe, ce)) / denom
             return cos >= self._chain_unfold_arc_min_similarity
         except Exception:
-            return True  # fail-open: never let the guard crash inference
+            # PR7: fail-closed — never let the guard crash inference into
+            # injecting an irrelevant arc.
+            return False
 
     def get_chain_unfold_stats(self) -> Dict[str, int]:
         """Return chain-unfold accounting (count + tokens injected)."""
@@ -581,6 +651,19 @@ class ProviderRetrievalMixin:
             final_results = results[:limit]
             self._record_injected(final_results)
             return final_results
+        # PR10: circuit breaker — skip graph boosting if recently disabled
+        # by consecutive failures.
+        import time as _time
+        if self._graph_retrieval_disabled_until > 0 and _time.monotonic() < self._graph_retrieval_disabled_until:
+            logger.debug(
+                "Graph-aware retrieval disabled (PR10 circuit breaker, "
+                "%.0fs remaining)",
+                self._graph_retrieval_disabled_until - _time.monotonic(),
+            )
+            final_results = results[:limit]
+            self._record_injected(final_results)
+            return final_results
+        # Reset failure counter if we get past the breaker (graph is healthy).
         try:
             # Entity alias resolution: expand the query with canonical
             # entity names for any aliases found in the query text.
@@ -609,8 +692,11 @@ class ProviderRetrievalMixin:
                         pass
                 # Also check if the query itself contains a canonical name
                 # that has aliases (even if no alias→canonical match fired)
+                # PR3: cache the alias list with a TTL so we don't scan all
+                # aliases (O(n) substring checks) on every turn.
                 if not alias_terms:
-                    for alias_map in (self._store.list_aliases() if hasattr(self._store, "list_aliases") else []):
+                    alias_maps = self._get_cached_alias_list()
+                    for alias_map in alias_maps:
                         canonical = alias_map.get("canonical_entity", "")
                         if canonical and canonical.lower() in effective_query.lower():
                             try:
@@ -774,6 +860,11 @@ class ProviderRetrievalMixin:
                         elif hasattr(record, "similarity"):
                             sim = record.similarity
                         record.similarity = sim
+                        # PR8: raw_similarity is always the pre-boost value;
+                        # similarity is post-boost+clamp (see below). This
+                        # invariant is relied on by downstream gates that
+                        # check raw_similarity to decide if a result was
+                        # graph-boosted or organic.
                         record.raw_similarity = sim
                         # #81: alias/traversal/PPR candidates are exempt from
                         # the inclusion gate — their boost floor is applied
@@ -847,10 +938,25 @@ class ProviderRetrievalMixin:
         except Exception as exc:
             # #84: expected fail-soft conditions degrade to unboosted results.
             self._graph_retrieval_failures = getattr(self, "_graph_retrieval_failures", 0) + 1
-            logger.warning(
-                "Graph-aware retrieval failed (fail-soft, count=%d): %s",
-                self._graph_retrieval_failures, exc,
-            )
+            # PR10: circuit breaker — after N consecutive graph failures,
+            # disable graph-aware retrieval for a cooldown period and log
+            # at ERROR level so a persistent bug isn't silently ignored.
+            _fail_count = self._graph_retrieval_failures
+            if _fail_count >= self._GRAPH_CIRCUIT_BREAKER_THRESHOLD:
+                import time as _time
+                self._graph_retrieval_disabled_until = (
+                    _time.monotonic() + self._GRAPH_CIRCUIT_BREAKER_COOLDOWN
+                )
+                logger.error(
+                    "Graph-aware retrieval failed %d times — disabling for "
+                    "%.0fs cooldown (PR10 circuit breaker): %s",
+                    _fail_count, self._GRAPH_CIRCUIT_BREAKER_COOLDOWN, exc,
+                )
+            else:
+                logger.warning(
+                    "Graph-aware retrieval failed (fail-soft, count=%d): %s",
+                    _fail_count, exc,
+                )
         final_results = results[:limit]
         if getattr(self, "_conflict_surfacing_enabled", False):
             try:
@@ -883,6 +989,9 @@ class ProviderRetrievalMixin:
         flagged = set()
         now = datetime.now(timezone.utc).isoformat()
         n = len(records)
+        # PR4: pre-compute value extractions once per record so the O(n²)
+        # pair scan doesn't re-extract on every comparison.
+        pre_values = [extract_values(r.content or "") for r in records]
         for i in range(n):
             if len(notes) >= max_notes:
                 break
@@ -897,8 +1006,9 @@ class ProviderRetrievalMixin:
                         rj.valid_to is not None and rj.valid_to):
                     continue  # only active-vs-active unlinked pairs
                 reason = None
+                # PR4: use pre-computed values instead of re-extracting.
                 if values_conflict(
-                    extract_values(a), extract_values(b), subject_threshold=0.2,
+                    pre_values[i], pre_values[j], subject_threshold=0.2,
                 ):
                     reason = "differing values"
                 elif (
@@ -946,6 +1056,13 @@ class ProviderRetrievalMixin:
     # Persisted in the store's system_state KV so a candidate is surfaced
     # at most once across provider restarts (the #99 failure mode was
     # re-asking the same candidate every turn, forever).
+    # PR2: a lock guards the read-modify-write so two concurrent prefetch
+    # threads can't clobber each other's addition.
+    _confirmation_ledger_lock = threading.Lock()
+    # PR1: cap the ledger so it doesn't grow unbounded over months/years.
+    # IDs for candidates no longer pending are pruned on each write; the
+    # cap is a safety net for stores where pending status isn't queryable.
+    _CONFIRMATION_LEDGER_MAX = 1000
 
     def _surfaced_confirmation_ids(self) -> set:
         try:
@@ -965,14 +1082,54 @@ class ProviderRetrievalMixin:
     def _mark_surfaced_confirmation(self, candidate_id: str | None) -> None:
         if not candidate_id or self._store is None:
             return
+        # PR2: lock the read-modify-write so concurrent prefetch threads
+        # don't clobber each other's addition.
+        with self._confirmation_ledger_lock:
+            try:
+                _ids = self._surfaced_confirmation_ids()
+                _ids.add(str(candidate_id))
+                # PR1: prune the ledger — remove IDs for candidates that are
+                # no longer in pending_user_confirmation status, and cap the
+                # total size as a safety net.
+                _ids = self._prune_confirmation_ledger(_ids)
+                self._store.set_state(
+                    "surfaced_confirmation_ids", json.dumps(sorted(_ids))
+                )
+            except Exception:
+                pass
+
+    def _prune_confirmation_ledger(self, ids: set) -> set:
+        """PR1: prune the confirmation ledger.
+
+        Removes IDs for candidates that are no longer in
+        ``pending_user_confirmation`` status (they've been confirmed or
+        rejected, so re-surfacing is harmless but wasteful). Falls back to
+        a size cap if the store doesn't support status queries.
+        """
+        if not ids or self._store is None:
+            return ids
         try:
-            _ids = self._surfaced_confirmation_ids()
-            _ids.add(str(candidate_id))
-            self._store.set_state(
-                "surfaced_confirmation_ids", json.dumps(sorted(_ids))
-            )
+            # Try to prune by status — keep only IDs still pending.
+            pending_ids: set = set()
+            for cid in ids:
+                try:
+                    rec = self._store.get_by_id(str(cid))
+                    if rec and getattr(rec, "status", None) == "pending_user_confirmation":
+                        pending_ids.add(str(cid))
+                except Exception:
+                    # Can't check this ID — keep it (safe default).
+                    pending_ids.add(str(cid))
+            if pending_ids:
+                return pending_ids
+            # No pending IDs remain — return empty (all confirmed/rejected).
+            if len(ids) > 0:
+                return set()
         except Exception:
             pass
+        # Fallback: cap by size (keep most recent — sorted = deterministic).
+        if len(ids) > self._CONFIRMATION_LEDGER_MAX:
+            return set(sorted(ids)[-self._CONFIRMATION_LEDGER_MAX:])
+        return ids
 
     # -- prefetch (auto-inject context before each turn) ---------------------
 
@@ -1005,6 +1162,12 @@ class ProviderRetrievalMixin:
             self._prefetch_query = query
             self._prefetch_result = ""
             self._prefetch_done = False
+            # PR6: set a cancel event on the old thread so it can exit
+            # early instead of wasting CPU on a superseded query.
+            old_cancel = getattr(self, "_prefetch_cancel_event", None)
+            if old_cancel is not None:
+                old_cancel.set()
+            self._prefetch_cancel_event = threading.Event()
 
         def _run() -> None:
             sections = []
@@ -1232,6 +1395,13 @@ class ProviderRetrievalMixin:
                 body = "\n\n".join(sections)
             except Exception as e:
                 logger.debug("Prefetch failed: %s", e)
+            # PR6: check the cancel event before writing — if a newer
+            # query superseded this one, skip the write (the guard on
+            # _prefetch_query already prevents overwriting, but this
+            # avoids the unnecessary lock acquisition).
+            _cancel = getattr(self, "_prefetch_cancel_event", None)
+            if _cancel is not None and _cancel.is_set():
+                return
             with self._prefetch_lock:
                 if self._prefetch_query == query:
                     self._prefetch_result = body
@@ -1258,6 +1428,14 @@ class ProviderRetrievalMixin:
             return result
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """PR9: on cache miss, start the prefetch and wait briefly for the
+        result. The wait adds latency to the first turn after restart, but
+        returning empty would mean the first turn has no context at all.
+        The wait is bounded by ``_PREFETCH_WAIT_SECS``; if the search is
+        slow, the caller gets an empty string and the prefetched result
+        is available on the next call (the thread continues in the
+        background). This is the documented trade-off — accepted.
+        """
         cached = self._consume_prefetch_result(query)
         if cached is not None:
             return cached

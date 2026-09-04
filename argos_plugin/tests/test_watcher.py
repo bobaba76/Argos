@@ -30,13 +30,16 @@ from watcher import (
     VERIFIED_STALE,
     VERIFIED_UNVERIFIED,
     classify_doc_type,
+    extract_doc_facts_llm,
     extract_doc_type_label,
+    extract_text_xlsx,
     has_correction_marker,
     hash_extraction_input,
     hash_file,
     heuristic_description,
     is_excluded,
     is_hot,
+    parse_doc_facts_response,
     prepare_extraction_input,
     scan_pass,
     verified_state_on_ocr_numeric,
@@ -549,3 +552,143 @@ class TestHeuristicDescription:
         long_text = "A" * 500
         desc = heuristic_description(f, "pdf", first_page_text=long_text)
         assert len(desc) <= 200
+
+
+# ---------------------------------------------------------------------------
+# 10. LLM doc-fact response parsing (issue #212, W1)
+# ---------------------------------------------------------------------------
+
+_FACTS = [
+    {"content": "Invoice total is $1,234.56", "category": "context_note"},
+    {"content": "Due date 2026-03-01", "category": "event"},
+]
+
+
+class TestParseDocFactsResponse:
+    """W1: fenced / prose-wrapped JSON must not silently lose facts."""
+
+    def test_plain_json_list(self):
+        assert parse_doc_facts_response(json.dumps(_FACTS)) == _FACTS
+
+    def test_json_code_fence(self):
+        raw = "```json\n" + json.dumps(_FACTS) + "\n```"
+        assert parse_doc_facts_response(raw) == _FACTS
+
+    def test_bare_code_fence(self):
+        raw = "```\n" + json.dumps(_FACTS, indent=2) + "\n```\n"
+        assert parse_doc_facts_response(raw) == _FACTS
+
+    def test_prose_wrapped(self):
+        raw = "Here are the facts:\n" + json.dumps(_FACTS) + "\nLet me know."
+        assert parse_doc_facts_response(raw) == _FACTS
+
+    def test_prose_and_fence(self):
+        raw = "Sure!\n```json\n" + json.dumps(_FACTS) + "\n```\nDone."
+        assert parse_doc_facts_response(raw) == _FACTS
+
+    def test_object_instead_of_list_is_rejected(self):
+        assert parse_doc_facts_response('{"content": "x"}') == []
+
+    def test_garbage_returns_empty(self):
+        assert parse_doc_facts_response("no json here [oops") == []
+        assert parse_doc_facts_response("") == []
+        assert parse_doc_facts_response(None) == []
+
+
+class TestExtractDocFactsLlmFenced:
+    """End-to-end through extract_doc_facts_llm with a stubbed client."""
+
+    @staticmethod
+    def _install_client(monkeypatch, content):
+        import types
+
+        class _Msg:
+            def __init__(self, c):
+                self.content = c
+
+        class _Choice:
+            def __init__(self, c):
+                self.message = _Msg(c)
+
+        class _Resp:
+            def __init__(self, c):
+                self.choices = [_Choice(c)]
+
+        fake_client = types.ModuleType("agent.auxiliary_client")
+        fake_client.call_llm = lambda **kw: _Resp(content)
+        fake_agent = types.ModuleType("agent")
+        fake_agent.auxiliary_client = fake_client
+        monkeypatch.setitem(sys.modules, "agent", fake_agent)
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", fake_client)
+
+    def test_fenced_response_yields_facts(self, monkeypatch):
+        self._install_client(
+            monkeypatch, "```json\n" + json.dumps(_FACTS) + "\n```"
+        )
+        text = "Invoice #1234 total $1,234.56 due 2026-03-01. " * 3
+        assert extract_doc_facts_llm(text) == _FACTS
+
+    def test_prose_response_yields_facts(self, monkeypatch):
+        self._install_client(
+            monkeypatch, "Facts:\n" + json.dumps(_FACTS) + "\nEnd."
+        )
+        text = "Invoice #1234 total $1,234.56 due 2026-03-01. " * 3
+        assert extract_doc_facts_llm(text) == _FACTS
+
+
+# ---------------------------------------------------------------------------
+# 11. XLSX workbook handle released on error (issue #212, W2)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractTextXlsxClosesOnError:
+    """W2: wb.close() must run even when iter_rows raises mid-sheet."""
+
+    @staticmethod
+    def _install_openpyxl(monkeypatch, rows_or_exc):
+        import types
+
+        class _Sheet:
+            def iter_rows(self, values_only=True):
+                for item in rows_or_exc:
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+
+        class _Workbook:
+            closed = False
+            sheetnames = ["Sheet1"]
+
+            def __getitem__(self, name):
+                return _Sheet()
+
+            def close(self):
+                self.closed = True
+
+        created = []
+
+        def load_workbook(path, read_only=True, data_only=True):
+            wb = _Workbook()
+            created.append(wb)
+            return wb
+
+        fake = types.ModuleType("openpyxl")
+        fake.load_workbook = load_workbook
+        monkeypatch.setitem(sys.modules, "openpyxl", fake)
+        return created
+
+    def test_closes_when_iter_rows_raises(self, monkeypatch, tmp_path):
+        created = self._install_openpyxl(
+            monkeypatch, [("a", 1), OSError("disk read failed")]
+        )
+        text, sheets = extract_text_xlsx(tmp_path / "book.xlsx")
+        assert (text, sheets) == ("", [])
+        assert len(created) == 1
+        assert created[0].closed is True
+
+    def test_closes_on_success(self, monkeypatch, tmp_path):
+        created = self._install_openpyxl(monkeypatch, [("h1", "h2"), (1, None)])
+        text, sheets = extract_text_xlsx(tmp_path / "book.xlsx")
+        assert sheets == ["Sheet1"]
+        assert text == "[Sheet: Sheet1]\nh1\th2\n1\t"
+        assert created[0].closed is True

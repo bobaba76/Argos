@@ -478,17 +478,19 @@ def extract_text_xlsx(path: str | Path) -> Tuple[str, List[str]]:
     try:
         from openpyxl import load_workbook
         wb = load_workbook(str(path), read_only=True, data_only=True)
-        sheet_names = wb.sheetnames
-        lines: List[str] = []
-        for sname in sheet_names:
-            ws = wb[sname]
-            lines.append(f"[Sheet: {sname}]")
-            for row in ws.iter_rows(values_only=True):
-                # Encode headers + values per row.
-                cells = [str(c) if c is not None else "" for c in row]
-                if any(c.strip() for c in cells):
-                    lines.append("\t".join(cells))
-        wb.close()
+        try:
+            sheet_names = wb.sheetnames
+            lines: List[str] = []
+            for sname in sheet_names:
+                ws = wb[sname]
+                lines.append(f"[Sheet: {sname}]")
+                for row in ws.iter_rows(values_only=True):
+                    # Encode headers + values per row.
+                    cells = [str(c) if c is not None else "" for c in row]
+                    if any(c.strip() for c in cells):
+                        lines.append("\t".join(cells))
+        finally:
+            wb.close()
         return "\n".join(lines), sheet_names
     except Exception as exc:
         logger.debug("XLSX extraction failed for %s: %s", path, exc)
@@ -650,12 +652,49 @@ def extract_doc_facts_llm(
         raw = response.choices[0].message.content
     except (AttributeError, IndexError, KeyError):
         return []
+    facts = parse_doc_facts_response(raw)
+    if not facts:
+        logger.warning(
+            "Doc-fact LLM response did not contain a JSON list (%d chars); "
+            "no facts extracted",
+            len(raw) if isinstance(raw, str) else 0,
+        )
+    return facts
+
+
+def parse_doc_facts_response(raw: Any) -> List[Dict[str, Any]]:
+    """Parse the LLM's doc-fact output into a list of fact dicts.
+
+    Tolerates markdown code fences (```json ... ```) and surrounding
+    prose: tries a direct parse first, then falls back to the first
+    balanced ``[...]`` block via ``raw_decode``. Returns ``[]`` when no
+    JSON list can be recovered.
+    """
+    if not isinstance(raw, str):
+        return []
+    text = raw.strip()
+    if not text:
+        return []
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
     try:
-        facts = json.loads(raw)
+        facts = json.loads(text)
         if isinstance(facts, list):
             return facts
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError:
         pass
+    decoder = json.JSONDecoder()
+    start = text.find("[")
+    while start != -1:
+        try:
+            facts, _end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            start = text.find("[", start + 1)
+            continue
+        if isinstance(facts, list):
+            return facts
+        start = text.find("[", start + 1)
     return []
 
 

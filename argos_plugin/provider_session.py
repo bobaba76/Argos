@@ -1770,13 +1770,20 @@ class ProviderSessionMixin:
             sweep_thread = getattr(sweep, "_thread", None)
             if sweep_thread and sweep_thread.is_alive():
                 sweep_thread.join(timeout=2.0)
-        # PS5: drain the sync queue before sending the stop sentinel so
+# PS5: drain the sync queue before sending the stop sentinel so
         # pending extractions are not lost. Bounded by a timeout so a
         # stuck item doesn't block shutdown indefinitely.
         try:
             self._sync_queue.join(timeout=10.0)
         except Exception:
             pass  # join timeout or empty queue — proceed to stop
+        # W6: stop the watcher thread and join it.
+        watcher = getattr(self, "_watcher_thread", None)
+        if watcher:
+            watcher.stop()
+            watcher_thread = getattr(watcher, "_thread", None)
+            if watcher_thread and watcher_thread.is_alive():
+                watcher_thread.join(timeout=2.0)
         # Signal the sync worker to stop and wait for it.
         try:
             self._sync_queue.put_nowait(None)

@@ -450,6 +450,8 @@ class ProviderCoreMixin:
         self._sync_thread: Optional[threading.Thread] = None
         self._sync_lock = threading.Lock()
         self._sync_worker_started = False
+        # W6: watcher thread (config-gated, None when disabled).
+        self._watcher_thread = None
 
     @property
     def name(self) -> str:
@@ -603,6 +605,25 @@ class ProviderCoreMixin:
                 "description": "Allow automatic reversible memory maintenance at session end",
                 "default": "false",
                 "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "watcher_enabled",
+                "description": "Enable the spec-07 document watcher (catalog scan + extraction pass). No watcher config = zero behaviour change.",
+                "default": "false",
+                "choices": ["true", "false"],
+                "required": False,
+            },
+            {
+                "key": "watcher_scan_roots",
+                "description": "Comma-separated list of directories to scan for the document catalog pass (e.g. ~/Documents/Reports, ~/Projects/docs).",
+                "default": "",
+                "required": False,
+            },
+            {
+                "key": "watcher_interval_min",
+                "description": "Interval in minutes between watcher catalog passes (default 30).",
+                "default": "30",
                 "required": False,
             },
         ]
@@ -869,6 +890,15 @@ class ProviderCoreMixin:
             self._config.get("extraction_llm_model", "")).strip()
         self._extraction_llm_provider = str(
             self._config.get("extraction_llm_provider", "")).strip()
+        # W6: watcher config (spec-07 wiring). No watcher config = zero
+        # behaviour change — the thread is not started.
+        self._watcher_enabled = _flag(self._config, "watcher_enabled", "false")
+        _roots = self._config.get("watcher_scan_roots", [])
+        if isinstance(_roots, str):
+            _roots = [r.strip() for r in _roots.split(",") if r.strip()]
+        self._watcher_scan_roots = [str(r) for r in _roots if r]
+        self._watcher_interval_min = int(
+            self._config.get("watcher_interval_min", 30))
         self._answering_llm_model = str(
             self._config.get("answering_llm_model", "")).strip()
         self._answering_llm_provider = str(
@@ -1199,3 +1229,28 @@ class ProviderCoreMixin:
                 self._stale_review_min_age_min,
                 self._stale_review_max_batch,
             )
+
+        # W6 (spec-07 wiring): start the watcher thread if config-gated.
+        # No watcher config = zero behaviour change (thread not started).
+        self._watcher_thread = None
+        if self._watcher_enabled and self._watcher_scan_roots and self._store:
+            try:
+                try:
+                    from .watcher_thread import WatcherThread
+                except ImportError:
+                    from watcher_thread import WatcherThread
+                self._watcher_thread = WatcherThread(
+                    self._store,
+                    scan_roots=self._watcher_scan_roots,
+                    interval_min=self._watcher_interval_min,
+                    extraction_llm_model=self._extraction_llm_model,
+                    extraction_llm_provider=self._extraction_llm_provider,
+                )
+                self._watcher_thread.start()
+                logger.info(
+                    "watcher started: roots=%s, interval=%dmin",
+                    self._watcher_scan_roots, self._watcher_interval_min,
+                )
+            except Exception as exc:
+                logger.warning("watcher thread start failed: %s", exc)
+                self._watcher_thread = None

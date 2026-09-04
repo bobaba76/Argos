@@ -36,6 +36,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# W3/W4: cap CSV extraction text to bound memory. 1MB is generous for any
+# legitimate CSV document while preventing a multi-GB file from consuming
+# unbounded RAM.
+_MAX_CSV_TEXT_CHARS = 1 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # D1 — Stable doc identity: content hash, not path
 # ---------------------------------------------------------------------------
@@ -413,14 +418,24 @@ def is_hot(
 # ---------------------------------------------------------------------------
 
 # Correction markers in filenames.
+# W5: dropped `v\d+` from the marker set — plain version numbers
+# (invoice_v1.pdf vs invoice_v2.pdf) are ubiquitous sequential versioning,
+# not correction markers. Real corrections stay covered by the word
+# markers (corrected, revised, amended, updated) and the (N) suffix.
 _CORRECTION_MARKERS = re.compile(
-    r"(?i)(corrected|revised|\(\s*\d+\s*\)|v\d+|rev\b|amended|updated)"
+    r"(?i)(corrected|revised|\(\s*\d+\s*\)|rev\b|amended|updated)"
 )
 
 
 def has_correction_marker(filename: str) -> bool:
     """Check if a filename carries a correction marker (CORRECTED, REVISED,
-    (2), v2, etc.). Used for cross-doc conflict surfacing — zero LLM."""
+    (2), rev, amended, updated). Used for cross-doc conflict surfacing —
+    zero LLM.
+
+    W5: ``v\\d+`` was removed — plain version numbers are sequential
+    versioning, not corrections. ``invoice_v1.pdf`` and ``invoice_v2.pdf``
+    no longer collapse to the same conflict label.
+    """
     return bool(_CORRECTION_MARKERS.search(filename))
 
 
@@ -444,7 +459,12 @@ def extract_doc_type_label(filename: str) -> str:
 def extract_text_pdf(path: str | Path) -> Tuple[str, str]:
     """Extract text from a PDF. Returns (text, method).
 
-    method is 'text' for born-digital PDFs, 'ocr' for scanned (fallback).
+    method is:
+    - 'text' for born-digital PDFs with a real text layer.
+    - 'ocr' for scanned PDFs (sparse text → needs OCR).
+    - 'encrypted' for password-protected PDFs (W7: surfaces for review
+      instead of silently returning empty text as method='text').
+
     Uses PyPDF2 for text extraction. If the text layer is empty or very
     sparse, returns method='ocr' to flag the document as needing OCR
     (the actual OCR is a separate pass, not implemented here).
@@ -452,6 +472,11 @@ def extract_text_pdf(path: str | Path) -> Tuple[str, str]:
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(str(path))
+        # W7: check for encrypted PDFs before extraction. An encrypted PDF
+        # would silently return empty text with method='text', causing the
+        # file to be skipped without surfacing for review.
+        if getattr(reader, "is_encrypted", False):
+            return "", "encrypted"
         pages: List[str] = []
         for page in reader.pages:
             try:
@@ -460,9 +485,16 @@ def extract_text_pdf(path: str | Path) -> Tuple[str, str]:
                 text = ""
             pages.append(text)
         full_text = "\n".join(pages).strip()
-        # Heuristic: if we got very little text, it's likely a scan.
-        if len(full_text) < 50 and len(reader.pages) > 0:
-            return full_text, "ocr"
+        # W8: per-page OCR heuristic — scale the threshold with page count
+        # so a 100-page scan with 49 chars (page numbers only) is flagged
+        # as OCR, but a 1-page 49-char document is judged by its own merit.
+        # Use 10 chars/page as the per-page threshold (generous for any
+        # legitimate short document, catches sparse multi-page scans).
+        page_count = len(reader.pages)
+        if page_count > 0:
+            per_page_threshold = 10 * page_count
+            if len(full_text) < per_page_threshold:
+                return full_text, "ocr"
         return full_text, "text"
     except Exception as exc:
         logger.debug("PDF text extraction failed for %s: %s", path, exc)
@@ -498,10 +530,27 @@ def extract_text_xlsx(path: str | Path) -> Tuple[str, List[str]]:
 
 
 def extract_text_csv(path: str | Path) -> str:
-    """Extract text from a CSV file. Returns the raw text content."""
+    """Extract text from a CSV file. Returns the text content as tab-joined rows.
+
+    W3: streams via ``csv.reader`` (row by row) instead of ``f.read()``
+    (entire file in memory). A large CSV (hundreds of MB–GB) would consume
+    that much RAM with ``f.read()``; streaming keeps memory bounded to
+    one row at a time. The output is capped at ``_MAX_CSV_TEXT_CHARS`` to
+    bound the extraction input (W4: callers don't need the entire file).
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        import csv as _csv
+        lines: List[str] = []
+        total = 0
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = _csv.reader(f)
+            for row in reader:
+                line = "\t".join(row)
+                lines.append(line)
+                total += len(line)
+                if total >= _MAX_CSV_TEXT_CHARS:
+                    break
+        return "\n".join(lines)
     except Exception as exc:
         logger.debug("CSV extraction failed for %s: %s", path, exc)
         return ""

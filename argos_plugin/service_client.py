@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -14,10 +15,12 @@ from typing import Any, Dict, List
 if __package__:
     from .memory_service import endpoint_path
     from .store import MemoryRecord
+    from .store_protocol import _PROTOCOL_VERSION
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from memory_service import endpoint_path
     from store import MemoryRecord
+    from store_protocol import _PROTOCOL_VERSION
 
 _START_LOCK_NAME = "hybrid_memory_service.starting"
 _START_LOCK_STALE_SECS = 90.0  # > _START_TIMEOUT; a healthy spawner unlinks well before this
@@ -33,6 +36,8 @@ _RETRY_BACKOFF_S = 0.5
 # response (search results, candidates, graph traversals) while preventing
 # a runaway server from exhausting client memory.
 _MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -114,6 +119,7 @@ class SharedMemoryServiceError(RuntimeError):
     def __init__(self, message: str, error_class: str | None = None) -> None:
         super().__init__(message)
         self.error_class = error_class or "SharedMemoryServiceError"
+        self.received_version: int | None = None  # #246: set on VersionMismatch
 
 
 def _read_endpoint(home: Path) -> dict | None:
@@ -188,7 +194,8 @@ class _SharedRPC:
         self._scope.user_id = value or "default_user"
 
     def _request(self, request: dict, timeout: float = _DEFAULT_TIMEOUT) -> Any:
-        """Send one request; retry once on connection-refused (#20).
+        """Send one request; retry once on connection-refused (#20) or
+        VersionMismatch (#246).
 
         ConnectionRefusedError at connect time means the request never
         reached the server (e.g. the service is mid-restart), so a retry
@@ -196,6 +203,10 @@ class _SharedRPC:
         file is re-read on retry because a restart may have bound a new
         port. Timeouts and other OSErrors are NOT retried: the request
         may have been processed.
+
+        #246: VersionMismatch means the running service is stale (old
+        protocol). Self-heal: stop the stale service, respawn via
+        _ensure_service, retry ONCE. Turns silent drift into self-healing.
         """
         attempt = 0
         while True:
@@ -209,12 +220,25 @@ class _SharedRPC:
                         error_class="ConnectionRefusedError",
                     ) from exc
                 time.sleep(_RETRY_BACKOFF_S)
+            except SharedMemoryServiceError as exc:
+                if exc.error_class == "VersionMismatch" and attempt < 2:
+                    # #246: stale service — kill + respawn + retry once.
+                    logger.warning(
+                        "Protocol version mismatch from service (got %s); "
+                        "respawning stale service and retrying",
+                        getattr(exc, "received_version", "?"),
+                    )
+                    self._kill_stale_service()
+                    self._ensure_service()
+                    continue
+                raise
 
     def _request_once(self, request: dict, timeout: float) -> Any:
         endpoint = _read_endpoint(self.home)
         if endpoint is None:
             raise SharedMemoryServiceError("shared memory service endpoint is unavailable")
         request = dict(request)
+        request["v"] = _PROTOCOL_VERSION
         request["token"] = endpoint["token"]
         request.setdefault("user_id", self.user_id)
         try:
@@ -252,10 +276,16 @@ class _SharedRPC:
             ) from exc
         if not response.get("ok"):
             # Error envelope (#20): surface the server's error class.
-            raise SharedMemoryServiceError(
+            err = SharedMemoryServiceError(
                 str(response.get("error", "service error")),
                 error_class=str(response.get("error_class") or "ServiceError"),
             )
+            # #246: attach the received version for VersionMismatch so the
+            # retry loop can log it.
+            err_info = response.get("error")
+            if isinstance(err_info, dict) and err_info.get("class") == "VersionMismatch":
+                err.received_version = err_info.get("received")
+            raise err
         return response.get("result")
 
     def _healthy(self) -> bool:
@@ -264,6 +294,25 @@ class _SharedRPC:
             return isinstance(result, dict) and result.get("status") == "ok"
         except SharedMemoryServiceError:
             return False
+
+    def _kill_stale_service(self) -> None:
+        """#246: stop the running service so _ensure_service can respawn it.
+
+        Best-effort: sends a shutdown request via the current endpoint.
+        If that fails (service already dead, endpoint stale), just
+        unlink the endpoint file so _ensure_service starts fresh.
+        """
+        try:
+            self._request_once({"method": "shutdown"}, timeout=3.0)
+        except Exception:
+            pass  # service may already be dead — that's fine
+        # Remove the stale endpoint so _ensure_service doesn't try to
+        # connect to a dead port.
+        try:
+            ep = endpoint_path(self.home)
+            ep.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _ensure_service(self) -> None:
         if self._healthy():

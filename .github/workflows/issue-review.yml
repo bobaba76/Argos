@@ -1,0 +1,39 @@
+# Review issues created by Devin — labels them devin-ready, needs-revision, or rejected
+name: "Issue Review (Hermes)"
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  review:
+    if: github.event.label.name == 'needs-review'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Review issue with Hermes via OpenRouter"
+        id: review
+        env:
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x .github/scripts/review-issue.sh
+          .github/scripts/review-issue.sh
+
+      - name: "Notify on failure"
+        if: failure() && steps.review.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "⚠️ **Hermes review failed** — the API call did not complete.
+            Check the [Action logs](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}).
+            Add the \`needs-review\` label again to re-trigger."

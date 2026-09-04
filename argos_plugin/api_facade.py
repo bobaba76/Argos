@@ -42,14 +42,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from access_scoping import ACLConfig
 from inbound_security import scan_inbound_text
+from store_common import VALID_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +183,10 @@ class AuthContext:
 
 # -- Idempotency (D5) --------------------------------------------------------
 
+# AF5: idempotency registry eviction settings.
+IDEMPOTENCY_TTL_SECONDS = 24 * 3600  # 24 hours
+IDEMPOTENCY_MAX_ENTRIES = 10_000
+
 # In-memory idempotency cache for v1. The spec calls for a DuckDB table
 # (api_idempotency) for durability across restarts; the in-memory cache
 # handles the common case (same client retrying within a session). The
@@ -197,10 +202,43 @@ class IdempotencyRegistry:
     - same key + same request hash → return original result, no duplicate
     - same key + different request hash → 409 conflict
     - no key → no idempotency guarantee (caller accepts at-least-once)
+
+    AF4: thread-safe via a ``threading.Lock`` around check/record (the
+    REST server allows concurrent requests).
+    AF5: entries are evicted after ``IDEMPOTENCY_TTL_SECONDS`` (24h) or
+    when the registry exceeds ``IDEMPOTENCY_MAX_ENTRIES`` (LRU-style
+    eviction by ``created_at``).
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = IDEMPOTENCY_TTL_SECONDS,
+        max_entries: int = IDEMPOTENCY_MAX_ENTRIES,
+    ) -> None:
         self._entries: Dict[str, _IdempotencyEntry] = {}
+        self._lock = threading.Lock()
+        self._ttl_seconds = ttl_seconds
+        self._max_entries = max_entries
+
+    def _evict_expired(self) -> None:
+        """Remove entries older than TTL. Must be called under the lock."""
+        if self._ttl_seconds <= 0:
+            return
+        cutoff = time.time() - self._ttl_seconds
+        expired = [k for k, v in self._entries.items() if v["created_at"] < cutoff]
+        for k in expired:
+            del self._entries[k]
+
+    def _evict_oldest(self) -> None:
+        """Evict oldest entries if over max_entries. Must be under the lock."""
+        if len(self._entries) <= self._max_entries:
+            return
+        # Sort by created_at ascending, evict the oldest.
+        sorted_keys = sorted(self._entries, key=lambda k: self._entries[k]["created_at"])
+        to_remove = len(self._entries) - self._max_entries
+        for k in sorted_keys[:to_remove]:
+            del self._entries[k]
 
     def check(
         self,
@@ -220,17 +258,19 @@ class IdempotencyRegistry:
         """
         if not key:
             return False, None
-        existing = self._entries.get(key)
-        if existing is None:
-            return False, None
-        if existing["request_hash"] != request_hash:
-            raise APIError(
-                "conflict",
-                "Idempotency key was used with a different request body.",
-                details={"idempotency_key": key},
-            )
-        # Same key + same hash → replay.
-        return True, existing.get("result")
+        with self._lock:
+            self._evict_expired()
+            existing = self._entries.get(key)
+            if existing is None:
+                return False, None
+            if existing["request_hash"] != request_hash:
+                raise APIError(
+                    "conflict",
+                    "Idempotency key was used with a different request body.",
+                    details={"idempotency_key": key},
+                )
+            # Same key + same hash → replay.
+            return True, existing.get("result")
 
     def record(
         self,
@@ -243,14 +283,17 @@ class IdempotencyRegistry:
         """Record a completed mutation for idempotency replay."""
         if not key:
             return
-        self._entries[key] = {
-            "key": key,
-            "principal": principal,
-            "operation": operation,
-            "request_hash": request_hash,
-            "created_at": time.time(),
-            "result": result,
-        }
+        with self._lock:
+            self._evict_expired()
+            self._entries[key] = {
+                "key": key,
+                "principal": principal,
+                "operation": operation,
+                "request_hash": request_hash,
+                "created_at": time.time(),
+                "result": result,
+            }
+            self._evict_oldest()
 
 
 # -- Input validation (D6) ---------------------------------------------------
@@ -262,6 +305,9 @@ MAX_CONTENT_LENGTH = 10000
 MAX_MEMORY_IDS = 50
 MAX_LIMIT = 50
 MIN_LIMIT = 1
+# AF7: limits for tags and payload in memory_propose.
+MAX_TAGS = 50
+MAX_PAYLOAD_BYTES = 4096
 
 # Client-controlled internal flags that are NEVER accepted from external
 # callers (D6). These are internal-only and must not be set by API clients.
@@ -324,11 +370,34 @@ def _validate_propose_params(params: Dict[str, Any]) -> Dict[str, Any]:
     category = str(params.get("category", "context_note")).strip()
     if not category:
         raise APIError("invalid_input", "category must not be empty")
+    # AF8: validate category against VALID_CATEGORIES (fail-fast).
+    if category not in VALID_CATEGORIES:
+        raise APIError(
+            "invalid_input",
+            f"category must be one of {sorted(VALID_CATEGORIES)}",
+        )
     cleaned["category"] = category
     # Optional fields.
     for opt_key in ("tags", "payload"):
         val = params.get(opt_key)
         if val is not None:
+            # AF7: validate types and sizes for tags and payload.
+            if opt_key == "tags":
+                if not isinstance(val, list):
+                    raise APIError("invalid_input", "tags must be a list")
+                if len(val) > MAX_TAGS:
+                    raise APIError(
+                        "request_too_large",
+                        f"tags exceeds max length {MAX_TAGS}",
+                    )
+            if opt_key == "payload":
+                if not isinstance(val, dict):
+                    raise APIError("invalid_input", "payload must be a dict")
+                if len(json.dumps(val)) > MAX_PAYLOAD_BYTES:
+                    raise APIError(
+                        "request_too_large",
+                        f"payload exceeds max size {MAX_PAYLOAD_BYTES} bytes",
+                    )
             cleaned[opt_key] = val
     # Reject forbidden client flags.
     for flag in FORBIDDEN_CLIENT_FLAGS:
@@ -616,6 +685,14 @@ class ArgosAPIFacade:
         a specific project_id within their allowed scope) but may never
         widen it. Any attempt to set user_id, tenant, or a wider scope
         than the credential allows is rejected with 403.
+
+        AF11: scope narrowing only activates when ``ctx.max_project_id``
+        or ``ctx.max_client_scope`` is not None. In the current REST
+        deployment, both are None (v1 single-user open scope), so
+        ``_enforce_identity`` does not narrow. This is correct for v1 —
+        scope enforcement requires credential-derived scopes (future
+        work, #129). The ``user_id`` and ``tenant`` checks are always
+        active regardless of scope settings.
         """
         cleaned = dict(params)
         # user_id: always server-derived. Client may not set it.
@@ -658,7 +735,16 @@ class ArgosAPIFacade:
     # -- Operation implementations -------------------------------------------
 
     def _op_search(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Read tier: search memories."""
+        """Read tier: search memories.
+
+        AF6: set the store's user scope to the caller's user_id before
+        searching, so results are scoped to the authenticated principal
+        (not the store's default ``default_user``). ``set_user_scope`` is
+        thread-local (#20), safe under the REST server's concurrency limiter.
+        """
+        # AF6: scope the search to the caller's user_id.
+        if hasattr(self._store, "set_user_scope"):
+            self._store.set_user_scope(ctx.user_id)
         results = self._store.search(
             query=params["query"],
             limit=params["limit"],
@@ -686,12 +772,37 @@ class ArgosAPIFacade:
             })
         return {"results": items, "count": len(items)}
 
+    def _scope_matches(self, ctx: AuthContext, record: Any) -> bool:
+        """AF1/AF2: check that a record is within the caller's ACL scope.
+
+        When ``max_project_id`` or ``max_client_scope`` is set on the
+        context, the record must match. When both are None (v1 open
+        scope), all records pass.
+        """
+        if ctx.max_project_id is not None:
+            rec_pid = getattr(record, "project_id", None)
+            if rec_pid is not None and rec_pid != ctx.max_project_id:
+                return False
+        if ctx.max_client_scope is not None:
+            rec_cs = getattr(record, "client_scope", None)
+            if rec_cs is not None and rec_cs != ctx.max_client_scope:
+                return False
+        return True
+
     def _op_fetch(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Read tier: fetch a single memory by ID."""
+        """Read tier: fetch a single memory by ID.
+
+        AF1: enforce ACL scope — the caller may only fetch memories
+        within their ``max_project_id`` / ``max_client_scope``.
+        """
         results = self._store.get_memories_by_ids([params["memory_id"]])
         if not results:
             raise APIError("not_found", "Memory not found.")
         r = results[0]
+        # AF1: scope check — return not_found if out of scope (don't leak
+        # existence to unauthorized callers).
+        if not self._scope_matches(ctx, r):
+            raise APIError("not_found", "Memory not found.")
         item = r.to_dict() if hasattr(r, "to_dict") else dict(r)
         return {
             "memory_id": item.get("memory_id"),
@@ -705,7 +816,18 @@ class ArgosAPIFacade:
         }
 
     def _op_fetch_history(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Read tier: fetch version history for a memory."""
+        """Read tier: fetch version history for a memory.
+
+        AF1: enforce ACL scope — history is only returned for memories
+        within the caller's scope.
+        """
+        # AF1: first fetch the current record to check scope. If the
+        # memory doesn't exist or is out of scope, return not_found.
+        current = self._store.get_memories_by_ids([params["memory_id"]])
+        if not current:
+            raise APIError("not_found", "Memory not found.")
+        if not self._scope_matches(ctx, current[0]):
+            raise APIError("not_found", "Memory not found.")
         history = self._store.get_memory_history(params["memory_id"])
         items = []
         for r in history:
@@ -740,8 +862,21 @@ class ArgosAPIFacade:
           transport = ctx.transport
           provenance_origin = "external"
           grounding = "extracted" (default; caller may not claim "observed")
+
+        AF10: the facade scans content with ``scan_inbound_text`` before
+        calling ``save_candidate``. The store also scans internally for
+        ``provenance_origin="external"`` (store_write.py). This double
+        scan is intentional defense-in-depth — the facade scan enables
+        early quarantine (before the candidate enters the review queue),
+        while the store scan is the authoritative boundary. The
+        redundancy is acceptable for v1; a future optimization can skip
+        the store-level scan when the facade has already quarantined.
         """
         content = params["content"]
+        # AF3: pass user_id from ctx to save_candidate so API-proposed
+        # memories are stored under the caller's user scope, not the
+        # store's default.
+        user_id = ctx.user_id
         # D9: scan inbound content for injection/poisoning patterns.
         # No weakening for "trusted" senders.
         scan_result = scan_inbound_text(content)
@@ -757,6 +892,7 @@ class ArgosAPIFacade:
                 scope="profile",
                 provenance_origin="external",
                 grounding="speculative",
+                user_id=user_id,  # AF3
             )
             if candidate and candidate.get("candidate_id"):
                 # Mark as quarantined with the injection reason.
@@ -784,6 +920,7 @@ class ArgosAPIFacade:
             scope="profile",
             provenance_origin="external",
             grounding="extracted",
+            user_id=user_id,  # AF3
         )
         return {
             "candidate_id": candidate.get("candidate_id") if candidate else None,
@@ -793,7 +930,18 @@ class ArgosAPIFacade:
     def _op_record_feedback(
         self, ctx: AuthContext, params: Dict[str, Any], idempotency_key: str | None,
     ) -> Dict[str, Any]:
-        """Feedback tier: record helpful/dismissed feedback on a memory."""
+        """Feedback tier: record helpful/dismissed feedback on a memory.
+
+        AF2: verify the caller has access to the memory before recording
+        feedback. An authenticated user should not be able to record
+        feedback on memories outside their ACL scope.
+        """
+        # AF2: fetch the memory first and check scope.
+        results = self._store.get_memories_by_ids([params["memory_id"]])
+        if not results:
+            raise APIError("not_found", "Memory not found.")
+        if not self._scope_matches(ctx, results[0]):
+            raise APIError("not_found", "Memory not found.")
         self._store.record_feedback(params["memory_id"], params["feedback"])
         return {"memory_id": params["memory_id"], "feedback": params["feedback"]}
 
@@ -817,6 +965,12 @@ class ArgosAPIFacade:
         default (the caller's query may contain personal/client data).
         The audit is operational access telemetry, not a governance-grade
         ledger (that's Themis's role).
+
+        AF9: for v1, audit events are log-only (INFO level). The
+        ``api_audit`` table is future work — the store-level
+        ``access_audit`` table (store_core.py) covers store-level audit.
+        Log rotation or process restart loses facade audit events. This
+        is an accepted v1 limitation.
         """
         # For v1, audit events are logged at INFO level. The access_audit
         # table (store_core.py) is the durable sink for store-level audit;

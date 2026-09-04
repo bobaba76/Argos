@@ -9,8 +9,8 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `storage_mode` | `shared_service` | `shared_service` (RPC service owns the DB, multi-process safe) or `direct` (plugin opens DuckDB directly, single-process; diagnostics only). |
-| `database_filename` | `hybrid_memory.duckdb` | DuckDB filename (in HERMES_HOME). |
-| `graph_dirname` | `hybrid_memory_kuzu` | Kùzu graph file base name (in HERMES_HOME). A single file, not a directory; a `.wal` sibling exists while the service holds the graph. |
+| `database_filename` | `hybrid_memory.duckdb` | DuckDB filename (in HERMES_HOME). Must be relative — no absolute path, drive letter, UNC prefix, or `..`; unsafe values fall back to the default. |
+| `graph_dirname` | `hybrid_memory_kuzu` | Kùzu graph file base name (in HERMES_HOME). A single file, not a directory; a `.wal` sibling exists while the service holds the graph. Same path rules as `database_filename`. |
 | `local_only` | `false` | Egress gate: restrict plugin-owned LLM calls (extraction, review, distillation, router sub-calls) to local-only models. |
 | `external_sources_require_confirmation` | `true` | Memory-safety gate: candidates tagged `external_source` (email/web/import) can never auto-activate — the reviewer short-circuits to `pending_user_confirmation` (no LLM call) and the store's `auto_review` transition is downgraded at the storage boundary. A human confirmation or a `manual`/`tool` review is required. Inbound scanning of external evidence runs regardless and always routes blocked content to pending. |
 
@@ -55,7 +55,7 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 | `graph_traversal_boost` | `0.60` | Boost strength for graph-traversal candidates. |
 | `alias_expansion_boost` | `0.7` | Similarity floor for alias-expanded candidates. |
 | `entity_aliases` | *(empty)* | JSON mapping of aliases → canonical entity names, e.g. `{"my role": "Entity-A"}`. |
-| `role_words` | *(empty)* | Extra role words for "my X is Name" alias extraction (comma-separated or JSON array). 40+ defaults built in; LLM-learned words auto-added. |
+| `role_words` | *(empty)* | Extra role words for "my X is Name" alias extraction. Canonical format is a JSON array of strings (`["wife", "boss"]`); a comma-separated string is accepted and rewritten to the array form. 40+ defaults built in; LLM-learned words auto-added. |
 
 ## Chains (version evolution)
 

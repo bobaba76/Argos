@@ -28,12 +28,14 @@ if __package__:
     from .graph import KuzuGraphStore
     from .store import DuckDBMemoryStore
     from .access_scoping import ACLConfig, filter_records_by_access
+    from .config_validation import storage_name_error
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from embeddings import LocalEmbedder
     from graph import KuzuGraphStore
     from store import DuckDBMemoryStore
     from access_scoping import ACLConfig, filter_records_by_access
+    from config_validation import storage_name_error
 
 logger = logging.getLogger("argos.service")
 _ENDPOINT_NAME = "hybrid_memory_service.json"
@@ -266,34 +268,9 @@ def _validate_tenant_name(name: str) -> None:
 
 def _validate_tenant_path(path: str, tenant_name: str, field: str) -> None:
     """Validate a tenant database/graph path: relative, no traversal."""
-    if not path:
-        raise ValueError(f"Tenant {tenant_name!r}: {field} is empty")
-    p = Path(path)
-    # Must be relative (no absolute paths). On Windows, Path.is_absolute()
-    # requires a drive letter, so also check for leading / or \.
-    if p.is_absolute() or path.startswith("/") or path.startswith("\\"):
-        raise ValueError(
-            f"Tenant {tenant_name!r}: {field}={path!r} must be relative to home, "
-            f"not absolute"
-        )
-    # No path traversal — no .. components.
-    parts = p.parts
-    if ".." in parts:
-        raise ValueError(
-            f"Tenant {tenant_name!r}: {field}={path!r} contains '..' "
-            f"(path traversal not allowed)"
-        )
-    # No Windows drive letters or UNC paths.
-    if len(path) >= 2 and path[1] == ":":
-        raise ValueError(
-            f"Tenant {tenant_name!r}: {field}={path!r} contains a drive letter "
-            f"(must be relative to home)"
-        )
-    if path.startswith("\\\\") or path.startswith("//"):
-        raise ValueError(
-            f"Tenant {tenant_name!r}: {field}={path!r} is a UNC path "
-            f"(must be relative to home)"
-        )
+    reason = storage_name_error(path)
+    if reason is not None:
+        raise ValueError(f"Tenant {tenant_name!r}: {field}={path!r} {reason}")
 
 
 def _parse_tenants(

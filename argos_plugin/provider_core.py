@@ -21,6 +21,13 @@ try:
     from .graph import KuzuGraphStore
     from .embeddings import LocalEmbedder, _resolve_embedding_model_path
     from .routing import resolve_storage_names
+    from .config_validation import (
+        deployment_consistency_error,
+        parse_positive_int_map,
+        parse_role_words,
+        parse_string_map,
+        safe_storage_name,
+    )
     from .service_client import SharedGraphStore, SharedMemoryStore
     from .reviewer import set_external_policy
     from .query_expander import QueryExpander
@@ -29,6 +36,13 @@ except ImportError:  # provider_core.py imported as a top-level module
     from graph import KuzuGraphStore
     from embeddings import LocalEmbedder, _resolve_embedding_model_path
     from routing import resolve_storage_names
+    from config_validation import (
+        deployment_consistency_error,
+        parse_positive_int_map,
+        parse_role_words,
+        parse_string_map,
+        safe_storage_name,
+    )
     from service_client import SharedGraphStore, SharedMemoryStore
     from reviewer import set_external_policy
     from query_expander import QueryExpander
@@ -600,8 +614,14 @@ class ProviderCoreMixin:
         self._config = _load_config(self._hermes_home)
         home = Path(self._hermes_home) if self._hermes_home else Path(os.path.expanduser("~/.hermes"))
 
-        db_filename = self._config.get("database_filename", "hybrid_memory.duckdb")
-        graph_dirname = self._config.get("graph_dirname", "hybrid_memory_kuzu")
+        db_filename = safe_storage_name(
+            self._config.get("database_filename", "hybrid_memory.duckdb"),
+            "database_filename", "hybrid_memory.duckdb",
+        )
+        graph_dirname = safe_storage_name(
+            self._config.get("graph_dirname", "hybrid_memory_kuzu"),
+            "graph_dirname", "hybrid_memory_kuzu",
+        )
 
         storage_mode = str(self._config.get("storage_mode", "shared_service")).lower()
         use_shared_service = storage_mode not in {"local", "direct"}
@@ -840,25 +860,17 @@ class ProviderCoreMixin:
             self._config.get("deployment_mode", "cloud_pilot")).strip()
         self._data_residency = str(
             self._config.get("data_residency", "cloud")).strip()
+        residency_error = deployment_consistency_error(
+            self._deployment_mode, self._data_residency
+        )
+        if residency_error:
+            logger.warning("Inconsistent deployment config: %s", residency_error)
         # Expiry config (Spec 1): TTL tiers / best-before dates.
         self._expiry_enabled = _flag(self._config, "expiry_enabled", "false")
-        # Parse the TTL map (JSON object of category→days). Fail-soft:
-        # fall back to the default on bad input, log a warning.
-        default_ttl = '{"context_note":30,"event":180,"goal":180}'
-        try:
-            ttl_raw = self._config.get("expiry_ttl_days", default_ttl)
-            if isinstance(ttl_raw, dict):
-                parsed_ttl = ttl_raw
-            else:
-                parsed_ttl = json.loads(str(ttl_raw))
-            self._expiry_ttl_days = {
-                str(k): max(1, int(v))
-                for k, v in parsed_ttl.items()
-                if isinstance(v, (int, float)) and int(v) > 0
-            }
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            logger.warning("expiry_ttl_days parse failed (%s); using default", exc)
-            self._expiry_ttl_days = {"context_note": 30, "event": 180, "goal": 180}
+        default_ttl = {"context_note": 30, "event": 180, "goal": 180}
+        self._expiry_ttl_days = parse_positive_int_map(
+            self._config.get("expiry_ttl_days"), "expiry_ttl_days", default_ttl,
+        )
         try:
             self._expiry_default_days = max(
                 1, min(int(self._config.get("expiry_default_days", 90)), 3650)
@@ -961,14 +973,10 @@ class ProviderCoreMixin:
         # _is_role_word() includes them. Defaults (therapist, accountant,
         # lawyer, etc.) are already in _DEFAULT_ROLE_WORDS; this adds any
         # user-configured extras and LLM-learned words persisted from prior
-        # sessions. Format: comma-separated string or JSON array.
-        role_words_cfg = str(self._config.get("role_words", "")).strip()
-        if role_words_cfg:
+        # sessions. Canonical format: JSON array (comma-separated accepted).
+        extra = parse_role_words(self._config.get("role_words", ""))
+        if extra:
             try:
-                if role_words_cfg.startswith("["):
-                    extra = json.loads(role_words_cfg)
-                else:
-                    extra = [w.strip() for w in role_words_cfg.split(",")]
                 from graph import _set_role_words_override, _get_role_words
                 _set_role_words_override(set(extra))
                 # Converge the extractor's role-word set with the graph's
@@ -1098,17 +1106,14 @@ class ProviderCoreMixin:
         # Must run AFTER store creation — issue #29 class bug: this block
         # was before self._store was assigned, so the `if aliases_json and
         # self._store:` guard was always False (dead code).
-        aliases_json = str(self._config.get("entity_aliases", "")).strip()
-        if aliases_json and self._store:
+        alias_map = parse_string_map(self._config.get("entity_aliases", ""), "entity_aliases")
+        if alias_map and self._store:
             try:
-                alias_map = json.loads(aliases_json)
-                if isinstance(alias_map, dict):
-                    for alias, canonical in alias_map.items():
-                        if isinstance(canonical, str):
-                            self._store.add_alias(alias, canonical)
-                    logger.info("Loaded %d entity aliases from config", len(alias_map))
+                for alias, canonical in alias_map.items():
+                    self._store.add_alias(alias, canonical)
+                logger.info("Loaded %d entity aliases from config", len(alias_map))
             except Exception as exc:
-                logger.warning("Failed to parse entity_aliases config: %s", exc)
+                logger.warning("Failed to load entity_aliases config: %s", exc)
 
         # #203: Load ACL config on the provider so the prefetch
         # defence-in-depth re-validation in provider_retrieval.py fires.

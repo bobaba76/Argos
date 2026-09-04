@@ -210,6 +210,9 @@ class TestPS10MemoryIdValidation:
     def test_valid_uuid_accepted(self):
         from provider_session import _valid_memory_id
         assert _valid_memory_id("12345678-1234-1234-1234-123456789abc")
+        # Also accept the store's internal format (mem-{32 hex}).
+        assert _valid_memory_id("mem-" + "a" * 32)
+        assert _valid_memory_id("cand-" + "b" * 32)
 
     def test_invalid_string_rejected(self):
         from provider_session import _valid_memory_id
@@ -217,6 +220,7 @@ class TestPS10MemoryIdValidation:
         assert not _valid_memory_id("")
         assert not _valid_memory_id("'; DROP TABLE memories; --")
         assert not _valid_memory_id("12345")  # too short
+        assert not _valid_memory_id("mem-short")  # not enough hex chars
 
     def test_validation_in_handle_tool_call(self):
         """PS10: handle_tool_call validates memory_id for memory_update."""

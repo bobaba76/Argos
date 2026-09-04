@@ -8,6 +8,8 @@ sibling form used by tests and the benchmark clone).
 from __future__ import annotations
 
 import re
+import html
+import unicodedata
 from typing import Any, Dict, List
 
 # English function words excluded from text-leg scoring. Kept deliberately
@@ -60,6 +62,47 @@ _HIDDEN_CHARS_RE = re.compile(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\u
 _FORMAT_SPACES_RE = re.compile(r"[\u2000-\u200a\u202f\u205f]")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
+# IS1: confusable homoglyph table for sanitize_content normalization.
+# Maps the most common Cyrillic/Greek lookalikes to ASCII so that
+# injection patterns like "ignorе previous" (Cyrillic е) are caught.
+# This mirrors the table in inbound_security._CONFUSABLE_TABLE; duplicated
+# here to avoid a circular import (inbound_security imports store_common).
+_CONFUSABLE_TABLE = str.maketrans({
+    # Cyrillic lookalikes
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p",
+    "\u0441": "c", "\u0445": "x", "\u0443": "y", "\u043a": "k",
+    "\u043c": "m", "\u0442": "t", "\u0438": "u", "\u0432": "b",
+    "\u043d": "h", "\u0433": "r", "\u0448": "w", "\u0449": "w",
+    "\u044a": "'", "\u044c": "'", "\u044d": "e",
+    # Greek lookalikes
+    "\u03b1": "a", "\u03bf": "o", "\u03c1": "p", "\u03c4": "t",
+    "\u03b5": "e", "\u03b9": "i", "\u03bd": "v", "\u03b7": "n",
+    "\u03ba": "k", "\u03bc": "m", "\u03be": "x", "\u03bf": "o",
+})
+
+
+def _normalize_for_injection_scan(text: str) -> str:
+    """IS1: normalize text before injection-pattern scanning.
+
+    Applies the same pipeline as inbound_security._normalize_for_scan:
+    HTML unescape, zero-width replacement, confusable mapping, NFKD.
+    This catches entity-encoded and homoglyph-evaded injection attempts
+    in conversation-derived content (not just external content).
+    """
+    if not text:
+        return ""
+    # 1. Decode HTML entities (handles named, decimal, and hex).
+    result = html.unescape(text)
+    # 2. Replace zero-width characters with a space.
+    result = re.sub(r"[\u200B\u200C\u200D\uFEFF]", " ", result)
+    # 3. Map confusable homoglyphs to ASCII.
+    result = result.translate(_CONFUSABLE_TABLE)
+    # 4. NFKD normalization.
+    result = unicodedata.normalize("NFKD", result)
+    # 5. Collapse whitespace.
+    result = re.sub(r"[ \t]+", " ", result)
+    return result
+
 # (compiled pattern, human label). First match wins; the label is stored in
 # quarantine_reason / raised in ValueError messages for audit. All patterns
 # are case-insensitive — payloads arrive in any casing.
@@ -88,14 +131,23 @@ def sanitize_content(content: str) -> tuple:
     (white-on-white PDF footers, invisible CJK joiners, BOMs). A non-None
     label means callers must refuse (direct saves/updates) or quarantine
     (proposals) — never store the text as active memory.
+
+    IS1: the injection check now runs on a normalized copy of the text
+    (HTML unescape + confusable mapping + NFKD) so that entity-encoded
+    and homoglyph-evaded injection attempts are caught in conversation-
+    derived content, not just external content. The returned cleaned
+    text is still the original (minus hidden/format/control chars) so
+    the stored content is not mangled by normalization.
     """
     if not content:
         return content, None
     clean = _HIDDEN_CHARS_RE.sub("", content)
     clean = _FORMAT_SPACES_RE.sub(" ", clean)
     clean = _CONTROL_CHARS_RE.sub("", clean)
+    # IS1: scan a normalized copy so evasion techniques are caught.
+    scan_text = _normalize_for_injection_scan(clean)
     for pattern, label in _INJECTION_PATTERNS:
-        if pattern.search(clean):
+        if pattern.search(scan_text):
             return clean, label
     return clean, None
 

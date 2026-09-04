@@ -778,6 +778,9 @@ class ArgosAPIFacade:
         When ``max_project_id`` or ``max_client_scope`` is set on the
         context, the record must match. When both are None (v1 open
         scope), all records pass.
+
+        R1: also checks ``namespace`` when set on the context, closing
+        the fetch authorization bypass for namespace-scoped records.
         """
         if ctx.max_project_id is not None:
             rec_pid = getattr(record, "project_id", None)
@@ -786,6 +789,12 @@ class ArgosAPIFacade:
         if ctx.max_client_scope is not None:
             rec_cs = getattr(record, "client_scope", None)
             if rec_cs is not None and rec_cs != ctx.max_client_scope:
+                return False
+        # R1: namespace scope check.
+        max_ns = getattr(ctx, "max_namespace", None)
+        if max_ns is not None:
+            rec_ns = getattr(record, "namespace", None)
+            if rec_ns is not None and rec_ns != max_ns:
                 return False
         return True
 

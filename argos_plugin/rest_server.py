@@ -32,19 +32,18 @@ They must not be the same value.
 """
 from __future__ import annotations
 
-import hashlib
 import hmac
 import logging
 import os
+import sys
 import threading
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, conint, constr
+from pydantic import BaseModel, conint, constr
 
 from api_facade import (
     APIError,
@@ -73,7 +72,8 @@ class SearchRequest(BaseModel):
     model_config = {"extra": "forbid"}
     query: constr(min_length=1, max_length=MAX_QUERY_LENGTH)
     limit: conint(ge=1, le=50) = 10
-    category_filter: Optional[str] = None
+    # R8: cap category_filter length to prevent wasteful large strings.
+    category_filter: Optional[constr(max_length=100)] = None
     # No project_id, client_scope, namespace, user_id, tenant — those
     # are server-derived from the credential. The facade enforces this.
 
@@ -149,7 +149,9 @@ class RESTAuth:
                     "request_id": request_id,
                 }},
             )
-        if not authorization.startswith("Bearer "):
+        # R6: RFC 7235 says the scheme is case-insensitive. Accept
+        # "Bearer", "bearer", "BEARER", etc.
+        if not authorization[:7].lower() == "bearer ":
             raise HTTPException(
                 status_code=401,
                 detail={"error": {
@@ -243,12 +245,21 @@ def create_app(
     @app.middleware("http")
     async def _middleware(request: Request, call_next):
         # Body size check (before reading).
+        # R2: guard against non-numeric Content-Length (return 400, not 500).
         cl = request.headers.get("content-length")
-        if cl and int(cl) > DEFAULT_MAX_BODY_BYTES:
-            return _error_response(
-                "request_too_large", "Request body exceeds limit.",
-                str(uuid.uuid4()), 413,
-            )
+        if cl:
+            try:
+                cl_int = int(cl)
+            except ValueError:
+                return _error_response(
+                    "malformed_request", "Invalid Content-Length header.",
+                    str(uuid.uuid4()), 400,
+                )
+            if cl_int > DEFAULT_MAX_BODY_BYTES:
+                return _error_response(
+                    "request_too_large", "Request body exceeds limit.",
+                    str(uuid.uuid4()), 413,
+                )
         # Concurrency check.
         if not limiter.acquire():
             return _error_response(
@@ -266,6 +277,9 @@ def create_app(
             origin = request.headers.get("origin", "")
             if origin in origins:
                 response.headers["Access-Control-Allow-Origin"] = origin
+                # R7: Vary: Origin prevents cache poisoning when the CORS
+                # header is set conditionally.
+                response.headers["Vary"] = "Origin"
         return response
 
     # -- Error handler for APIError ------------------------------------------
@@ -275,6 +289,18 @@ def create_app(
         status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
         return _error_response(
             exc.code, exc.message, exc.request_id, status, exc.details,
+        )
+
+    # R4: catch-all exception handler — non-APIError exceptions return a
+    # stable error envelope (code + request_id) instead of FastAPI's default
+    # {"detail": "Internal Server Error"} with no request_id. Never leaks
+    # a traceback to the client (D7 design goal).
+    @app.exception_handler(Exception)
+    async def _catch_all(request: Request, exc: Exception):
+        request_id = str(uuid.uuid4())
+        logger.exception("Unhandled error (request_id=%s): %s", request_id, exc)
+        return _error_response(
+            "internal_error", "Internal server error.", request_id, 500,
         )
 
     # -- Liveness: GET /v1/health --------------------------------------------
@@ -294,6 +320,11 @@ def create_app(
         Readiness is NEVER "healthy" if the first search would trigger
         a model load. This means the embedding model must be loaded
         before readiness returns ok.
+
+        R5: returns only {"status": "ok"} / {"status": "not_ready"}
+        without component details — internal state (e.g. "acl": "error")
+        should not be visible to unauthenticated callers. Component
+        details are available via the authenticated admin endpoint.
         """
         if readiness_probe is not None:
             probe = readiness_probe()
@@ -302,18 +333,14 @@ def create_app(
         # If any critical component is not ready, return 503.
         critical = ["store", "acl", "embedding"]
         all_ready = all(probe.get(k) == "ok" for k in critical)
-        # Graph can be degraded (available-or-degraded).
-        graph_status = probe.get("graph", "ok")
         if not all_ready:
             return JSONResponse(
                 status_code=503,
-                content={"status": "not_ready", "components": probe},
+                content={"status": "not_ready"},
                 headers={"Cache-Control": "no-store"},
             )
         return {
             "status": "ok",
-            "components": probe,
-            "graph": graph_status,
         }
 
     # -- Capabilities: GET /v1/capabilities ----------------------------------
@@ -460,5 +487,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import sys
     main()

@@ -48,7 +48,11 @@ def test_sensitive_identifier_blocks_conversation_kinds():
 
 
 def test_store_kinds_ignore_sensitive_identifier_gate():
-    cfg = {}
+    # E3: the per-site flag is now enforced in gate(), so distillation
+    # (default OFF) must be explicitly enabled here to isolate the test's
+    # original intent: the sensitive-identifier gate does not apply to
+    # store-derived kinds.
+    cfg = {"distillation_enabled": "true", "llm_fallback": "true"}
     for kind in ("graph_typing", "distillation"):
         assert gate(kind, SENSITIVE, cfg) is True
 

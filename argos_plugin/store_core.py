@@ -76,14 +76,26 @@ class StoreCoreMixin:
         return "being used by another process" in msg or "cannot access the file" in msg
 
     def _connect(self) -> None:
+        self._read_only = False
         try:
             self.connection = duckdb.connect(str(self.db_path))
         except Exception as exc:
             if self._is_lock_error(exc):
-                logger.warning("DuckDB locked by another process; opening read-only")
+                # SC1: track read-only state and log ERROR (not WARNING) —
+                # writes will fail with confusing DuckDB errors without this.
+                logger.error(
+                    "DuckDB locked by another process; opening read-only. "
+                    "All write operations (remember, save_candidate, etc.) "
+                    "will fail until the lock is released."
+                )
+                self._read_only = True
                 self.connection = duckdb.connect(str(self.db_path), read_only=True)
             else:
                 raise
+
+    def is_read_only(self) -> bool:
+        """SC1: returns True if the store was opened in read-only fallback mode."""
+        return self._read_only
 
     def _init_db(self) -> None:
         assert self.connection is not None
@@ -337,6 +349,12 @@ class StoreCoreMixin:
             except Exception as exc:
                 logger.warning("Evidence schema migration (candidate_id) failed: %s", exc)
 
+            # SC6: wrap backfill UPDATEs in a transaction for atomicity.
+            # The backfills are idempotent (WHERE ... IS NULL), but a
+            # transaction makes the atomicity explicit — a crash mid-backfill
+            # rolls back the partial state instead of leaving it inconsistent.
+            if not self._read_only:
+                self.connection.execute("BEGIN TRANSACTION")
             try:
                 # One-time: link pre-existing evidence rows (written before the
                 # column existed) back to their source candidate.
@@ -348,10 +366,6 @@ class StoreCoreMixin:
                       AND e.source_session_id = c.session_id
                       AND e.source_timestamp = c.source_timestamp
                 """)
-            except Exception as exc:
-                logger.warning("Evidence candidate_id backfill failed: %s", exc)
-
-            try:
                 self.connection.execute("""
                     UPDATE memory_records
                     SET source = COALESCE(
@@ -373,45 +387,25 @@ class StoreCoreMixin:
                         helpful_count = COALESCE(helpful_count, 0),
                         dismissed_count = COALESCE(dismissed_count, 0)
                 """)
-            except Exception as exc:
-                logger.warning("Memory metadata backfill failed: %s", exc)
-
-            # Retroactive temporal-validity migration: every existing memory
-            # gets valid_from = created_at. valid_to stays NULL (current).
-            # This runs once on databases that predate the versioning feature.
-            try:
+                # Retroactive temporal-validity migration: every existing memory
+                # gets valid_from = created_at. valid_to stays NULL (current).
                 self.connection.execute("""
                     UPDATE memory_records
                     SET valid_from = COALESCE(valid_from, created_at)
                     WHERE valid_from IS NULL
                 """)
-            except Exception as exc:
-                logger.warning("Temporal validity backfill failed: %s", exc)
-
-            # user_scope column backfill (NULL stays NULL = legacy global scope).
-            try:
                 self.connection.execute("""
                     UPDATE memory_records
                     SET user_scope = json_extract_string(payload, '$.user_scope')
                     WHERE user_scope IS NULL
                       AND json_extract_string(payload, '$.user_scope') IS NOT NULL
                 """)
-            except Exception as exc:
-                logger.warning("user_scope backfill failed: %s", exc)
-            try:
                 self.connection.execute("""
                     UPDATE memory_candidates
                     SET user_scope = json_extract_string(payload, '$.user_scope')
                     WHERE user_scope IS NULL
                       AND json_extract_string(payload, '$.user_scope') IS NOT NULL
                 """)
-            except Exception as exc:
-                logger.warning("candidate user_scope backfill failed: %s", exc)
-
-            # Provenance-origin backfill (#43): derive the taint label from the
-            # payload's external_source flag for pre-existing records. Fails
-            # closed — anything not clearly internal becomes external.
-            try:
                 self.connection.execute("""
                     UPDATE memory_records
                     SET provenance_origin = CASE
@@ -423,9 +417,6 @@ class StoreCoreMixin:
                         ELSE 'internal'
                     END
                 """)
-            except Exception as exc:
-                logger.warning("provenance_origin backfill failed: %s", exc)
-            try:
                 self.connection.execute("""
                     UPDATE memory_candidates
                     SET provenance_origin = CASE
@@ -437,14 +428,6 @@ class StoreCoreMixin:
                         ELSE 'internal'
                     END
                 """)
-            except Exception as exc:
-                logger.warning("candidate provenance_origin backfill failed: %s", exc)
-
-            # Grounding backfill (#40): derive from the write-path source for
-            # pre-existing records. Distill-derived and external-origin records
-            # ground as inferred; llm_extraction as extracted; explicit/user as
-            # observed. Anything unresolved stays speculative (strictest).
-            try:
                 self.connection.execute("""
                     UPDATE memory_records
                     SET grounding = CASE
@@ -457,9 +440,6 @@ class StoreCoreMixin:
                         ELSE 'speculative'
                     END
                 """)
-            except Exception as exc:
-                logger.warning("grounding backfill failed: %s", exc)
-            try:
                 self.connection.execute("""
                     UPDATE memory_candidates
                     SET grounding = CASE
@@ -472,8 +452,15 @@ class StoreCoreMixin:
                         ELSE 'extracted'
                     END
                 """)
+                if not self._read_only:
+                    self.connection.execute("COMMIT")
             except Exception as exc:
-                logger.warning("candidate grounding backfill failed: %s", exc)
+                if not self._read_only:
+                    try:
+                        self.connection.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                logger.warning("Backfill transaction failed (rolled back): %s", exc)
             # Composite index: scope → status → validity.
             try:
                 self.connection.execute("""
@@ -497,6 +484,7 @@ class StoreCoreMixin:
             # Spec-06 (#69): append-only access audit log. Every query and
             # every deny writes a row. Exportable via the service API.
             # Principals-only read; rotates on a configurable window.
+            # SC2: rotation is now implemented via _purge_access_audit.
             try:
                 self.connection.execute("""
                     CREATE TABLE IF NOT EXISTS access_audit (
@@ -513,6 +501,13 @@ class StoreCoreMixin:
                 """)
             except Exception as exc:
                 logger.warning("access_audit table creation failed: %s", exc)
+
+            # SC2: purge old access_audit rows on startup (keep latest 100k).
+            if not self._read_only:
+                try:
+                    self._purge_access_audit(max_rows=100000)
+                except Exception as exc:
+                    logger.warning("access_audit purge failed: %s", exc)
 
             # Spec-09 (#112): form-level identity — layout_family column on
             # file_catalog. Additive migration for DBs that predate the
@@ -573,7 +568,14 @@ class StoreCoreMixin:
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return parsed.isoformat()
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError) as exc:
+            # SC7: log a warning so the operator can see the dropped
+            # timestamp. The silent-drop behavior can lead to subtle data
+            # quality issues (e.g. valid_from = None breaks temporal queries).
+            logger.warning(
+                "Unparseable timestamp %r dropped (returned None): %s",
+                ts, exc,
+            )
             return None
 
     @staticmethod
@@ -592,21 +594,62 @@ class StoreCoreMixin:
                 ref = datetime.now(timezone.utc)
             return exp <= ref
         except (ValueError, TypeError, AttributeError) as exc:
-            # #80: fail loud — a date-only or unparseable expires_at must
-            # not be silently treated as "never expires". Log the warning so
-            # the broken value is visible; return False only because there is
-            # no valid expiry to enforce (the record is treated as non-
-            # expiring, but the operator can see the bad data in logs).
+            # SC4: fail-safe — an unparseable expires_at is treated as
+            # expired (return True) rather than non-expiring (return False).
+            # The old behavior (return False) meant broken timestamps caused
+            # sensitive memories to never expire. The safe side is to expire.
             logger.warning(
-                "Unparseable expires_at %r (at=%r): %s — treating as no "
-                "expiry. Normalize timestamps at the write boundary.",
+                "Unparseable expires_at %r (at=%r): %s — treating as "
+                "expired (fail-safe). Normalize timestamps at the write "
+                "boundary to prevent this.",
                 expires_at, at, exc,
             )
-            return False
+            return True
 
-    def _matches_scope(self, payload: dict) -> bool:
-        scope = payload.get("user_scope")
+    def _matches_scope(self, payload: dict | object) -> bool:
+        """Check whether a record belongs to the current user's scope.
+
+        SC5: accepts either a dict (legacy) or a MemoryRecord. When given
+        a MemoryRecord, checks the ``user_scope`` column attribute (the
+        SQL-level filter's source of truth) rather than the payload JSON
+        (which could diverge from the column after a migration).
+        """
+        # SC5: prefer the record's user_scope attribute over payload dict.
+        scope = getattr(payload, "user_scope", None)
+        if scope is None and isinstance(payload, dict):
+            scope = payload.get("user_scope")
         if scope is None:
             return True  # global memory
         return scope == self.user_id
+
+    def _purge_access_audit(self, max_rows: int = 100000) -> int:
+        """SC2: purge old access_audit rows, keeping only the latest *max_rows*.
+
+        Called on startup to prevent unbounded growth. Returns the number
+        of rows deleted.
+        """
+        try:
+            with self._lock:
+                assert self.connection is not None
+                count = self.connection.execute(
+                    "SELECT COUNT(*) FROM access_audit"
+                ).fetchone()
+                if not count or count[0] <= max_rows:
+                    return 0
+                # Delete the oldest rows beyond max_rows.
+                result = self.connection.execute(
+                    f"""DELETE FROM access_audit
+                        WHERE audit_id NOT IN (
+                            SELECT audit_id FROM access_audit
+                            ORDER BY ts DESC
+                            LIMIT {int(max_rows)}
+                        )"""
+                )
+                deleted = int(result.fetchone()[0]) if result else 0
+                if deleted:
+                    logger.info("access_audit purged %d old rows (kept %d)", deleted, max_rows)
+                return deleted
+        except Exception as exc:
+            logger.warning("access_audit purge failed: %s", exc)
+            return 0
 

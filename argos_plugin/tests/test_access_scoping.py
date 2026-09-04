@@ -376,7 +376,9 @@ class TestAccessAudit:
             "FROM access_audit"
         ).fetchone()
         assert result[0] == "alice"
-        assert result[1] == "what is acme's VAT number?"
+        # SC3: query_text is now hashed (SHA-256, 16 chars), not raw.
+        assert result[1] != "what is acme's VAT number?"
+        assert len(result[1]) == 16
         assert result[2] == 3
         assert result[3] == 1
         assert result[4] is True

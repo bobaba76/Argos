@@ -371,3 +371,176 @@ class TestSC6CloseIsNoOp:
         """SharedGraphStore.close() should return None (no-op)."""
         store = service_client.SharedGraphStore.__new__(service_client.SharedGraphStore)
         assert store.close() is None
+
+
+# ---------------------------------------------------------------------------
+# MS1-MS10: Memory service audit fixes (#224)
+# ---------------------------------------------------------------------------
+
+class TestMS1SanitizeArgs:
+    """MS1: strip server-set fields from client-supplied args."""
+
+    def test_ms1_strips_provenance_origin(self):
+        assert "provenance_origin" not in memory_service._sanitize_args(
+            {"content": "test", "provenance_origin": "internal"}
+        )
+
+    def test_ms1_strips_grounding(self):
+        assert "grounding" not in memory_service._sanitize_args(
+            {"content": "test", "grounding": "observed"}
+        )
+
+    def test_ms1_strips_status(self):
+        assert "status" not in memory_service._sanitize_args(
+            {"content": "test", "status": "active"}
+        )
+
+    def test_ms1_strips_source(self):
+        assert "source" not in memory_service._sanitize_args(
+            {"content": "test", "source": "internal"}
+        )
+
+    def test_ms1_strips_user_scope(self):
+        assert "user_scope" not in memory_service._sanitize_args(
+            {"content": "test", "user_scope": "other-user"}
+        )
+
+    def test_ms1_strips_confidence(self):
+        assert "confidence" not in memory_service._sanitize_args(
+            {"content": "test", "confidence": 1.0}
+        )
+
+    def test_ms1_strips_review_mode(self):
+        assert "review_mode" not in memory_service._sanitize_args(
+            {"content": "test", "review_mode": "auto"}
+        )
+
+    def test_ms1_preserves_valid_args(self):
+        cleaned = memory_service._sanitize_args(
+            {"content": "test", "category": "personal_fact", "tags": ["a"]}
+        )
+        assert cleaned == {"content": "test", "category": "personal_fact", "tags": ["a"]}
+
+    def test_ms1_non_dict_returns_empty(self):
+        assert memory_service._sanitize_args(None) == {}
+        assert memory_service._sanitize_args("not-a-dict") == {}
+
+
+class TestMS2ForbiddenMethods:
+    """MS2: destructive methods are forbidden on the RPC boundary."""
+
+    def test_ms2_forbidden_store_methods_defined(self):
+        assert "delete_memory" in memory_service._FORBIDDEN_STORE_METHODS
+        assert "quarantine_memory" in memory_service._FORBIDDEN_STORE_METHODS
+        assert "cleanup_junk" in memory_service._FORBIDDEN_STORE_METHODS
+        assert "consolidate" in memory_service._FORBIDDEN_STORE_METHODS
+        assert "purge_tombstone" in memory_service._FORBIDDEN_STORE_METHODS
+        assert "mark_superseded" in memory_service._FORBIDDEN_STORE_METHODS
+
+    def test_ms2_set_state_forbidden(self):
+        """MS7: set_state is forbidden on the RPC boundary."""
+        assert "set_state" in memory_service._FORBIDDEN_STORE_METHODS
+
+    def test_ms2_forbidden_graph_methods_defined(self):
+        assert "clear_scope" in memory_service._FORBIDDEN_GRAPH_METHODS
+
+    def test_ms2_delete_memory_rejected_in_dispatch(self, tmp_path):
+        """MS2: calling delete_memory via dispatch raises PermissionError."""
+        service = memory_service.MemoryService.__new__(memory_service.MemoryService)
+        service._credential_mode = False
+        service._strict_routing = False
+        service._user_tenant_map = {}
+        # Need a dummy tenant for _resolve_tenant to succeed before the
+        # forbidden methods check runs.
+        dummy = type("DummyTenant", (), {"store_lock": threading.RLock(), "graph_lock": threading.RLock()})()
+        service._tenants = {"default": dummy}
+        service._default_tenant = "default"
+        service._lock_wait_total_s = 0.0
+        service._lock_wait_count = 0
+        service.server = None
+        with pytest.raises(PermissionError):
+            service.dispatch({
+                "component": "store",
+                "method": "delete_memory",
+                "args": {"memory_id": "m1"},
+                "user_id": "default_user",
+            })
+
+    def test_ms2_set_state_rejected_in_dispatch(self, tmp_path):
+        """MS7: calling set_state via dispatch raises PermissionError."""
+        service = memory_service.MemoryService.__new__(memory_service.MemoryService)
+        service._credential_mode = False
+        service._strict_routing = False
+        service._user_tenant_map = {}
+        dummy = type("DummyTenant", (), {"store_lock": threading.RLock(), "graph_lock": threading.RLock()})()
+        service._tenants = {"default": dummy}
+        service._default_tenant = "default"
+        service._lock_wait_total_s = 0.0
+        service._lock_wait_count = 0
+        service.server = None
+        with pytest.raises(PermissionError):
+            service.dispatch({
+                "component": "store",
+                "method": "set_state",
+                "args": {"key": "k", "value": "v"},
+                "user_id": "default_user",
+            })
+
+
+class TestMS4NoTracebackLeak:
+    """MS4: error responses must not include traceback."""
+
+    def test_ms4_no_traceback_import_needed(self):
+        """MS4: the traceback module should not be imported (unused after fix)."""
+        source = Path(memory_service.__file__).read_text(encoding="utf-8")
+        # Should not have "import traceback" as an active import
+        assert "import traceback" not in source, (
+            "traceback import should be removed (MS4)"
+        )
+
+    def test_ms4_error_envelope_no_traceback_field(self):
+        """MS4: the _write method should not include a traceback field."""
+        source = Path(memory_service.__file__).read_text(encoding="utf-8")
+        # The error response should not contain "traceback" as a key
+        # (it may appear in comments explaining what was removed).
+        # Check the _RequestHandler.handle method doesn't write traceback.
+        assert '"traceback"' not in source, (
+            "Error response should not include a traceback field (MS4)"
+        )
+
+
+class TestMS6ResponseSizeLimit:
+    """MS6: response size limit prevents unbounded memory."""
+
+    def test_ms6_max_response_bytes_defined(self):
+        assert hasattr(memory_service, "_MAX_RESPONSE_BYTES")
+        assert memory_service._MAX_RESPONSE_BYTES > 0
+
+    def test_ms6_response_too_large_error(self):
+        """MS6: _write should return a ResponseTooLarge error for oversized data."""
+        class FakeWriteFile:
+            def __init__(self):
+                self.written = []
+            def write(self, data):
+                self.written.append(data)
+            def flush(self):
+                pass
+
+        handler = memory_service._RequestHandler.__new__(memory_service._RequestHandler)
+        handler.wfile = FakeWriteFile()
+        # Create a response that exceeds the limit.
+        huge_value = {"ok": True, "result": "x" * (memory_service._MAX_RESPONSE_BYTES + 1)}
+        handler._write(huge_value)
+        # The written data should be an error, not the huge response.
+        assert len(handler.wfile.written) == 1
+        response = json.loads(handler.wfile.written[0].decode("utf-8"))
+        assert response["ok"] is False
+        assert response["error_class"] == "ResponseTooLarge"
+
+
+class TestMS8ProbeSizeCap:
+    """MS8: single-instance guard probe has a size cap."""
+
+    def test_ms8_probe_max_bytes_defined(self):
+        assert hasattr(memory_service, "_PROBE_MAX_BYTES")
+        assert memory_service._PROBE_MAX_BYTES > 0

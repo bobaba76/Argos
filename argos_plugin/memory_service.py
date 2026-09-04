@@ -19,7 +19,6 @@ import socketserver
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +37,55 @@ else:
 logger = logging.getLogger("argos.service")
 _ENDPOINT_NAME = "hybrid_memory_service.json"
 _MAX_REQUEST_BYTES = 4 * 1024 * 1024
+# MS6: response size limit — prevents unbounded memory from large responses.
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024  # 16 MB
+# MS8: single-instance guard probe read cap.
+_PROBE_MAX_BYTES = 65536
+
+# MS1/MS9: server-set fields that clients may NOT inject via **args.
+# These are stripped from client-supplied args before passing to the store
+# or graph. The facade (api_facade.py) already strips these — the RPC
+# service must too, since it's a separate trust boundary.
+_FORBIDDEN_CLIENT_ARGS = frozenset({
+    "provenance_origin",
+    "grounding",
+    "status",
+    "source",
+    "user_scope",
+    "confidence",
+    "review_mode",  # policy is server-derived (#127)
+})
+
+# MS2: destructive/admin methods forbidden on the RPC boundary (same as
+# the facade's FORBIDDEN_OPERATIONS). Any local process with the endpoint
+# token should NOT be able to call these.
+_FORBIDDEN_STORE_METHODS = frozenset({
+    "delete_memory",
+    "quarantine_memory",
+    "restore_memory",
+    "cleanup_junk",
+    "consolidate",
+    "purge_tombstone",
+    "mark_superseded",
+    "set_state",  # MS7: system state corruption risk
+})
+
+_FORBIDDEN_GRAPH_METHODS = frozenset({
+    "clear_scope",
+})
+
+
+def _sanitize_args(args: dict) -> dict:
+    """MS1/MS9: strip server-set fields from client-supplied args.
+
+    The RPC service is a trust boundary — clients can send arbitrary keys
+    in ``args``. Fields like ``provenance_origin``, ``grounding``,
+    ``status``, ``source``, ``user_scope``, ``confidence``, and
+    ``review_mode`` are server-set and must not be injectable.
+    """
+    if not isinstance(args, dict):
+        return {}
+    return {k: v for k, v in args.items() if k not in _FORBIDDEN_CLIENT_ARGS}
 
 
 def _load_config(home: Path) -> dict:
@@ -554,9 +602,11 @@ class MemoryService:
                 records = visible
             return [_record_to_dict(record) for record in records]
         if method == "remember":
-            return _record_to_dict(store.remember(**args))
+            # MS1: strip server-set fields from client args.
+            return _record_to_dict(store.remember(**_sanitize_args(args)))
         if method == "update_memory":
-            return _record_to_dict(store.update_memory(**args))
+            # MS1: strip server-set fields from client args.
+            return _record_to_dict(store.update_memory(**_sanitize_args(args)))
         if method == "get_memories_by_ids":
             records = store.get_memories_by_ids(
                 args.get("memory_ids", []),
@@ -578,7 +628,8 @@ class MemoryService:
                 records = visible
             return [_record_to_dict(record) for record in records]
         if method == "save_candidate":
-            return store.save_candidate(**args)
+            # MS1: strip server-set fields from client args.
+            return store.save_candidate(**_sanitize_args(args))
         if method == "find_semantic_duplicate":
             return _record_to_dict(
                 store.find_semantic_duplicate(
@@ -795,11 +846,14 @@ class MemoryService:
                 limit=int(args.get("limit", 100)),
             )
         if method == "add_relationship":
-            return graph.add_relationship(**args)
+            # MS9: strip server-set fields from client args.
+            return graph.add_relationship(**_sanitize_args(args))
         if method == "index_memory":
-            return graph.index_memory(**args)
+            # MS9: strip server-set fields from client args.
+            return graph.index_memory(**_sanitize_args(args))
         if method == "remove_memory":
-            return graph.remove_memory(**args)
+            # MS9: strip server-set fields from client args.
+            return graph.remove_memory(**_sanitize_args(args))
         if method == "quarantine_junk_entities":
             return graph.quarantine_junk_entities()
         if method == "clear_scope":
@@ -815,15 +869,41 @@ class MemoryService:
                 "lock_wait_count": self._lock_wait_count,
             }
         if request.get("method") == "get_status":
+            # MS3: in credential mode, require a valid credential.
+            # MS5: restrict status to the caller's tenant only.
+            caller_tenant = None
+            if self._credential_mode:
+                credential = str(request.get("credential") or "")
+                if not credential:
+                    raise PermissionError(
+                        "Credential required for get_status in multi-user mode"
+                    )
+                cred_hash = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+                matched = None
+                for stored_hash, (cred_tenant, cred_user) in self._credential_map.items():
+                    if hmac.compare_digest(cred_hash, stored_hash):
+                        matched = (cred_tenant, cred_user)
+                        break
+                if matched is None:
+                    raise PermissionError(
+                        "Authentication failed: invalid or revoked credential"
+                    )
+                caller_tenant = matched[0]
             # #147: return a config fingerprint + runtime info so clients
             # can detect staleness (service running old config/code vs disk).
             # #127: include per-tenant policy summaries.
             config = _load_config(self.home)
             config_str = json.dumps(config, sort_keys=True)
             config_hash = hashlib.sha256(config_str.encode("utf-8")).hexdigest()[:16]
+            # MS5: in credential mode, restrict to the caller's tenant.
+            visible_tenants = (
+                {caller_tenant: self._tenants[caller_tenant]}
+                if caller_tenant and caller_tenant in self._tenants
+                else self._tenants
+            )
             tenant_policies = {
                 name: t.policy.to_dict()
-                for name, t in self._tenants.items()
+                for name, t in visible_tenants.items()
             }
             tenant_acl_status = {
                 name: {
@@ -832,7 +912,7 @@ class MemoryService:
                     "role_count": len(t.acl.roles),
                     "user_count": len(t.acl.user_roles),
                 }
-                for name, t in self._tenants.items()
+                for name, t in visible_tenants.items()
             }
             # #130: Per-tenant cell info — resolved paths, identity mode.
             # No secrets or personal data leaked.
@@ -852,7 +932,7 @@ class MemoryService:
                     "acl_enforcement": t.acl.enforcement_on,
                     "review_mode": t.policy.review_mode,
                 }
-                for name, t in self._tenants.items()
+                for name, t in visible_tenants.items()
             }
             return {
                 "status": "ok",
@@ -878,6 +958,26 @@ class MemoryService:
                 "lock_wait_count": self._lock_wait_count,
             }
         if request.get("method") == "shutdown":
+            # MS3: in credential mode, require a valid credential.
+            # shutdown is an admin operation — any client with the shared
+            # service token should not be able to shut down a multi-user
+            # service.
+            if self._credential_mode:
+                credential = str(request.get("credential") or "")
+                if not credential:
+                    raise PermissionError(
+                        "Credential required for shutdown in multi-user mode"
+                    )
+                cred_hash = hashlib.sha256(credential.encode("utf-8")).hexdigest()
+                matched = None
+                for stored_hash, (cred_tenant, cred_user) in self._credential_map.items():
+                    if hmac.compare_digest(cred_hash, stored_hash):
+                        matched = (cred_tenant, cred_user)
+                        break
+                if matched is None:
+                    raise PermissionError(
+                        "Authentication failed: invalid or revoked credential"
+                    )
             if self.server is not None:
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             return {"status": "shutting_down"}
@@ -975,6 +1075,20 @@ class MemoryService:
             tenant = self._resolve_tenant(user_id)
         if component not in {"store", "graph"} or not isinstance(method, str):
             raise ValueError("Invalid service request")
+        # MS2/MS7: operation allowlist — forbid destructive/admin methods
+        # on the RPC boundary (same as the facade's FORBIDDEN_OPERATIONS).
+        # Any local process with the endpoint token should NOT be able to
+        # delete memories, purge tombstones, corrupt system state, etc.
+        if component == "store" and method in _FORBIDDEN_STORE_METHODS:
+            raise PermissionError(
+                f"Method {method!r} is not available on the RPC boundary "
+                f"(destructive/admin operation). Use the facade or CLI."
+            )
+        if component == "graph" and method in _FORBIDDEN_GRAPH_METHODS:
+            raise PermissionError(
+                f"Method {method!r} is not available on the RPC boundary "
+                f"(destructive graph operation)."
+            )
         t0 = time.monotonic()
         # Per-tenant locks (#20 + #49): store and graph calls run
         # concurrently, and one tenant's long operation never blocks
@@ -998,6 +1112,14 @@ class MemoryService:
         BK8: only the CHECKPOINT + EXPORT phase holds the store lock; the
         verify + manifest + prune phase runs outside it so a large backup
         doesn't block the tenant's reads/writes for its whole duration.
+
+        MS10: the backup config (dst_root, retention) is reloaded from
+        disk on every call via ``_load_config``. This means if the config
+        file changes between startup and backup, the backup could use
+        different settings than the service was started with. This is an
+        accepted v1 behavior — it allows runtime config changes without
+        a service restart. For strict consistency, cache the config at
+        startup (future work).
         """
         if __package__:
             from .backup import _export_for_backup, _finalize_backup, list_snapshots
@@ -1078,17 +1200,16 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 result = server.memory_service.dispatch(request)
                 self._write({"ok": True, "result": result})
             except Exception as exc:
-                # Error envelope (#20): carry the error class + a short
-                # traceback so clients can distinguish failure kinds; log
-                # the full traceback server-side (diagnostics are silent
-                # today — the client only ever sees str(exc)).
+                # MS4: do NOT send traceback to the client — it could
+                # contain file paths, SQL queries, internal variable names,
+                # or secrets in stack frames. The full traceback is already
+                # logged server-side (exc_info=True). The error_class and
+                # str(exc) are sufficient for client-side error handling.
                 logger.warning("Memory service request failed: %s", exc, exc_info=True)
-                tb = traceback.format_exc(limit=6)
                 self._write({
                     "ok": False,
                     "error": str(exc),
                     "error_class": type(exc).__name__,
-                    "traceback": tb[-1200:],
                 })
         finally:
             with server.in_flight_lock:
@@ -1096,6 +1217,20 @@ class _RequestHandler(socketserver.StreamRequestHandler):
 
     def _write(self, value: dict) -> None:
         data = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
+        # MS6: response size limit — prevent unbounded memory from large
+        # responses (e.g. list_recent with a high limit). If the serialized
+        # response exceeds _MAX_RESPONSE_BYTES, return an error instead.
+        if len(data) > _MAX_RESPONSE_BYTES:
+            error_data = (
+                json.dumps({
+                    "ok": False,
+                    "error": f"Response exceeds max size {_MAX_RESPONSE_BYTES} bytes",
+                    "error_class": "ResponseTooLarge",
+                }) + "\n"
+            ).encode("utf-8")
+            self.wfile.write(error_data)
+            self.wfile.flush()
+            return
         self.wfile.write(data)
         self.wfile.flush()
 
@@ -1163,6 +1298,10 @@ def serve(home: Path, port: int = 0) -> None:
                 if not chunk:
                     break
                 _resp += chunk
+                # MS8: cap the probe response size to prevent memory
+                # exhaustion from a rogue endpoint.
+                if len(_resp) > _PROBE_MAX_BYTES:
+                    break
             probe_sock.close()
             if _resp and json.loads(_resp.splitlines()[0]).get("ok"):
                 logger.info("Shared memory service already running; exiting 0.")

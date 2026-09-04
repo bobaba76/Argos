@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import types
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -308,7 +309,8 @@ def load_config() -> dict:
         # briefly so we don't re-stat on every call).
         cfg: dict = {}
         _apply_env_overrides(cfg)
-        return cfg
+        # EG1: return an immutable view so callers can't mutate the cache.
+        return types.MappingProxyType(cfg)
     path_str = str(found_path)
     try:
         mtime = found_path.stat().st_mtime
@@ -325,10 +327,13 @@ def load_config() -> dict:
         logger.debug("egress: could not read %s", found_path, exc_info=True)
         cfg = {}
     _apply_env_overrides(cfg)
-    _config_cache = cfg
+    # EG1: wrap in MappingProxyType so callers get a read-only view.
+    # One mutating caller could otherwise poison every subsequent gate
+    # decision (e.g. flipping local_only or a site flag with no error).
+    _config_cache = types.MappingProxyType(cfg)
     _config_cache_mtime = mtime
     _config_cache_path = path_str
-    return cfg
+    return _config_cache
 
 
 def _apply_env_overrides(cfg: dict) -> None:

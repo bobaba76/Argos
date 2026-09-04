@@ -667,8 +667,12 @@ def extract_doc_facts_llm(
         from egress import gate as _egress_gate
         if not _egress_gate("watcher_extraction", text):
             return []
-    except Exception:
-        pass  # egress gate unavailable — fail soft
+    except Exception as exc:
+        # WT3: fail-closed — if the egress gate itself is unavailable
+        # (config-load bug, import error), refuse to send text to the LLM.
+        # This matches SW7's fail-closed doctrine on security boundaries.
+        logger.error("egress gate unavailable — refusing watcher extraction: %s", exc)
+        return []
 
     try:
         from agent.auxiliary_client import call_llm

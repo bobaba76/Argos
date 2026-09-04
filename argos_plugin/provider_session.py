@@ -1633,10 +1633,14 @@ class ProviderSessionMixin:
     # -- shutdown ------------------------------------------------------------
 
     def shutdown(self) -> None:
-        # #10: stop the stale-review sweep thread.
+        # #10: stop the stale-review sweep thread and join it so it
+        # doesn't access the store after we close it.
         sweep = getattr(self, "_stale_sweep_thread", None)
         if sweep:
             sweep.stop()
+            sweep_thread = getattr(sweep, "_thread", None)
+            if sweep_thread and sweep_thread.is_alive():
+                sweep_thread.join(timeout=2.0)
         # Signal the sync worker to stop and wait for it.
         try:
             self._sync_queue.put_nowait(None)

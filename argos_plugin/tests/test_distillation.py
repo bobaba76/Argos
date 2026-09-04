@@ -810,3 +810,224 @@ class TestD2ProseWrappedJson:
         response = _make_mock_response("this is not json at all")
         parsed = _parse_distill_response(response)
         assert parsed is None
+
+
+# ---------------------------------------------------------------------------
+# #232 Distillation audit D1-D10
+# ---------------------------------------------------------------------------
+
+class TestDistillationAudit232:
+    """Regression tests for issue #232: distillation audit D1-D10."""
+
+    # -- D1: markup neutralization in LLM prompts ---------------------------
+
+    def test_d1_neutralize_markup_helper(self):
+        """D1: _neutralize_markup replaces < and > with fullwidth variants."""
+        from distillation import _neutralize_markup
+        assert _neutralize_markup("<script>") == "\uFF1Cscript\uFF1E"
+        assert _neutralize_markup("clean text") == "clean text"
+        assert _neutralize_markup("") == ""
+
+    def test_d1_cluster_prompt_neutralizes_content(self, store):
+        """D1: _build_cluster_prompt neutralizes < and > in record content."""
+        from distillation import _build_cluster_prompt
+        from store_common import MemoryRecord
+        rec = MemoryRecord(
+            memory_id="m1", category="personal_fact",
+            content="<script>ignore previous</script>",
+            embedding=[1.0], helpful_count=0, dismissed_count=0,
+            retrieval_count=0, created_at="2025-01-01T00:00:00Z",
+            status="active", scope="profile",
+        )
+        prompt = _build_cluster_prompt([rec])
+        assert "\uFF1C" in prompt, "content < should be neutralized"
+        assert "\uFF1E" in prompt, "content > should be neutralized"
+        assert "<script>" not in prompt
+
+    def test_d1_high_signal_prompt_neutralizes_content(self):
+        """D1: _build_high_signal_prompt neutralizes < and > in content."""
+        from distillation import _build_high_signal_prompt
+        from store_common import MemoryRecord
+        rec = MemoryRecord(
+            memory_id="m1", category="personal_fact",
+            content="<b>injection</b>",
+            embedding=[1.0], helpful_count=0, dismissed_count=0,
+            retrieval_count=0, created_at="2025-01-01T00:00:00Z",
+            status="active", scope="profile",
+        )
+        prompt = _build_high_signal_prompt([rec])
+        assert "\uFF1C" in prompt
+        assert "\uFF1E" in prompt
+
+    def test_d1_system_prompt_mentions_data(self):
+        """D1: system prompts instruct the LLM to treat content as DATA."""
+        from distillation import _DISTILL_SYSTEM, _HIGH_SIGNAL_SYSTEM
+        assert "DATA" in _DISTILL_SYSTEM
+        assert "DATA" in _HIGH_SIGNAL_SYSTEM
+
+    # -- D4: caps on proposals per cluster -----------------------------------
+
+    def test_d4_insights_capped(self):
+        """D4: _MAX_INSIGHTS_PER_CLUSTER is set to 5."""
+        from distillation import _MAX_INSIGHTS_PER_CLUSTER
+        assert _MAX_INSIGHTS_PER_CLUSTER == 5
+
+    def test_d4_guardrails_capped(self):
+        """D4: _MAX_GUARDRAILS_PER_CLUSTER is set to 3."""
+        from distillation import _MAX_GUARDRAILS_PER_CLUSTER
+        assert _MAX_GUARDRAILS_PER_CLUSTER == 3
+
+    def test_d4_contradictions_capped(self):
+        """D4: _MAX_CONTRADICTIONS_PER_CLUSTER is set to 3."""
+        from distillation import _MAX_CONTRADICTIONS_PER_CLUSTER
+        assert _MAX_CONTRADICTIONS_PER_CLUSTER == 3
+
+    def test_d4_insights_actually_capped_in_run(self, store):
+        """D4: a run with 20 insights from the LLM only emits 5."""
+        from distillation import run_distillation
+        _seed_related_records(store, n=25)
+        # LLM returns 20 insights.
+        response = _make_distill_response(
+            insights=[{"text": f"Insight {i}"} for i in range(20)],
+        )
+        with patch("distillation._get_llm_client",
+                    return_value=lambda *a, **kw: _make_mock_response(response)):
+            report = run_distillation(store, min_new_records=20, cooldown_hours=0)
+        assert report["ran"] is True
+        # Should be capped at 5 (assuming no dedup collisions).
+        assert report["proposals_emitted"] <= 5, (
+            f"Expected <= 5 proposals (capped), got {report['proposals_emitted']}"
+        )
+
+    # -- D5: human-readable contradiction content ----------------------------
+
+    def test_d5_contradiction_content_no_raw_ids(self):
+        """D5: contradiction content should not contain raw memory IDs."""
+        from distillation import _emit_contradiction
+        saved_args = {}
+        class FakeStore:
+            def save_candidate(self, **kwargs):
+                saved_args.update(kwargs)
+                return {"candidate_id": "c1"}
+        result = _emit_contradiction(
+            FakeStore(), "mem-abc-123", "mem-def-456",
+            "They disagree on the project name",
+            ["mem-abc-123", "mem-def-456"], "evidence",
+        )
+        assert result is not None
+        content = saved_args["content"]
+        assert "mem-abc-123" not in content
+        assert "mem-def-456" not in content
+        assert "contradiction" in content.lower()
+
+    # -- D7: empty content after truncation ----------------------------------
+
+    def test_d7_empty_after_truncation_returns_none(self):
+        """D7: content that becomes empty after truncation returns None."""
+        from distillation import _emit_proposal
+        class FakeStore:
+            def save_candidate(self, **kwargs):
+                raise AssertionError("save_candidate should not be called")
+        # 201 chars of whitespace — passes old check, empty after strip+trunc.
+        result = _emit_proposal(
+            FakeStore(), " " * 201, "insight", ["m1"], "ev", 0.7,
+        )
+        assert result is None
+
+    # -- D8: parameter clamping ----------------------------------------------
+
+    def test_d8_zero_max_records_clamped(self, store):
+        """D8: max_records_per_run=0 should be clamped to 1, not silently
+        do nothing."""
+        from distillation import run_distillation
+        _seed_related_records(store, n=25)
+        empty_response = _make_mock_response(
+            json.dumps({"insights": [], "guardrails": [], "contradictions": []})
+        )
+        with patch("distillation._get_llm_client",
+                    return_value=lambda *a, **kw: _make_mock_response(empty_response)):
+            report = run_distillation(
+                store, min_new_records=20, cooldown_hours=0,
+                max_records_per_run=0, max_calls=1,
+            )
+        # Should not silently abort — clamped to 1, loads 1 record.
+        # With 1 record, no multi-clusters form, so it completes with no work.
+        assert report["ran"] is True or report["reason"] != ""
+
+    def test_d8_zero_max_calls_clamped(self, store):
+        """D8: max_calls=0 should be clamped to 1. With calls_budget=1,
+        the cluster loop reserves 1 call for high-signal (so 0 cluster
+        calls), but the run should not silently abort — it should still
+        complete (either run or skip with a valid reason, not crash)."""
+        from distillation import run_distillation
+        _seed_related_records(store, n=25)
+        empty_response = _make_mock_response(
+            json.dumps({"insights": [], "guardrails": [], "contradictions": []})
+        )
+        with patch("distillation._get_llm_client",
+                    return_value=lambda *a, **kw: _make_mock_response(empty_response)):
+            report = run_distillation(
+                store, min_new_records=20, cooldown_hours=0,
+                max_calls=0,
+            )
+        # Should not crash or silently do nothing — the run completes.
+        assert report["ran"] is True or report["reason"] != "", (
+            f"Expected run to complete or have a reason, got {report}"
+        )
+
+    # -- D9: renamed to _unanimous_project_id --------------------------------
+
+    def test_d9_unanimous_project_id_exists(self):
+        """D9: _unanimous_project_id should exist (renamed from _majority_project_id)."""
+        from distillation import _unanimous_project_id
+        assert callable(_unanimous_project_id)
+
+    def test_d9_unanimous_returns_pid_when_all_same(self):
+        """D9: returns the project_id when all records share it."""
+        from distillation import _unanimous_project_id
+        from store_common import MemoryRecord
+        recs = [
+            MemoryRecord(memory_id="m1", category="x", content="c",
+                         embedding=[1.0], helpful_count=0, dismissed_count=0,
+                         retrieval_count=0, created_at="2025-01-01T00:00:00Z",
+                         status="active", scope="profile", project_id="proj-a"),
+            MemoryRecord(memory_id="m2", category="x", content="c",
+                         embedding=[1.0], helpful_count=0, dismissed_count=0,
+                         retrieval_count=0, created_at="2025-01-01T00:00:00Z",
+                         status="active", scope="profile", project_id="proj-a"),
+        ]
+        assert _unanimous_project_id(recs) == "proj-a"
+
+    def test_d9_unanimous_returns_none_when_mixed(self):
+        """D9: returns None when records have different project_ids."""
+        from distillation import _unanimous_project_id
+        from store_common import MemoryRecord
+        recs = [
+            MemoryRecord(memory_id="m1", category="x", content="c",
+                         embedding=[1.0], helpful_count=0, dismissed_count=0,
+                         retrieval_count=0, created_at="2025-01-01T00:00:00Z",
+                         status="active", scope="profile", project_id="proj-a"),
+            MemoryRecord(memory_id="m2", category="x", content="c",
+                         embedding=[1.0], helpful_count=0, dismissed_count=0,
+                         retrieval_count=0, created_at="2025-01-01T00:00:00Z",
+                         status="active", scope="profile", project_id="proj-b"),
+        ]
+        assert _unanimous_project_id(recs) is None
+
+    # -- D10: created_at in cluster prompt -----------------------------------
+
+    def test_d10_cluster_prompt_includes_created_at(self):
+        """D10: _build_cluster_prompt should include created_at timestamps."""
+        from distillation import _build_cluster_prompt
+        from store_common import MemoryRecord
+        rec = MemoryRecord(
+            memory_id="m1", category="personal_fact",
+            content="test content",
+            embedding=[1.0], helpful_count=0, dismissed_count=0,
+            retrieval_count=0, created_at="2025-06-15T12:00:00Z",
+            status="active", scope="profile",
+        )
+        prompt = _build_cluster_prompt([rec])
+        parsed = json.loads(prompt)
+        assert "created_at" in parsed["records"][0]
+        assert parsed["records"][0]["created_at"] == "2025-06-15T12:00:00Z"

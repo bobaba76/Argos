@@ -154,7 +154,7 @@ def test_review_candidate_refuses_approval_of_flagged_content(tmp_path):
 
     cid = f"cand-{uuid.uuid4().hex}"
     now = datetime.now(timezone.utc).isoformat()
-    with store._lock:
+    with store._state.lock:
         store.connection.execute(
             """INSERT INTO memory_candidates
               (candidate_id, category, content, tags, payload, source,

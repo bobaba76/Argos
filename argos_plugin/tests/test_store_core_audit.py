@@ -45,10 +45,10 @@ class TestSC1ReadOnlyTracking:
         assert store.is_read_only() is False
 
     def test_connect_sets_read_only_flag(self):
-        """SC1: _connect sets self._read_only in the fallback branch."""
+        """SC1: _connect sets self._state.read_only in the fallback branch."""
         from store_core import StoreCoreMixin as DuckDBMemoryStore
         src = inspect.getsource(DuckDBMemoryStore._connect)
-        assert "_read_only" in src
+        assert "read_only" in src
         assert "logger.error" in src  # SC1: ERROR, not WARNING
 
 
@@ -80,7 +80,7 @@ class TestSC2AccessAuditRotation:
         deleted = store._purge_access_audit(max_rows=2)
         assert deleted == 3
         # Verify only 2 remain.
-        with store._lock:
+        with store._state.lock:
             count = store.connection.execute(
                 "SELECT COUNT(*) FROM access_audit"
             ).fetchone()
@@ -106,7 +106,7 @@ class TestSC3QueryTextHashed:
             user_id="alice", query_text="sensitive search query",
             granted_count=1, denied_count=0,
         )
-        with store._lock:
+        with store._state.lock:
             row = store.connection.execute(
                 "SELECT query_text FROM access_audit LIMIT 1"
             ).fetchone()

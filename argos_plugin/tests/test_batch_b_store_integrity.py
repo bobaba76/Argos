@@ -87,7 +87,7 @@ class TestDeleteMemoryPromoteTransaction:
             assert result["action"] == "promoted"
             assert result["promoted_memory_id"] == old_mem.memory_id
             # Old should be current again (valid_to IS NULL).
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT valid_to FROM memory_records WHERE memory_id = ?",
                     [old_mem.memory_id],
@@ -144,7 +144,7 @@ class TestDeleteMemoryPromoteTransaction:
             # After rollback: the head (new) should still be current, and
             # the predecessor (old) should still be superseded (valid_to set)
             # — NOT promoted. No two active versions.
-            with store._lock:
+            with store._state.lock:
                 rows = store.connection.execute(
                     """SELECT memory_id, valid_to FROM memory_records
                        WHERE memory_id IN (?, ?)
@@ -251,7 +251,7 @@ class TestResolveConflictGuards:
                 content="accuracy on the test set is 89.8 percent",
             )
             # Patch the candidate's payload to point at the other user's mem.
-            with store._lock:
+            with store._state.lock:
                 store.connection.execute(
                     """UPDATE memory_candidates
                        SET payload = ?
@@ -266,7 +266,7 @@ class TestResolveConflictGuards:
                 cand["candidate_id"], "keep_new", reason="cross-scope",
             )
             # The other user's memory should NOT be superseded.
-            with other_store._lock:
+            with other_store._state.lock:
                 row = other_store.connection.execute(
                     "SELECT valid_to FROM memory_records WHERE memory_id = ?",
                     [other_mem.memory_id],
@@ -290,7 +290,7 @@ class TestResolveConflictGuards:
                 category="personal_fact",
                 content="accuracy on the test set is 89.8 percent",
             )
-            with store._lock:
+            with store._state.lock:
                 store.connection.execute(
                     """UPDATE memory_candidates
                        SET payload = ?
@@ -304,7 +304,7 @@ class TestResolveConflictGuards:
             store.resolve_conflict(
                 cand["candidate_id"], "remove_both", reason="cross-scope",
             )
-            with other_store._lock:
+            with other_store._state.lock:
                 row = other_store.connection.execute(
                     "SELECT valid_to FROM memory_records WHERE memory_id = ?",
                     [other_mem.memory_id],

@@ -35,7 +35,7 @@ class StoreMaintenanceMixin:
         if not alias or not canonical:
             return
         now = self._now()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             self.connection.execute(
                 """INSERT OR REPLACE INTO entity_aliases
@@ -43,13 +43,13 @@ class StoreMaintenanceMixin:
                    VALUES (?, ?, ?, ?)""",
                 [alias, canonical.lower(), self.user_id, now],
             )
-            self._alias_cache = None  # Invalidate cache on write
+            self._state.alias_cache = None  # Invalidate cache on write
 
     def remove_alias(self, alias: str, canonical_entity: str | None = None) -> bool:
         """Remove an alias mapping. If canonical_entity is None, removes all
         mappings for that alias."""
         alias = alias.strip().lower()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             if canonical_entity:
                 canonical = canonical_entity.strip().lower()
@@ -64,7 +64,7 @@ class StoreMaintenanceMixin:
                        WHERE alias = ? AND user_scope = ?""",
                     [alias, self.user_id],
                 )
-            self._alias_cache = None  # Invalidate cache on write
+            self._state.alias_cache = None  # Invalidate cache on write
             return True
 
     def resolve_aliases(self, text: str) -> List[str]:
@@ -80,16 +80,16 @@ class StoreMaintenanceMixin:
         if not text:
             return []
         text_lower = text.lower()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
-            if self._alias_cache is None:
+            if self._state.alias_cache is None:
                 rows = self.connection.execute(
                     """SELECT alias, canonical_entity FROM entity_aliases
                        WHERE user_scope = ?""",
                     [self.user_id],
                 ).fetchall()
-                self._alias_cache = [(r[0], r[1]) for r in rows]
-            aliases = self._alias_cache
+                self._state.alias_cache = [(r[0], r[1]) for r in rows]
+            aliases = self._state.alias_cache
         canonicals: set[str] = set()
         for alias, canonical in aliases:
             if alias and alias in text_lower:
@@ -98,7 +98,7 @@ class StoreMaintenanceMixin:
 
     def list_aliases(self) -> List[Dict[str, str]]:
         """List all alias mappings for this user."""
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT alias, canonical_entity FROM entity_aliases
@@ -117,7 +117,7 @@ class StoreMaintenanceMixin:
         canonical = canonical_entity.strip().lower()
         if not canonical:
             return []
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT alias FROM entity_aliases
@@ -221,7 +221,7 @@ class StoreMaintenanceMixin:
 
     def count(self) -> int:
         """Count current (non-superseded) memories for this user."""
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             result = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
@@ -646,7 +646,7 @@ class StoreMaintenanceMixin:
         now_iso = now.isoformat()
         soon_iso = (now + timedelta(days=7)).isoformat()
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 expired_count = int(self.connection.execute(
                     """SELECT COUNT(*) FROM memory_records
@@ -921,7 +921,7 @@ class StoreMaintenanceMixin:
         exempt_set = {c.lower() for c in exempt_categories}
         now = datetime.now(timezone.utc)
         cutoff_iso = (now - timedelta(days=max(1, archive_after_days))).isoformat()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # Build the exempt clause dynamically.
             if exempt_set:
@@ -970,7 +970,7 @@ class StoreMaintenanceMixin:
         Also callable directly. Returns True if the record was archived
         and is now revived, False if it was already active or not found.
         """
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             row = self.connection.execute(
                 "SELECT tier FROM memory_records WHERE memory_id = ?"
@@ -1006,7 +1006,7 @@ class StoreMaintenanceMixin:
         cat_set = {c.lower() for c in categories}
         now = datetime.now(timezone.utc)
         cutoff_iso = (now - timedelta(days=max(1, forget_after_days))).isoformat()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             placeholders = ", ".join(["?" for _ in cat_set])
             rows = self.connection.execute(
@@ -1102,7 +1102,7 @@ class StoreMaintenanceMixin:
             logger.warning("get_state: key %r not in allowlist (SM9)", key)
             return None
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 row = self.connection.execute(
                     "SELECT value FROM system_state WHERE key = ?", [key],
@@ -1120,7 +1120,7 @@ class StoreMaintenanceMixin:
             logger.warning("set_state: key %r not in allowlist (SM2)", key)
             return
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute(
                     """INSERT INTO system_state (key, value) VALUES (?, ?)
@@ -1155,7 +1155,7 @@ class StoreMaintenanceMixin:
             + " AND ".join(conditions)
         )
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 row = self.connection.execute(sql, params).fetchone()
             return int(row[0]) if row else 0
@@ -1242,7 +1242,7 @@ class StoreMaintenanceMixin:
             + " AND ".join(conditions)
         )
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 row = self.connection.execute(sql, params).fetchone()
             return int(row[0]) if row else 0
@@ -1277,7 +1277,7 @@ class StoreMaintenanceMixin:
                 embedder._ensure_loaded()
             if hasattr(embedder, "is_available") and not embedder.is_available:
                 return 0
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT memory_id, content FROM memory_records
@@ -1299,7 +1299,7 @@ class StoreMaintenanceMixin:
                 vecs = embedder.embed_batch(texts)
             else:
                 vecs = [embedder.embed(t) for t in texts]
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 for (memory_id, _content), vec in zip(chunk, vecs):
                     if not vec:
@@ -1322,7 +1322,7 @@ class StoreMaintenanceMixin:
         return updated
 
     def close(self) -> None:
-        with self._lock:
+        with self._state.lock:
             conn = getattr(self, "connection", None)
             if conn is None:
                 return

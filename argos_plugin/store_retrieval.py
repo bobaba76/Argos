@@ -93,7 +93,7 @@ class StoreRetrievalMixin:
     def _fetch_records(
         self, query: str, params: list | None = None, sim_col: str = ""
     ) -> List[MemoryRecord]:
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             result = self.connection.execute(query, params or [])
             columns = [desc[0] for desc in result.description]
@@ -819,7 +819,7 @@ class StoreRetrievalMixin:
         now = self._now()
         ids = [record.memory_id for record in records]
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 # Single batched UPDATE (was a per-ID loop: 96 round-trips ->
                 # 1). Measured 2026-08-22: the loop cost 0.5-1.3s on a 96-row
@@ -901,9 +901,10 @@ class StoreRetrievalMixin:
         """
         _t0 = time.perf_counter()
         try:
-            retriever = getattr(self, "_retriever", None)
+            retriever = self._state.retriever
             if retriever is None:
-                retriever = self._retriever = DuckDBRetriever(self)
+                retriever = DuckDBRetriever(self)
+                self._state.retriever = retriever
             return retriever.search(query, *args, **kwargs)
         finally:
             self._record_scale_metric(time.perf_counter() - _t0)
@@ -917,32 +918,32 @@ class StoreRetrievalMixin:
         threshold that was exceeded, not a vague "slow".
         """
         try:
-            self._scale_latencies.append(elapsed_s * 1000.0)
-            self._scale_queries += 1
+            self._state.scale_latencies.append(elapsed_s * 1000.0)
+            self._state.scale_queries += 1
             # Sample the record count every 25 queries (COUNT(*) on every
             # query would add overhead we're trying to measure).
-            if self._scale_queries - self._scale_last_count_check >= 25:
-                self._scale_last_count_check = self._scale_queries
+            if self._state.scale_queries - self._state.scale_last_count_check >= 25:
+                self._state.scale_last_count_check = self._state.scale_queries
                 try:
-                    self._scale_record_count = int(self.count())
+                    self._state.scale_record_count = int(self.count())
                 except Exception:
                     pass
-            n = len(self._scale_latencies)
+            n = len(self._state.scale_latencies)
             if n < 5:
                 return  # too few samples to be meaningful
-            avg_ms = sum(self._scale_latencies) / n
-            p95_ms = sorted(self._scale_latencies)[int(n * 0.95) - 1]
-            over_latency = p95_ms > self._scale_warn_latency_ms
-            over_count = (self._scale_record_count or 0) > self._scale_warn_records
+            avg_ms = sum(self._state.scale_latencies) / n
+            p95_ms = sorted(self._state.scale_latencies)[int(n * 0.95) - 1]
+            over_latency = p95_ms > self._state.scale_warn_latency_ms
+            over_count = (self._state.scale_record_count or 0) > self._state.scale_warn_records
             if over_latency or over_count:
-                self._scale_warnings_fired += 1
+                self._state.scale_warnings_fired += 1
                 logger.warning(
                     "ARGOS_SCALE: p95=%.0fms avg=%.0fms (warn>%.0fms) "
                     "records=%s (warn>%s) — if this persists, enable ANN/BM25 "
                     "indexing or fact-family consolidation per the scaling "
                     "roadmap (trigger: %s)",
-                    p95_ms, avg_ms, self._scale_warn_latency_ms,
-                    self._scale_record_count, self._scale_warn_records,
+                    p95_ms, avg_ms, self._state.scale_warn_latency_ms,
+                    self._state.scale_record_count, self._state.scale_warn_records,
                     "latency" if over_latency else "corpus-size",
                 )
         except Exception:
@@ -950,28 +951,28 @@ class StoreRetrievalMixin:
 
     def set_scale_thresholds(self, warn_latency_ms: float, warn_records: int) -> None:
         """Configure the scale-trigger thresholds (from the provider config)."""
-        self._scale_warn_latency_ms = float(warn_latency_ms)
-        self._scale_warn_records = int(warn_records)
+        self._state.scale_warn_latency_ms = float(warn_latency_ms)
+        self._state.scale_warn_records = int(warn_records)
 
     def get_scale_metrics(self) -> Dict[str, Any]:
         """Return current scale-trigger state (for dashboards/handoffs)."""
-        n = len(self._scale_latencies)
-        p95 = sorted(self._scale_latencies)[int(n * 0.95) - 1] if n >= 5 else 0.0
+        n = len(self._state.scale_latencies)
+        p95 = sorted(self._state.scale_latencies)[int(n * 0.95) - 1] if n >= 5 else 0.0
         return {
-            "queries_measured": self._scale_queries,
+            "queries_measured": self._state.scale_queries,
             "window": n,
-            "avg_latency_ms": round(sum(self._scale_latencies) / n, 1) if n else 0.0,
+            "avg_latency_ms": round(sum(self._state.scale_latencies) / n, 1) if n else 0.0,
             "p95_latency_ms": round(p95, 1),
-            "max_latency_ms": round(max(self._scale_latencies), 1) if n else 0.0,
-            "record_count": self._scale_record_count,
-            "warnings_fired": self._scale_warnings_fired,
-            "warn_latency_ms": self._scale_warn_latency_ms,
-            "warn_records": self._scale_warn_records,
+            "max_latency_ms": round(max(self._state.scale_latencies), 1) if n else 0.0,
+            "record_count": self._state.scale_record_count,
+            "warnings_fired": self._state.scale_warnings_fired,
+            "warn_latency_ms": self._state.scale_warn_latency_ms,
+            "warn_records": self._state.scale_warn_records,
         }
 
     def set_retriever(self, retriever: Any) -> None:
         """Swap the retrieval engine (advanced; must match the protocol)."""
-        self._retriever = retriever
+        self._state.retriever = retriever
 
     def _hybrid_search(
         self,
@@ -1277,7 +1278,7 @@ class StoreRetrievalMixin:
         scope_sql, scope_params = self._doc_identity_scope_clause(
             namespace, client_scope, doc_class, source_doc_id,
         )
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # Layer 1: exact match (only against current versions).
             result = self.connection.execute(
@@ -1393,7 +1394,7 @@ class StoreRetrievalMixin:
         if _qt:
             _qt = hashlib.sha256(_qt.encode("utf-8")).hexdigest()[:16]
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute(
                     """INSERT INTO access_audit
@@ -1430,7 +1431,7 @@ class StoreRetrievalMixin:
         audit leak.
         """
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     """SELECT audit_id, ts, tenant, user_id, query_text,
@@ -1503,7 +1504,7 @@ class StoreRetrievalMixin:
         scan pass for new and changed files."""
         now = self._now()
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute(
                     """INSERT INTO file_catalog
@@ -1546,7 +1547,7 @@ class StoreRetrievalMixin:
         """Record an alias path for a known file_id (move/rename detection)."""
         now = self._now()
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute(
                     """INSERT OR IGNORE INTO file_aliases
@@ -1566,7 +1567,7 @@ class StoreRetrievalMixin:
         """
         now = self._now()
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute(
                     "UPDATE file_catalog SET status = 'tombstoned', last_seen = ? "
@@ -1601,7 +1602,7 @@ class StoreRetrievalMixin:
             scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
             params.append(client_scope)
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     f"SELECT * FROM file_catalog WHERE file_id = ?{scope_clause}",
@@ -1631,7 +1632,7 @@ class StoreRetrievalMixin:
             scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
             params.append(client_scope)
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     f"SELECT * FROM file_catalog WHERE canonical_path = ?{scope_clause}",
@@ -1661,7 +1662,7 @@ class StoreRetrievalMixin:
         where = " AND ".join(conditions)
         params.append(max(1, min(int(limit), 10000)))
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     f"SELECT * FROM file_catalog WHERE {where} "
@@ -1689,7 +1690,7 @@ class StoreRetrievalMixin:
         params: list = [layout_family, status]
         params.append(max(1, min(int(limit), 10000)))
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     "SELECT * FROM file_catalog "
@@ -1732,7 +1733,7 @@ class StoreRetrievalMixin:
             params.append(until)
         where = " AND ".join(conditions)
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     f"""SELECT category, status, reviewed_at, review_reason,
@@ -1773,7 +1774,7 @@ class StoreRetrievalMixin:
             params.append(until)
         where = " WHERE " + " AND ".join(conditions)
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     f"""SELECT subject, predicate, user_scope, reason, created_at
@@ -1808,7 +1809,7 @@ class StoreRetrievalMixin:
         placeholders = ", ".join("?" for _ in statuses)
         cap = max(1, min(int(limit), 10000))
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     f"""SELECT candidate_id, category, content, status,
@@ -1841,7 +1842,7 @@ class StoreRetrievalMixin:
         Used by the labelling surface and the eval stratification script.
         """
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     "SELECT layout_family, COUNT(*) AS doc_count "
@@ -1865,7 +1866,7 @@ class StoreRetrievalMixin:
         marked stale.
         """
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     "UPDATE memory_records SET verified_state = 'stale' "
@@ -1885,7 +1886,7 @@ class StoreRetrievalMixin:
         verified.
         """
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute(
                     "UPDATE memory_records SET verified_state = 'current', "

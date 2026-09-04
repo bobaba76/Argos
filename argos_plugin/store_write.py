@@ -317,7 +317,7 @@ class StoreWriteMixin:
                  valid_from, provenance_origin, grounding)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
         """
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             self.connection.execute(sql, [
                 memory_id, category, content, tags or [],
@@ -495,7 +495,7 @@ class StoreWriteMixin:
         for tok in _re.findall(r"[a-z]+", content.lower()):
             if len(tok) >= 4:
                 _subject_tokens.add(tok)
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             if _subject_tokens:
                 # Build a LIKE clause for each token. DuckDB supports
@@ -570,7 +570,7 @@ class StoreWriteMixin:
         history queries.  Returns True if the record was found and updated.
         """
         now = self._now()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             check = self.connection.execute(
                 """SELECT 1 FROM memory_records
@@ -718,7 +718,7 @@ class StoreWriteMixin:
         if category not in VALID_CATEGORIES:
             category = "context_note"
         if dedup:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 existing = self.connection.execute(
                     """SELECT candidate_id FROM memory_candidates
@@ -739,7 +739,7 @@ class StoreWriteMixin:
             content_stripped = content.strip()
             content_lower = content_stripped.lower()
             if len(content_lower) > 20:
-                with self._lock:
+                with self._state.lock:
                     assert self.connection is not None
                     near_dupes = self.connection.execute(
                         """SELECT candidate_id, content FROM memory_candidates
@@ -837,7 +837,7 @@ class StoreWriteMixin:
             normalized_confidence = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):
             normalized_confidence = 0.5
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             self.connection.execute(
                 """INSERT INTO memory_candidates
@@ -885,7 +885,7 @@ class StoreWriteMixin:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(sql, params).fetchall()
         return [self._candidate_row_to_dict(row) for row in rows]
@@ -933,7 +933,7 @@ class StoreWriteMixin:
         sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(max(1, min(int(limit), 500)))
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(sql, params).fetchall()
         candidates = [self._candidate_row_to_dict(row) for row in rows]
@@ -1121,7 +1121,7 @@ class StoreWriteMixin:
         # Wrap the entire review path (remember + supersede + candidate-status
         # + evidence) in one transaction so a crash between steps cannot leave
         # the chain forked or the candidate status inconsistent (issue #9).
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             self.connection.execute("BEGIN TRANSACTION")
             try:
@@ -1326,7 +1326,7 @@ class StoreWriteMixin:
         old_memory_id = supersession_info.get("supersedes_memory_id")
         now = self._now()
         memory = None
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             self.connection.execute("BEGIN TRANSACTION")
             try:
@@ -1690,7 +1690,7 @@ class StoreWriteMixin:
         - new_value, old_value (from value_supersession payload)
         """
         cutoff = (datetime.now(timezone.utc) - timedelta(days=recent_days)).isoformat()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # Candidates with a value_supersession payload, created within
             # the recent window, still pending or pending_user_confirmation.
@@ -1768,7 +1768,7 @@ class StoreWriteMixin:
 
     def get_evidence(self, memory_id: str) -> dict | None:
         """Return the provenance record for a memory, or None."""
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             row = self.connection.execute(
                 """SELECT memory_id, source_session_id, source_timestamp,
@@ -1805,9 +1805,9 @@ class StoreWriteMixin:
         the best-matching active memory when raw similarity is strong.
         """
         # Pass 2 runs OUTSIDE the lock: self.search() acquires the same
-        # non-reentrant lock, so calling it inside `with self._lock` deadlocks.
+        # non-reentrant lock, so calling it inside `with self._state.lock` deadlocks.
         orphan_rows = None
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT c.candidate_id, c.evidence_text, c.evidence_role,
@@ -1871,7 +1871,7 @@ class StoreWriteMixin:
                 raw = top.similarity if hasattr(top, "similarity") else 0.0
             if raw < 0.5:
                 continue  # not confident enough — leave orphaned
-            with self._lock:
+            with self._state.lock:
                 inserted = self._write_evidence_row(
                     top.memory_id, cand_id, evidence_text, evidence_role,
                     source_ts, session_id, created_at, payload, retention,
@@ -1941,7 +1941,7 @@ class StoreWriteMixin:
         superseded (historical) versions. UPDATE includes user_scope guard.
         """
         now = self._now()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             check = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
@@ -1972,7 +1972,7 @@ class StoreWriteMixin:
         (memory_why_not, memory_tombstones) rather than silent.
         """
         now = self._now()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # B9: fetch valid_to alongside the existence check so we can
             # warn about non-head restores.
@@ -2013,7 +2013,7 @@ class StoreWriteMixin:
         if feedback not in {"helpful", "dismissed", "incorrect"}:
             raise ValueError("feedback must be helpful, dismissed, or incorrect")
         now = self._now()
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             exists = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
@@ -2241,7 +2241,7 @@ class StoreWriteMixin:
         # Generate new version ID
         new_id = f"mem-{uuid.uuid4().hex}"
 
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # B6 TOCTOU fix: the head was resolved outside the lock (above).
             # Between resolution and this transaction another thread may
@@ -2499,7 +2499,7 @@ class StoreWriteMixin:
         """
         if not memory_ids:
             return {}
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             placeholders = ", ".join(["?"] * len(memory_ids))
             result = self.connection.execute(
@@ -2544,7 +2544,7 @@ class StoreWriteMixin:
         """
         if not memory_ids:
             return {}
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             placeholders = ", ".join(["?"] * len(memory_ids))
             # Find every record that either IS a hit or is superseded BY a
@@ -2651,7 +2651,7 @@ class StoreWriteMixin:
           Returns {"action": "deleted"}.
         Returns False if the memory is not found.
         """
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # Check existence first — DuckDB's execute() return value for
             # DELETE is not a reliable indicator of whether rows were deleted.
@@ -2766,7 +2766,7 @@ class StoreWriteMixin:
                           reason: str = "user_delete") -> None:
         """Fingerprint hard-deleted content so re-feeding it is blocked.
 
-        MUST be called while holding self._lock (threading.Lock is not
+        MUST be called while holding self._state.lock (threading.Lock is not
         reentrant; both call sites live inside delete_memory's locked
         section). External tombstone writes go through delete_memory.
         """
@@ -2783,7 +2783,7 @@ class StoreWriteMixin:
 
     def tombstone_check(self, content: str, category: str) -> dict | None:
         """Return the tombstone row (as a dict) if this content was deleted."""
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             row = self.connection.execute(
                 """SELECT reason, created_at FROM deletion_tombstones
@@ -2802,7 +2802,7 @@ class StoreWriteMixin:
         user says otherwise. Returns True if a tombstone was removed.
         """
         h = self._tombstone_hash(content)
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             # RETURNING yields the deleted rows so we can distinguish a
             # real purge from a no-op. DuckDB's cursor.rowcount is always
@@ -2827,7 +2827,7 @@ class StoreWriteMixin:
         sees another tenant's tombstones (#49 isolation surface).
         """
         limit = max(1, min(int(limit), 1000))
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT content_hash, category, user_scope, reason, created_at
@@ -2861,7 +2861,7 @@ class StoreWriteMixin:
                              "user_scope": self.user_id})
         if not key[0] or not key[1]:
             return None
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             row = self.connection.execute(
                 """SELECT reason, created_at FROM rejection_ledger
@@ -2876,7 +2876,7 @@ class StoreWriteMixin:
                          reason: str = "review_rejected") -> None:
         """Fingerprint a rejected claim slot so it cannot be resurrected (#39).
 
-        MUST be called while holding self._lock (call sites live inside the
+        MUST be called while holding self._state.lock (call sites live inside the
         locked review section). External rejection writes go through
         review_candidate.
         """
@@ -2902,7 +2902,7 @@ class StoreWriteMixin:
                              "user_scope": self.user_id})
         if not key[0] or not key[1]:
             return False
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             self.connection.execute(
                 """DELETE FROM rejection_ledger
@@ -2922,7 +2922,7 @@ class StoreWriteMixin:
         SW1: filtered by user_scope — no cross-tenant rejection leak.
         """
         limit = max(1, min(int(limit), 1000))
-        with self._lock:
+        with self._state.lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT subject, predicate, user_scope, reason, created_at

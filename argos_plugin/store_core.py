@@ -6,16 +6,16 @@ neutral: no renames, no fixes). Composed into DuckDBMemoryStore via MRO.
 from __future__ import annotations
 
 import logging
-import threading
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Deque, Dict, Optional
+from typing import Dict, Optional
 
 try:
     from .store_common import _DEFAULT_TTL_DAYS
+    from .store_state import StoreMixinState
 except ImportError:  # store_core.py imported as a top-level module
     from store_common import _DEFAULT_TTL_DAYS
+    from store_state import StoreMixinState
 
 import duckdb
 
@@ -37,20 +37,11 @@ class StoreCoreMixin:
         self.user_id = (user_id or "default_user").strip()
         self.embedder = embedder
         self.reranker = reranker
-        self._lock = threading.RLock()
+        # #249-slice: shared state lives in one documented dataclass.
+        self._state = StoreMixinState()
         self.connection: Optional[duckdb.DuckDBPyConnection] = None
         self._connect()
         self._init_db()
-        # Scale-trigger metrics (measured gate for ANN/BM25 per the roadmap):
-        # rolling p95 latency window + record count, warn when thresholds cross.
-        self._scale_warn_latency_ms = 300.0
-        self._scale_warn_records = 5000
-        self._scale_window = 50
-        self._scale_latencies: Deque[float] = deque(maxlen=self._scale_window)
-        self._scale_queries = 0
-        self._scale_warnings_fired = 0
-        self._scale_last_count_check = 0
-        self._scale_record_count: Optional[int] = None
         # Expiry (Spec 1): configurable TTL tiers. When expiry_enabled is
         # False, the hardcoded _DEFAULT_TTL_DAYS is used (current behavior).
         # When True, the provider sets ttl_days from config and the tool
@@ -66,7 +57,7 @@ class StoreCoreMixin:
         self.external_sources_require_confirmation: bool = True
         # Alias cache: avoids a full-table scan on every search query
         # (issue #27). Invalidated on add_alias / remove_alias.
-        self._alias_cache: dict[str, list[tuple[str, str]]] | None = None
+        self._state.alias_cache = None
 
     # -- connection management ------------------------------------------------
 
@@ -76,7 +67,7 @@ class StoreCoreMixin:
         return "being used by another process" in msg or "cannot access the file" in msg
 
     def _connect(self) -> None:
-        self._read_only = False
+        self._state.read_only = False
         try:
             self.connection = duckdb.connect(str(self.db_path))
         except Exception as exc:
@@ -88,18 +79,18 @@ class StoreCoreMixin:
                     "All write operations (remember, save_candidate, etc.) "
                     "will fail until the lock is released."
                 )
-                self._read_only = True
+                self._state.read_only = True
                 self.connection = duckdb.connect(str(self.db_path), read_only=True)
             else:
                 raise
 
     def is_read_only(self) -> bool:
         """SC1: returns True if the store was opened in read-only fallback mode."""
-        return self._read_only
+        return self._state.read_only
 
     def _init_db(self) -> None:
         assert self.connection is not None
-        with self._lock:
+        with self._state.lock:
             self.connection.execute("""
                 CREATE SEQUENCE IF NOT EXISTS seq_memory_id;
                 CREATE TABLE IF NOT EXISTS memory_records (
@@ -354,7 +345,7 @@ class StoreCoreMixin:
             # transaction makes the atomicity explicit — a crash mid-backfill
             # rolls back the partial state instead of leaving it inconsistent.
             # SC6: skip entirely in read-only mode (UPDATEs would fail).
-            if not self._read_only:
+            if not self._state.read_only:
                 self.connection.execute("BEGIN TRANSACTION")
                 try:
                     self.connection.execute("""
@@ -498,7 +489,7 @@ class StoreCoreMixin:
                 logger.warning("access_audit table creation failed: %s", exc)
 
             # SC2: purge old access_audit rows on startup (keep latest 100k).
-            if not self._read_only:
+            if not self._state.read_only:
                 try:
                     self._purge_access_audit(max_rows=100000)
                 except Exception as exc:
@@ -538,7 +529,7 @@ class StoreCoreMixin:
         # resolve_aliases() result within a shared-tenant store. The cache is
         # already invalidated on add_alias/remove_alias; this closes the
         # scope-switch path (every RPC request calls set_user_scope first).
-        self._alias_cache = None
+        self._state.alias_cache = None
 
     @staticmethod
     def _now() -> str:
@@ -624,7 +615,7 @@ class StoreCoreMixin:
         of rows deleted.
         """
         try:
-            with self._lock:
+            with self._state.lock:
                 assert self.connection is not None
                 count = self.connection.execute(
                     "SELECT COUNT(*) FROM access_audit"

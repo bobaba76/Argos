@@ -36,6 +36,12 @@ try:
 except ImportError:  # store_retrieval.py imported as a top-level module
     from retriever import DuckDBRetriever
 
+# #248: tuning constants consolidated in tuning.py
+try:
+    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K
+except ImportError:  # store_retrieval.py imported as a top-level module
+    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K
+
 logger = logging.getLogger(__name__)
 
 
@@ -255,7 +261,7 @@ class StoreRetrievalMixin:
                     if not tf:
                         continue
                     idf = math.log(1.0 + (n_docs - dfs[t] + 0.5) / (dfs[t] + 0.5))
-                    score += idf * (2.2 * tf / (tf + 0.75 * (dlen / avg_len)))
+                    score += idf * (BM25_K1 * tf / (tf + BM25_B * (dlen / avg_len)))
                 r.similarity = score
             top = max((r.similarity for r in out), default=0.0)
             if top > 0:
@@ -432,10 +438,22 @@ class StoreRetrievalMixin:
          "am", "very", "have", "has", "had", "would", "will", "can", "could")
     )
 
-    _RRF_K = 20  # Lowered from 60 to sharpen relevance discrimination.
+    _RRF_K = RRF_K  # #248: from tuning.py (monkeypatched in tests via cls._RRF_K)
     # With k=60, rank 1 → 0.0164 and rank 10 → 0.0143 (spread ~0.002).
     # With k=20, rank 1 → 0.0476 and rank 10 → 0.0323 (spread ~0.015).
     # The wider spread lets relevance survive the importance adjustment.
+
+    # #248 exclusion boundary: the following inline literals are intentionally
+    # NOT consolidated into tuning.py because they are structural query
+    # parameters (not tuning knobs):
+    #   - LIMIT 2000/500 in _text_search_raw/_vector_search_raw: SQL fetch
+    #     limits tied to the candidate pool size, not user-tunable.
+    #   - limit * 4 candidate multiplier (_text_search_raw:344): over-fetch
+    #     ratio for the post-filter pool, tied to the LIMIT above.
+    #   - [:8] token cap (_tokenize:148): max tokens for BM25 scoring,
+    #     a correctness constraint not a tuning parameter.
+    # If any of these need to become tunable in the future, add them to
+    # tuning.py at that time.
 
     # Rank-1 survival guard (#38): if a single arm ranks an item #1 by a
     # clear margin, the fused top-k must still contain it. RRF can bury a
@@ -1147,13 +1165,11 @@ class StoreRetrievalMixin:
 
     # -- write operations -----------------------------------------------------
 
-    # Semantic dedup threshold: cosine similarity above this means "same fact".
-    _DEDUP_SIMILARITY_THRESHOLD = 0.85
-
-    # SR13: max valid embedding dimension. Embeddings with 0 dims or dims
-    # above this cap are rejected before SQL interpolation to prevent
-    # silent degradation of semantic search/dedup.
-    _MAX_EMBEDDING_DIM = 4096
+    # #248: tuning constants consolidated in tuning.py. Class attrs alias
+    # the module-level constants for backward compatibility with any code
+    # that references them via the class.
+    _DEDUP_SIMILARITY_THRESHOLD = DEDUP_SIMILARITY_THRESHOLD
+    _MAX_EMBEDDING_DIM = MAX_EMBEDDING_DIM
 
     def _content_exists(
         self, content: str, category: str,

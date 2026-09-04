@@ -172,35 +172,35 @@ def _build_rollup_prompt(records: List[Any], now: Optional[datetime] = None) -> 
 def _parse_rollup_response(content: str) -> List[Dict[str, Any]]:
     """Parse the LLM response into a list of proposal dicts.
 
-    D6: strips code fences and prose wrapping before parsing (same class
-    as R4 in reviewer and D2 in distillation).
+    D6/R4/D2: uses the shared LLM JSON array parser (handles code fences
+    and prose-wrapped JSON consistently across reviewer, distillation, rollup).
     """
     if not content:
         return []
-    stripped = _strip_json_fences(content)
     try:
-        data = json.loads(stripped)
-        if not isinstance(data, list):
-            return []
-        proposals = []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content", "").strip()
-            if not content:
-                continue
-            proposals.append({
-                "content": content,
-                "category": item.get("category", "insight"),
-                "source": "rollup",
-                "confidence": float(item.get("confidence", 0.7)),
-                "source_loc": item.get("source_loc", "rollup"),
-            })
-            if len(proposals) >= _MAX_PROPOSALS_PER_RUN:  # RU4
-                break
-        return proposals
-    except (json.JSONDecodeError, TypeError, ValueError):
+        from .llm_json import parse_llm_json_array
+    except ImportError:
+        from llm_json import parse_llm_json_array
+    data = parse_llm_json_array(content)
+    if data is None:
         return []
+    proposals = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        item_content = item.get("content", "").strip()
+        if not item_content:
+            continue
+        proposals.append({
+            "content": item_content,
+            "category": item.get("category", "insight"),
+            "source": "rollup",
+            "confidence": float(item.get("confidence", 0.7)),
+            "source_loc": item.get("source_loc", "rollup"),
+        })
+        if len(proposals) >= _MAX_PROPOSALS_PER_RUN:  # RU4
+            break
+    return proposals
 
 
 def run_rollup(

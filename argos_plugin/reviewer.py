@@ -193,32 +193,14 @@ def is_sensitive_candidate(candidate: Dict[str, Any]) -> bool:
 
 
 def _parse_json_response(response: Any) -> dict | None:
+    # R4/D2/D6: use the shared LLM JSON parser (handles code fences and
+    # prose-wrapped JSON consistently across reviewer, distillation, rollup).
     try:
-        text = response.choices[0].message.content
-    except (AttributeError, IndexError, KeyError, TypeError):
-        return None
-    if not text or not text.strip():
-        return None
-    text = text.strip()
-    # Strip a single pair of leading/trailing markdown code fences.
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text).strip()
-    # Try a direct parse first (the common case: pure JSON or fenced JSON).
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        # Fallback: the LLM may have wrapped the JSON in conversational prose
-        # ("Here is my review:\n{...}\nLet me know."). Extract the first
-        # balanced {...} object via the JSON decoder's raw_decode.
-        start = text.find("{")
-        if start == -1:
-            return None
-        try:
-            value, _end = json.JSONDecoder().raw_decode(text[start:])
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(value, dict):
+        from .llm_json import parse_llm_response
+    except ImportError:
+        from llm_json import parse_llm_response
+    value = parse_llm_response(response)
+    if value is None:
         return None
     # RV6: validate decision/confidence types before returning so the
     # caller doesn't have to guard against unexpected types.

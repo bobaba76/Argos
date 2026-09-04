@@ -303,36 +303,15 @@ def _build_high_signal_prompt(records: List[Any]) -> str:
 def _parse_distill_response(response: Any) -> Optional[Dict[str, Any]]:
     """Parse the LLM response into a dict, or None if invalid.
 
-    D2: strips code fences and handles prose-wrapped JSON (same class as
-    R4 in reviewer and D6 in rollup). The old code only stripped fences
-    at the start/end; if the LLM returned ``Here is the JSON: {...} Done.``,
-    parsing would fail.
+    D2/R4/D6: uses the shared LLM JSON parser (handles code fences and
+    prose-wrapped JSON consistently across reviewer, distillation, rollup).
     """
     try:
-        text = response.choices[0].message.content
-    except (AttributeError, IndexError, KeyError, TypeError):
-        return None
-    if not text or not text.strip():
-        return None
-    text = text.strip()
-    # Strip a single pair of leading/trailing markdown code fences.
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text).strip()
-    # Try a direct parse first (the common case).
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        # D2: fallback — extract the first balanced {...} object via
-        # the JSON decoder's raw_decode (handles prose-wrapped JSON).
-        start = text.find("{")
-        if start == -1:
-            return None
-        try:
-            value, _end = json.JSONDecoder().raw_decode(text[start:])
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(value, dict):
+        from .llm_json import parse_llm_response
+    except ImportError:
+        from llm_json import parse_llm_response
+    value = parse_llm_response(response)
+    if value is None:
         return None
     # Validate expected keys.
     for key in ("insights", "guardrails"):

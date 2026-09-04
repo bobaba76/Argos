@@ -1,4 +1,4 @@
-﻿"""Audit tests for store_core.py SC1-SC7 (issue #223).
+"""Audit tests for store_core.py SC1-SC7 (issue #223).
 
 Covers read-only fallback tracking, access_audit rotation + query text
 hashing, _is_expired fail-safe, _matches_scope column check, transactional
@@ -30,7 +30,7 @@ def store(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# SC1 â€” read-only fallback tracking
+# SC1 ---- read-only fallback tracking
 # ---------------------------------------------------------------------------
 
 class TestSC1ReadOnlyTracking:
@@ -53,7 +53,7 @@ class TestSC1ReadOnlyTracking:
 
 
 # ---------------------------------------------------------------------------
-# SC2 â€” access_audit rotation
+# SC2 ---- access_audit rotation
 # ---------------------------------------------------------------------------
 
 class TestSC2AccessAuditRotation:
@@ -76,7 +76,7 @@ class TestSC2AccessAuditRotation:
                 user_id="alice", query_text=f"query {i}",
                 granted_count=1, denied_count=0,
             )
-        # Purge with max_rows=2 â€” should keep only 2.
+        # Purge with max_rows=2 ---- should keep only 2.
         deleted = store._purge_access_audit(max_rows=2)
         assert deleted == 3
         # Verify only 2 remain.
@@ -96,7 +96,7 @@ class TestSC2AccessAuditRotation:
 
 
 # ---------------------------------------------------------------------------
-# SC3 â€” hash query text in access_audit
+# SC3 ---- hash query text in access_audit
 # ---------------------------------------------------------------------------
 
 class TestSC3QueryTextHashed:
@@ -124,7 +124,7 @@ class TestSC3QueryTextHashed:
 
 
 # ---------------------------------------------------------------------------
-# SC4 â€” _is_expired fail-safe
+# SC4 ---- _is_expired fail-safe
 # ---------------------------------------------------------------------------
 
 class TestSC4IsExpiredFailSafe:
@@ -136,7 +136,7 @@ class TestSC4IsExpiredFailSafe:
     def test_unparseable_does_not_return_false(self):
         """SC4: unparseable expires_at must NOT return False (old behavior)."""
         from store_core import StoreCoreMixin as DuckDBMemoryStore
-        # The old behavior returned False (never expires) â€” dangerous.
+        # The old behavior returned False (never expires) ---- dangerous.
         result = DuckDBMemoryStore._is_expired("garbage")
         assert result is not False
 
@@ -152,7 +152,7 @@ class TestSC4IsExpiredFailSafe:
 
 
 # ---------------------------------------------------------------------------
-# SC5 â€” _matches_scope uses column attribute
+# SC5 ---- _matches_scope uses column attribute
 # ---------------------------------------------------------------------------
 
 class TestSC5MatchesScopeColumn:
@@ -181,7 +181,7 @@ class TestSC5MatchesScopeColumn:
 
 
 # ---------------------------------------------------------------------------
-# SC6 â€” schema migrations transactional
+# SC6 ---- schema migrations transactional
 # ---------------------------------------------------------------------------
 
 class TestSC6TransactionalMigrations:
@@ -195,7 +195,7 @@ class TestSC6TransactionalMigrations:
 
 
 # ---------------------------------------------------------------------------
-# SC7 â€” _normalize_timestamp warns on drop
+# SC7 ---- _normalize_timestamp warns on drop
 # ---------------------------------------------------------------------------
 
 class TestSC7TimestampWarn:

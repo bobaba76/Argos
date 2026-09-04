@@ -353,114 +353,109 @@ class StoreCoreMixin:
             # The backfills are idempotent (WHERE ... IS NULL), but a
             # transaction makes the atomicity explicit — a crash mid-backfill
             # rolls back the partial state instead of leaving it inconsistent.
+            # SC6: skip entirely in read-only mode (UPDATEs would fail).
             if not self._read_only:
                 self.connection.execute("BEGIN TRANSACTION")
-            try:
-                # One-time: link pre-existing evidence rows (written before the
-                # column existed) back to their source candidate.
-                self.connection.execute("""
-                    UPDATE memory_evidence e
-                    SET candidate_id = c.candidate_id
-                    FROM memory_candidates c
-                    WHERE e.candidate_id IS NULL
-                      AND e.source_session_id = c.session_id
-                      AND e.source_timestamp = c.source_timestamp
-                """)
-                self.connection.execute("""
-                    UPDATE memory_records
-                    SET source = COALESCE(
-                            NULLIF(json_extract_string(payload, '$.source'), ''),
-                            NULLIF(source, ''), 'explicit'
-                        ),
-                        status = COALESCE(NULLIF(status, ''), 'active'),
-                        durability = CASE
-                            WHEN category IN ('context_note', 'event') THEN 'temporary'
-                            ELSE COALESCE(NULLIF(durability, ''), 'durable')
-                        END,
-                        scope = COALESCE(NULLIF(scope, ''), 'profile'),
-                        confidence = CASE
-                            WHEN json_extract_string(payload, '$.source') = 'llm_extraction'
-                                 AND (confidence IS NULL OR confidence >= 0.99) THEN 0.45
-                            ELSE COALESCE(confidence, 0.75)
-                        END,
-                        retrieval_count = COALESCE(retrieval_count, 0),
-                        helpful_count = COALESCE(helpful_count, 0),
-                        dismissed_count = COALESCE(dismissed_count, 0)
-                """)
-                # Retroactive temporal-validity migration: every existing memory
-                # gets valid_from = created_at. valid_to stays NULL (current).
-                self.connection.execute("""
-                    UPDATE memory_records
-                    SET valid_from = COALESCE(valid_from, created_at)
-                    WHERE valid_from IS NULL
-                """)
-                self.connection.execute("""
-                    UPDATE memory_records
-                    SET user_scope = json_extract_string(payload, '$.user_scope')
-                    WHERE user_scope IS NULL
-                      AND json_extract_string(payload, '$.user_scope') IS NOT NULL
-                """)
-                self.connection.execute("""
-                    UPDATE memory_candidates
-                    SET user_scope = json_extract_string(payload, '$.user_scope')
-                    WHERE user_scope IS NULL
-                      AND json_extract_string(payload, '$.user_scope') IS NOT NULL
-                """)
-                self.connection.execute("""
-                    UPDATE memory_records
-                    SET provenance_origin = CASE
-                        WHEN provenance_origin IN ('internal', 'external')
-                            THEN provenance_origin
-                        WHEN json_extract_string(payload, '$.external_source') = 'true'
-                             OR json_extract_string(payload, '$.external_source') = '1'
-                            THEN 'external'
-                        ELSE 'internal'
-                    END
-                """)
-                self.connection.execute("""
-                    UPDATE memory_candidates
-                    SET provenance_origin = CASE
-                        WHEN provenance_origin IN ('internal', 'external')
-                            THEN provenance_origin
-                        WHEN json_extract_string(payload, '$.external_source') = 'true'
-                             OR json_extract_string(payload, '$.external_source') = '1'
-                            THEN 'external'
-                        ELSE 'internal'
-                    END
-                """)
-                self.connection.execute("""
-                    UPDATE memory_records
-                    SET grounding = CASE
-                        WHEN grounding IN ('speculative','inferred','extracted','observed')
-                            THEN grounding
-                        WHEN source IN ('explicit', 'user', 'manual') THEN 'observed'
-                        WHEN source IN ('llm_extraction', 'extraction') THEN 'extracted'
-                        WHEN source IN ('distillation', 'distill') THEN 'inferred'
-                        WHEN provenance_origin = 'external' THEN 'inferred'
-                        ELSE 'speculative'
-                    END
-                """)
-                self.connection.execute("""
-                    UPDATE memory_candidates
-                    SET grounding = CASE
-                        WHEN grounding IN ('speculative','inferred','extracted','observed')
-                            THEN grounding
-                        WHEN source IN ('explicit', 'user', 'manual') THEN 'observed'
-                        WHEN source IN ('llm_extraction', 'extraction') THEN 'extracted'
-                        WHEN source IN ('distillation', 'distill') THEN 'inferred'
-                        WHEN provenance_origin = 'external' THEN 'inferred'
-                        ELSE 'extracted'
-                    END
-                """)
-                if not self._read_only:
+                try:
+                    self.connection.execute("""
+                        UPDATE memory_evidence e
+                        SET candidate_id = c.candidate_id
+                        FROM memory_candidates c
+                        WHERE e.candidate_id IS NULL
+                          AND e.source_session_id = c.session_id
+                          AND e.source_timestamp = c.source_timestamp
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_records
+                        SET source = COALESCE(
+                                NULLIF(json_extract_string(payload, '$.source'), ''),
+                                NULLIF(source, ''), 'explicit'
+                            ),
+                            status = COALESCE(NULLIF(status, ''), 'active'),
+                            durability = CASE
+                                WHEN category IN ('context_note', 'event') THEN 'temporary'
+                                ELSE COALESCE(NULLIF(durability, ''), 'durable')
+                            END,
+                            scope = COALESCE(NULLIF(scope, ''), 'profile'),
+                            confidence = CASE
+                                WHEN json_extract_string(payload, '$.source') = 'llm_extraction'
+                                     AND (confidence IS NULL OR confidence >= 0.99) THEN 0.45
+                                ELSE COALESCE(confidence, 0.75)
+                            END,
+                            retrieval_count = COALESCE(retrieval_count, 0),
+                            helpful_count = COALESCE(helpful_count, 0),
+                            dismissed_count = COALESCE(dismissed_count, 0)
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_records
+                        SET valid_from = COALESCE(valid_from, created_at)
+                        WHERE valid_from IS NULL
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_records
+                        SET user_scope = json_extract_string(payload, '$.user_scope')
+                        WHERE user_scope IS NULL
+                          AND json_extract_string(payload, '$.user_scope') IS NOT NULL
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_candidates
+                        SET user_scope = json_extract_string(payload, '$.user_scope')
+                        WHERE user_scope IS NULL
+                          AND json_extract_string(payload, '$.user_scope') IS NOT NULL
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_records
+                        SET provenance_origin = CASE
+                            WHEN provenance_origin IN ('internal', 'external')
+                                THEN provenance_origin
+                            WHEN json_extract_string(payload, '$.external_source') = 'true'
+                                 OR json_extract_string(payload, '$.external_source') = '1'
+                                THEN 'external'
+                            ELSE 'internal'
+                        END
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_candidates
+                        SET provenance_origin = CASE
+                            WHEN provenance_origin IN ('internal', 'external')
+                                THEN provenance_origin
+                            WHEN json_extract_string(payload, '$.external_source') = 'true'
+                                 OR json_extract_string(payload, '$.external_source') = '1'
+                                THEN 'external'
+                            ELSE 'internal'
+                        END
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_records
+                        SET grounding = CASE
+                            WHEN grounding IN ('speculative','inferred','extracted','observed')
+                                THEN grounding
+                            WHEN source IN ('explicit', 'user', 'manual') THEN 'observed'
+                            WHEN source IN ('llm_extraction', 'extraction') THEN 'extracted'
+                            WHEN source IN ('distillation', 'distill') THEN 'inferred'
+                            WHEN provenance_origin = 'external' THEN 'inferred'
+                            ELSE 'speculative'
+                        END
+                    """)
+                    self.connection.execute("""
+                        UPDATE memory_candidates
+                        SET grounding = CASE
+                            WHEN grounding IN ('speculative','inferred','extracted','observed')
+                                THEN grounding
+                            WHEN source IN ('explicit', 'user', 'manual') THEN 'observed'
+                            WHEN source IN ('llm_extraction', 'extraction') THEN 'extracted'
+                            WHEN source IN ('distillation', 'distill') THEN 'inferred'
+                            WHEN provenance_origin = 'external' THEN 'inferred'
+                            ELSE 'extracted'
+                        END
+                    """)
                     self.connection.execute("COMMIT")
-            except Exception as exc:
-                if not self._read_only:
+                except Exception as exc:
                     try:
                         self.connection.execute("ROLLBACK")
                     except Exception:
                         pass
-                logger.warning("Backfill transaction failed (rolled back): %s", exc)
+                    logger.warning("Backfill transaction failed (rolled back): %s", exc)
             # Composite index: scope → status → validity.
             try:
                 self.connection.execute("""

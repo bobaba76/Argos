@@ -485,11 +485,15 @@ class TestTimestampNormalization:
             )
 
     def test_is_expired_unparseable_logs_warning(self, caplog):
-        """_is_expired on an unparseable string should log a warning."""
+        """_is_expired on an unparseable string should log a warning and
+        return True (SC4 fail-safe: expired = safe side)."""
         import logging
         with caplog.at_level(logging.WARNING):
             result = DuckDBMemoryStore._is_expired("not-a-date")
-            assert result is False  # can't enforce, but should log
+            # SC4: fail-safe — unparseable expiry returns True (expired),
+            # not False (never expires). Sensitive memories with broken
+            # timestamps should expire rather than persist forever.
+            assert result is True
             assert any("Unparseable expires_at" in r.message for r in caplog.records)
 
 

@@ -197,6 +197,37 @@ class TestSW9ChainMembershipPreFetch:
         # Should have pre-fetched edge walking code.
         assert "reverse" in src or "supersede_map" in src
 
+    def test_chain_membership_counts_full_chain_from_head(self, store):
+        """SW9 regression: querying the head of a 3-version chain returns 3,
+        not 2. The initial edge fetch only gets one level of predecessors;
+        iterative ancestor fetch is needed to get the full chain."""
+        r1 = store.remember("t", "v1", source="explicit")
+        assert r1 is not None
+        r2 = store.update_memory(r1.memory_id, content="v2")
+        assert r2 is not None
+        r3 = store.update_memory(r2.memory_id, content="v3")
+        assert r3 is not None
+        m = store.get_chain_membership([r3.memory_id])
+        assert m[r3.memory_id]["versions"] == 3
+        assert m[r3.memory_id]["has_history"] is True
+
+    def test_chain_membership_counts_full_chain_from_middle(self, store):
+        """SW9: querying a middle version also counts the full chain."""
+        r1 = store.remember("t", "v1", source="explicit")
+        assert r1 is not None
+        r2 = store.update_memory(r1.memory_id, content="v2")
+        assert r2 is not None
+        r3 = store.update_memory(r2.memory_id, content="v3")
+        assert r3 is not None
+        m = store.get_chain_membership([r2.memory_id])
+        assert m[r2.memory_id]["versions"] == 3
+
+    def test_chain_membership_scope_filter_on_edges(self):
+        """SW9: edge queries include user_scope filter."""
+        from store_write import StoreWriteMixin
+        src = inspect.getsource(StoreWriteMixin.get_chain_membership)
+        assert "user_scope IS NULL OR user_scope" in src
+
 
 # ---------------------------------------------------------------------------
 # SW10 — save_candidate dedup LIMIT reduced

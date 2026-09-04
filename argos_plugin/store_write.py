@@ -2536,9 +2536,11 @@ class StoreWriteMixin:
         annotation that lets the agent know a fact has a history without
         unfolding it automatically.
 
-        SW9: pre-fetches all superseded_by edges for the hit IDs in one
-        query, then walks the edges in Python — avoids N+1 calls to
-        get_memory_history per hit.
+        SW9: pre-fetches all superseded_by edges for the hit IDs
+        iteratively (fetching ancestors until no new edges appear), then
+        walks the edges in Python — avoids N+1 calls to get_memory_history
+        per hit. Edge queries are scope-filtered to prevent cross-tenant
+        chain existence/length leaks.
         """
         if not memory_ids:
             return {}
@@ -2548,19 +2550,47 @@ class StoreWriteMixin:
             # Find every record that either IS a hit or is superseded BY a
             # hit (i.e. a hit is the head of a chain) — plus every record
             # whose superseded_by points at a hit (hit is a predecessor).
+            # SW9: scope-filter to prevent cross-tenant chain leaks.
             rows = self.connection.execute(
                 f"""SELECT memory_id, superseded_by FROM memory_records
-                    WHERE memory_id IN ({placeholders})
-                       OR superseded_by IN ({placeholders})""",
-                [*memory_ids, *memory_ids],
+                    WHERE (memory_id IN ({placeholders})
+                       OR superseded_by IN ({placeholders}))
+                       AND (user_scope IS NULL OR user_scope = ?)""",
+                [*memory_ids, *memory_ids, self.user_id],
             ).fetchall()
-        if not rows:
-            return {mid: {"versions": 1, "has_history": False} for mid in memory_ids}
-        # Build a quick lookup of superseded_by edges (scope-agnostic here;
-        # the per-chain walk via get_memory_history enforces scope).
-        supersede_map: Dict[str, str | None] = {
-            row[0]: row[1] for row in rows
-        }
+            if not rows:
+                return {mid: {"versions": 1, "has_history": False} for mid in memory_ids}
+            # Build edge map from the initial fetch.
+            supersede_map: Dict[str, str | None] = {
+                row[0]: row[1] for row in rows
+            }
+            # SW9: iteratively fetch predecessors until no new edges appear.
+            # The initial query only fetches one level of predecessors;
+            # for a 3+ version chain (A→B→C), querying C fetches B but
+            # not A. We need to keep fetching nodes whose superseded_by
+            # points to any node we already know about, until no new
+            # predecessors are found.
+            known = set(supersede_map.keys())
+            while True:
+                # Find nodes that point to any known node (predecessors).
+                ph = ", ".join(["?"] * len(known))
+                extra = self.connection.execute(
+                    f"""SELECT memory_id, superseded_by FROM memory_records
+                        WHERE superseded_by IN ({ph})
+                          AND memory_id NOT IN ({ph})
+                          AND (user_scope IS NULL OR user_scope = ?)""",
+                    [*known, *known, self.user_id],
+                ).fetchall()
+                if not extra:
+                    break
+                _added = False
+                for rid, sup in extra:
+                    if rid not in supersede_map:
+                        supersede_map[rid] = sup
+                        known.add(rid)
+                        _added = True
+                if not _added:
+                    break
         out: Dict[str, Dict[str, Any]] = {}
         # SW9: walk chains in Python using the pre-fetched edge map instead
         # of calling get_memory_history (N+1 queries) per hit. Cycle-guarded.

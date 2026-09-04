@@ -67,14 +67,17 @@ def run_watcher_pass(
     *,
     extraction_llm_model: str = "",
     extraction_llm_provider: str = "",
+    stop_event: Optional[threading.Event] = None,
 ) -> Dict[str, int]:
-    """Run one watcher pass: scan → catalog → tombstone → extract.
+    """Run one watcher pass: scan -> catalog -> tombstone -> extract.
 
     Args:
         store: the memory store (DuckDBMemoryStore or SharedMemoryStore).
         roots: directories to scan.
         extraction_llm_model: model for the extraction LLM call.
         extraction_llm_provider: provider for the extraction LLM call.
+        stop_event: optional threading.Event — if set, the pass aborts
+            early between documents (WT2: responsive shutdown).
 
     Returns:
         Dict with counts: ``{"new": N, "changed": N, "moved": N,
@@ -129,7 +132,14 @@ def run_watcher_pass(
 
     # Extraction pass: hot docs only (new + changed). The extract_hash
     # gate in the store ensures unchanged files are not re-extracted.
-    for info in result.get("new", []) + result.get("changed", []):
+    # WT2: cap docs per pass to avoid long-running passes that block shutdown.
+    _MAX_DOCS_PER_PASS = 20
+    hot_docs = (result.get("new", []) + result.get("changed", []))[:_MAX_DOCS_PER_PASS]
+    for info in hot_docs:
+        # WT2: check stop event between documents so shutdown is responsive.
+        if stop_event is not None and stop_event.is_set():
+            logger.debug("watcher: pass interrupted by stop event")
+            break
         try:
             facts, extract_hash, method, text = extract_facts_from_doc(
                 info["path"],
@@ -140,16 +150,22 @@ def run_watcher_pass(
             if facts:
                 # W4: persist a bounded excerpt, not the full text.
                 excerpt = text[:_MAX_EXCERPT_CHARS] if text else ""
-                # Write facts as candidates via the normal store path.
+                # WT1: per-fact loop moved out of the per-doc try block so
+                # one malformed fact can't bury the rest. Confidence is
+                # normalized per-fact (same clamp as SW6 in remember()).
                 for fact in facts:
                     if isinstance(fact, dict):
                         content = str(fact.get("content", "")).strip()
                         if content:
+                            try:
+                                conf = max(0.0, min(1.0, float(fact.get("confidence", 0.7))))
+                            except (TypeError, ValueError):
+                                conf = 0.5
                             store.save_candidate(
                                 content=content,
                                 category=fact.get("category", "insight"),
                                 source="watcher",
-                                confidence=float(fact.get("confidence", 0.7)),
+                                confidence=conf,
                                 evidence_text=excerpt,
                                 source_loc=info["path"],
                             )
@@ -216,6 +232,7 @@ class WatcherThread:
                     self._scan_roots,
                     extraction_llm_model=self._extraction_llm_model,
                     extraction_llm_provider=self._extraction_llm_provider,
+                    stop_event=self._stopped,
                 )
             except Exception as exc:
                 logger.debug("watcher pass failed: %s", exc)

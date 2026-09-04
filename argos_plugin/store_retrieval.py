@@ -139,9 +139,13 @@ def _build_memory_where(
         fragments.append("AND category = ?")
         params.append(category)
     if excluded:
-        placeholders = ", ".join(["?" for _ in excluded])
+        # Sort for deterministic SQL/param order — set iteration order is
+        # hash-seed-dependent (PYTHONHASHSEED), which made the emitted
+        # clause and the tests that assert on it flip between runs.
+        ordered = sorted(excluded)
+        placeholders = ", ".join(["?" for _ in ordered])
         fragments.append(f"AND LOWER(category) NOT IN ({placeholders})")
-        params.extend(e.lower() for e in excluded)
+        params.extend(e.lower() for e in ordered)
 
     # 9. Tier — exclude archived records unless explicitly requested.
     if tier:

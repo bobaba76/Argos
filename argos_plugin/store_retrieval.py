@@ -215,7 +215,7 @@ class StoreRetrievalMixin:
             f"{client_scope_clause}"
             f"{category_clause}"
             f"{tier_clause} AND ("
-            f"{conditions}) LIMIT 2000"
+            f"{conditions}) LIMIT 500"
         )
         results = self._fetch_records(
             sql, [*temporal_params, *params, *category_params, *patterns]
@@ -748,8 +748,16 @@ class StoreRetrievalMixin:
 
     @classmethod
     def _apply_p2c(cls, records: List[MemoryRecord]) -> None:
-        """If enabled, promote the newer member of each near-duplicate pair above the older."""
+        """If enabled, promote the newer member of each near-duplicate pair above the older.
+
+        SR11: O(n²) over the result set — gated by ``_P2C_ENABLED = False``
+        (default off). If ever enabled, the result-size guard below caps
+        the comparison window to avoid quadratic blowup on large result sets.
+        """
         if not cls._P2C_ENABLED:
+            return
+        # SR11: cap the comparison window to avoid O(n²) blowup.
+        if len(records) > 50:
             return
         for i in range(len(records)):
             for j in range(i + 1, len(records)):
@@ -798,8 +806,9 @@ class StoreRetrievalMixin:
                             last_retrieved_at = ?
                         WHERE memory_id IN ({placeholders})
                           AND COALESCE(status, 'active') = 'active'
-                          AND valid_to IS NULL""",
-                    [now, *ids],
+                          AND valid_to IS NULL
+                          AND (user_scope IS NULL OR user_scope = ?)""",
+                    [now, *ids, self.user_id],
                 )
             for record in records:
                 record.retrieval_count += 1
@@ -1257,6 +1266,9 @@ class StoreRetrievalMixin:
             # Layer 2: substring containment (case-insensitive, current only).
             # ORDER BY created_at DESC so the scan window is recency-ordered,
             # not arbitrary storage order (#82).
+            # SR10: reduced from 500 to 200 — bounded O(n) substring
+            # comparisons on every remember() call. 200 is sufficient for
+            # recency-ordered dedup; the exact-match Layer 1 catches most.
             result = self.connection.execute(
                 f"""SELECT memory_id, content FROM memory_records
                   WHERE category = ?
@@ -1264,7 +1276,7 @@ class StoreRetrievalMixin:
                     AND (user_scope IS NULL OR user_scope = ?)
                     {scope_sql}
                   ORDER BY created_at DESC
-                  LIMIT 500""",
+                  LIMIT 200""",
                 [category, self.user_id, *scope_params],
             ).fetchall()
             content_lower = content.lower().strip()
@@ -1369,6 +1381,9 @@ class StoreRetrievalMixin:
 
         Principals-only read; the caller is responsible for access
         control on the export itself.
+
+        SR1: filtered to the caller's tenant/user_id — no cross-tenant
+        audit leak.
         """
         try:
             with self._lock:
@@ -1377,15 +1392,34 @@ class StoreRetrievalMixin:
                     """SELECT audit_id, ts, tenant, user_id, query_text,
                               granted_count, denied_count, denied_scopes, excluded
                        FROM access_audit
+                       WHERE user_id = ? OR tenant = ?
                        ORDER BY ts DESC
                        LIMIT ?""",
-                    [max(1, min(int(limit), 100000))],
+                    [self.user_id, self.user_id,
+                     max(1, min(int(limit), 100000))],
                 )
                 columns = [desc[0] for desc in result.description]
                 rows = result.fetchall()
         except Exception as exc:
             logger.warning("access_audit export failed: %s", exc)
             return ""
+        # SR12: hash query_text in the export to avoid leaking sensitive
+        # user queries. The hash is sufficient for audit correlation
+        # (matching repeated queries) without exposing the raw text.
+        qt_idx = columns.index("query_text") if "query_text" in columns else -1
+        if qt_idx >= 0:
+            import hashlib as _hl
+            hashed_rows = []
+            for row in rows:
+                row_list = list(row)
+                if row_list[qt_idx]:
+                    row_list[qt_idx] = _hl.sha256(
+                        str(row_list[qt_idx]).encode("utf-8")
+                    ).hexdigest()[:16]
+                else:
+                    row_list[qt_idx] = ""
+                hashed_rows.append(tuple(row_list))
+            rows = hashed_rows
         if format == "csv":
             import csv
             import io
@@ -1480,7 +1514,12 @@ class StoreRetrievalMixin:
 
     def tombstone_catalog_entry(self, *, file_id: str) -> None:
         """Mark a catalog entry as tombstoned (file deleted). Facts sourced
-        from this file become invalidated (D4 lifecycle)."""
+        from this file become invalidated (D4 lifecycle).
+
+        SR6: the memory_records invalidation is guarded by user_scope —
+        only the caller's own facts are invalidated. The catalog entry
+        itself is shared (no user_scope on file_catalog).
+        """
         now = self._now()
         try:
             with self._lock:
@@ -1491,21 +1530,38 @@ class StoreRetrievalMixin:
                     [now, file_id],
                 )
                 # Invalidate facts sourced from this document.
+                # SR6: guard by user_scope to prevent cross-tenant modification.
                 self.connection.execute(
                     "UPDATE memory_records SET verified_state = 'invalidated' "
-                    "WHERE source_doc_id = ? AND verified_state != 'invalidated'",
-                    [file_id],
+                    "WHERE source_doc_id = ? AND verified_state != 'invalidated' "
+                    "AND (user_scope IS NULL OR user_scope = ?)",
+                    [file_id, self.user_id],
                 )
         except Exception as exc:
             logger.warning("tombstone failed for %s: %s", file_id, exc)
 
-    def get_catalog_entry(self, file_id: str) -> dict | None:
-        """Fetch a catalog entry by file_id."""
+    def get_catalog_entry(
+        self, file_id: str, *, client_scope: str | None = None,
+    ) -> dict | None:
+        """Fetch a catalog entry by file_id.
+
+        SR7: *client_scope* is an optional explicit filter (matching the
+        ``list_catalog`` convention). When None (default), no scope
+        filter is applied — the caller is responsible for access control.
+        When set, only entries with matching or NULL client_scope are
+        returned.
+        """
+        scope_clause = ""
+        params: list = [file_id]
+        if client_scope is not None:
+            scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
+            params.append(client_scope)
         try:
             with self._lock:
                 assert self.connection is not None
                 result = self.connection.execute(
-                    "SELECT * FROM file_catalog WHERE file_id = ?", [file_id]
+                    f"SELECT * FROM file_catalog WHERE file_id = ?{scope_clause}",
+                    params,
                 )
                 columns = [desc[0] for desc in result.description]
                 row = result.fetchone()
@@ -1515,14 +1571,27 @@ class StoreRetrievalMixin:
             logger.warning("catalog get failed: %s", exc)
         return None
 
-    def get_catalog_by_path(self, path: str) -> dict | None:
-        """Fetch a catalog entry by canonical_path."""
+    def get_catalog_by_path(
+        self, path: str, *, client_scope: str | None = None,
+    ) -> dict | None:
+        """Fetch a catalog entry by canonical_path.
+
+        SR7: *client_scope* is an optional explicit filter (matching the
+        ``list_catalog`` convention). When None (default), no scope
+        filter is applied. When set, only entries with matching or NULL
+        client_scope are returned.
+        """
+        scope_clause = ""
+        params: list = [path]
+        if client_scope is not None:
+            scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
+            params.append(client_scope)
         try:
             with self._lock:
                 assert self.connection is not None
                 result = self.connection.execute(
-                    "SELECT * FROM file_catalog WHERE canonical_path = ?",
-                    [path],
+                    f"SELECT * FROM file_catalog WHERE canonical_path = ?{scope_clause}",
+                    params,
                 )
                 columns = [desc[0] for desc in result.description]
                 row = result.fetchone()
@@ -1608,8 +1677,9 @@ class StoreRetrievalMixin:
         ``drift_check``. Read-only — never writes to or mutates the
         candidates table or the ledger.
         """
-        conditions = ["status NOT IN ('pending')"]
-        params: list = []
+        conditions = ["status NOT IN ('pending')",
+                      "(user_scope IS NULL OR user_scope = ?)"]
+        params: list = [self.user_id]
         if since:
             conditions.append("(reviewed_at IS NULL OR reviewed_at >= ?)")
             params.append(since)
@@ -1649,15 +1719,15 @@ class StoreRetrievalMixin:
         the claim-slot identity of rejections (subject/predicate/scope) while
         the candidates table captures the review decision. Read-only.
         """
-        conditions: list[str] = []
-        params: list = []
+        conditions: list[str] = ["(user_scope IS NULL OR user_scope = ?)"]
+        params: list = [self.user_id]
         if since:
             conditions.append("created_at >= ?")
             params.append(since)
         if until:
             conditions.append("created_at <= ?")
             params.append(until)
-        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        where = " WHERE " + " AND ".join(conditions)
         try:
             with self._lock:
                 assert self.connection is not None
@@ -1745,14 +1815,19 @@ class StoreRetrievalMixin:
 
     def stale_facts_for_doc(self, file_id: str) -> int:
         """Mark facts from a document as stale (version bump → old facts
-        stale, new facts current). Returns the number of stale-marked rows."""
+        stale, new facts current). Returns the number of stale-marked rows.
+
+        SR4: guarded by user_scope — only the caller's own facts are
+        marked stale.
+        """
         try:
             with self._lock:
                 assert self.connection is not None
                 result = self.connection.execute(
                     "UPDATE memory_records SET verified_state = 'stale' "
-                    "WHERE source_doc_id = ? AND verified_state = 'current'",
-                    [file_id],
+                    "WHERE source_doc_id = ? AND verified_state = 'current' "
+                    "AND (user_scope IS NULL OR user_scope = ?)",
+                    [file_id, self.user_id],
                 )
                 return int(result.fetchone()[0]) if result else 0
         except Exception as exc:
@@ -1760,15 +1835,20 @@ class StoreRetrievalMixin:
             return 0
 
     def verify_fact(self, memory_id: str) -> bool:
-        """Principal verify action: flip unverified → current."""
+        """Principal verify action: flip unverified → current.
+
+        SR5: guarded by user_scope — only the caller's own facts can be
+        verified.
+        """
         try:
             with self._lock:
                 assert self.connection is not None
                 self.connection.execute(
                     "UPDATE memory_records SET verified_state = 'current', "
                     "verified_at = ? WHERE memory_id = ? "
-                    "AND verified_state = 'unverified'",
-                    [self._now(), memory_id],
+                    "AND verified_state = 'unverified' "
+                    "AND (user_scope IS NULL OR user_scope = ?)",
+                    [self._now(), memory_id, self.user_id],
                 )
                 return True
         except Exception as exc:

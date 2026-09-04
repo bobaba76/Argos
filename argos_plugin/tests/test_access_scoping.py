@@ -382,7 +382,11 @@ class TestAccessAudit:
         assert result[4] is True
 
     def test_export_jsonl(self, store):
-        """Export produces JSONL with the audit rows."""
+        """Export produces JSONL with the audit rows.
+
+        SR1: export is filtered to the caller's user_id — only alice's
+        entries are visible (store was created with user_id='alice').
+        """
         store.write_access_audit(
             user_id="alice", query_text="query 1",
             granted_count=2, denied_count=0,
@@ -393,9 +397,12 @@ class TestAccessAudit:
         )
         export = store.export_access_audit(format="jsonl")
         lines = [json.loads(line) for line in export.strip().split("\n") if line]
-        assert len(lines) == 2
-        assert lines[0]["user_id"] == "bob"  # DESC by ts
-        assert lines[1]["user_id"] == "alice"
+        # SR1: only alice's entries are exported (cross-tenant filter).
+        assert len(lines) == 1
+        assert lines[0]["user_id"] == "alice"
+        # SR12: query_text is hashed, not raw.
+        assert lines[0]["query_text"] != "query 1"
+        assert len(lines[0]["query_text"]) == 16  # SHA-256 truncated to 16 chars
 
     def test_export_csv(self, store):
         """Export produces CSV with a header row."""

@@ -31,7 +31,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 # JSON-RPC 2.0 error codes (per spec).
 JSONRPC_PARSE_ERROR = -32700
@@ -161,7 +161,8 @@ def _propose_input_schema() -> Dict[str, Any]:
 
 # Tool name → (facade operation, input schema, description, output schema).
 # Deterministic ordering (D6): sorted by tool name.
-TOOL_DEFINITIONS: List[Dict[str, Any]] = [
+# M9: tuple (immutable) to prevent accidental mutation across instances.
+TOOL_DEFINITIONS: tuple = (
     {
         "name": "memory_capabilities",
         "description": "List the operations available to the authenticated principal.",
@@ -271,7 +272,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             },
         },
     },
-]
+)
 
 # Map MCP tool names to facade operations.
 TOOL_TO_OPERATION: Dict[str, str] = {
@@ -300,7 +301,12 @@ def _make_response(
 
 
 def _make_error(code: int, message: str, data: Any = None) -> Dict[str, Any]:
-    """Build a JSON-RPC 2.0 error object."""
+    """Build a JSON-RPC 2.0 error object.
+
+    M10: *data* is sent verbatim to the client — it must be client-safe
+    (no stack traces, internal IDs, file paths, or SQL). The facade
+    redacts errors, but callers must not pass unredacted data here.
+    """
     err: Dict[str, Any] = {"code": code, "message": message}
     if data is not None:
         err["data"] = data
@@ -359,6 +365,8 @@ class MCPServer:
         """Main loop: read lines from stdin, process, write to stdout.
 
         Exits when stdin is closed (EOF) or a fatal error occurs.
+        M5: KeyboardInterrupt/SystemExit are caught and logged so the
+        server shuts down gracefully rather than dying mid-message.
         """
         for line in self._stdin:
             line = line.strip()
@@ -374,6 +382,14 @@ class MCPServer:
                 continue
             try:
                 self._handle_line(line)
+            except (KeyboardInterrupt, SystemExit):
+                # M5: graceful shutdown on signals — log and re-exit.
+                logger.info("MCP server shutting down (signal received).")
+                raise
+            except BrokenPipeError:
+                # M6: stdout closed — client disconnected. Exit gracefully.
+                logger.info("MCP server: stdout closed (client disconnected).")
+                break
             except Exception as exc:
                 # Fatal error — log to stderr, send error to stdout, continue.
                 logger.error("MCP server error: %s", exc, exc_info=True)
@@ -421,9 +437,26 @@ class MCPServer:
             self._initialized = True
             # No response for notifications.
         elif method == "tools/list":
-            self._handle_tools_list(msg_id)
+            # M8: tools should not be listed until after notifications/initialized.
+            if not self._initialized:
+                self._send(_make_response(
+                    msg_id, error=_make_error(
+                        JSONRPC_INVALID_REQUEST,
+                        "Server not initialized — send notifications/initialized first.",
+                    ),
+                ))
+            else:
+                self._handle_tools_list(msg_id)
         elif method == "tools/call":
-            self._handle_tools_call(msg_id, params)
+            if not self._initialized:
+                self._send(_make_response(
+                    msg_id, error=_make_error(
+                        JSONRPC_INVALID_REQUEST,
+                        "Server not initialized — send notifications/initialized first.",
+                    ),
+                ))
+            else:
+                self._handle_tools_call(msg_id, params)
         elif method == "ping":
             self._send(_make_response(msg_id, result={}))
         else:
@@ -435,8 +468,19 @@ class MCPServer:
             ))
 
     def _handle_initialize(self, msg_id: Any, params: Dict[str, Any]) -> None:
-        """Handle the initialize request (capability negotiation)."""
+        """Handle the initialize request (capability negotiation).
+
+        M4: logs a warning if the client's protocol version is older than
+        the server's minimum supported version.
+        """
         client_version = params.get("protocolVersion", "")
+        # M4: warn on incompatible versions (server still responds with its own).
+        if client_version and client_version != MCP_PROTOCOL_VERSION:
+            logger.warning(
+                "MCP client requested protocol %s; server supports %s. "
+                "Responding with server version (per spec).",
+                client_version, MCP_PROTOCOL_VERSION,
+            )
         # Respond with our protocol version. If the client requested a
         # different version, we respond with ours (per spec: server
         # responds with a version it supports).
@@ -476,7 +520,7 @@ class MCPServer:
     def _handle_tools_call(self, msg_id: Any, params: Dict[str, Any]) -> None:
         """Handle tools/call — invoke a tool through the facade."""
         tool_name = params.get("name", "")
-        arguments = params.get("arguments") or {}
+        arguments = dict(params.get("arguments") or {})  # copy — don't mutate caller's
         # Map tool name to facade operation.
         operation = TOOL_TO_OPERATION.get(tool_name)
         if operation is None:
@@ -487,10 +531,40 @@ class MCPServer:
                 ),
             ))
             return
-        # Extract the idempotency key for mutation operations (D5).
-        # The facade's validator ignores this field — it's passed as a
-        # keyword arg, not in the params dict.
-        idempotency_key = arguments.pop("idempotency_key", None)
+        # M2: validate arguments against the tool's inputSchema before
+        # calling the facade. The MCP spec requires the server to validate
+        # against the declared schema.
+        tool_def = None
+        for td in TOOL_DEFINITIONS:
+            if td["name"] == tool_name:
+                tool_def = td
+                break
+        if tool_def is not None:
+            schema = tool_def.get("inputSchema")
+            if schema is not None:
+                try:
+                    import jsonschema
+                    jsonschema.validate(instance=arguments, schema=schema)
+                except jsonschema.ValidationError as exc:
+                    self._send(_make_response(
+                        msg_id, error=_make_error(
+                            JSONRPC_INVALID_PARAMS,
+                            f"Invalid arguments: {exc.message}",
+                        ),
+                    ))
+                    return
+                except Exception:
+                    # jsonschema unavailable or broken — fall through to
+                    # facade validation (fail-open, not fail-closed, since
+                    # the facade does its own validation).
+                    pass
+        # M1: only pop idempotency_key for memory_propose — other tools
+        # should not have it, and the schema validation above would have
+        # already rejected it (additionalProperties: false). For propose,
+        # the key is passed as a keyword arg, not in the params dict.
+        idempotency_key = None
+        if tool_name == "memory_propose":
+            idempotency_key = arguments.pop("idempotency_key", None)
         # Call the facade. The facade handles validation, auth, ACL,
         # idempotency, audit, and error redaction.
         try:
@@ -544,10 +618,17 @@ class MCPServer:
                 }))
 
     def _send(self, msg: Dict[str, Any]) -> None:
-        """Write one JSON-RPC message to stdout (newline-delimited)."""
+        """Write one JSON-RPC message to stdout (newline-delimited).
+
+        M6: BrokenPipeError (client disconnected) is caught and logged
+        rather than propagating — the run loop handles the exit.
+        """
         data = json.dumps(msg, ensure_ascii=False) + "\n"
-        self._stdout.write(data)
-        self._stdout.flush()
+        try:
+            self._stdout.write(data)
+            self._stdout.flush()
+        except (BrokenPipeError, OSError) as exc:
+            logger.info("MCP server: write failed (%s) — client may be gone.", exc)
 
 
 # -- Entry point -------------------------------------------------------------
@@ -559,6 +640,16 @@ def _load_auth_context(home: Path) -> "AuthContext":
     ARGOS_API_PRINCIPAL env var (default: "local"), the tenant from
     ARGOS_API_TENANT (default: "default"), and the user_id from
     ARGOS_API_USER_ID (default: "default_user").
+
+    M3 — Threat model (trusted-local mode):
+    Identity is derived from environment variables with NO credential
+    verification. Any process that can set env vars can impersonate any
+    user. This is acceptable ONLY in trusted-local mode (single-user
+    workstation, MCP client spawned by the user's own shell). In a
+    multi-process or hosted environment, the env vars are controlled by
+    the spawner, not the user — a malicious spawner can impersonate
+    anyone. For non-trusted-local deployments, a credential file or
+    signed token MUST be used instead (future work, #129).
 
     In production (multi-user/hosted mode, #129), this would verify
     a credential file and derive identity from it. For now, the env-var
@@ -609,6 +700,12 @@ def main() -> None:
     )
 
     # Build the store, facade, and auth context.
+    # M7: embedder=None means the MCP server degrades to text-only search
+    # (no vector search). This is intentional for v1 — the MCP server is
+    # a lightweight read/propose adapter. Loading the default embedder
+    # here would add startup latency and a model dependency that may not
+    # be available in all environments. Vector search can be added in a
+    # future version by loading the embedder from the config.
     store = SharedMemoryStore(args.home, user_id="default_user", embedder=None)
     acl = ACLConfig()  # v1: open store (trusted-local mode)
     facade = ArgosAPIFacade(store, acl=acl, api_mode=False)

@@ -31,6 +31,7 @@ try:
     from .service_client import SharedGraphStore, SharedMemoryStore
     from .reviewer import set_external_policy
     from .query_expander import QueryExpander
+    from .config_model import MemoryConfig
 except ImportError:  # provider_core.py imported as a top-level module
     from store import DuckDBMemoryStore
     from graph import KuzuGraphStore
@@ -46,6 +47,7 @@ except ImportError:  # provider_core.py imported as a top-level module
     from service_client import SharedGraphStore, SharedMemoryStore
     from reviewer import set_external_policy
     from query_expander import QueryExpander
+    from config_model import MemoryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -141,13 +143,13 @@ _AUTO_EXTRACT_PAUSE_MARKER = "argos.auto_extract.paused"
 
 # Config cache for the hot path (pre_llm_call calls _load_config() every
 # turn — issue #29). Invalidated by mtime when the JSON file changes.
-_config_cache: dict | None = None
+_config_cache: MemoryConfig | None = None
 _config_cache_mtime: float = 0.0
 _config_cache_path: str = ""
 _config_cache_lock = threading.Lock()
 
 
-def _load_config_cached() -> dict | None:
+def _load_config_cached() -> MemoryConfig | None:
     """Return cached config if the file hasn't changed, else None."""
     global _config_cache, _config_cache_mtime, _config_cache_path
     try:
@@ -167,7 +169,7 @@ def _load_config_cached() -> dict | None:
     return None
 
 
-def _store_config_cache(cfg: dict) -> None:
+def _store_config_cache(cfg: MemoryConfig) -> None:
     """Store config in the cache after a fresh load."""
     global _config_cache, _config_cache_mtime, _config_cache_path
     try:
@@ -186,12 +188,16 @@ def _store_config_cache(cfg: dict) -> None:
         _config_cache_path = str(config_path)
 
 
-def _load_config(hermes_home: str | None = None) -> dict:
+def _load_config(hermes_home: str | None = None) -> MemoryConfig:
     """Load config from $HERMES_HOME/hybrid_memory.json.
 
     Uses the explicit hermes_home when provided (from initialize() kwargs),
     falling back to get_hermes_home() only when not provided. This ensures
     the config file and databases resolve to the same directory.
+
+    #244: returns a validated ``MemoryConfig`` object (was a raw dict).
+    Fail-soft: invalid values fall back to defaults with a warning, matching
+    the pre-#244 try/except slurp behaviour.
     """
     # Config cache with mtime-based invalidation (issue #29: pre_llm_call
     # was re-reading the JSON file on every turn). When hermes_home is not
@@ -201,76 +207,6 @@ def _load_config(hermes_home: str | None = None) -> dict:
         cached = _load_config_cached()
         if cached is not None:
             return cached
-    config = {
-        "database_filename": "hybrid_memory.duckdb",
-        "graph_dirname": "hybrid_memory_kuzu",
-        "storage_mode": "shared_service",
-        "max_injected_items": str(_DEFAULT_MAX_INJECTED),
-        "inject_content_char_cap": str(_DEFAULT_INJECT_CONTENT_CHAR_CAP),
-        "freshness_markers": "true",
-        "local_embedding_model": _DEFAULT_MODEL,
-        "auto_extract": "true",
-        "llm_fallback": "true",
-        "extraction_shadow_diff": "false",
-        "auto_review": "true",
-        "stale_review_sweep_enabled": "true",
-        "stale_review_interval_min": "15",
-        "stale_review_min_age_min": "30",
-        "stale_review_max_batch": "25",
-        "graph_aware_retrieval": "true",
-        "graph_retrieval_boost": "0.0",
-        "graph_inject_candidates": "false",
-        "graph_boost_min_similarity": "0.15",
-        "alias_expansion_boost": "0.7",
-        "graph_traversal_enabled": "true",
-        "graph_traversal_depth": "2",
-        "graph_traversal_boost": "0.60",
-        "chain_unfold": "off",
-        "chain_unfold_min_similarity": "0.30",
-        "chain_max_versions": "3",
-        "chain_max_inject": "150",
-        "chain_unfold_top_k": "3",
-        "chain_unfold_query_fallback": "false",
-        "consolidation_enabled": "false",
-        "consolidation_min_age_days": "30",
-        "consolidation_max_actions": "25",
-        "duplicate_min_similarity": "0.88",
-        "duplicate_semantic_max_pairs": "20000",
-        "reranker_enabled": "false",
-        "reranker_model": "BAAI/bge-reranker-base",
-        "reranker_top_n": "10",
-        "context_aware_retrieval": "true",
-        "context_window_size": "3",
-        "context_max_chars": "500",
-        "query_expansion_enabled": "true",
-        "query_expansion_similarity_floor": "0.3",
-        "llm_model": "",
-        "llm_provider": "",
-        "entity_aliases": "",
-        "role_words": "",
-        "role_alias_llm_fallback": "true",
-        "expiry_enabled": "false",
-        "expiry_ttl_days": '{"context_note":30,"event":180,"goal":180}',
-        "expiry_default_days": "90",
-        "expiry_auto_suggest": "false",
-        # Distillation (P4.2)
-        "distillation_enabled": "false",
-        "distillation_min_new_records": "20",
-        "distillation_cooldown_hours": "24",
-        "distillation_max_records_per_run": "100",
-        "distillation_max_calls": "10",
-        # Lifecycle (P5.1, #6)
-        "archive_enabled": "false",
-        "archive_after_days": "180",
-        "forget_enabled": "false",
-        "forget_after_days": "365",
-        "rollup_enabled": "false",
-        "rollup_interval_days": "30",
-        "rollup_max_records_per_run": "100",
-        # Egress (review point 6)
-        "local_only": "false",
-        "external_sources_require_confirmation": "true",
-    }
     if hermes_home:
         home = Path(hermes_home)
     else:
@@ -281,20 +217,30 @@ def _load_config(hermes_home: str | None = None) -> dict:
             home = Path(os.path.expanduser("~/.hermes"))
 
     config_path = home / "hybrid_memory.json"
+    raw: dict = {}
     if config_path.exists():
         try:
             file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            config.update({k: v for k, v in file_cfg.items()
-                           if v is not None and v != ""})
+            if isinstance(file_cfg, dict):
+                raw = {k: v for k, v in file_cfg.items()
+                       if v is not None and v != ""}
         except Exception as exc:
             # Log + fall through to defaults — a trailing comma or typo in
             # the user's config must not be silently swallowed (the old
             # `except: pass` made hybrid_memory.json a no-op with no signal).
             logger.warning("malformed config %s: %s", config_path, exc)
+    # Build the validated config object (fail-soft: the before-validator
+    # in MemoryConfig handles clamping and type coercion, so this should
+    # only raise on extra/forbid keys or storage_name validation).
+    try:
+        cfg = MemoryConfig.model_validate(raw)
+    except Exception as exc:
+        logger.warning("config validation error in %s: %s; using defaults", config_path, exc)
+        cfg = MemoryConfig()
     # Cache the result for the hot path (issue #29).
     if hermes_home is None:
-        _store_config_cache(config)
-    return config
+        _store_config_cache(cfg)
+    return cfg
 
 
 def _flag(cfg: dict, key: str, default: str = "false") -> bool:
@@ -650,19 +596,22 @@ class ProviderCoreMixin:
         _set_active_user_id(self._user_id)
         self._current_project_id = str(kwargs.get("project_id") or "").strip()
 
+        # #244: _load_config() returns a validated MemoryConfig object.
+        # The ~60-attribute slurp is replaced by direct field access —
+        # clamping, type coercion, and fail-soft defaults are handled by
+        # the model's before-validator.
         self._config = _load_config(self._hermes_home)
+        cfg = self._config
         home = Path(self._hermes_home) if self._hermes_home else Path(os.path.expanduser("~/.hermes"))
 
         db_filename = safe_storage_name(
-            self._config.get("database_filename", "hybrid_memory.duckdb"),
-            "database_filename", "hybrid_memory.duckdb",
+            cfg.database_filename, "database_filename", "hybrid_memory.duckdb",
         )
         graph_dirname = safe_storage_name(
-            self._config.get("graph_dirname", "hybrid_memory_kuzu"),
-            "graph_dirname", "hybrid_memory_kuzu",
+            cfg.graph_dirname, "graph_dirname", "hybrid_memory_kuzu",
         )
 
-        storage_mode = str(self._config.get("storage_mode", "shared_service")).lower()
+        storage_mode = cfg.storage_mode
         use_shared_service = storage_mode not in {"local", "direct"}
 
         # Local fallback routing. The shared service path below always owns the
@@ -671,53 +620,36 @@ class ProviderCoreMixin:
             self._platform, db_filename, graph_dirname
         )
 
-        model_name = self._config.get("local_embedding_model", _DEFAULT_MODEL)
+        model_name = cfg.local_embedding_model
 
-        try:
-            self._max_injected = int(self._config.get("max_injected_items", _DEFAULT_MAX_INJECTED))
-        except (ValueError, TypeError):
-            self._max_injected = _DEFAULT_MAX_INJECTED
-
-        try:
-            self._inject_cap = int(self._config.get("inject_content_char_cap", _DEFAULT_INJECT_CONTENT_CHAR_CAP))
-        except (ValueError, TypeError):
-            self._inject_cap = _DEFAULT_INJECT_CONTENT_CHAR_CAP
+        self._max_injected = cfg.max_injected_items
+        self._inject_cap = cfg.inject_content_char_cap
 
         # Freshness markers (Tier-2 anti-staleness, default ON): append an
         # as-of marker to injected memories whose content carries a date
         # anchor. Append-only text; ranking and retrieval untouched.
-        self._freshness_markers = _flag(self._config, "freshness_markers", "true")
+        self._freshness_markers = cfg.freshness_markers
 
         # Injection gates (default OFF — benchmark parity; enable per config):
         # skip_retrieval_on_trivial: no heavy retrieval when the turn is a
         # low-information fragment ("test", "hi", "ok"). Explicit memory_search
         # tool calls never pass through this path and stay unaffected.
         # injection_min_score: drop injected items with similarity below floor.
-        self._skip_retrieval_on_trivial = _flag(self._config, "skip_retrieval_on_trivial", "false")
-        try:
-            self._injection_min_score = float(
-                self._config.get("injection_min_score", _DEFAULT_INJECTION_MIN_SCORE)
-            )
-        except (ValueError, TypeError):
-            self._injection_min_score = _DEFAULT_INJECTION_MIN_SCORE
+        self._skip_retrieval_on_trivial = cfg.skip_retrieval_on_trivial
+        self._injection_min_score = cfg.injection_min_score
 
-        self._chronological_injection = _flag(self._config, "chronological_injection", "false")
+        self._chronological_injection = cfg.chronological_injection
+        self._date_anchor_rerank = cfg.date_anchor_rerank
+        self._history_at_current_time = cfg.history_at_current_time
 
-        self._date_anchor_rerank = _flag(self._config, "date_anchor_rerank", "false")
-
-        self._history_at_current_time = _flag(self._config, "history_at_current_time", "true")
-
-        self._auto_extract = _flag(self._config, "auto_extract", "true")
-
-        self._llm_fallback = _flag(self._config, "llm_fallback", "true")
-        self._extraction_shadow_diff = _flag(self._config, "extraction_shadow_diff", "false")
-        self._auto_review = _flag(self._config, "auto_review", "true")
+        self._auto_extract = cfg.auto_extract
+        self._llm_fallback = cfg.llm_fallback
+        self._extraction_shadow_diff = cfg.extraction_shadow_diff
+        self._auto_review = cfg.auto_review
         # Guarded confirmation surfacing (#99 rework, 3/9): surface one
         # pending user-confirmation per non-trivial turn, genuine needs
         # only, never re-ask a candidate (ledger in system_state).
-        self._confirmation_surfacing = _flag(
-            self._config, "confirmation_surfacing", "true"
-        )
+        self._confirmation_surfacing = cfg.confirmation_surfacing
         logger.info(
             "Confirmation surfacing %s (guarded: one per turn, genuine-only, no re-asks)",
             "enabled" if self._confirmation_surfacing else "disabled",
@@ -725,264 +657,102 @@ class ProviderCoreMixin:
         # Extraction-time dedupe: proposals whose embedding cosine against an
         # active memory clears this threshold are skipped entirely (no
         # candidate emitted). 1.0 disables semantic dedupe.
-        try:
-            self._extraction_dup_threshold = max(
-                0.0, min(float(self._config.get("extraction_dup_threshold", 0.88)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._extraction_dup_threshold = 0.88
+        self._extraction_dup_threshold = cfg.extraction_dup_threshold
         # Stale-pending review sweep: re-review proposals stranded in
         # `pending` after a failed/rate-limited reviewer call, so a rate-limit
         # hiccup no longer condemns a proposal to sit unreviewed forever.
-        self._stale_review_sweep_enabled = _flag(self._config, "stale_review_sweep_enabled", "true")
-        try:
-            self._stale_review_interval_min = max(
-                1, int(self._config.get("stale_review_interval_min", 15))
-            )
-        except (TypeError, ValueError):
-            self._stale_review_interval_min = 15
-        try:
-            self._stale_review_min_age_min = max(
-                0, int(self._config.get("stale_review_min_age_min", 30))
-            )
-        except (TypeError, ValueError):
-            self._stale_review_min_age_min = 30
-        try:
-            self._stale_review_max_batch = max(
-                1, min(int(self._config.get("stale_review_max_batch", 25)), 500)
-            )
-        except (TypeError, ValueError):
-            self._stale_review_max_batch = 25
-        self._graph_aware_retrieval = _flag(self._config, "graph_aware_retrieval", "true")
-        try:
-            self._graph_retrieval_boost = max(
-                0.0, min(float(self._config.get("graph_retrieval_boost", 0.05)), 0.5)
-            )
-        except (TypeError, ValueError):
-            self._graph_retrieval_boost = 0.05
-        self._graph_inject_candidates = _flag(self._config, "graph_inject_candidates", "false")
-        try:
-            self._graph_boost_min_similarity = max(
-                0.0, min(float(self._config.get("graph_boost_min_similarity", 0.15)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._graph_boost_min_similarity = 0.15
-        self._graph_traversal_enabled = _flag(self._config, "graph_traversal_enabled", "true")
-        try:
-            self._graph_traversal_depth = max(
-                1, min(int(self._config.get("graph_traversal_depth", 2)), 4)
-            )
-        except (TypeError, ValueError):
-            self._graph_traversal_depth = 2
-        try:
-            self._graph_traversal_boost = max(
-                0.0, min(float(self._config.get("graph_traversal_boost", 0.0)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._graph_traversal_boost = 0.0
+        self._stale_review_sweep_enabled = cfg.stale_review_sweep_enabled
+        self._stale_review_interval_min = cfg.stale_review_interval_min
+        self._stale_review_min_age_min = cfg.stale_review_min_age_min
+        self._stale_review_max_batch = cfg.stale_review_max_batch
+        self._graph_aware_retrieval = cfg.graph_aware_retrieval
+        self._graph_retrieval_boost = cfg.graph_retrieval_boost
+        self._graph_inject_candidates = cfg.graph_inject_candidates
+        self._graph_boost_min_similarity = cfg.graph_boost_min_similarity
+        self._graph_traversal_enabled = cfg.graph_traversal_enabled
+        self._graph_traversal_depth = cfg.graph_traversal_depth
+        self._graph_traversal_boost = cfg.graph_traversal_boost
         # PPR config (issue #37).
-        self._graph_ppr_enabled = _flag(self._config, "graph_ppr_enabled", "false")
-        try:
-            self._graph_ppr_damping = max(
-                0.0, min(float(self._config.get("graph_ppr_damping", 0.5)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._graph_ppr_damping = 0.5
+        self._graph_ppr_enabled = cfg.graph_ppr_enabled
+        self._graph_ppr_damping = cfg.graph_ppr_damping
         # Read-side conflict surfacing (eval-first, default OFF): when the
         # injected set contains two active records that conflict on the same
         # subject (differing values, or one asserting a rule vs a later
         # discontinuation/scoping), inject an explicit conflict note so the
         # answerer surfaces the disagreement instead of smoothing it.
-        self._conflict_surfacing_enabled = _flag(self._config, "conflict_surfacing", "true")
-        try:
-            self._graph_ppr_boost = max(
-                0.0, min(float(self._config.get("graph_ppr_boost", 0.0)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._graph_ppr_boost = 0.0
-        try:
-            self._alias_expansion_boost = max(
-                0.0, min(float(self._config.get("alias_expansion_boost", 0.7)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._alias_expansion_boost = 0.7
-        self._consolidation_enabled = _flag(self._config, "consolidation_enabled", "false")
-        try:
-            self._consolidation_min_age_days = max(
-                1, int(self._config.get("consolidation_min_age_days", 30))
-            )
-        except (TypeError, ValueError):
-            self._consolidation_min_age_days = 30
-        try:
-            self._consolidation_max_actions = max(
-                1, min(int(self._config.get("consolidation_max_actions", 25)), 500)
-            )
-        except (TypeError, ValueError):
-            self._consolidation_max_actions = 25
+        self._conflict_surfacing_enabled = cfg.conflict_surfacing
+        self._graph_ppr_boost = cfg.graph_ppr_boost
+        self._alias_expansion_boost = cfg.alias_expansion_boost
+        self._consolidation_enabled = cfg.consolidation_enabled
+        self._consolidation_min_age_days = cfg.consolidation_min_age_days
+        self._consolidation_max_actions = cfg.consolidation_max_actions
         # Semantic dedup config (P4.1)
-        try:
-            self._duplicate_min_similarity = max(
-                0.0, min(float(self._config.get("duplicate_min_similarity", 0.88)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._duplicate_min_similarity = 0.88
-        try:
-            self._duplicate_semantic_max_pairs = max(
-                100, min(int(self._config.get("duplicate_semantic_max_pairs", 20000)), 1000000)
-            )
-        except (TypeError, ValueError):
-            self._duplicate_semantic_max_pairs = 20000
+        self._duplicate_min_similarity = cfg.duplicate_min_similarity
+        self._duplicate_semantic_max_pairs = cfg.duplicate_semantic_max_pairs
         # Reranker config
-        self._reranker_enabled = _flag(self._config, "reranker_enabled", "false")
-        self._reranker_model = str(
-            self._config.get("reranker_model", "BAAI/bge-reranker-base")
-        )
-        try:
-            self._reranker_top_n = max(
-                5, min(int(self._config.get("reranker_top_n", 10)), 100)
-            )
-        except (TypeError, ValueError):
-            self._reranker_top_n = 10
+        self._reranker_enabled = cfg.reranker_enabled
+        self._reranker_model = cfg.reranker_model
+        self._reranker_top_n = cfg.reranker_top_n
         # Context-aware retrieval config
-        self._context_aware_retrieval = _flag(self._config, "context_aware_retrieval", "true")
+        self._context_aware_retrieval = cfg.context_aware_retrieval
         # Exact-phrase lift config (default on? off? read global toggle).
         # alpha 0.0 disables; ~0.25 is the measured sweet spot.
-        try:
-            self._phrase_lift_alpha = max(
-                0.0, min(float(self._config.get("phrase_lift_alpha", 0.0)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._phrase_lift_alpha = 0.0
-        try:
-            self._phrase_lift_pool = max(
-                0, min(int(self._config.get("phrase_lift_pool", 200)), 1000)
-            )
-        except (TypeError, ValueError):
-            self._phrase_lift_pool = 200
-        try:
-            self._context_window_size = max(
-                1, min(int(self._config.get("context_window_size", 3)), 10)
-            )
-        except (TypeError, ValueError):
-            self._context_window_size = 3
-        try:
-            self._context_max_chars = max(
-                100, min(int(self._config.get("context_max_chars", 500)), 2000)
-            )
-        except (TypeError, ValueError):
-            self._context_max_chars = 500
+        self._phrase_lift_alpha = cfg.phrase_lift_alpha
+        self._phrase_lift_pool = cfg.phrase_lift_pool
+        self._context_window_size = cfg.context_window_size
+        self._context_max_chars = cfg.context_max_chars
         # Query expansion config
-        self._query_expansion_enabled = _flag(self._config, "query_expansion_enabled", "true")
-        try:
-            self._query_expansion_similarity_floor = float(
-                self._config.get("query_expansion_similarity_floor", "0.3")
-            )
-        except (TypeError, ValueError):
-            self._query_expansion_similarity_floor = 0.3
+        self._query_expansion_enabled = cfg.query_expansion_enabled
+        self._query_expansion_similarity_floor = cfg.query_expansion_similarity_floor
         # LLM model/provider config (empty = use auxiliary client default)
-        self._llm_model = str(self._config.get("llm_model", "")).strip()
-        self._llm_provider = str(self._config.get("llm_provider", "")).strip()
+        self._llm_model = cfg.llm_model
+        self._llm_provider = cfg.llm_provider
         # Spec-08 (#72): provider abstraction extended to extraction +
         # answering. Empty = fall back to llm_model/llm_provider, then
         # auxiliary client default. Switching endpoint = config change,
         # never a code path change.
-        self._extraction_llm_model = str(
-            self._config.get("extraction_llm_model", "")).strip()
-        self._extraction_llm_provider = str(
-            self._config.get("extraction_llm_provider", "")).strip()
+        self._extraction_llm_model = cfg.extraction_llm_model
+        self._extraction_llm_provider = cfg.extraction_llm_provider
         # W6: watcher config (spec-07 wiring). No watcher config = zero
         # behaviour change — the thread is not started.
-        self._watcher_enabled = _flag(self._config, "watcher_enabled", "false")
-        _roots = self._config.get("watcher_scan_roots", [])
-        if isinstance(_roots, str):
-            _roots = [r.strip() for r in _roots.split(",") if r.strip()]
-        self._watcher_scan_roots = [str(r) for r in _roots if r]
-        self._watcher_interval_min = int(
-            self._config.get("watcher_interval_min", 30))
-        self._answering_llm_model = str(
-            self._config.get("answering_llm_model", "")).strip()
-        self._answering_llm_provider = str(
-            self._config.get("answering_llm_provider", "")).strip()
+        self._watcher_enabled = cfg.watcher_enabled
+        self._watcher_scan_roots = list(cfg.watcher_scan_roots)
+        self._watcher_interval_min = cfg.watcher_interval_min
+        self._answering_llm_model = cfg.answering_llm_model
+        self._answering_llm_provider = cfg.answering_llm_provider
         # Deployment mode (POPIA): cloud_pilot (default) or local_sku.
-        self._deployment_mode = str(
-            self._config.get("deployment_mode", "cloud_pilot")).strip()
-        self._data_residency = str(
-            self._config.get("data_residency", "cloud")).strip()
+        self._deployment_mode = cfg.deployment_mode
+        self._data_residency = cfg.data_residency
         residency_error = deployment_consistency_error(
             self._deployment_mode, self._data_residency
         )
         if residency_error:
             logger.warning("Inconsistent deployment config: %s", residency_error)
         # Expiry config (Spec 1): TTL tiers / best-before dates.
-        self._expiry_enabled = _flag(self._config, "expiry_enabled", "false")
+        self._expiry_enabled = cfg.expiry_enabled
         default_ttl = {"context_note": 30, "event": 180, "goal": 180}
         self._expiry_ttl_days = parse_positive_int_map(
-            self._config.get("expiry_ttl_days"), "expiry_ttl_days", default_ttl,
+            cfg.expiry_ttl_days, "expiry_ttl_days", default_ttl,
         )
-        try:
-            self._expiry_default_days = max(
-                1, min(int(self._config.get("expiry_default_days", 90)), 3650)
-            )
-        except (TypeError, ValueError):
-            self._expiry_default_days = 90
-        self._expiry_auto_suggest = _flag(self._config, "expiry_auto_suggest", "false")
+        self._expiry_default_days = cfg.expiry_default_days
+        self._expiry_auto_suggest = cfg.expiry_auto_suggest
         # Push expiry config to the store so remember() uses the right TTL map.
         # (Moved after store creation — issue #29: these blocks were dead code
         # when run before the store exists during initialize.)
         # Distillation config (P4.2)
-        self._distillation_enabled = _flag(self._config, "distillation_enabled", "false")
-        try:
-            self._distillation_min_new_records = max(
-                1, int(self._config.get("distillation_min_new_records", 20))
-            )
-        except (TypeError, ValueError):
-            self._distillation_min_new_records = 20
-        try:
-            self._distillation_cooldown_hours = max(
-                0, int(self._config.get("distillation_cooldown_hours", 24))
-            )
-        except (TypeError, ValueError):
-            self._distillation_cooldown_hours = 24
-        try:
-            self._distillation_max_records_per_run = max(
-                10, min(int(self._config.get("distillation_max_records_per_run", 100)), 1000)
-            )
-        except (TypeError, ValueError):
-            self._distillation_max_records_per_run = 100
-        try:
-            self._distillation_max_calls = max(
-                1, min(int(self._config.get("distillation_max_calls", 10)), 100)
-            )
-        except (TypeError, ValueError):
-            self._distillation_max_calls = 10
+        self._distillation_enabled = cfg.distillation_enabled
+        self._distillation_min_new_records = cfg.distillation_min_new_records
+        self._distillation_cooldown_hours = cfg.distillation_cooldown_hours
+        self._distillation_max_records_per_run = cfg.distillation_max_records_per_run
+        self._distillation_max_calls = cfg.distillation_max_calls
         # Lifecycle config (P5.1, #6)
-        self._archive_enabled = _flag(self._config, "archive_enabled", "false")
-        try:
-            self._archive_after_days = max(
-                1, int(self._config.get("archive_after_days", 180))
-            )
-        except (TypeError, ValueError):
-            self._archive_after_days = 180
-        self._forget_enabled = _flag(self._config, "forget_enabled", "false")
-        try:
-            self._forget_after_days = max(
-                1, int(self._config.get("forget_after_days", 365))
-            )
-        except (TypeError, ValueError):
-            self._forget_after_days = 365
-        self._rollup_enabled = _flag(self._config, "rollup_enabled", "false")
-        try:
-            self._rollup_interval_days = max(
-                1, int(self._config.get("rollup_interval_days", 30))
-            )
-        except (TypeError, ValueError):
-            self._rollup_interval_days = 30
-        try:
-            self._rollup_max_records_per_run = max(
-                10, min(int(self._config.get("rollup_max_records_per_run", 100)), 1000)
-            )
-        except (TypeError, ValueError):
-            self._rollup_max_records_per_run = 100
+        self._archive_enabled = cfg.archive_enabled
+        self._archive_after_days = cfg.archive_after_days
+        self._forget_enabled = cfg.forget_enabled
+        self._forget_after_days = cfg.forget_after_days
+        self._rollup_enabled = cfg.rollup_enabled
+        self._rollup_interval_days = cfg.rollup_interval_days
+        self._rollup_max_records_per_run = cfg.rollup_max_records_per_run
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,
@@ -1009,12 +779,8 @@ class ProviderCoreMixin:
         # engines (ANN/BM25, fact families) behind MEASURED triggers. The
         # store owns the latency window and record-count sampling; the
         # provider exposes them via get_scale_metrics().
-        self._scale_warn_latency_ms = float(
-            self._config.get("scale_warn_latency_ms", 300.0)
-        )
-        self._scale_warn_records = int(
-            self._config.get("scale_warn_records", 5000)
-        )
+        self._scale_warn_latency_ms = cfg.scale_warn_latency_ms
+        self._scale_warn_records = cfg.scale_warn_records
         # (Scale threshold push moved after store creation — issue #29.)
 
         # Role words: load user-configured words into the graph module so
@@ -1022,7 +788,7 @@ class ProviderCoreMixin:
         # lawyer, etc.) are already in _DEFAULT_ROLE_WORDS; this adds any
         # user-configured extras and LLM-learned words persisted from prior
         # sessions. Canonical format: JSON array (comma-separated accepted).
-        extra = parse_role_words(self._config.get("role_words", ""))
+        extra = parse_role_words(cfg.role_words)
         if extra:
             try:
                 from graph import _set_role_words_override, _get_role_words
@@ -1042,51 +808,18 @@ class ProviderCoreMixin:
         # Embedder (lazy — model loads on first embed call).
         resolved_model = _resolve_embedding_model_path(model_name, home)
         self._embedder = LocalEmbedder(resolved_model, hermes_home=home)
-        self._evidence_retention = str(
-            self._config.get("evidence_retention", "full")
-        ).lower()
+        self._evidence_retention = cfg.evidence_retention
         # Chain-unfold config (ships off; flip to "auto" after eval).
-        self._chain_unfold = str(
-            self._config.get("chain_unfold", "off")
-        ).lower()
-        if self._chain_unfold not in {"off", "auto", "always"}:
-            self._chain_unfold = "off"
-        try:
-            self._chain_unfold_min_similarity = max(
-                0.0, min(float(self._config.get("chain_unfold_min_similarity", 0.30)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._chain_unfold_min_similarity = 0.30
+        self._chain_unfold = cfg.chain_unfold
+        self._chain_unfold_min_similarity = cfg.chain_unfold_min_similarity
         # Option A semantic-arc floor: cosine(query, current-version content)
         # that the unfolded chain must clear before the arc is injected
         # (precision guard — filters false triggers while keeping top-K recall).
-        try:
-            self._chain_unfold_arc_min_similarity = max(
-                0.0, min(float(self._config.get("chain_unfold_arc_min_similarity", 0.15)), 1.0)
-            )
-        except (TypeError, ValueError):
-            self._chain_unfold_arc_min_similarity = 0.15
-        try:
-            self._chain_max_versions = max(
-                1, min(int(self._config.get("chain_max_versions", 3)), 10)
-            )
-        except (TypeError, ValueError):
-            self._chain_max_versions = 3
-        try:
-            self._chain_max_inject = max(
-                1, int(self._config.get("chain_max_inject", 150))
-            )
-        except (TypeError, ValueError):
-            self._chain_max_inject = 150
-        try:
-            self._chain_unfold_top_k = max(
-                1, min(int(self._config.get("chain_unfold_top_k", 3)), 20)
-            )
-        except (TypeError, ValueError):
-            self._chain_unfold_top_k = 3
-        self._chain_unfold_query_fallback = str(
-            self._config.get("chain_unfold_query_fallback", "false")
-        ).lower() in {"1", "true", "yes", "on"}
+        self._chain_unfold_arc_min_similarity = cfg.chain_unfold_arc_min_similarity
+        self._chain_max_versions = cfg.chain_max_versions
+        self._chain_max_inject = cfg.chain_max_inject
+        self._chain_unfold_top_k = cfg.chain_unfold_top_k
+        self._chain_unfold_query_fallback = cfg.chain_unfold_query_fallback
 
         # Reranker (lazy — model loads on first rerank call).
         # In shared-service mode, the reranker runs inside the service
@@ -1102,9 +835,7 @@ class ProviderCoreMixin:
             )
 
         # External-source write policy: config flag → reviewer gate + storage.
-        self._external_require_confirmation = _flag(
-            self._config, "external_sources_require_confirmation", "true"
-        )
+        self._external_require_confirmation = cfg.external_sources_require_confirmation
         set_external_policy(self._external_require_confirmation)
 
         if use_shared_service:
@@ -1154,7 +885,7 @@ class ProviderCoreMixin:
         # Must run AFTER store creation — issue #29 class bug: this block
         # was before self._store was assigned, so the `if aliases_json and
         # self._store:` guard was always False (dead code).
-        alias_map = parse_string_map(self._config.get("entity_aliases", ""), "entity_aliases")
+        alias_map = parse_string_map(cfg.entity_aliases, "entity_aliases")
         if alias_map and self._store:
             try:
                 for alias, canonical in alias_map.items():
@@ -1180,7 +911,7 @@ class ProviderCoreMixin:
         if store_acl is not None:
             self._acl_config = store_acl
         else:
-            acl_data = self._config.get("acl")
+            acl_data = cfg.acl
             if isinstance(acl_data, dict):
                 self._acl_config = ACLConfig.from_dict(acl_data)
             else:

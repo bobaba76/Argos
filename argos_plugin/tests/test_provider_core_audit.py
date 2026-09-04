@@ -94,5 +94,5 @@ class TestPC6AclConfigFromStore:
         """PC6: when store has no _acl_config, falls back to loading from config."""
         from provider_core import ProviderCoreMixin
         src = inspect.getsource(ProviderCoreMixin.initialize)
-        # The fallback path should still load from self._config["acl"].
-        assert "self._config.get(\"acl\")" in src or 'self._config.get("acl")' in src
+        # #244: ACL is read from the MemoryConfig object (cfg.acl).
+        assert "cfg.acl" in src

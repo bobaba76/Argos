@@ -421,12 +421,13 @@ class TestFlagAcceptsOn:
             assert m._flag({"key": val}, "key") is True
 
     def test_initialize_wires_chrono_via_flag(self):
-        """Guard: initialize() must route chronological_injection through
-        _flag (not an inline parser that lacks 'on')."""
+        """Guard: initialize() must read chronological_injection from the
+        config object. #244: _flag() is replaced by MemoryConfig bool
+        coercion (which handles 'on' the same way _flag did)."""
         import inspect
         m = self._mod()
         src = inspect.getsource(m.ArgosProvider.initialize)
-        assert '_flag(self._config, "chronological_injection", "false")' in src
+        assert 'cfg.chronological_injection' in src
 
 
 # ---------------------------------------------------------------------------
@@ -446,9 +447,10 @@ class TestLoadConfigMalformedJson:
         with caplog.at_level(logging.WARNING, logger="argos_plugin.provider_core"):
             cfg = _load_config(str(tmp_path))
 
+        # #244: _load_config now returns a MemoryConfig object.
         # Defaults must still be returned.
-        assert isinstance(cfg, dict)
-        assert "database_filename" in cfg  # a default key
+        assert hasattr(cfg, "database_filename")
+        assert cfg.database_filename == "hybrid_memory.duckdb"
 
         # A warning must be logged naming the file path.
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -462,13 +464,15 @@ class TestLoadConfigMalformedJson:
             json.dumps({"chronological_injection": "on"}), encoding="utf-8",
         )
         cfg = _load_config(str(tmp_path))
-        assert cfg.get("chronological_injection") == "on"
+        # #244: "on" is coerced to True by the bool validator.
+        assert cfg.chronological_injection is True
 
     def test_no_config_file_returns_defaults(self, tmp_path):
         from provider_core import _load_config
         cfg = _load_config(str(tmp_path))
-        assert isinstance(cfg, dict)
-        assert "database_filename" in cfg
+        # #244: returns MemoryConfig with defaults.
+        assert hasattr(cfg, "database_filename")
+        assert cfg.database_filename == "hybrid_memory.duckdb"
 
     def test_memory_service_load_config_malformed_json(self, tmp_path, caplog):
         """Same-class fix: memory_service._load_config must also log + return

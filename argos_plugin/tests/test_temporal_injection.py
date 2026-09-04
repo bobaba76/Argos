@@ -136,13 +136,14 @@ class TestFlagParse:
                        "chronological_injection") is False
 
     def test_initialize_wires_both_flags(self):
-        # Guard: initialize() must route both keys through _flag so values
-        # in the live config actually reach the provider attributes.
+        # Guard: initialize() must read both keys from the config object so
+        # values in the live config actually reach the provider attributes.
+        # #244: _flag() is replaced by MemoryConfig bool coercion.
         import inspect
         m = self._mod()
         src = inspect.getsource(m.ArgosProvider.initialize)
-        assert '_flag(self._config, "chronological_injection", "false")' in src
-        assert '_flag(self._config, "date_anchor_rerank", "false")' in src
+        assert 'cfg.chronological_injection' in src
+        assert 'cfg.date_anchor_rerank' in src
 
 
 # ---------------------------------------------------------------------------

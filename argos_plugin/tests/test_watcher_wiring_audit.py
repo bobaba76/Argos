@@ -115,15 +115,16 @@ class TestW6WatcherThread:
         assert "extraction_llm_provider" in init_src
 
     def test_watcher_enabled_uses_flag_not_bool(self):
-        """W6: watcher_enabled is parsed via _flag(), not bool().
+        """W6: watcher_enabled is parsed via MemoryConfig bool coercion, not bool().
 
         bool("false") is True in Python (non-empty string is truthy),
         which would start the watcher even when config says disabled.
-        _flag() handles string "false" correctly.
+        #244: MemoryConfig's before-validator handles string "false" correctly
+        (same semantics as the old _flag()).
         """
-        from provider_core import ProviderCoreMixin, _flag
+        from provider_core import ProviderCoreMixin
         init_src = inspect.getsource(ProviderCoreMixin.initialize)
-        assert "_flag(" in init_src and "watcher_enabled" in init_src
+        assert "cfg.watcher_enabled" in init_src
         assert "bool(self._config.get(\"watcher_enabled\"" not in init_src
 
     def test_watcher_enabled_string_false_not_enabled(self):

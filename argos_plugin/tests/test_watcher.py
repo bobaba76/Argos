@@ -282,7 +282,6 @@ class TestConflictSurfacing:
         "Tax Invoice CORRECTED.pdf",
         "Invoice_REVISED.pdf",
         "Report (2).pdf",
-        "Document v2.pdf",
         "Statement rev.pdf",
         "Invoice amended.pdf",
     ])
@@ -303,8 +302,15 @@ class TestConflictSurfacing:
         assert "Tax Invoice" in base
 
     def test_doc_type_label_strips_version(self):
-        base = extract_doc_type_label("Report v2.pdf")
-        assert "v2" not in base
+        # W5: v\d+ is no longer a correction marker — version-only names
+        # keep their distinct labels. So "Report v2.pdf" → "Report v2"
+        # (v2 is NOT stripped). Use "Report REVISED.pdf" for stripping.
+        base = extract_doc_type_label("Report REVISED.pdf")
+        assert "REVISED" not in base
+        assert "Report" in base
+        # W5: v2 is NOT stripped (plain version number, not a correction).
+        base_v2 = extract_doc_type_label("Report v2.pdf")
+        assert "v2" in base_v2
 
 
 # ---------------------------------------------------------------------------

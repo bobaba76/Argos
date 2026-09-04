@@ -55,6 +55,24 @@ except ImportError:  # provider_retrieval.py imported as a top-level module
 
 logger = logging.getLogger(__name__)
 
+# -- #247: system prompt template (byte-stable for prompt caching) -----------
+import functools
+import os as _os
+
+@functools.lru_cache(maxsize=1)
+def _load_system_prompt() -> str:
+    """Load the system prompt template once from the template file.
+
+    #247: the template is a plain text file with a single {graph_status}
+    placeholder. Loaded once and cached via lru_cache. The text must stay
+    byte-stable for prompt caching — do not modify the template file.
+    """
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    _path = _os.path.join(_here, "system_prompt_template.txt")
+    with open(_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
 # -- Read-side conflict surfacing (config-gated, default OFF) ----------------
 # When the injected set contains two ACTIVE records that conflict on the same
 # subject, append an explicit conflict note to the context so the answerer
@@ -108,44 +126,10 @@ class ProviderRetrievalMixin:
         # Dynamic state (memory count, embedding status) is NOT included here
         # because it changes between turns and would invalidate the cached prefix.
         # The prefetch() method injects dynamic recall context separately.
+        # #247: the prompt text is loaded from system_prompt_template.txt to
+        # keep it byte-stable and separable from code changes.
         graph_status = "available" if self._graph else "unavailable"
-        return (
-            "# Argos (Local)\n"
-            f"Active. Relationship graph: {graph_status}.\n"
-            "You have persistent memory of this user from past conversations — "
-            "any topic: personal life, work, tech, hobbies, relationships. "
-            "Relevant memories are auto-injected before each turn. For deeper or "
-            "multi-hop lookups, call memory_search with different wording.\n"
-            "Categories: personal_fact (stable facts), preference (how they like things), "
-            "insight (self-observations, realizations), event (life events, milestones), "
-            "relationship (people in their life), goal (what they're working toward), "
-            "context_note (situational context).\n"
-            "When the user states a durable fact, preference, or insight — about "
-            "ANY topic — call memory_save immediately — don't wait to be asked. "
-            "Automatic extraction creates pending proposals, not active memories. "
-            "Review them with memory_candidate_list and memory_candidate_review; "
-            "never approve a proposal merely because another model produced it.\n"
-            "\n"
-            "## Save reasoning, not just conclusions\n"
-            "When you work through a non-trivial topic with the user — technical reasoning, "
-            "analytical reasoning, trade-off analysis, decision-making, important "
-            "decisions — save the REASONING CHAIN, not just the final conclusion. "
-            "A bare fact like 'Fact-A might be Fact-B' is far less useful than the full "
-            "reasoning: what evidence supports it, what was considered and ruled out, "
-            "what the uncertainty level is, and what would confirm or deny it. "
-            "Use the content field to store a self-contained reasoning summary "
-            "(200-800 chars is fine — the system handles long content). "
-            "This ensures future sessions can reconstruct WHY a conclusion was reached, "
-            "not just WHAT it was.\n"
-            "\n"
-            "## Quality over quantity\n"
-            "Don't save trivial facts the agent could infer from context ('user uses "
-            "a keyboard', 'user is typing'). Don't save fragments of your own output. "
-            "Don't save the same fact in slightly different wording. One rich, "
-            "well-reasoned memory is worth ten shallow flashcards.\n"
-            "Use memory_graph_search to find relationships between people, tools, "
-            "and concepts in the user's life."
-        )
+        return _load_system_prompt().format(graph_status=graph_status)
 
     # -- retrieval ------------------------------------------------------------
 

@@ -23,7 +23,7 @@
 # %LOCALAPPDATA%\Temp\argos_tests_<timestamp>.log (printed at the end), and
 # the exit code matches pytest's.
 param(
-    [string]$Python = "C:\Users\michael\AppData\Local\hermes\hermes-agent\venv-cuda\Scripts\python.exe",
+    [string]$Python = "",
     [string]$TestPath = "argos_plugin/tests/",
     [switch]$Pop,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -36,10 +36,8 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 # -- Pop mode: launch a fresh window running the same script inline -----------
 if ($Pop) {
     $inlineArgs = @("-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-TestPath", $TestPath)
-    if ($Python -ne "C:\Users\michael\AppData\Local\hermes\hermes-agent\venv-cuda\Scripts\python.exe") {
-        $inlineArgs += "-Python"
-        $inlineArgs += $Python
-    }
+    $inlineArgs += "-Python"
+    $inlineArgs += $Python
     $inlineArgs += $PytestArgs
     $p = Start-Process -FilePath "powershell.exe" -ArgumentList $inlineArgs -WorkingDirectory $RepoRoot -PassThru
     Write-Output "Launched test window (PID $($p.Id)) - watch it on your desktop."
@@ -47,6 +45,10 @@ if ($Pop) {
 }
 
 # -- Resolve the python executable --------------------------------------------
+if (-not $Python) {
+    $Python = Join-Path $env:LOCALAPPDATA "hermes\hermes-agent\venv-cuda\Scripts\python.exe"
+}
+
 if (-not (Test-Path $Python)) {
     Write-Warning "Python '$Python' not found - falling back to 'python' on PATH."
     $Python = "python"

@@ -106,8 +106,8 @@ CUDA recipe (validated):
 
 ```bash
 cd argos_plugin
-PYTHONPATH="C:/Users/michael/AppData/Local/hermes/hermes-agent" HF_HUB_OFFLINE=1 \
-  "C:/Users/michael/AppData/Local/hermes/hermes-agent/venv-cuda/Scripts/python.exe" \
+PYTHONPATH="%LOCALAPPDATA%/hermes/hermes-agent" HF_HUB_OFFLINE=1 \
+  "%LOCALAPPDATA%/hermes/hermes-agent/venv-cuda/Scripts/python.exe" \
   -m pytest tests/ -q -n 4 > "$LOCALAPPDATA/Temp/argos_tests_<stage>.log" 2>&1
 ```
 

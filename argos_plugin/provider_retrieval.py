@@ -1134,6 +1134,8 @@ class ProviderRetrievalMixin:
     # -- prefetch (auto-inject context before each turn) ---------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        # PS6: reset the per-turn tool call counter.
+        self._tool_call_count = 0
         self._record_user_message(message)
         self._start_prefetch(message)
 

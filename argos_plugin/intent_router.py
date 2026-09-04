@@ -22,6 +22,14 @@ Design (v3 — precision-fixed):
   * Always returns an explicit model (smart for temporal/multi-hop, default
     otherwise) so the answerer self-corrects across turns.
   * Failure here is never allowed to break the turn — best-effort only.
+    Swallowed routing failures are counted in ``ROUTING_FAILURES`` (see
+    ``routing_failure_count``) so they stay visible to monitoring.
+
+Scoring model: ``temporal_score`` / ``multi_hop_score`` are SUMS of
+independent evidence weights, clamped to 1.0.  They are NOT probabilities —
+a query hitting many signals can exceed 1.0 before the clamp, and a score of
+0.50 does not mean "50% likely".  Only the ordering relative to the
+thresholds is meaningful.
 """
 
 from __future__ import annotations
@@ -102,14 +110,17 @@ _ORDER_RE = re.compile(
 
 # Reporting verbs are DEMOTED in v3: a bare verb alone (0.25) must not route;
 # it only pays when an entity or "about X" topic is present.
+# Single-word verbs are matched against the query's word set; multi-word
+# phrases are matched with a word-boundary regex (a set intersection can
+# never hit a phrase containing a space).
 _REPORTING_VERBS = {
     "said", "says", "say", "told", "tell", "mentioned", "mentions",
     "discussed", "discuss", "agreed", "agree", "explained", "explain",
     "wrote", "write", "sent", "send", "asked", "ask", "recommended",
     "recommend", "suggested", "suggest", "claimed", "claim", "stated",
-    "state", "replied", "reply", "messaged", "talked about", "talk about",
-    "brought up", "raised",
+    "state", "replied", "reply", "messaged", "raised",
 }
+_REPORTING_PHRASES = {"talked about", "talk about", "brought up"}
 _COMPARISON_VERBS = {
     "compare", "compared", "comparison", "versus", "vs", "different",
     "differ", "better than", "worse than", "how does", "how do", "which is",
@@ -124,13 +135,17 @@ _YOU_SAID_RE = re.compile(
     r"\b(you\s+(said|told|wrote|mentioned|agreed|suggested|recommended|"
     r"advised|claimed|explained|sent))\b", re.I,
 )
+# A "?" only counts as question shape when it terminates the query; a quoted
+# question inside a statement ("he said 'are you sure?' and left") does not.
 _QUESTION_RE = re.compile(
     r"\b(?:what|when|where|who|which|why|how)\b"
     r"|\b(?:did|does|do|is|are|was|were|has|have|had)\s+\w+"
-    r"|\?",
+    r"|\?\s*$",
     re.IGNORECASE,
 )
 
+# Case-sensitive on purpose: searched against the ORIGINAL query (not the
+# lowercased ``q``) because capitalisation is the only entity signal here.
 _ENTITY_PAIR_RE = re.compile(
     r"\b([A-Z][a-z]+)\s+(and|vs|versus|then|compared to)\s+([A-Z][a-z]+)\b"
 )
@@ -140,13 +155,24 @@ _ENTITY_PAIR_RE = re.compile(
 # topic: adverbs/pronouns ("about earlier", "about that") are not topics.
 _TOPIC_RE = re.compile(
     r"\b(?:about|regarding)\s+(?:(?:the|my|our|your|this|that|a|an)\s+)?"
-    r"(?!earlier|later|before|after|today|yesterday|tomorrow|tonight|now|"
+    r"(?!(?:earlier|later|before|after|today|yesterday|tomorrow|tonight|now|"
     r"then|here|there|it|them|him|her|us|me|you|this|that|these|those|"
-    r"what|when|where|why|how)[a-z0-9'-]{2,}",
+    r"what|when|where|why|how|something|someone|somehow|anything|anyone|"
+    r"nothing)\b)[a-z0-9'-]{2,}",
     re.I,
 )
 
 _WORDS_RE = re.compile(r"[a-z0-9']+", re.I)
+
+
+def _phrase_re(items) -> "re.Pattern[str]":
+    """Word-boundary alternation over ``items`` (longest first)."""
+    alts = "|".join(re.escape(i) for i in sorted(items, key=len, reverse=True))
+    return re.compile(r"\b(?:" + alts + r")\b", re.I)
+
+
+_RELATIVE_TIME_RE = _phrase_re(_RELATIVE_TIME)
+_REPORTING_PHRASES_RE = _phrase_re(_REPORTING_PHRASES)
 
 # English sentence-starters / function words that get capitalized at
 # sentence start but are NOT proper nouns.  Excluded from entity detection.
@@ -164,6 +190,9 @@ _NON_ENTITY_CAPS = {
     "though", "though", "although", "because", "while", "after", "before",
     "during", "with", "without", "from", "by", "via", "etc", "e", "g",
     "vs",
+    # Imperative sentence-starters (capitalised only by position).
+    "tell", "remind", "remember", "show", "give", "let", "find", "check",
+    "look", "help", "explain", "list", "summarize", "summarise", "compare",
 }
 # Months/weekdays are calendar words, not entities.
 _NON_ENTITY_CAPS |= _MONTHS | _WEEKDAYS
@@ -173,26 +202,18 @@ def _words(text: str):
     return _WORDS_RE.findall(text.lower())
 
 
-def _has_any(text_lower: str, items) -> bool:
-    return any(item in text_lower for item in items)
-
-
 def _proper_nouns(query: str) -> int:
     """Count capitalized words that are plausibly named entities.
 
-    Excludes the query's first word (sentence-start capitalization) and a
-    stopword set of common capitalized function words.  Case-sensitive on the
-    ORIGINAL query — "alex" lowercase is not an entity, "Alex" is.
+    Excludes a stopword set of common capitalized function words and
+    imperative sentence-starters, so a sentence-initial "Alex" still counts
+    while "What"/"Tell" do not.  Case-sensitive on the ORIGINAL query —
+    "alex" lowercase is not an entity, "Alex" is.
     """
     tokens = re.findall(r"[A-Za-z][A-Za-z']*", query)
-    if not tokens:
-        return 0
-    first = tokens[0].lower()
     count = 0
     for tok in tokens:
         low = tok.lower()
-        if low == first:
-            continue  # skip the sentence-initial word
         if (
             len(tok) >= 3
             and tok[0].isupper()
@@ -208,7 +229,10 @@ def _proper_nouns(query: str) -> int:
 # ---------------------------------------------------------------------------
 
 def temporal_score(query: str) -> float:
-    """Additive temporal confidence in [0, 1].
+    """Additive temporal evidence weight, clamped to [0, 1].
+
+    Not a probability: each matched signal adds its fixed weight and the raw
+    sum may exceed 1.0 before clamping (see module docstring).
 
     v3: single weak calendar/time words (weeks, months, relative adverbs)
     are deliberately below the 0.50 threshold on their own.  Genuine anchors
@@ -232,7 +256,7 @@ def temporal_score(query: str) -> float:
     if _ORDER_RE.search(q):
         score += 0.50
     # Relative-time adverbs: weak on purpose.
-    if _has_any(q, _RELATIVE_TIME):
+    if _RELATIVE_TIME_RE.search(q):
         score += 0.25
     # Explicit durations, dated formats, years.
     if _DURATION_RE.search(q):
@@ -251,7 +275,10 @@ def temporal_score(query: str) -> float:
 
 
 def multi_hop_score(query: str) -> float:
-    """Additive multi-hop confidence in [0, 1].
+    """Additive multi-hop evidence weight, clamped to [0, 1].
+
+    Not a probability: each matched signal adds its fixed weight and the raw
+    sum may exceed 1.0 before clamping (see module docstring).
 
     v3: a bare reporting verb scores 0.25 — below the 0.45 threshold.  It
     routes only when paired with a proper-noun entity (+0.30), an "about X"
@@ -264,7 +291,9 @@ def multi_hop_score(query: str) -> float:
         return 0.0
     score = 0.0
     words = set(_words(q))
-    reporting_hits = words & _REPORTING_VERBS
+    reporting_hits = (words & _REPORTING_VERBS) | set(
+        m.lower() for m in _REPORTING_PHRASES_RE.findall(q)
+    )
     comparison_hits = words & _COMPARISON_VERBS
     chain_hits = words & _CHAIN_TERMS
 
@@ -283,7 +312,8 @@ def multi_hop_score(query: str) -> float:
     if (reporting_hits or comparison_hits or chain_hits) and _TOPIC_RE.search(q):
         score += 0.35
     # Entity-pair ("X and Y") — only pays when >=1 verb class hit present
-    # (prevents "X and Y products" false positives).
+    # (prevents "X and Y products" false positives).  Searches the original
+    # ``query`` (not ``q``) because the pattern relies on capitalisation.
     if _ENTITY_PAIR_RE.search(query) and (reporting_hits or comparison_hits or chain_hits):
         score += 0.30
     return min(1.0, score)
@@ -333,6 +363,13 @@ def is_historical_query(query: str) -> bool:
     then") AND question shape, so ordinary current-state questions never
     pay the widened-search cost.  This gates the include-closed-versions
     retrieval path in ``_search_memories``.
+
+    Deliberately does NOT reuse ``_PAST_TENSE_FACT_RE`` from
+    ``temporal_score``: that probe fires on any past-tense fact question
+    ("what did I eat yesterday") whose answer is still a CURRENT fact, so
+    sharing it would widen retrieval to closed versions for ordinary
+    questions.  The two detectors overlap on "used to" style phrasing only
+    because both happen to describe the past; their purposes differ.
     """
     if not query or not query.strip():
         return False
@@ -354,6 +391,28 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+# Config thresholds are clamped to this range: 0.0 would route every
+# question, >1.0 could never be reached (scores are clamped to 1.0).
+THRESHOLD_MIN = 0.1
+THRESHOLD_MAX = 1.0
+
+
+def _threshold(value: Any, default: float) -> float:
+    parsed = _as_float(value, default)
+    if parsed != parsed:  # NaN
+        parsed = default
+    return max(THRESHOLD_MIN, min(THRESHOLD_MAX, parsed))
+
+
+# Count of swallowed exceptions in ``route_answerer`` (IR7): routing bugs
+# fall back to the default model silently, so expose them for monitoring.
+ROUTING_FAILURES = 0
+
+
+def routing_failure_count() -> int:
+    return ROUTING_FAILURES
 
 
 def route_answerer(config: Dict[str, Any], user_message: str) -> Optional[Dict[str, str]]:
@@ -385,8 +444,8 @@ def route_answerer(config: Dict[str, Any], user_message: str) -> Optional[Dict[s
             return None
         temporal = temporal_score(msg)
         multi_hop = multi_hop_score(msg)
-        t_thresh = _as_float(config.get("router_temporal_threshold"), ROUTE_TEMPORAL_THRESHOLD)
-        m_thresh = _as_float(config.get("router_multihop_threshold"), ROUTE_MULTI_HOP_THRESHOLD)
+        t_thresh = _threshold(config.get("router_temporal_threshold"), ROUTE_TEMPORAL_THRESHOLD)
+        m_thresh = _threshold(config.get("router_multihop_threshold"), ROUTE_MULTI_HOP_THRESHOLD)
         if temporal >= t_thresh or multi_hop >= m_thresh:
             pick = smart
             provider = str(config.get("router_smart_provider") or "").strip()
@@ -397,5 +456,7 @@ def route_answerer(config: Dict[str, Any], user_message: str) -> Optional[Dict[s
             result["provider"] = provider
         return result
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("router: failed to route: %s", exc)
+        global ROUTING_FAILURES
+        ROUTING_FAILURES += 1
+        logger.warning("router: failed to route (failure #%d): %s", ROUTING_FAILURES, exc)
         return None

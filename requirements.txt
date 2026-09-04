@@ -22,3 +22,4 @@ PyYAML==6.0.3
 # Test runner (README: python -m pytest hybrid_memory_plugin/tests/ -v)
 pytest==9.1.1
 pytest-xdist==3.8.0
+pytest-timeout==2.3.1

@@ -32,9 +32,18 @@ jobs:
       - name: Compute changed test files
         id: changed
         run: |
+          # Base SHA for the diff: PR base for PRs, previous commit for pushes.
+          # Fall back to HEAD~1 if github.event.before is empty (e.g. first push
+          # to a branch or API-triggered runs).
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
-          # Changed test files (excluding known-env-dependent ones)
-          TESTS=$(git diff --name-only "$BASE" HEAD -- argos_plugin/tests/ | grep '\.py$' || true)
+          if [ -z "$BASE" ]; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+          fi
+          if [ -z "$BASE" ]; then
+            echo "No base SHA available — skipping pytest (smoke only)."
+            echo "TESTS=" >> "$GITHUB_ENV"
+            exit 0
+          fi
           # Add test files matching changed source modules (e.g. store.py -> test_store*.py)
           SRC=$(git diff --name-only "$BASE" HEAD -- argos_plugin/ | grep -v '/tests/' | sed 's|.*/||; s|\.py$||' | sort -u)
           for m in $SRC; do

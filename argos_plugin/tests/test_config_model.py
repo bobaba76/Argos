@@ -321,3 +321,56 @@ class TestLegacyKeysSurvival:
             "backup": {"dst_root": "/mnt/backup", "retention_snapshots": 10},
         })
         assert c.backup == {"dst_root": "/mnt/backup", "retention_snapshots": 10}
+
+    def test_t1_schema_model_parity(self):
+        """T1: every key declared in config_schema.py is a MemoryConfig field.
+
+        Catches the 9-key mismatch that caused the router to be silently
+        disabled. If a new key is added to config_schema.py without adding
+        it to MemoryConfig, this test fails at CI.
+        """
+        import re
+        from pathlib import Path
+        from config_model import MemoryConfig
+
+        schema_path = Path(__file__).resolve().parent.parent / "config_schema.py"
+        schema_text = schema_path.read_text(encoding="utf-8")
+        schema_keys = set(re.findall(r'key="(\w+)"', schema_text))
+        model_keys = set(MemoryConfig.model_fields.keys())
+
+        missing = schema_keys - model_keys
+        assert not missing, (
+            f"config_schema.py declares keys not in MemoryConfig: {sorted(missing)}. "
+            f"Add them to config_model.py or .get() will return None and silently "
+            f"disable the feature that reads them."
+        )
+
+    def test_t3_round_trip_router_keys_readable(self):
+        """T3: every router_* key written to config is readable via .get().
+
+        The dict handed to intent_router / provider_ambient must contain all
+        router_* keys with their configured values, not None.
+        """
+        from config_model import MemoryConfig
+
+        raw = {
+            "router_enabled": "true",
+            "router_smart_model": "deepseek/deepseek-v4-pro-0813",
+            "router_smart_provider": "openrouter",
+            "router_default_model": "deepseek-v4-flash",
+            "router_default_provider": "opencode-go",
+            "router_subcall_enabled": "true",
+            "router_temporal_threshold": "0.6",
+            "router_multihop_threshold": "0.4",
+        }
+        c = MemoryConfig.model_validate(raw)
+
+        # Every router key must be readable with the configured value.
+        assert c.get("router_enabled") is True
+        assert c.get("router_smart_model") == "deepseek/deepseek-v4-pro-0813"
+        assert c.get("router_smart_provider") == "openrouter"
+        assert c.get("router_default_model") == "deepseek-v4-flash"
+        assert c.get("router_default_provider") == "opencode-go"
+        assert c.get("router_subcall_enabled") is True
+        assert c.get("router_temporal_threshold") == 0.6
+        assert c.get("router_multihop_threshold") == 0.4

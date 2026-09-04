@@ -299,6 +299,13 @@ class StoreRetrievalMixin:
         # ~14ms at 5k).  Exact — identical ranking, no approximation.  The
         # dimension is derived from the actual vector, so a model swap with a
         # different embedding size keeps working.
+        # SR13: validate embedding dimension before SQL interpolation.
+        if not emb or len(emb) > self._MAX_EMBEDDING_DIM:
+            logger.warning(
+                "embedder returned invalid dim %d — vector search skipped",
+                len(emb) if emb else 0,
+            )
+            return []
         vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
         params: List[Any] = [vec_text]
         # Temporal filter: default to current (valid_to IS NULL),
@@ -1143,6 +1150,11 @@ class StoreRetrievalMixin:
     # Semantic dedup threshold: cosine similarity above this means "same fact".
     _DEDUP_SIMILARITY_THRESHOLD = 0.85
 
+    # SR13: max valid embedding dimension. Embeddings with 0 dims or dims
+    # above this cap are rejected before SQL interpolation to prevent
+    # silent degradation of semantic search/dedup.
+    _MAX_EMBEDDING_DIM = 4096
+
     def _content_exists(
         self, content: str, category: str,
         *,
@@ -1305,6 +1317,13 @@ class StoreRetrievalMixin:
             if self.embedder and hasattr(self.embedder, "embed"):
                 emb = self.embedder.embed(content)
                 if emb:
+                    # SR13: validate embedding dimension before SQL interpolation.
+                    if len(emb) > self._MAX_EMBEDDING_DIM:
+                        logger.warning(
+                            "embedder returned invalid dim %d — semantic dedup skipped",
+                            len(emb),
+                        )
+                        return None, None
                     try:
                         # Same string-cast constant trick as _vector_search_raw
                         # (Python-list params bind per-row; ~1s at 1k rows).

@@ -1,102 +1,74 @@
 # Argos
 
-Persistent memory for AI agents, on your own machine. A Hermes plugin with a standalone server: hybrid vector + graph store, local embeddings, and an external API (MCP + REST).
+Persistent memory for AI agents, running on your own machine.
 
-## Capabilities
+## What Argos is
 
-- **Facts persist across sessions.** Tell it once, ask weeks later.
-- **Changes are versioned, not erased.** Updating a fact chains a new version onto the old one. Ask "what changed?" and get the history.
-- **Semantic search.** Vector + keyword fusion (RRF), optional GPU reranker (BAAI/bge-reranker-base, similarity + cross-encoder blend), date-anchored temporal handling, and a change-intent chain-unfold pass.
-- **Relationship graph.** A Kùzu graph of entities, relations, and aliases powers multi-hop queries ("who works with my sister?").
-- **Ambient context.** Time, location, weather, and recent file activity inject every turn via a `pre_llm_call` hook.
-- **Insight capture.** "I just realised…" moments are logged verbatim. Browse with `/ilog`, resurface with `/revisit`, store exclusions with `/neg <claim>`.
-- **Gated distillation.** Once a day, cost-capped, Argos proposes distilled patterns from accumulated records. Nothing lands in memory without your approval.
-- **External API.** A read tier over MCP (stdio) and REST (HTTP) — any MCP-capable agent or script can search, fetch, and inspect histories against the same store, behind a canonical auth → ACL → validation → audit facade. See [External API](#external-api).
-- **Multitenant cells.** Per-tenant stores behind the shared service: provisioning, isolation, and concurrency gates (end-to-end tested).
-- **Temporal as-of queries.** Records carry `valid_from` / `valid_to` / `superseded_by`; retrieval defaults to the current view and supports `as_of` and `include_closed`. Chronological injection (oldest-first on temporal turns) is implemented, off by default.
-- **Reversible cleanup.** Maintenance and consolidation quarantine stale or duplicate memories, not delete them. Explicit deletion (`memory_delete`) is chain-aware: multi-version records promote the predecessor or quarantine the middle version; single-version records are hard-deleted and tombstoned against re-creation.
+Argos gives your AI agent a memory that actually sticks. It's a plugin for the Hermes agent framework (a standalone server is also on the table), and it remembers what your agent learns across sessions instead of forgetting the moment the conversation ends. Facts get versioned, not deleted, so you can always see how something changed. Everything is searchable, and everything is auditable.
 
-## Trust model
+Your data stays where you can see it: records, embeddings, and the relationship graph are all local files in your agent's home directory. No hosted memory vendor, no data leaving your machine for storage. Embeddings run locally too, using BGE-small-en-v1.5, a compact model under 130MB. The one honest exception: extraction, candidate review, and query expansion currently call your configured cloud model. There's no native local-LLM runtime yet.
 
-Nothing becomes a memory silently. Every turn is mined for facts (regex first, LLM fallback), but the output is a *proposal* — pending until you approve it. `memory_save` is the explicit exception: it writes directly to active memory, an intentional agent action rather than passive ingestion. Updates chain versions instead of overwriting. Cleanup quarantines instead of deleting; explicit `memory_delete` on a single-version record hard-deletes and tombstones it (re-creation is blocked until the tombstone is purged). Distillation proposes but never writes. Provenance and grounding are tracked per record (write-time trust taint, quote verification). Every capability listed above is measured by the eval harness or structurally verified against source — see [Verification](#verification).
+## What it does for you
 
-## External API
+- Facts persist across sessions. Ask "what did we agree about the budget last week?" and get a real answer, not a shrug.
+- Changes are versioned, never erased. Ask "what was the old value before I updated it?" and Argos shows you the chain.
+- Semantic search fuses vector and keyword matching with RRF, so "find that thing about the car service" actually finds it.
+- A relationship graph (built on Kùzu) answers multi-hop questions like "who works with my sister?"
+- Ambient context — time, weather, location, recent files — gets injected automatically every turn, so your agent isn't starting cold.
+- Insight capture logs "I just realised..." moments verbatim. Browse them with /ilog, bring them back with /revisit.
+- Once a day, cost-capped, Argos proposes patterns distilled from accumulated records. Nothing lands in memory without your approval.
+- A read-tier external API, over MCP (stdio) and REST, lets any MCP-capable agent or script search, fetch, and inspect history against the same store, behind auth, ACL, validation, and audit.
+- Multitenant cells keep per-tenant stores separate behind a shared service.
+- Temporal as-of queries: records carry valid_from and valid_to, retrieval defaults to the current view, and you can ask for a past state or include closed records.
+- Cleanup is reversible. Maintenance quarantines stale or duplicate records rather than destroying them, and explicit deletes are chain-aware — promoting the predecessor, quarantining the middle, tombstoning single versions so they can't quietly reappear.
 
-The API is a **read tier today** (spec-09: transports are trust boundaries, not thin wrappers). Both servers bind to loopback only and enforce a bearer token; the operation set is an explicit allowlist behind `ArgosAPIFacade` (auth-context → ACL → validation → audit). No raw RPC passthrough — internal operations (shutdown, backup, set_state, purge, and friends) are never exposed.
+## How it earns trust
 
-- **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio; `search`, `fetch`, `fetch_history`, `capabilities`. Register with any MCP client.
-- **REST (HTTP):** `argos_plugin/rest_server.py` — `GET /v1/health`, `GET /v1/ready`, `GET /v1/capabilities`, `POST /v1/memory/search`, `GET /v1/memories/{memory_id}`, `GET /v1/memories/{memory_id}/history`. Bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
+Nothing becomes a memory silently. Every turn gets mined for facts, but the result is a proposal sitting in a queue until you approve it. The one exception is memory_save, which is an explicit, intentional action by the agent, not a background guess.
 
-```bash
-# REST
-ARGOS_REST_TOKEN=<token> python -m argos_plugin.rest_server --home <hermes-home> --port 8732
-# MCP
-python -m argos_plugin.mcp_server --home <hermes-home>
-```
+Updates chain versions instead of overwriting history, so "what changed?" is always answerable. Cleanup quarantines instead of deleting, and explicit deletes are chain-aware with tombstones, so a deleted record can't be silently recreated.
 
-Writes over the API (propose → human-approve classes) are on the roadmap behind the same facade.
+Every capability claim in this README is backed by a committed, re-runnable artifact in CLAIMS-AUDIT.md. A reproducibility gate re-derives every headline number and fails the build if the numbers drift.
 
-## Tools
+## The tools
 
-Sixteen `memory_*` tools, grouped:
+Argos ships 16 memory_* tools. The MCP and REST surface exposes the read subset.
 
 | Group | Tools |
-|-------|-------|
-| Store & search | `memory_search`, `memory_save`, `memory_fetch_full` |
-| Version chains | `memory_update`, `memory_delete`, `memory_chain` |
-| Graph | `memory_graph_search`, `memory_graph_query` |
-| Review & restore | `memory_candidate_list`, `memory_candidate_review`, `memory_restore` |
-| Feedback & maintenance | `memory_feedback`, `memory_maintenance` |
-| Diagnostics | `memory_why_not`, `memory_tombstones`, `memory_tombstone_purge` |
+|---|---|
+| Store and search | memory_search, memory_save, memory_fetch_full |
+| Version chains | memory_update, memory_delete, memory_chain |
+| Graph | memory_graph_search, memory_graph_query |
+| Review and restore | memory_candidate_list, memory_candidate_review, memory_restore |
+| Feedback and maintenance | memory_feedback, memory_maintenance |
+| Diagnostics | memory_why_not, memory_tombstones, memory_tombstone_purge |
 
-The MCP/REST surface exposes the read subset of these through the facade.
+## What it can't do yet
 
-## Numbers
-
-| Metric | Result | Protocol |
-|--------|--------|----------|
-| LongMemEval_S (best config) | 89.8% (449/500) | GLM-5.3-flash answerer, gpt-4o judge |
-| LongMemEval_S (baseline) | 70.4% (352/500) | gpt-4o judge, default answerer |
-| Chain-unfold (change-intent) | 93% recall / 93% precision | canonical eval harness |
-| Temporal questions | 88.7% (118/133) | full-bank, text-leg hardening |
-| Recall@96 | 99.6% | answer-bearing memories reaching top-96 |
-
-Protocols, dataset SHA-256, per-category denominators, model versions, prompts, exact commands, and judged outputs: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
-
-## Verification
-
-Every number and capability statement above is backed by a committed, re-runnable artifact — nothing is quoted without evidence.
-
-- **Claims audit** — [CLAIMS-AUDIT.md](CLAIMS-AUDIT.md) maps every claim to its evidence and separates three tiers: *measured* (committed judged artifacts), *structural* (checked against source), and *aspirational* (not claims yet). It is updated whenever a claim changes.
-- **Reproducibility gate** — `./eval/repro/verify_repro.sh` re-derives every headline number and fails on any drift. Reproducing a number fully needs the committed judged artifacts **plus** the documented external run data: the sibling LongMemEval dataset checkout and the phase-A retrieval caches (see §1 → §8 of the reproducibility doc). Last gate run: **2026-09-03, all checks PASS**.
-- **Test suite** — 1600+ test functions across 75 test modules (as of 2026-09-03), covering the store, retrieval, security gates, API facade, multitenancy, and eval harness; runs hermetically on a fresh clone without a live Hermes runtime. The gate forces hermetic mode (`ARGOS_HERMETIC_TESTS=1` in the runner) so unmocked LLM-path tests can never make real calls, even in venvs that resolve the Hermes runtime. Run it in a visible, live-updating window (GPU venv + bounded parallel workers with the shared-service grouping, per #98): `powershell -File scripts/run_tests_visible.ps1`. Manual equivalent from `argos_plugin/`: `"C:/Users/michael/AppData/Local/hermes/hermes-agent/venv-cuda/Scripts/python.exe" -m pytest tests/ -q -n 4 --dist loadgroup`.
-
-Honest boundaries that travel with the claims:
-
-- Benchmark numbers are self-measured on the maintainer's stack and answerer-conditional (the 89.8% headline uses a GLM-5.3-flash answerer with a gpt-4o judge); small-n bands are indicative.
-- Some measurements are internal-only, not yet banked as committed artifacts — they are deliberately excluded from the public claim set.
-- The plugin is developed and tested on the maintainer's build of Hermes. It uses only stock plugin APIs (memory provider, pre-call hook, user-context injection), but a stock upstream build hasn't been through the test suite yet.
-
-## What it can't do
-
-The external API is read-tier only — no remote writes yet. Memory data, embeddings, and graph live locally as flat files — no hosted vendor. LLM calls for extraction, review, and distillation go through your configured cloud model; no native local-LLM support yet. Embeddings run offline (CPU or CUDA); the optional reranker needs a GPU (or falls back to similarity-only).
+- The external API is read-tier only. No remote writes yet.
+- LLM calls go through your configured cloud model. There's no native local-LLM runtime yet.
+- The optional GPU reranker (BGE-reranker-base) needs a GPU, or it falls back to similarity-only search.
+- Argos has been tested on the maintainer's build of Hermes. A stock upstream build hasn't been through the full suite yet.
+- Argos ships as a Hermes plugin, but the external API (MCP and REST) means any MCP-capable agent or custom script can use the same store without running inside Hermes.
 
 ## Quick start
 
-1. Copy `argos_plugin/` to your Hermes plugins directory (`%LOCALAPPDATA%\hermes\plugins\hybrid_memory` on Windows).
-2. Restart Hermes.
-3. Run `hermes tools` — confirm the 16 `memory_*` tools appear.
-4. Configure in `hybrid_memory.json` or the settings UI (Memory → Argos).
-5. Optional: start the external API (see [External API](#external-api)) for non-Hermes agents.
+1. Drop the argos_plugin/ folder into your Hermes plugins directory.
+2. Restart Hermes. Dependencies install automatically.
+3. Check `hermes tools` and confirm you see 16 memory_* tools.
+4. Configure settings in hybrid_memory.json or the settings UI.
 
-Full walkthrough: [SETUP_GUIDE.md](SETUP_GUIDE.md). Compatibility boundary: see [Verification](#verification).
+Full walkthrough in SETUP_GUIDE.md.
+
+## Docs
+
+- SETUP_GUIDE.md — full install walkthrough
+- MEMORY_SYSTEM.md — how it works under the hood
+- CONFIG_REFERENCE.md — every setting, default, and description
+- REINSTALL.md — reinstall, migration, graph rebuild
+- CLAIMS-AUDIT.md — every claim mapped to evidence
+- BENCHMARK_REPRODUCIBILITY.md — how to re-derive every headline number
 
 ## License
 
-Business Source License 1.1 (BSL 1.1): free for personal and non-production use; production or commercial use requires a license. Converts to Apache 2.0 on August 21, 2030. Full terms: [LICENSE.md](LICENSE.md).
-
-## More docs
-
-- [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) — every setting, default, and description
-- [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md) — how the system works under the hood
-- [REINSTALL.md](REINSTALL.md) — reinstall, migration, graph rebuild
+BSL 1.1. Free for personal and non-production use. Commercial or production use needs a license. Converts to Apache 2.0 on August 21, 2030.

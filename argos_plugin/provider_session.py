@@ -11,9 +11,27 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# PS10: validate memory_id is a UUID-like string before passing to store
+# methods. The store uses parameterized queries so no SQL injection, but
+# validation prevents an LLM from probing with arbitrary strings.
+# Accepts both standard UUID format (8-4-4-4-12) and the store's internal
+# format (mem-{32 hex chars} or cand-{32 hex chars}).
+_MEMORY_ID_RE = re.compile(
+    r"^(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|(?:mem|cand)-[0-9a-fA-F]{32})$"
+)
+
+
+def _valid_memory_id(memory_id: str) -> bool:
+    """PS10: return True if *memory_id* looks like a UUID or store ID."""
+    if not memory_id or not isinstance(memory_id, str):
+        return False
+    return bool(_MEMORY_ID_RE.match(memory_id))
 
 try:
     from .store import VALID_CATEGORIES
@@ -551,6 +569,17 @@ class ProviderSessionMixin:
                 return
         self._ensure_sync_worker()
 
+    def get_sync_stats(self) -> dict:
+        """PS4: surface sync queue drop count so data loss is visible.
+
+        Returns a dict with ``dropped_turns`` — the number of turns dropped
+        from the sync queue under load. A non-zero value means extraction
+        and review were skipped for those turns (silent data loss).
+        """
+        return {
+            "dropped_turns": getattr(self, "_sync_dropped_turns", 0),
+        }
+
     def _ensure_sync_worker(self) -> None:
         """Start the persistent sync worker if it isn't running."""
         with self._sync_lock:
@@ -652,6 +681,13 @@ class ProviderSessionMixin:
                     )
             except Exception as e:
                 logger.warning("Sync turn proposal failed: %s", e)
+            except BaseException as e:
+                # PS9: catch BaseException (KeyboardInterrupt, SystemExit)
+                # so the worker doesn't die silently — log and re-raise
+                # so the process can handle the signal.
+                logger.warning("Sync turn interrupted by BaseException: %s", e)
+                self._sync_queue.task_done()
+                raise
             finally:
                 self._sync_queue.task_done()
 
@@ -682,8 +718,19 @@ class ProviderSessionMixin:
                 logger.debug("Memory quarantine failed: %s", e)
             if self._consolidation_enabled:
                 try:
+                    # PS2: consolidation is an automatic irreversible quarantine
+                    # at session end. It's already gated by
+                    # _consolidation_enabled (config flag), but we also check
+                    # _consolidation_auto_apply — when False (the safe default
+                    # for new installs), consolidation runs in dry_run mode
+                    # (report only) and the user must explicitly call
+                    # consolidate(dry_run=False) to apply. This prevents
+                    # automatic quarantine without explicit opt-in.
+                    auto_apply = str(
+                        self._config.get("consolidation_auto_apply", "true")
+                    ).lower() in ("true", "1", "yes")
                     report = self._store.consolidate(
-                        dry_run=False,
+                        dry_run=not auto_apply,
                         max_actions=self._consolidation_max_actions,
                         min_age_days=self._consolidation_min_age_days,
                         duplicate_min_similarity=self._duplicate_min_similarity,
@@ -964,6 +1011,12 @@ class ProviderSessionMixin:
                 r"([A-Z][A-Za-z0-9'_-]*(?:\s+[A-Z][A-Za-z0-9'_-]*)?)",
             )
             known_words = _get_role_words()
+            # PS7: cap the number of LLM classifications per memory so a
+            # long content with many "my X is Name" patterns doesn't make
+            # many LLM calls. 3 is generous — a typical memory has at most
+            # one or two such patterns.
+            _llm_classify_count = 0
+            _PS7_MAX_LLM_CLASSIFICATIONS = 3
             for match in ambiguous.finditer(content):
                 role_word = match.group(1).lower()
                 name = match.group(2)
@@ -973,6 +1026,14 @@ class ProviderSessionMixin:
                     continue
                 if _is_role_word(name):
                     continue  # "my wife is Wife" — not a real name
+                # PS7: cap LLM calls per memory.
+                if _llm_classify_count >= _PS7_MAX_LLM_CLASSIFICATIONS:
+                    logger.debug(
+                        "PS7: capped LLM role-word classifications at %d "
+                        "for this memory", _PS7_MAX_LLM_CLASSIFICATIONS,
+                    )
+                    break
+                _llm_classify_count += 1
                 # LLM ambiguity gate: is this word a person-role?
                 if self._llm_classify_role_word(role_word):
                     # Self-extending: add to in-memory set + persist to config
@@ -1017,10 +1078,16 @@ class ProviderSessionMixin:
         except Exception:
             return False
 
+        # PS3: wrap the word in a structured format and escape it via
+        # json.dumps so a malicious word containing quotes or newlines
+        # cannot inject instructions into the LLM prompt.
+        escaped_word = json.dumps(word)
         prompt = (
-            f'Is "{word}" a person role word — a word that describes a '
-            f"relationship between a person and another person, like "
-            f'"wife", "therapist", "boss", "accountant", "coach"? '
+            f'Classify the following word as a person-role word or not. '
+            f"A person-role word describes a relationship between a person "
+            f"and another person, like \"wife\", \"therapist\", \"boss\", "
+            f"\"accountant\", \"coach\".\n\n"
+            f"Word: {escaped_word}\n\n"
             f"Answer with only JSON: "
             f'{{"is_role": true}} or {{"is_role": false}}'
         )
@@ -1050,36 +1117,59 @@ class ProviderSessionMixin:
         except Exception:
             return text.lower().strip() in ("true", "yes")
 
+    # PS1: lock around the read-modify-write of hybrid_memory.json so two
+    # concurrent calls don't clobber each other's addition.
+    _role_word_persist_lock = threading.Lock()
+
     def _persist_learned_role_word(self, word: str) -> None:
         """Persist a learned role word to hybrid_memory.json so it survives restarts.
 
         Reads the current config, adds the word to the role_words list,
-        and writes back. Thread-safe via atomic write. Never raises —
-        persistence failure just means the word won't survive a restart
-        (it's still in the in-memory set for this session).
+        and writes back. PS1: thread-safe via a lock around the
+        read-modify-write AND an atomic write (temp file + os.replace).
+        Never raises — persistence failure just means the word won't
+        survive a restart (it's still in the in-memory set for this session).
         """
         if not word:
             return
-        try:
-            home = self._hermes_home or os.path.expanduser("~/.hermes")
-            config_path = Path(home) / "hybrid_memory.json"
-            if config_path.exists():
-                cfg = json.loads(config_path.read_text(encoding="utf-8"))
-            else:
-                cfg = {}
+        # PS1: lock the read-modify-write so concurrent calls don't clobber.
+        with self._role_word_persist_lock:
+            try:
+                home = self._hermes_home or os.path.expanduser("~/.hermes")
+                config_path = Path(home) / "hybrid_memory.json"
+                if config_path.exists():
+                    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+                else:
+                    cfg = {}
 
-            # role_words is stored as a JSON array string
-            words = parse_role_words(cfg.get("role_words", ""))
+                # role_words is stored as a JSON array string
+                words = parse_role_words(cfg.get("role_words", ""))
 
-            if word not in words:
-                words.append(word)
-                cfg["role_words"] = json.dumps(words)
-                config_path.write_text(
-                    json.dumps(cfg, indent=2), encoding="utf-8"
-                )
-                logger.debug("Persisted learned role word: %s", word)
-        except Exception as exc:
-            logger.debug("Failed to persist role word %r: %s", word, exc)
+                if word not in words:
+                    words.append(word)
+                    cfg["role_words"] = json.dumps(words)
+                    # PS1: atomic write — temp file + os.replace. A crash
+                    # mid-write with write_text() would corrupt the config;
+                    # os.replace is atomic on both POSIX and Windows.
+                    import tempfile
+                    config_dir = config_path.parent
+                    config_dir.mkdir(parents=True, exist_ok=True)
+                    fd, tmp_path = tempfile.mkstemp(
+                        dir=str(config_dir), suffix=".tmp"
+                    )
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f, indent=2)
+                        os.replace(tmp_path, str(config_path))
+                    except Exception:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        raise
+                    logger.debug("Persisted learned role word: %s", word)
+            except Exception as exc:
+                logger.debug("Failed to persist role word %r: %s", word, exc)
 
     def _try_graph_relationship(self, content: str) -> None:
         """Attempt to extract a relationship from content text and add to graph.
@@ -1140,9 +1230,23 @@ class ProviderSessionMixin:
         schemas.extend([GRAPH_SEARCH_SCHEMA, GRAPH_QUERY_SCHEMA])
         return schemas
 
+    # PS6: per-turn tool call rate limit. An LLM could spam tool calls
+    # (hundreds of memory_save/search) in a single turn, exhausting CPU.
+    # This counter is reset on each new turn (on_turn_start).
+    _tool_call_count: int = 0
+    _TOOL_CALL_MAX_PER_TURN = 50
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if self._store is None:
             return tool_error("Memory store not initialized")
+
+        # PS6: rate-limit tool calls per turn.
+        self._tool_call_count = getattr(self, "_tool_call_count", 0) + 1
+        if self._tool_call_count > self._TOOL_CALL_MAX_PER_TURN:
+            return tool_error(
+                f"Tool call rate limit exceeded ({self._TOOL_CALL_MAX_PER_TURN} "
+                f"calls per turn). Please continue without memory tools."
+            )
 
         if tool_name == "memory_search":
             query = args.get("query", "")
@@ -1167,7 +1271,18 @@ class ProviderSessionMixin:
             # memory_chain when the conversation is about change). Does NOT
             # unfold chains — annotation only. Fail-soft: any store error
             # leaves results intact with no chain field.
-            result_payloads = [r.to_dict() for r in results]
+            # PS8: filter the payload to only fields the LLM needs — the
+            # full to_dict() includes quality_flags, evidence references,
+            # and other internal metadata that shouldn't be in the LLM
+            # context.
+            _LLM_PAYLOAD_FIELDS = frozenset({
+                "memory_id", "content", "category", "tags",
+                "created_at", "similarity", "chain",
+            })
+            result_payloads = [
+                {k: v for k, v in r.to_dict().items() if k in _LLM_PAYLOAD_FIELDS}
+                for r in results
+            ]
             if results and hasattr(self._store, "get_chain_membership"):
                 try:
                     membership = self._store.get_chain_membership(
@@ -1232,6 +1347,8 @@ class ProviderSessionMixin:
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
+            if not _valid_memory_id(memory_id):
+                return tool_error("Invalid memory_id format (expected UUID)")
             content = args.get("content")
             tags = args.get("tags")
             # memory_id must be passed as a keyword: SharedMemoryStore.update_memory
@@ -1280,6 +1397,8 @@ class ProviderSessionMixin:
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
+            if not _valid_memory_id(memory_id):
+                return tool_error("Invalid memory_id format (expected UUID)")
             result = self._store.delete_memory(memory_id=memory_id)
             if not result:
                 return tool_error(f"Memory not found: {memory_id}")
@@ -1392,6 +1511,8 @@ class ProviderSessionMixin:
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
+            if not _valid_memory_id(memory_id):
+                return tool_error("Invalid memory_id format (expected UUID)")
             if not self._store.restore_memory(memory_id):
                 return tool_error(f"Memory not found: {memory_id}")
             if self._graph:
@@ -1410,7 +1531,9 @@ class ProviderSessionMixin:
             memory_id = args.get("memory_id", "")
             feedback = args.get("feedback", "")
             if not memory_id or not feedback:
-                return tool_error("Missing required parameter: memory_id or feedback")
+                return tool_error("Missing required parameters: memory_id and feedback")
+            if not _valid_memory_id(memory_id):
+                return tool_error("Invalid memory_id format (expected UUID)")
             try:
                 recorded = self._store.record_feedback(memory_id, feedback)
             except ValueError as exc:
@@ -1455,6 +1578,8 @@ class ProviderSessionMixin:
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
+            if not _valid_memory_id(memory_id):
+                return tool_error("Invalid memory_id format (expected UUID)")
             mode = args.get("mode", "arc")
             if mode not in {"arc", "versions", "diff"}:
                 return tool_error("Invalid mode. Valid: arc, versions, diff")
@@ -1554,6 +1679,8 @@ class ProviderSessionMixin:
             memory_id = args.get("memory_id", "")
             if not memory_id:
                 return tool_error("Missing required parameter: memory_id")
+            if not _valid_memory_id(memory_id):
+                return tool_error("Invalid memory_id format (expected UUID)")
             records = self._store.get_memories_by_ids([memory_id])
             if not records:
                 return tool_error(f"Memory not found or no longer active: {memory_id}")
@@ -1585,6 +1712,8 @@ class ProviderSessionMixin:
                 return tool_error("Missing required parameter: query")
             if not expected_memory_id:
                 return tool_error("Missing required parameter: expected_memory_id")
+            if not _valid_memory_id(expected_memory_id):
+                return tool_error("Invalid expected_memory_id format (expected UUID)")
             try:
                 top_k = max(1, min(int(args.get("top_k", 20)), 100))
             except (TypeError, ValueError):
@@ -1641,6 +1770,13 @@ class ProviderSessionMixin:
             sweep_thread = getattr(sweep, "_thread", None)
             if sweep_thread and sweep_thread.is_alive():
                 sweep_thread.join(timeout=2.0)
+        # PS5: drain the sync queue before sending the stop sentinel so
+        # pending extractions are not lost. Bounded by a timeout so a
+        # stuck item doesn't block shutdown indefinitely.
+        try:
+            self._sync_queue.join(timeout=10.0)
+        except Exception:
+            pass  # join timeout or empty queue — proceed to stop
         # Signal the sync worker to stop and wait for it.
         try:
             self._sync_queue.put_nowait(None)

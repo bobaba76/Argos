@@ -34,7 +34,7 @@ from typing import List, Set
 # (category, pattern_name, regex) — all matched case-insensitively on the
 # lowercased input. Patterns are written to be specific rather than broad:
 # false positives here are cheap (→ human review), false negatives are not.
-_NEG = r"(?:do\s+not|don'?t|dont|do\s+n['\u2019]?t)"  # "do not" / "don't"
+_NEG = r"(?:do\s+not|don['\u2019]?t|dont|do\s+n['\u2019]?t)"  # "do not" / "don't" / "don't"
 
 # ---------------------------------------------------------------------------
 # Confusable homoglyph mapping (IS2)
@@ -82,8 +82,11 @@ _PATTERNS: List[tuple] = [
     # ---- stealth / suppression -------------------------------------------
     ("stealth_suppression", "do_not_mention",
      rf"{_NEG}\s+mention\s+this"),
+    # IS3: tightened to exclude "from competitors" (legitimate business
+    # language) while still catching suppression directives targeting
+    # specific groups (compliance, admin, management, the user).
     ("stealth_suppression", "keep_secret",
-     r"keep\s+(?:this\s+)?secret\s+from"),
+     r"keep\s+(?:this\s+)?secret\s+from\s+(?!competitors|rivals|other\s+companies)\w+"),
     ("stealth_suppression", "do_not_notify",
      rf"{_NEG}\s+notify"),
     ("stealth_suppression", "do_not_tell",
@@ -97,14 +100,20 @@ _PATTERNS: List[tuple] = [
     ("stealth_suppression", "hide_from",
      r"hide\s+(?:this\s+)?from\s+(?:admin|management|your\s+\w+)"),
     # ---- durable-state mutation directives --------------------------------
+    # IS3: patterns tightened to require instruction context so common
+    # business language ("update the knowledge base article", "record this
+    # decision for the meeting", "new price list is attached") doesn't
+    # trigger false positives. The patterns now require a possessive
+    # pronoun ("your memory") or an explicit directive verb ("remember
+    # this as", "store this as a permanent rule").
     ("memory_mutation", "update_knowledge",
-     r"update\s+(?:your|the)\s+(?:knowledge\s+)?(?:base|knowledge|memory|records)"),
+     r"update\s+your\s+(?:knowledge\s+base|memory|records|internal\s+state)"),
     ("memory_mutation", "record_decision",
-     r"(?:record(?:ed|s)?|note(?:d)?|log(?:ged)?|store(?:d)?)\s+(?:this\s+)?(?:decision|fact|policy|change|instruction)"),
+     r"(?:remember|store|save)\s+(?:this\s+)?(?:decision|fact|policy|change|instruction)\s+as\s+(?:a\s+)?(?:permanent|durable|long-term)"),
     ("memory_mutation", "decision_recorded",
      r"decision\s+recorded"),
     ("memory_mutation", "effective_now",
-     r"effective\s+(?:now|immediately)"),
+     r"(?:this|the\s+above|all)\s+(?:is|are)\s+effective\s+(?:now|immediately)"),
     ("memory_mutation", "final_approved",
      r"final\s+approved"),
     ("memory_mutation", "from_now_on",
@@ -116,7 +125,7 @@ _PATTERNS: List[tuple] = [
     ("memory_mutation", "resume_targeting",
      r"resume\s+(?:all\s+)?(?:marketing|targeting|campaigns?|communication)"),
     ("memory_mutation", "price_change_directive",
-     r"(?:new\s+)?(?:price|pricing|rates?)\s+(?:list|change|update|effective)"),
+     r"(?:new\s+)?(?:price|pricing|rates?)\s+(?:change|update|directive)\s+(?:is\s+)?(?:effective|active|now)"),
     # ---- SQL / web injection ----------------------------------------------
     ("sql_code", "sql_select",
      r"select\s+\*?\s*from\s+(?!the\b|a\b|an\b|my\b|your\b|his\b|her\b|our\b|their\b|this\b|that\b|these\b|those\b|all\b|some\b|any\b|each\b|every\b)\w+"),

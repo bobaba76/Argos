@@ -85,7 +85,8 @@ HTTP_RESPONSE=$(curl -s -w '\n%{http_code}' -X POST https://openrouter.ai/api/v1
       {\"role\": \"user\", \"content\": $USER_JSON}
     ],
     \"max_tokens\": 1024,
-    \"temperature\": 0.3
+    \"temperature\": 0.3,
+    \"reasoning\": {\"enabled\": true, \"effort\": \"max\"}
   }")
 
 HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
@@ -126,6 +127,23 @@ fi
 # Extract reasoning and feedback
 REASONING=$(echo "$REVIEW_TEXT" | awk '/^## REASONING:/{found=1; next} /^## FEEDBACK:/{exit} found{print}' | head -c 2000)
 FEEDBACK=$(echo "$REVIEW_TEXT" | awk '/^## FEEDBACK:/{found=1; next} /^## /{if(found) exit} found{print}' | head -c 4000)
+
+# Ensure the verdict label exists, so a deleted/missing label cannot fail the run.
+case "$NEW_LABEL" in
+  devin-ready)
+    LABEL_COLOR="0E8A16"
+    LABEL_DESCRIPTION="Hermes approved: ready for Devin"
+    ;;
+  needs-revision)
+    LABEL_COLOR="FBCA04"
+    LABEL_DESCRIPTION="Hermes requested issue changes"
+    ;;
+  rejected)
+    LABEL_COLOR="B60205"
+    LABEL_DESCRIPTION="Hermes rejected this issue"
+    ;;
+esac
+gh label create "$NEW_LABEL" --color "$LABEL_COLOR" --description "$LABEL_DESCRIPTION" 2>/dev/null || true
 
 # Remove needs-review label
 gh issue edit "$ISSUE_NUMBER" --remove-label "needs-review" 2>/dev/null || true

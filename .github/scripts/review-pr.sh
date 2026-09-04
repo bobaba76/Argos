@@ -122,7 +122,8 @@ HTTP_RESPONSE=$(curl -s -w '\n%{http_code}' -X POST https://openrouter.ai/api/v1
       {\"role\": \"user\", \"content\": $USER_JSON}
     ],
     \"max_tokens\": 2048,
-    \"temperature\": 0.3
+    \"temperature\": 0.3,
+    \"reasoning\": {\"enabled\": true, \"effort\": \"max\"}
   }")
 
 HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
@@ -158,12 +159,20 @@ fi
 REASONING=$(echo "$REVIEW_TEXT" | awk '/^## REASONING:/{found=1; next} /^## CONCERNS:/{exit} found{print}' | head -c 2000)
 CONCERNS=$(echo "$REVIEW_TEXT" | awk '/^## CONCERNS:/{found=1; next} /^## /{if(found) exit} found{print}' | head -c 4000)
 
-# Add label
+# Ensure the verdict label exists, so a deleted/missing label cannot fail the run.
 if [ "$VERDICT" = "APPROVED" ]; then
-  gh pr edit "$PR_NUMBER" --add-label "review-approved" 2>/dev/null || true
+  NEW_LABEL="review-approved"
+  LABEL_COLOR="0E8A16"
+  LABEL_DESCRIPTION="Hermes approved this PR"
 else
-  gh pr edit "$PR_NUMBER" --add-label "changes-requested" 2>/dev/null || true
+  NEW_LABEL="changes-requested"
+  LABEL_COLOR="D93F0B"
+  LABEL_DESCRIPTION="Hermes requested PR changes"
 fi
+gh label create "$NEW_LABEL" --color "$LABEL_COLOR" --description "$LABEL_DESCRIPTION" 2>/dev/null || true
+
+# Add label
+gh pr edit "$PR_NUMBER" --add-label "$NEW_LABEL" 2>/dev/null || true
 
 # Build comment
 COMMENT="## ${EMOJI} Hermes PR Review: ${VERDICT}

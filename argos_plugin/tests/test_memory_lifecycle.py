@@ -535,7 +535,9 @@ class TestRollupAuditFixes:
         assert "messages" in call_args.kwargs, (
             "call_llm should be called with messages= kwarg (D3)"
         )
-        assert call_args.kwargs["messages"][0]["role"] == "user"
+        # RU1: system/user message split — first message is system, second is user.
+        assert call_args.kwargs["messages"][0]["role"] == "system"
+        assert call_args.kwargs["messages"][1]["role"] == "user"
         store.close()
 
     def test_d4_egress_gate_checked(self, tmp_path):
@@ -677,3 +679,316 @@ class TestRollupAuditFixes:
         )
         store_a.close()
         store_b.close()
+
+
+# ---------------------------------------------------------------------------
+# RU1-RU10: Rollup audit fixes (#236)
+# ---------------------------------------------------------------------------
+
+class TestRollupAuditRU:
+    """Regression tests for issue #236: rollup audit RU1-RU10."""
+
+    # -- RU1: prompt injection via raw memory content -------------------------
+
+    def test_ru1_system_message_present(self, tmp_path):
+        """RU1: the LLM call should include a system message that sets the
+        instruction boundary, so memory content is treated as data."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru1.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            run_rollup(store, interval_days=30, max_records_per_run=15)
+        call_args = mock_call.call_args
+        messages = call_args.kwargs["messages"]
+        assert messages[0]["role"] == "system"
+        assert "DATA" in messages[0]["content"] or "data" in messages[0]["content"]
+        store.close()
+
+    def test_ru1_markup_neutralized_in_prompt(self, tmp_path):
+        """RU1: < and > in memory content should be neutralized in the
+        prompt so stored markup cannot be interpreted as prompt-structure."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru1b.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(
+                category="context_note",
+                content=f"<script>alert({i})</script> record {i}",
+            )
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            run_rollup(store, interval_days=30, max_records_per_run=15)
+        user_msg = mock_call.call_args.kwargs["messages"][1]["content"]
+        assert "\uFF1C" in user_msg, "markup should be neutralized (< → ＜)"
+        assert "\uFF1E" in user_msg, "markup should be neutralized (> → ＞)"
+        store.close()
+
+    def test_ru1_prompt_is_json_not_prose(self, tmp_path):
+        """RU1: the user message should be structured JSON (data format),
+        not free-form prose with interpolated content."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru1c.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            run_rollup(store, interval_days=30, max_records_per_run=15)
+        user_msg = mock_call.call_args.kwargs["messages"][1]["content"]
+        parsed = json.loads(user_msg)
+        assert "records" in parsed
+        assert isinstance(parsed["records"], list)
+        store.close()
+
+    # -- RU2: public store API instead of _fetch_records ---------------------
+
+    def test_ru2_uses_public_store_method(self, tmp_path):
+        """RU2: _load_rollup_candidates should call store.load_rollup_candidates
+        (public API), not store._fetch_records (private)."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru2.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        records = store.load_rollup_candidates(15)
+        assert len(records) == 15
+        timestamps = [r.created_at for r in records if r.created_at]
+        assert timestamps == sorted(timestamps), (
+            "load_rollup_candidates should return oldest-first (ASC)"
+        )
+        store.close()
+
+    def test_ru2_load_rollup_candidates_filters_active_tier(self, tmp_path):
+        """RU2: load_rollup_candidates should only return active-tier records."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru2b.duckdb", user_id="alice")
+        rec_active = store.remember(category="context_note", content="active rec")
+        rec_archived = store.remember(category="context_note", content="archived rec")
+        store.connection.execute(
+            "UPDATE memory_records SET tier = 'archived' WHERE memory_id = ?",
+            [rec_archived.memory_id],
+        )
+        records = store.load_rollup_candidates(10)
+        ids = {r.memory_id for r in records}
+        assert rec_active.memory_id in ids
+        assert rec_archived.memory_id not in ids, (
+            "archived records should not be rollup candidates"
+        )
+        store.close()
+
+    # -- RU3: novelty gate ---------------------------------------------------
+
+    def test_ru3_novelty_gate_skips_with_old_last_run(self, tmp_path):
+        """RU3: with an old last_run but no new records since then, the
+        novelty gate should skip the run."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru3b.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        # Set all records' created_at to 90 days ago (before last_run).
+        old_record_ts = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        store.connection.execute(
+            "UPDATE memory_records SET created_at = ?",
+            [old_record_ts],
+        )
+        # Set last_run to 60 days ago (past cooldown of 30 days, but
+        # after the records' created_at — so no "new" records exist).
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        store.set_state("rollup_last_run", old_ts)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=MagicMock()):
+            report = run_rollup(store, interval_days=30, max_records_per_run=15)
+        assert not report["ran"]
+        assert report["skipped"] == "novelty_gate", (
+            f"Expected novelty_gate, got {report.get('skipped')}"
+        )
+        store.close()
+
+    def test_ru3_novelty_gate_passes_with_new_records(self, tmp_path):
+        """RU3: with an old last_run AND new records created after it,
+        the rollup should proceed past the novelty gate."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru3c.duckdb", user_id="alice")
+        # Old records (created_at set to 90 days ago).
+        for i in range(10):
+            store.remember(category="context_note", content=f"old record {i}")
+        old_record_ts = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        store.connection.execute(
+            "UPDATE memory_records SET created_at = ?",
+            [old_record_ts],
+        )
+        # Set last_run to 60 days ago (past cooldown of 30 days).
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        store.set_state("rollup_last_run", old_ts)
+        # New records created "now" (after last_run).
+        for i in range(5):
+            store.remember(category="context_note", content=f"new record {i}")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            report = run_rollup(store, interval_days=30, max_records_per_run=15)
+        assert report["ran"], (
+            f"Expected ran=True, got skipped={report.get('skipped')}"
+        )
+        store.close()
+
+    # -- RU4: cap proposals at 10 --------------------------------------------
+
+    def test_ru4_proposals_capped_at_10(self):
+        """RU4: _parse_rollup_response should cap at 10 proposals."""
+        from rollup import _parse_rollup_response
+        items = [
+            {"content": f"proposal {i}", "category": "insight", "confidence": 0.8}
+            for i in range(20)
+        ]
+        proposals = _parse_rollup_response(json.dumps(items))
+        assert len(proposals) == 10, (
+            f"Expected 10 proposals (capped), got {len(proposals)}"
+        )
+
+    # -- RU5: compute now once -----------------------------------------------
+
+    def test_ru5_now_passed_to_build_prompt(self):
+        """RU5: _build_rollup_prompt should accept a now parameter and use
+        it instead of calling datetime.now() per record."""
+        from rollup import _build_rollup_prompt
+        records = []
+        fixed_now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for i in range(3):
+            rec = SimpleNamespace(
+                memory_id=f"m{i}",
+                category="context_note",
+                content=f"record {i}",
+                created_at=(fixed_now - timedelta(days=10 + i)).isoformat(),
+            )
+            records.append(rec)
+        prompt = _build_rollup_prompt(records, now=fixed_now)
+        parsed = json.loads(prompt)
+        assert parsed["records"][0]["age_days"] == "10d"
+        assert parsed["records"][1]["age_days"] == "11d"
+        assert parsed["records"][2]["age_days"] == "12d"
+
+    # -- RU6: clamp minimums -------------------------------------------------
+
+    def test_ru6_clamps_interval_days_to_1(self, tmp_path):
+        """RU6: interval_days=0 should be clamped to 1, not cause
+        cooldown to always return True."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru6.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            report = run_rollup(store, interval_days=0, max_records_per_run=15)
+        assert report["ran"], (
+            f"Expected ran=True with clamped interval, got {report.get('skipped')}"
+        )
+        store.close()
+
+    def test_ru6_clamps_max_records_to_10(self, tmp_path):
+        """RU6: max_records_per_run=0 should be clamped to 10, not cause
+        insufficient_records gate to always trigger."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru6b.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            report = run_rollup(store, interval_days=30, max_records_per_run=0)
+        assert report["ran"], (
+            f"Expected ran=True with clamped max_records, got {report.get('skipped')}"
+        )
+        store.close()
+
+    # -- RU8: _strip_json_fences returns "" on failure -----------------------
+
+    def test_ru8_strip_fences_returns_empty_on_no_bracket(self):
+        """RU8: _strip_json_fences should return "" (not the original text)
+        when there's no [ bracket to extract from."""
+        from rollup import _strip_json_fences
+        result = _strip_json_fences("no json here at all")
+        assert result == "", f"Expected empty string, got {result!r}"
+
+    def test_ru8_strip_fences_returns_empty_on_parse_failure(self):
+        """RU8: _strip_json_fences should return "" when raw_decode fails."""
+        from rollup import _strip_json_fences
+        result = _strip_json_fences("[invalid json content")
+        assert result == "", f"Expected empty string, got {result!r}"
+
+    # -- RU9: dedup=True on save_candidate -----------------------------------
+
+    def test_ru9_dedup_passed_to_save_candidate(self, tmp_path):
+        """RU9: save_candidate should be called with dedup=True to
+        prevent duplicate proposals across runs."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru9.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps([
+                    {"content": "Test insight", "category": "insight", "confidence": 0.8},
+                ])
+            ))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        original_save = store.save_candidate
+        captured_dedup = []
+        def capture_save(*args, **kwargs):
+            captured_dedup.append(kwargs.get("dedup", None))
+            return original_save(*args, **kwargs)
+        store.save_candidate = capture_save
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            run_rollup(store, interval_days=30, max_records_per_run=15)
+        assert captured_dedup, "save_candidate should have been called"
+        assert all(d is True for d in captured_dedup), (
+            f"dedup should be True for all calls, got {captured_dedup}"
+        )
+        store.close()
+
+    # -- RU10: egress gate with actual content -------------------------------
+
+    def test_ru10_egress_gate_receives_content(self, tmp_path):
+        """RU10: the egress gate should receive the actual record content,
+        not an empty string, so PII checks apply to the real payload."""
+        store = DuckDBMemoryStore(tmp_path / "test_ru10.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(
+                category="context_note",
+                content=f"unique egress content {i}",
+            )
+        from rollup import run_rollup
+        import egress as egress_mod
+        captured_text = []
+        original_gate = egress_mod.gate
+        def capture_gate(kind, text="", cfg=None):
+            captured_text.append((kind, text))
+            return original_gate(kind, text, cfg)
+        with patch("egress.gate", side_effect=capture_gate):
+            with patch("rollup._get_llm_client", return_value=MagicMock(
+                return_value=SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+                )
+            )):
+                run_rollup(store, interval_days=30, max_records_per_run=15)
+        rollup_calls = [(k, t) for k, t in captured_text if k == "memory_rollup"]
+        assert rollup_calls, "egress gate should have been called for memory_rollup"
+        _, text = rollup_calls[-1]
+        assert text, "egress gate should receive non-empty content (RU10)"
+        assert "unique egress content" in text, (
+            "egress gate text should contain actual record content"
+        )
+        store.close()

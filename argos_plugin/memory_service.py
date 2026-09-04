@@ -752,6 +752,15 @@ class MemoryService:
                     int(args.get("limit", 20)),
                 )
             ]
+        if method == "load_rollup_candidates":
+            return [
+                _record_to_dict(record)
+                for record in store.load_rollup_candidates(
+                    int(args.get("limit", 100)),
+                )
+            ]
+        if method == "count_rollup_candidates_since":
+            return store.count_rollup_candidates_since(args.get("since"))
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str, graph) -> Any:

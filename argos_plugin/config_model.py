@@ -193,6 +193,38 @@ class MemoryConfig(BaseModel):
     acl: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
+    # INTERNAL (non-UI) keys — advanced/tuning + internal-object fields
+    # that exist in code but are deliberately NOT rendered in the Hermes
+    # settings UI (config_schema.py). They are either: advanced tuning
+    # thresholds (phrase_lift_*, graph_ppr_*, router_*_threshold,
+    # injection_min_score, chain_unfold_arc_min_similarity), operational
+    # instrumentation (scale_warn_*), internal config objects (acl,
+    # backup dict), or experimental wired-but-off features (watcher_*).
+    #
+    # Source of truth: MemoryConfig.internal_keys() ==
+    # model_fields - schema_keys. A new model field that is NOT in the UI
+    # schema MUST be added here (or to the schema) — enforced by
+    # test_t1b_internal_keys_allowlist (no silent hidden-key accretion).
+    _INTERNAL_KEYS: ClassVar[frozenset] = frozenset({
+        "acl", "backup",
+        "chain_unfold_arc_min_similarity",
+        "consolidation_auto_apply",
+        "evidence_retention",
+        "graph_ppr_enabled", "graph_ppr_damping", "graph_ppr_boost",
+        "injection_min_score",
+        "phrase_lift_alpha", "phrase_lift_pool",
+        "router_temporal_threshold", "router_multihop_threshold",
+        "scale_warn_latency_ms", "scale_warn_records",
+        "skip_retrieval_on_trivial",
+        "watcher_enabled", "watcher_interval_min", "watcher_scan_roots",
+    })
+
+    @classmethod
+    def internal_keys(cls) -> frozenset:
+        """Frozenset of model fields that are deliberately NOT UI-exposed."""
+        return cls._INTERNAL_KEYS
+
+    # ------------------------------------------------------------------
     # Fail-soft parsing — matches today's try/except + _flag behaviour.
     # All clamping and type coercion happens here so the model always
     # validates successfully.

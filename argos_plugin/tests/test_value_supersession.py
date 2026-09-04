@@ -111,6 +111,99 @@ class TestExtractValues:
         assert "accuracy" in pct.subject
 
 
+class TestExtractValuesAudit238:
+    """Regression tests for the value-extractor audit (#238, VE1-VE10)."""
+
+    # VE2 — "$1000" must not be truncated to "100"
+    def test_currency_no_thousands_separator(self):
+        from argos.value_extractor import extract_values
+        for text, expected in [
+            ("paid $1000", "1000"),
+            ("paid $12345.67", "12345.67"),
+            ("paid ¥1000000", "1000000"),
+            ("paid $1,200", "1200"),
+            ("paid $5", "5"),
+        ]:
+            cur = [v for v in extract_values(text) if v.unit.startswith("currency:")]
+            assert [v.value for v in cur] == [expected], text
+
+    # VE3 — a bare 4-digit number is not a year without a context word
+    def test_year_requires_context(self):
+        from argos.value_extractor import extract_values
+        assert extract_values("2026") == []
+        assert [v.unit for v in extract_values("I have 2026 rows in the database")] == ["count"]
+        for text in ("in 2026", "since 2019", "by 2030", "the year 1999", "from 1990 to 2000"):
+            years = [v for v in extract_values(text) if v.unit == "year"]
+            assert years, text
+
+    # VE1 — year detection runs before counts; "2026 years" is not a count
+    def test_year_not_consumed_as_count(self):
+        from argos.value_extractor import extract_values
+        vals = extract_values("launched in 2026 years ahead of plan")
+        assert [(v.value, v.unit) for v in vals] == [("2026", "year")]
+        assert extract_values("2026 years") == []
+        counts = [v for v in extract_values("35 years") if v.unit == "count"]
+        assert [v.value for v in counts] == ["35"]
+
+    # VE10 — "is NN" is not an age
+    def test_bare_is_number_not_age(self):
+        from argos.value_extractor import extract_values
+        vals = extract_values("the temperature is 35 degrees")
+        assert [v.unit for v in vals] == ["count"]
+        for text in ("user is 35 years old", "age 35", "aged 35"):
+            ages = [v for v in extract_values(text) if v.unit == "age"]
+            assert [v.value for v in ages] == ["35"], text
+
+    # VE9 — a repeated (value, unit) is reported once
+    def test_duplicate_values_deduplicated(self):
+        from argos.value_extractor import extract_values
+        vals = extract_values("89.8% accuracy, up from 89.8%")
+        assert [(v.value, v.unit) for v in vals] == [("89.8", "percent")]
+        vals = extract_values("$449 for X and 449 rows in Y")
+        assert sorted(v.unit for v in vals) == ["count", "currency:$"]
+
+
+class TestValuesConflictUnitBucketing:
+    # VE6 — cross-unit pairs are never compared; same-unit conflicts still found
+    def test_only_same_unit_compared(self):
+        from argos.value_extractor import ExtractedValue, values_conflict
+        old = [
+            ExtractedValue("db rows total", "5", "percent", "5%"),
+            ExtractedValue("db rows total", "5", "count", "5"),
+        ]
+        new = [ExtractedValue("db rows total", "6", "count", "6")]
+        result = values_conflict(new, old)
+        assert result is not None
+        assert result[1].unit == "count"
+        assert values_conflict(new, [old[0]]) is None
+
+    def test_unit_normalised_when_bucketing(self):
+        from argos.value_extractor import ExtractedValue, values_conflict
+        old = [ExtractedValue("db rows total", "5", " Count ", "5")]
+        new = [ExtractedValue("db rows total", "6", "count", "6")]
+        assert values_conflict(new, old) is not None
+
+
+class TestTransitionNegationContractions:
+    # VE8 — "won't"/"can't"/"couldn't"/"wouldn't"/"shouldn't" negate a transition
+    def test_negated_contractions_not_transition(self):
+        from argos.value_extractor import is_transition_statement
+        for text in (
+            "I won't switch to Postgres",
+            "I can't change to the new plan",
+            "I cannot move to Berlin",
+            "we couldn't replace the old server",
+            "she wouldn't switch to Linux",
+            "you shouldn\u2019t stop using the tracker",
+        ):
+            assert not is_transition_statement(text), text
+
+    def test_plain_transition_still_detected(self):
+        from argos.value_extractor import is_transition_statement
+        assert is_transition_statement("I switched to Postgres")
+        assert is_transition_statement("we now use 1200 rows")
+
+
 class TestSubjectOverlap:
     def test_identical_subjects(self):
         from argos.value_extractor import subject_overlap

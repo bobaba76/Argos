@@ -1540,19 +1540,28 @@ class StoreRetrievalMixin:
         except Exception as exc:
             logger.warning("tombstone failed for %s: %s", file_id, exc)
 
-    def get_catalog_entry(self, file_id: str) -> dict | None:
+    def get_catalog_entry(
+        self, file_id: str, *, client_scope: str | None = None,
+    ) -> dict | None:
         """Fetch a catalog entry by file_id.
 
-        SR7: filtered by client_scope — entries in other client scopes
-        are not visible. NULL client_scope = global (visible to all).
+        SR7: *client_scope* is an optional explicit filter (matching the
+        ``list_catalog`` convention). When None (default), no scope
+        filter is applied — the caller is responsible for access control.
+        When set, only entries with matching or NULL client_scope are
+        returned.
         """
+        scope_clause = ""
+        params: list = [file_id]
+        if client_scope is not None:
+            scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
+            params.append(client_scope)
         try:
             with self._lock:
                 assert self.connection is not None
                 result = self.connection.execute(
-                    "SELECT * FROM file_catalog WHERE file_id = ? "
-                    "AND (client_scope IS NULL OR client_scope = ?)",
-                    [file_id, self.user_id],
+                    f"SELECT * FROM file_catalog WHERE file_id = ?{scope_clause}",
+                    params,
                 )
                 columns = [desc[0] for desc in result.description]
                 row = result.fetchone()
@@ -1562,19 +1571,27 @@ class StoreRetrievalMixin:
             logger.warning("catalog get failed: %s", exc)
         return None
 
-    def get_catalog_by_path(self, path: str) -> dict | None:
+    def get_catalog_by_path(
+        self, path: str, *, client_scope: str | None = None,
+    ) -> dict | None:
         """Fetch a catalog entry by canonical_path.
 
-        SR7: filtered by client_scope — entries in other client scopes
-        are not visible. NULL client_scope = global (visible to all).
+        SR7: *client_scope* is an optional explicit filter (matching the
+        ``list_catalog`` convention). When None (default), no scope
+        filter is applied. When set, only entries with matching or NULL
+        client_scope are returned.
         """
+        scope_clause = ""
+        params: list = [path]
+        if client_scope is not None:
+            scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
+            params.append(client_scope)
         try:
             with self._lock:
                 assert self.connection is not None
                 result = self.connection.execute(
-                    "SELECT * FROM file_catalog WHERE canonical_path = ? "
-                    "AND (client_scope IS NULL OR client_scope = ?)",
-                    [path, self.user_id],
+                    f"SELECT * FROM file_catalog WHERE canonical_path = ?{scope_clause}",
+                    params,
                 )
                 columns = [desc[0] for desc in result.description]
                 row = result.fetchone()

@@ -147,17 +147,68 @@ class TestSR6TombstoneGuard:
 # ---------------------------------------------------------------------------
 
 class TestSR7CatalogScopeFilter:
-    def test_get_catalog_entry_has_client_scope_filter(self):
-        """SR7: get_catalog_entry SQL includes client_scope filter."""
+    def test_get_catalog_entry_has_explicit_client_scope_param(self):
+        """SR7: get_catalog_entry takes an explicit client_scope param
+        (matching list_catalog convention), not self.user_id."""
         from store_retrieval import StoreRetrievalMixin
-        src = inspect.getsource(StoreRetrievalMixin.get_catalog_entry)
-        assert "client_scope IS NULL OR client_scope" in src
+        sig = inspect.signature(StoreRetrievalMixin.get_catalog_entry)
+        assert "client_scope" in sig.parameters
+        assert sig.parameters["client_scope"].default is None
 
-    def test_get_catalog_by_path_has_client_scope_filter(self):
-        """SR7: get_catalog_by_path SQL includes client_scope filter."""
+    def test_get_catalog_by_path_has_explicit_client_scope_param(self):
+        """SR7: get_catalog_by_path takes an explicit client_scope param."""
         from store_retrieval import StoreRetrievalMixin
-        src = inspect.getsource(StoreRetrievalMixin.get_catalog_by_path)
-        assert "client_scope IS NULL OR client_scope" in src
+        sig = inspect.getsource(StoreRetrievalMixin.get_catalog_by_path)
+        assert "client_scope" in sig
+
+    def test_get_catalog_entry_no_scope_returns_entry(self, store):
+        """SR7 regression: entry with client_scope='acme' is fetchable
+        via get_catalog_entry('abc') with NO scope arg → returns entry.
+        Default None = no filter (matches list_catalog convention)."""
+        store.upsert_catalog_entry(
+            file_id="test_fid_sr7",
+            canonical_path="/docs/test.pdf",
+            size=100,
+            mtime="2026-01-01T00:00:00+00:00",
+            doc_type="pdf",
+            client_scope="acme",
+        )
+        # No client_scope arg → no filter → entry is returned.
+        entry = store.get_catalog_entry("test_fid_sr7")
+        assert entry is not None
+        assert entry["file_id"] == "test_fid_sr7"
+        assert entry["client_scope"] == "acme"
+
+    def test_get_catalog_entry_with_scope_filters(self, store):
+        """SR7: when client_scope is passed, only matching entries return."""
+        store.upsert_catalog_entry(
+            file_id="test_fid_sr7b",
+            canonical_path="/docs/test2.pdf",
+            size=100,
+            mtime="2026-01-01T00:00:00+00:00",
+            doc_type="pdf",
+            client_scope="acme",
+        )
+        # Matching scope → returns entry.
+        entry = store.get_catalog_entry("test_fid_sr7b", client_scope="acme")
+        assert entry is not None
+        # Non-matching scope → returns None.
+        entry_none = store.get_catalog_entry("test_fid_sr7b", client_scope="other")
+        assert entry_none is None
+
+    def test_get_catalog_by_path_no_scope_returns_entry(self, store):
+        """SR7 regression: get_catalog_by_path with no scope arg returns entry."""
+        store.upsert_catalog_entry(
+            file_id="test_fid_sr7c",
+            canonical_path="/docs/test3.pdf",
+            size=100,
+            mtime="2026-01-01T00:00:00+00:00",
+            doc_type="pdf",
+            client_scope="acme",
+        )
+        entry = store.get_catalog_by_path("/docs/test3.pdf")
+        assert entry is not None
+        assert entry["file_id"] == "test_fid_sr7c"
 
 
 # ---------------------------------------------------------------------------

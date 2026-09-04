@@ -45,6 +45,117 @@ except ImportError:  # store_retrieval.py imported as a top-level module
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# #245: Shared WHERE-clause builder for memory_records queries.
+#
+# The same domain filters (status, temporal, expiry, user_scope, project,
+# namespace, client_scope, category/excluded, tier) were duplicated across
+# _text_search_raw and _vector_search_raw with different clause ordering and
+# param sequencing. This builder composes them in a single canonical order
+# so a filter fix is a single-point change.
+#
+# Column names are FIXED SQL tokens inside the builder — never interpolated
+# from caller data. Only values are parameterized.
+# ---------------------------------------------------------------------------
+
+def _build_memory_where(
+    *,
+    user_scope: str | None = None,
+    project_id: str | None = None,
+    namespace: str | None = None,
+    client_scope: str | None = None,
+    category: str | None = None,
+    excluded: set[str] | None = None,
+    tier: str | None = None,
+    as_of: str | None = None,
+    include_closed: bool = False,
+    include_expired: bool = False,
+    now: str | None = None,
+    extra_sql: str = "",
+) -> tuple[str, list]:
+    """Return ``(sql_fragment, params)`` for the shared memory_records WHERE
+    clause.
+
+    Canonical clause order:
+        status → temporal → expiry → user_scope → project → namespace →
+        client_scope → category/excluded → tier → extra
+
+    The returned *sql_fragment* starts with ``COALESCE(status, 'active') =
+    'active'`` and is ready to be placed after ``WHERE`` in the caller's
+    SQL.  Callers add their own SELECT/FROM prefix and any caller-specific
+    suffix (e.g. ``AND (content ILIKE ? OR ...) LIMIT 500``).
+
+    *now* is the current timestamp for the expiry reference; when *as_of*
+    is set it takes precedence (expiry is relative to the temporal
+    snapshot, not wall-clock now).
+    """
+    fragments: list[str] = []
+    params: list = []
+
+    # 1. Status — always present.
+    fragments.append("COALESCE(status, 'active') = 'active'")
+
+    # 2. Temporal — default: current only (valid_to IS NULL).
+    #    as_of: valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of).
+    #    include_closed: no temporal filter (closed versions visible).
+    if as_of:
+        fragments.append("AND valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)")
+        params.extend([as_of, as_of])
+    elif include_closed:
+        pass  # no temporal gate
+    else:
+        fragments.append("AND valid_to IS NULL")
+
+    # 3. Expiry — default: exclude expired rows.
+    expiry_ref = as_of if as_of else now
+    if not include_expired and expiry_ref is not None:
+        fragments.append("AND (expires_at IS NULL OR expires_at > ?)")
+        params.append(expiry_ref)
+
+    # 4. User scope — NULL = global (visible to all users).
+    if user_scope:
+        fragments.append("AND (user_scope IS NULL OR user_scope = ?)")
+        params.append(user_scope)
+
+    # 5. Project — NULL = global (visible to all projects).
+    if project_id:
+        fragments.append("AND (project_id IS NULL OR project_id = ?)")
+        params.append(project_id)
+
+    # 6. Namespace — exact match only.
+    if namespace:
+        fragments.append("AND namespace = ?")
+        params.append(namespace)
+
+    # 7. Client scope — NULL = global (visible to all clients).
+    if client_scope:
+        fragments.append("AND (client_scope IS NULL OR client_scope = ?)")
+        params.append(client_scope)
+
+    # 8. Category / excluded — push into SQL so the candidate pool is
+    #    pre-filtered (issue #27: Python-side filtering after fetch
+    #    starves narrow queries with wrong-category rows).
+    if category:
+        fragments.append("AND category = ?")
+        params.append(category)
+    if excluded:
+        placeholders = ", ".join(["?" for _ in excluded])
+        fragments.append(f"AND LOWER(category) NOT IN ({placeholders})")
+        params.extend(e.lower() for e in excluded)
+
+    # 9. Tier — exclude archived records unless explicitly requested.
+    if tier:
+        fragments.append("AND COALESCE(tier, 'active') = 'active'")
+
+    # 10. Extra — caller-specific fixed SQL text (no params), e.g.
+    #     "AND embedding IS NOT NULL".
+    if extra_sql:
+        fragments.append(extra_sql)
+
+    sql = " ".join(fragments)
+    return sql, params
+
+
 class StoreRetrievalMixin:
     """Search, fusion, scale-metric and hybrid-retrieval methods."""
 
@@ -156,76 +267,27 @@ class StoreRetrievalMixin:
             return []
         patterns = [f"%{t}%" for t in tokens]
         conditions = " OR ".join(["content ILIKE ?" for _ in patterns])
-        project_clause = ""
-        namespace_clause = ""
-        client_scope_clause = ""
         expiry_ref = as_of if as_of else self._now()
-        if include_expired:
-            expiry_clause = ""
-            expiry_params: list = []
-        else:
-            expiry_clause = "AND (expires_at IS NULL OR expires_at > ?) "
-            expiry_params = [expiry_ref]
-        params: list = [self.user_id, *expiry_params]
-        if project_id:
-            project_clause = " AND (project_id IS NULL OR project_id = ?)"
-            params.append(project_id)
-        if namespace:
-            namespace_clause = " AND namespace = ?"
-            params.append(namespace)
-        if client_scope:
-            # NULL = global: a client-scoped query still sees global rows.
-            client_scope_clause = " AND (client_scope IS NULL OR client_scope = ?)"
-            params.append(client_scope)
-        # Temporal filter: default to current (valid_to IS NULL),
-        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)).
-        # include_closed widens to closed versions too — used by the
-        # historical-query path so "where did I use to live" can see
-        # superseded facts. as_of takes precedence when both are set.
-        if as_of:
-            temporal_clause = (
-                "AND valid_from <= ? "
-                "AND (valid_to IS NULL OR valid_to > ?) "
-            )
-            temporal_params = [as_of, as_of]
-        elif include_closed:
-            temporal_clause = " "
-            temporal_params = []
-        else:
-            temporal_clause = "AND valid_to IS NULL "
-            temporal_params = []
-
-        # Push category_filter and excluded into SQL so the LIMIT 2000
-        # candidate pool is pre-filtered (issue #27: Python-side filtering
-        # after the fetch starves narrow queries with wrong-category rows).
-        category_clause = ""
-        category_params: list = []
-        if category_filter:
-            category_clause = " AND category = ?"
-            category_params.append(category_filter)
-        if excluded:
-            excluded_placeholders = ", ".join(["?" for _ in excluded])
-            category_clause += f" AND LOWER(category) NOT IN ({excluded_placeholders})"
-            category_params.extend(e.lower() for e in excluded)
-        # P5.1 (#6): exclude archived records from the injection pool
-        # unless include_archived is explicitly requested.
-        tier_clause = "" if include_archived else " AND COALESCE(tier, 'active') = 'active'"
+        # #245: shared WHERE-clause builder — single canonical composition
+        # replaces the duplicated inline clauses.
+        where_sql, where_params = _build_memory_where(
+            user_scope=self.user_id,
+            project_id=project_id,
+            namespace=namespace,
+            client_scope=client_scope,
+            category=category_filter,
+            excluded=excluded if excluded else None,
+            tier=None if include_archived else "active",
+            as_of=as_of,
+            include_closed=include_closed,
+            include_expired=include_expired,
+            now=expiry_ref,
+        )
         sql = (
-            "SELECT * FROM memory_records "
-            "WHERE COALESCE(status, 'active') = 'active' "
-            f"{temporal_clause} "
-            "AND (user_scope IS NULL OR user_scope = ?) "
-            f"{expiry_clause}"
-            f"{project_clause}"
-            f"{namespace_clause}"
-            f"{client_scope_clause}"
-            f"{category_clause}"
-            f"{tier_clause} AND ("
-            f"{conditions}) LIMIT 500"
+            f"SELECT * FROM memory_records WHERE {where_sql} "
+            f"AND ({conditions}) LIMIT 500"
         )
-        results = self._fetch_records(
-            sql, [*temporal_params, *params, *category_params, *patterns]
-        )
+        results = self._fetch_records(sql, [*where_params, *patterns])
         out: List[MemoryRecord] = []
         for r in results:
             if not self._matches_scope(r.payload):
@@ -295,9 +357,6 @@ class StoreRetrievalMixin:
         When *include_expired* is True, the expiry filter is omitted (expired
         memories are returned, ranked normally).
         """
-        project_clause = ""
-        namespace_clause = ""
-        client_scope_clause = ""
         # String-cast the query vector as a fixed-size array constant.
         # A Python-list parameter binds through an interpreted per-row path
         # (~1ms/row — measured ~1.2s at 1k rows); the string-cast form is
@@ -313,67 +372,31 @@ class StoreRetrievalMixin:
             )
             return []
         vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
-        params: List[Any] = [vec_text]
-        # Temporal filter: default to current (valid_to IS NULL),
-        # or as_of (valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)).
-        # include_closed widens to closed versions — historical-query path.
-        if as_of:
-            temporal_clause = (
-                "AND valid_from <= ? "
-                "AND (valid_to IS NULL OR valid_to > ?) "
-            )
-            params.extend([as_of, as_of])
-        elif include_closed:
-            temporal_clause = " "
-        else:
-            temporal_clause = "AND valid_to IS NULL "
         expiry_ref = as_of if as_of else self._now()
-        params.append(self.user_id)
-        if include_expired:
-            expiry_clause = ""
-        else:
-            expiry_clause = "  AND (expires_at IS NULL OR expires_at > ?) "
-            params.append(expiry_ref)
-        if project_id:
-            project_clause = " AND (project_id IS NULL OR project_id = ?)"
-            params.append(project_id)
-        if namespace:
-            namespace_clause = " AND namespace = ?"
-            params.append(namespace)
-        if client_scope:
-            client_scope_clause = (
-                " AND (client_scope IS NULL OR client_scope = ?)"
-            )
-            params.append(client_scope)
-        # Push category_filter and excluded into SQL (issue #27).
-        category_clause = ""
-        if category_filter:
-            category_clause = " AND category = ?"
-            params.append(category_filter)
-        if excluded:
-            excluded_placeholders = ", ".join(["?" for _ in excluded])
-            category_clause += f" AND LOWER(category) NOT IN ({excluded_placeholders})"
-            params.extend(e.lower() for e in excluded)
-        params.append(limit * 4)
-        # P5.1 (#6): exclude archived records from the injection pool
-        # unless include_archived is explicitly requested.
-        tier_clause = "" if include_archived else " AND COALESCE(tier, 'active') = 'active'"
+        # #245: shared WHERE-clause builder — single canonical composition
+        # replaces the duplicated inline clauses.  extra_sql carries the
+        # embedding-IS-NOT-NULL gate (fixed text, no params).
+        where_sql, where_params = _build_memory_where(
+            user_scope=self.user_id,
+            project_id=project_id,
+            namespace=namespace,
+            client_scope=client_scope,
+            category=category_filter,
+            excluded=excluded if excluded else None,
+            tier=None if include_archived else "active",
+            as_of=as_of,
+            include_closed=include_closed,
+            include_expired=include_expired,
+            now=expiry_ref,
+            extra_sql="AND embedding IS NOT NULL",
+        )
         sql = (
             f"SELECT *, list_cosine_similarity(embedding, CAST(? AS DOUBLE[{len(emb)}])) AS sim "
-            "FROM memory_records "
-            "WHERE COALESCE(status, 'active') = 'active' "
-            f"  {temporal_clause} "
-            "  AND embedding IS NOT NULL "
-            "  AND (user_scope IS NULL OR user_scope = ?) "
-            f"{expiry_clause}"
-            f"{project_clause}"
-            f"{namespace_clause}"
-            f"{client_scope_clause}"
-            f"{category_clause}"
-            f"{tier_clause} "
+            f"FROM memory_records WHERE {where_sql} "
             "ORDER BY sim DESC "
             "LIMIT ?"
         )
+        params: List[Any] = [vec_text, *where_params, limit * 4]
         results = self._fetch_records(sql, params, sim_col="sim")
         out: List[MemoryRecord] = []
         for r in results:

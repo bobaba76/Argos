@@ -183,6 +183,28 @@ class StoreWriteMixin:
         status = str(status or "active")
         if status not in {"active", "quarantined"}:
             status = "active"
+        # SW6: normalize confidence to [0.0, 1.0] (matching save_candidate).
+        try:
+            confidence = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        # SW12: validate tags type, payload size, scope/durability values.
+        if tags is not None and not isinstance(tags, list):
+            tags = [tags] if isinstance(tags, str) else []
+        _VALID_SCOPES = {"profile", "context", "session", "global"}
+        if scope not in _VALID_SCOPES:
+            scope = "profile"
+        _VALID_DURABILITY = {"durable", "temporary", "ephemeral"}
+        if durability not in _VALID_DURABILITY:
+            durability = "durable" if category not in {"context_note", "event", "goal"} else "temporary"
+        _MAX_PAYLOAD_SIZE = 65536  # 64KB
+        try:
+            _payload_size = len(json.dumps(record_payload))
+            if _payload_size > _MAX_PAYLOAD_SIZE:
+                logger.warning("remember(): payload size %d exceeds %d limit, truncating", _payload_size, _MAX_PAYLOAD_SIZE)
+                record_payload = {"source": source}
+        except (TypeError, ValueError):
+            record_payload = {"source": source}
         record_payload.setdefault("source", source)
 
         # Explicit expires_at wins over the TTL map.  None = no expiry.
@@ -488,16 +510,17 @@ class StoreWriteMixin:
                          AND COALESCE(status, 'active') = 'active'
                          AND ({_like_clauses})
                        ORDER BY created_at DESC, memory_id DESC
-                       LIMIT 50""",
+                       LIMIT 200""",
                     [self.user_id, *_subject_tokens],
                 ).fetchall()
                 # D6 (2/9 review): the pre-filter LIMIT can drop the ONE
-                # conflicting row when >50 active records match any token
+                # conflicting row when >N active records match any token
                 # (no ORDER BY made it nondeterministic; the cap made it
                 # silently lossy). If the filter hit the cap, escalate to a
                 # full scan so the answer never changes with row count.
+                # SW8: increased from 50 to 200 to reduce escalation frequency.
                 # The common path (few matching rows) stays bounded.
-                if len(rows) == 50:
+                if len(rows) == 200:
                     extra = self.connection.execute(
                         """SELECT memory_id, content FROM memory_records
                            WHERE valid_to IS NULL
@@ -724,7 +747,7 @@ class StoreWriteMixin:
                              AND (user_scope IS NULL OR user_scope = ?)
                              AND length(content) > 20
                            ORDER BY created_at DESC
-                           LIMIT 500""",
+                           LIMIT 200""",
                         [category, self.user_id],
                     ).fetchall()
                 for _cand_id, _existing_content in near_dupes:
@@ -1795,10 +1818,13 @@ class StoreWriteMixin:
                    WHERE c.status = 'approved'
                      AND c.evidence_text IS NOT NULL AND c.evidence_text != ''
                      AND m.status = 'active'
+                     AND (c.user_scope IS NULL OR c.user_scope = ?)
+                     AND (m.user_scope IS NULL OR m.user_scope = ?)
                      AND NOT EXISTS (
                          SELECT 1 FROM memory_evidence e
                          WHERE e.memory_id = m.memory_id
-                     )"""
+                     )""",
+                [self.user_id, self.user_id],
             ).fetchall()
             written = 0
             for (cand_id, evidence_text, evidence_role, source_ts,
@@ -1816,6 +1842,7 @@ class StoreWriteMixin:
                    FROM memory_candidates
                    WHERE status = 'approved'
                      AND evidence_text IS NOT NULL AND evidence_text != ''
+                     AND (user_scope IS NULL OR user_scope = ?)
                      AND NOT EXISTS (
                          SELECT 1 FROM memory_records m
                          WHERE m.content = memory_candidates.content
@@ -1824,7 +1851,8 @@ class StoreWriteMixin:
                      AND NOT EXISTS (
                          SELECT 1 FROM memory_evidence e
                          WHERE e.candidate_id = memory_candidates.candidate_id
-                     )"""
+                     )""",
+                [self.user_id],
             ).fetchall()
 
         for (cand_id, content, evidence_text, evidence_role, source_ts,
@@ -1907,14 +1935,19 @@ class StoreWriteMixin:
         return 1  # pre-checked: no existing row, so the insert succeeded
 
     def quarantine_memory(self, memory_id: str, reason: str) -> bool:
-        """Hide a memory from retrieval without deleting its record."""
+        """Hide a memory from retrieval without deleting its record.
+
+        SW5: existence check includes valid_to IS NULL — can't quarantine
+        superseded (historical) versions. UPDATE includes user_scope guard.
+        """
         now = self._now()
         with self._lock:
             assert self.connection is not None
             check = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE memory_id = ?
-                     AND (user_scope IS NULL OR user_scope = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND valid_to IS NULL""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not check or check[0] == 0:
@@ -1922,8 +1955,9 @@ class StoreWriteMixin:
             self.connection.execute(
                 """UPDATE memory_records
                    SET status = 'quarantined', quarantine_reason = ?, quarantined_at = ?, updated_at = ?
-                   WHERE memory_id = ?""",
-                [reason or "manual review", now, now, memory_id],
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)""",
+                [reason or "manual review", now, now, memory_id, self.user_id],
             )
         return True
 
@@ -1962,13 +1996,19 @@ class StoreWriteMixin:
                 """UPDATE memory_records
                    SET status = 'active', quarantine_reason = NULL,
                        quarantined_at = NULL, updated_at = ?
-                   WHERE memory_id = ?""",
-                [now, memory_id],
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)""",
+                [now, memory_id, self.user_id],
             )
         return True
 
     def record_feedback(self, memory_id: str, feedback: str) -> bool:
-        """Record helpful/dismissed/incorrect feedback; incorrect hides the memory."""
+        """Record helpful/dismissed/incorrect feedback; incorrect hides the memory.
+
+        SW4: existence check includes valid_to IS NULL — feedback on
+        superseded (historical) versions is rejected. UPDATE statements
+        include user_scope guard (defense-in-depth).
+        """
         feedback = feedback.strip().lower()
         if feedback not in {"helpful", "dismissed", "incorrect"}:
             raise ValueError("feedback must be helpful, dismissed, or incorrect")
@@ -1978,24 +2018,30 @@ class StoreWriteMixin:
             exists = self.connection.execute(
                 """SELECT COUNT(*) FROM memory_records
                    WHERE memory_id = ?
-                     AND (user_scope IS NULL OR user_scope = ?)""",
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND valid_to IS NULL""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not exists or exists[0] == 0:
                 return False
             if feedback == "helpful":
-                sql = "UPDATE memory_records SET helpful_count = COALESCE(helpful_count, 0) + 1, updated_at = ?, tier = 'active' WHERE memory_id = ?"
-                params = [now, memory_id]
+                sql = ("UPDATE memory_records SET helpful_count = COALESCE(helpful_count, 0) + 1, "
+                       "updated_at = ?, tier = 'active' WHERE memory_id = ? "
+                       "AND (user_scope IS NULL OR user_scope = ?)")
+                params = [now, memory_id, self.user_id]
             elif feedback == "dismissed":
-                sql = "UPDATE memory_records SET dismissed_count = COALESCE(dismissed_count, 0) + 1, updated_at = ?, tier = 'active' WHERE memory_id = ?"
-                params = [now, memory_id]
+                sql = ("UPDATE memory_records SET dismissed_count = COALESCE(dismissed_count, 0) + 1, "
+                       "updated_at = ?, tier = 'active' WHERE memory_id = ? "
+                       "AND (user_scope IS NULL OR user_scope = ?)")
+                params = [now, memory_id, self.user_id]
             else:
                 sql = """UPDATE memory_records
                          SET dismissed_count = COALESCE(dismissed_count, 0) + 1,
                              status = 'quarantined', quarantine_reason = 'marked incorrect',
                              quarantined_at = ?, updated_at = ?
-                         WHERE memory_id = ?"""
-                params = [now, now, memory_id]
+                         WHERE memory_id = ?
+                           AND (user_scope IS NULL OR user_scope = ?)"""
+                params = [now, now, memory_id, self.user_id]
             self.connection.execute(sql, params)
             return True
 
@@ -2042,6 +2088,40 @@ class StoreWriteMixin:
                     f"Content blocked: updated text matches an instruction-injection "
                     f"pattern ({_inj}). Refusing to write."
                 )
+        # SW7: apply inbound security scan for external-origin content updates.
+        # remember() applies this gate for external content; update_memory()
+        # must do the same so external content injected via update bypasses
+        # neither the injection check nor the inbound security scanner.
+        if content is not None:
+            existing_rec = self._fetch_records(
+                """SELECT provenance_origin FROM memory_records
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)""",
+                [memory_id, self.user_id],
+            )
+            _is_external_update = False
+            if existing_rec:
+                _prov = getattr(existing_rec[0], "provenance_origin", None)
+                _is_external_update = _prov == "external"
+            if _is_external_update:
+                try:
+                    if __package__:
+                        from .inbound_security import scan_inbound_text
+                    else:
+                        from inbound_security import scan_inbound_text
+                    _scan = scan_inbound_text(content)
+                    if _scan.blocked:
+                        raise ValueError(
+                            f"Content blocked by inbound security scan: "
+                            f"{_scan.summary()}. External-origin content "
+                            f"matching poisoning/injection patterns is refused."
+                        )
+                except ImportError:
+                    logger.warning(
+                        "Inbound security scanner unavailable for external "
+                        "memory update — refusing write as fail-closed"
+                    )
+                    return None
         existing = self._fetch_records(
             """SELECT * FROM memory_records
                WHERE memory_id = ?
@@ -2455,6 +2535,10 @@ class StoreWriteMixin:
         each chain is walked to count its versions. This is the trigger
         annotation that lets the agent know a fact has a history without
         unfolding it automatically.
+
+        SW9: pre-fetches all superseded_by edges for the hit IDs in one
+        query, then walks the edges in Python — avoids N+1 calls to
+        get_memory_history per hit.
         """
         if not memory_ids:
             return {}
@@ -2478,25 +2562,47 @@ class StoreWriteMixin:
             row[0]: row[1] for row in rows
         }
         out: Dict[str, Dict[str, Any]] = {}
+        # SW9: walk chains in Python using the pre-fetched edge map instead
+        # of calling get_memory_history (N+1 queries) per hit. Cycle-guarded.
+        _walked_chains: Dict[str, int] = {}  # head_id → chain length
         for mid in memory_ids:
             if mid in out:
                 continue
             if mid not in supersede_map:
                 out[mid] = {"versions": 1, "has_history": False}
                 continue
-            # Walk the full chain for this hit to count versions. Reuse
-            # get_memory_history (scope-isolated, cycle-guarded). Cache by
-            # chain so two hits in the same chain share one walk.
-            chain = self.get_memory_history(mid)
-            n = len(chain)
+            # Walk forward along superseded_by to find the head, then
+            # walk backward to count all versions in this chain.
+            visited: set = set()
+            cur = mid
+            # Walk forward to head.
+            while cur and cur in supersede_map and supersede_map[cur] and cur not in visited:
+                visited.add(cur)
+                cur = supersede_map[cur]
+            head = cur
+            if head in _walked_chains:
+                n = _walked_chains[head]
+            else:
+                # Count all nodes that point to head (directly or transitively).
+                # Build reverse map: superseded_by → [memory_ids]
+                reverse: Dict[str, list] = {}
+                for k, v in supersede_map.items():
+                    if v:
+                        reverse.setdefault(v, []).append(k)
+                # BFS backward from head.
+                chain_ids = {head}
+                queue = [head]
+                while queue:
+                    node = queue.pop(0)
+                    for pred in reverse.get(node, []):
+                        if pred not in chain_ids:
+                            chain_ids.add(pred)
+                            queue.append(pred)
+                n = len(chain_ids)
+                _walked_chains[head] = n
             has = n > 1
             entry = {"versions": n, "has_history": has}
-            # Annotate every other hit that belongs to this same chain.
-            for rec in chain:
-                if rec.memory_id in memory_ids:
-                    out[rec.memory_id] = entry
-            if mid not in out:
-                out[mid] = entry
+            out[mid] = entry
         # Any hit not yet annotated has no chain row at all.
         for mid in memory_ids:
             out.setdefault(mid, {"versions": 1, "has_history": False})
@@ -2586,8 +2692,9 @@ class StoreWriteMixin:
                        SET status = 'quarantined',
                            quarantine_reason = 'deleted from chain (reversible)',
                            quarantined_at = ?, updated_at = ?
-                       WHERE memory_id = ?""",
-                    [now, now, memory_id],
+                       WHERE memory_id = ?
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [now, now, memory_id, self.user_id],
                 )
                 return {"deleted": True, "action": "quarantined"}
             # Head with no predecessor: hard delete. Fingerprint the content
@@ -2780,16 +2887,20 @@ class StoreWriteMixin:
         return bool(check and check[0] == 0)
 
     def list_rejections(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """Read-only census of the rejection ledger, newest first (#39)."""
+        """Read-only census of the rejection ledger, newest first (#39).
+
+        SW1: filtered by user_scope — no cross-tenant rejection leak.
+        """
         limit = max(1, min(int(limit), 1000))
         with self._lock:
             assert self.connection is not None
             rows = self.connection.execute(
                 """SELECT subject, predicate, user_scope, reason, created_at
                    FROM rejection_ledger
+                   WHERE (user_scope IS NULL OR user_scope = ?)
                    ORDER BY created_at DESC
                    LIMIT ?""",
-                [limit],
+                [self.user_id, limit],
             ).fetchall()
         return [
             {

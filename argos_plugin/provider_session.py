@@ -21,12 +21,14 @@ try:
     from .reviewer import review_candidate_with_llm, suggest_expiry
     from .distillation import run_distillation
     from .rollup import run_rollup
+    from .config_validation import parse_role_words
 except ImportError:  # provider_session.py imported as a top-level module
     from store import VALID_CATEGORIES
     from extractor import extract_from_turn
     from reviewer import review_candidate_with_llm, suggest_expiry
     from distillation import run_distillation
     from rollup import run_rollup
+    from config_validation import parse_role_words
 try:
     from tools.registry import tool_error
 except ImportError:  # hermes runtime absent (conftest stub shape)
@@ -1067,13 +1069,7 @@ class ProviderSessionMixin:
                 cfg = {}
 
             # role_words is stored as a JSON array string
-            raw = str(cfg.get("role_words", "")).strip()
-            if raw.startswith("["):
-                words = json.loads(raw)
-            elif raw:
-                words = [w.strip() for w in raw.split(",")]
-            else:
-                words = []
+            words = parse_role_words(cfg.get("role_words", ""))
 
             if word not in words:
                 words.append(word)

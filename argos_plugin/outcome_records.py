@@ -233,7 +233,7 @@ def tripwatch_check_store(store) -> List[TripwatchAlert]:
     them for tripwire conditions. Zero LLM, zero storage schema.
     """
     try:
-        with store._lock:
+        with store._state.lock:
             assert store.connection is not None
             rows = store.connection.execute(
                 """SELECT memory_id, payload FROM memory_records

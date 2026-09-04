@@ -73,7 +73,7 @@ def test_legacy_store_without_tier_column_migrates_on_init(tmp_path):
         hit = next(r for r in results if "tax deadline" in r.content)
         assert getattr(hit, "tier", "active") == "active"
         # And the column now exists for lifecycle ops.
-        with store._lock:
+        with store._state.lock:
             row = store.connection.execute(
                 "SELECT tier FROM memory_records LIMIT 1"
             ).fetchone()

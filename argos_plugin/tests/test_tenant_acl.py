@@ -316,7 +316,7 @@ class TestAccessAudit:
         _search(svc, "alice", "Acme data")
         # Check the audit table.
         store = svc._tenants["default"].store
-        with store._lock:
+        with store._state.lock:
             rows = store.connection.execute(
                 "SELECT user_id, query_text, granted_count, denied_count, tenant FROM access_audit"
             ).fetchall()
@@ -346,7 +346,7 @@ class TestAccessAudit:
         # her ACL client_scope mask, so it should be denied.
         _search(svc, "alice", "Beta secret")
         store = svc._tenants["default"].store
-        with store._lock:
+        with store._state.lock:
             rows = store.connection.execute(
                 "SELECT user_id, denied_count, excluded FROM access_audit WHERE user_id = 'alice'"
             ).fetchall()

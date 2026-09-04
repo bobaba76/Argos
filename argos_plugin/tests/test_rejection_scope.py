@@ -25,7 +25,7 @@ from store import DuckDBMemoryStore  # noqa: E402
 
 def _pollute_with_degenerate_ledger_rows(store: DuckDBMemoryStore) -> None:
     """Simulate pre-fix pollution: slot-less rejections keyed on bare category."""
-    with store._lock:
+    with store._state.lock:
         for cat in ("context_note", "insight"):
             store.connection.execute(
                 """INSERT OR REPLACE INTO rejection_ledger
@@ -56,7 +56,7 @@ def test_specific_claim_rejection_still_blocks_same_slot(tmp_path):
     store = DuckDBMemoryStore(tmp_path / "t.duckdb", embedder=None)
     try:
         # Reject the specific claim slot 'personal_fact:age' for subject 'user'.
-        with store._lock:
+        with store._state.lock:
             store.record_rejection(
                 "personal_fact", {"attribute": "age"},
                 reason="review_rejected",

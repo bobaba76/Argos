@@ -61,15 +61,14 @@ _stub_agent_modules()
 # ---------------------------------------------------------------------------
 
 class TestDequeImport:
-    """store_core.py annotates ``self._scale_latencies: Deque[float]`` but
-    ``Deque`` was never imported from ``typing``. Annotation-only so no
-    runtime error, but pyflakes flags it and ``__annotations__`` introspection
-    breaks."""
+    """store_state.py annotates ``scale_latencies: Deque[float]`` — the
+    ``Deque`` import must exist in store_state.py (was store_core.py before
+    #249-slice moved the scale state into the dataclass)."""
 
     def test_deque_in_typing_import(self):
-        import store_core
-        src = Path(store_core.__file__).read_text(encoding="utf-8")
-        assert "Deque" in src, "Deque must be imported in store_core.py"
+        import store_state
+        src = Path(store_state.__file__).read_text(encoding="utf-8")
+        assert "Deque" in src, "Deque must be imported in store_state.py"
 
     def test_store_core_imports_cleanly(self):
         """The module must import without NameError even under

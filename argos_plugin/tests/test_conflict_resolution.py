@@ -286,7 +286,7 @@ class TestConflictResolution:
             assert result["memory"] is not None
             # Both should be active (old not superseded).
             # Check that the old memory is still valid (valid_to IS NULL).
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT valid_to FROM memory_records WHERE memory_id = ?",
                     [old_mem.memory_id],
@@ -307,7 +307,7 @@ class TestConflictResolution:
             updated_cand = result["candidate"]
             assert updated_cand["status"] == "rejected"
             # Old memory should be superseded (valid_to set).
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT valid_to FROM memory_records WHERE memory_id = ?",
                     [old_mem.memory_id],
@@ -358,7 +358,7 @@ class TestConflictResolution:
             updated_cand = result["candidate"]
             assert updated_cand["status"] == "rejected"
             # Old memory should be superseded.
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT valid_to FROM memory_records WHERE memory_id = ?",
                     [old_mem.memory_id],
@@ -555,7 +555,7 @@ class TestWritePathAuditB7B9D8:
             v3 = store.update_memory(v2.memory_id, content="I live in Capital City")
             assert v3 is not None
             # v2 is a middle version (valid_to set, superseded_by v3).
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT valid_to, status FROM memory_records WHERE memory_id = ?",
                     [v2.memory_id],
@@ -568,7 +568,7 @@ class TestWritePathAuditB7B9D8:
             # in an inconsistent state where status='active' but valid_to is set.
             restored = store.restore_memory(v2.memory_id)
             assert restored is True
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT valid_to, status FROM memory_records WHERE memory_id = ?",
                     [v2.memory_id],
@@ -640,7 +640,7 @@ class TestWritePathAuditB7B9D8:
             assert result["outcome"] == "keep_both"
             # Check: the superseded old_mem should NOT have conflict_resolved
             # in its payload (it's no longer current — modifying it is wrong).
-            with store._lock:
+            with store._state.lock:
                 row = store.connection.execute(
                     "SELECT payload FROM memory_records WHERE memory_id = ?",
                     [old_mem.memory_id],
@@ -693,7 +693,7 @@ class TestWritePathAuditD5D6D7:
             # Simulate another thread superseding m1 with m2.
             m2_id = "mem-race-winner"
             now = store._now()
-            with store._lock:
+            with store._state.lock:
                 store.connection.execute(
                     """UPDATE memory_records
                        SET valid_to = ?, superseded_by = ?, updated_at = ?
@@ -725,7 +725,7 @@ class TestWritePathAuditD5D6D7:
             # valid_to IS NULL guard prevents overwriting m1's superseded_by.
             result = store.update_memory(m1.memory_id, content="I live in Berlin")
             # m1's superseded_by should still be m2_id (not overwritten).
-            with store._lock:
+            with store._state.lock:
                 m1_row = store.connection.execute(
                     "SELECT superseded_by FROM memory_records WHERE memory_id = ?",
                     [m1.memory_id],
@@ -762,7 +762,7 @@ class TestWritePathAuditD5D6D7:
                 # between head resolution and the transaction.
                 m2_id = "mem-race-winner"
                 now = store._now()
-                with store._lock:
+                with store._state.lock:
                     store.connection.execute(
                         """UPDATE memory_records
                            SET valid_to = ?, superseded_by = ?, updated_at = ?
@@ -856,7 +856,7 @@ class TestWritePathAuditD5D6D7:
             if _real_conn is not None:
                 store.connection = _real_conn
             # B6 FIX: there should be only ONE current head.
-            with store._lock:
+            with store._state.lock:
                 current = store.connection.execute(
                     """SELECT memory_id FROM memory_records
                        WHERE valid_to IS NULL
@@ -997,7 +997,7 @@ class TestD6ConflictScanCapEscalation:
 
     def _seed(self, tmp_path, n_fillers, db_name="test_d6_cap.duckdb"):
         store = DuckDBMemoryStore(tmp_path / db_name)
-        with store._lock:
+        with store._state.lock:
             c = store.connection
             for i in range(n_fillers):
                 c.execute(

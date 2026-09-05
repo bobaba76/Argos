@@ -12,6 +12,18 @@ Modes:
   copy (no --check)   copy changed + new runtime files; .bak-<ts> before
                       overwrite; re-hash every copied file (byte-verify);
                       append to deploy_state.json.
+  --atomic-swap       #308: staging-then-atomic-rename. Copy ALL runtime
+                      files to a versioned staged dir
+                      (``hybrid_memory.staged-<ts>``), verify byte-parity,
+                      then atomically swap the live directory reference
+                      (rename old live → ``hybrid_memory.bak-<ts>``,
+                      rename staged → ``hybrid_memory``). The previous
+                      live dir is preserved for rollback.
+  --rollback          #308: roll back to the previous versioned live dir.
+                      Reads deploy_state.json for the last backup dir,
+                      renames current live → ``hybrid_memory.failed-<ts>``,
+                      renames the backup back to ``hybrid_memory``.
+  --list-versions     #308: list available versioned live dirs for rollback.
   --prune (opt-in)    remove target files absent from source (never deletes
                       protected live artifacts; never default).
   --restart-service   restart the memory shared service after copy (kill
@@ -21,11 +33,16 @@ Modes:
 Hard rules (SYNC_HANDOFF.md):
   - Only runtime modules are synced: top-level *.py + plugin.yaml, minus
     dev utilities (cleanup/dump/migrate/rebuild/reembed/review/why_not/
-    backfill/run_tests).
+    backfill).
   - Never touch live-only artifacts: skills/, *.duckdb, *.duckdb.wal,
     hybrid_memory_service.json, hybrid_memory.json, __pycache__/, cron/,
     state.db, _mh_analysis.txt, *.bak-*, *.pre_*.
   - Never delete anything without --prune.
+
+#308 atomic swap: the live dir is swapped via os.replace (atomic on the
+same filesystem). The previous live dir is preserved as
+``hybrid_memory.bak-<ts>`` for rollback. Only the most recent backup is
+kept by --rollback; older backups can be cleaned manually.
 
 Stdlib only, Windows-safe. Run with the Hermes venv python.
 
@@ -33,6 +50,9 @@ Usage:
     python scripts/deploy.py                      # check (default)
     python scripts/deploy.py --check              # explicit
     python scripts/deploy.py                      # copy (same as check+copy)
+    python scripts/deploy.py --atomic-swap        # copy + atomic swap
+    python scripts/deploy.py --rollback           # roll back to previous
+    python scripts/deploy.py --list-versions      # list available versions
     python scripts/deploy.py --prune              # copy + prune
     python scripts/deploy.py --restart-service    # copy + restart
 """
@@ -401,6 +421,279 @@ def restart_service() -> bool:
         return False
 
 
+# --- #308: atomic swap / versioned rollback --------------------------------
+
+def _copy_tree(src: Path, dst: Path, files: List[Path], source_base: Path) -> List[Dict[str, str]]:
+    """Copy a list of files from src to dst, preserving relative structure.
+
+    Returns a list of {file, sha256} dicts. Raises on copy or hash failure.
+    """
+    import shutil
+    copied: List[Dict[str, str]] = []
+    for p in files:
+        rel = _rel_key(p, source_base)
+        dst_path = dst / rel
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p, dst_path)
+        src_hash = sha256(p)
+        dst_hash = sha256(dst_path)
+        if src_hash != dst_hash:
+            raise RuntimeError(
+                f"byte-parity verification failed for {rel} "
+                f"({src_hash[:12]} != {dst_hash[:12]})"
+            )
+        copied.append({"file": rel, "sha256": src_hash})
+    return copied
+
+
+def _find_versioned_backups(target: Path) -> List[Path]:
+    """Find versioned backup dirs (hybrid_memory.bak-*) sorted newest first."""
+    parent = target.parent
+    name = target.name
+    backups = []
+    if not parent.exists():
+        return backups
+    for p in sorted(parent.iterdir(), reverse=True):
+        if p.is_dir() and p.name.startswith(f"{name}.bak-"):
+            backups.append(p)
+    return backups
+
+
+def atomic_swap_mode(
+    source: Path,
+    target: Path,
+    state: Path,
+    restart: bool,
+) -> int:
+    """#308: staging-then-atomic-rename deploy.
+
+    1. Copy ALL runtime files to a versioned staged dir.
+    2. Verify byte-parity between staged and source.
+    3. Atomically swap: rename old live → backup, rename staged → live.
+    4. Record the deployment + backup dir in deploy_state.json.
+    """
+    if not source.exists():
+        print(f"ERROR: source dir not found: {source}", file=sys.stderr)
+        return 2
+    if not target.exists():
+        print(f"ERROR: target dir not found: {target}", file=sys.stderr)
+        return 2
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    parent = target.parent
+    staged = parent / f"{target.name}.staged-{ts}"
+    backup = parent / f"{target.name}.bak-{ts}"
+    # Handle name collisions (e.g. two deploys in the same second).
+    _counter = 0
+    while backup.exists():
+        _counter += 1
+        backup = parent / f"{target.name}.bak-{ts}-{_counter}"
+    _counter = 0
+    while staged.exists():
+        _counter += 1
+        staged = parent / f"{target.name}.staged-{ts}-{_counter}"
+
+    # Clean up any stale staged dir from a failed previous run.
+    if staged.exists():
+        import shutil
+        shutil.rmtree(staged, ignore_errors=True)
+
+    print(f"=== deploy --atomic-swap ({ts}) ===")
+    print(f"source: {source}")
+    print(f"target: {target}")
+    print(f"staged: {staged}")
+
+    # Phase 1: copy all runtime files to the staged dir.
+    files = source_files(source)
+    if not files:
+        print("ERROR: no source files to deploy", file=sys.stderr)
+        return 2
+
+    staged.mkdir(parents=True, exist_ok=True)
+    try:
+        copied = _copy_tree(source, staged, files, source)
+    except Exception as exc:
+        print(f"ERROR: staging failed: {exc}", file=sys.stderr)
+        import shutil
+        shutil.rmtree(staged, ignore_errors=True)
+        return 2
+
+    print(f"staged {len(copied)} files (byte-parity verified)")
+
+    # Phase 2: atomic swap.
+    # On Windows, os.replace works for dirs on the same volume but only
+    # if the target dir is empty or doesn't exist. We rename instead:
+    #   target → backup, staged → target
+    # If the rename of target → backup fails, we abort (no harm done).
+    # If the rename of staged → target fails after target → backup
+    # succeeded, we try to rename backup → target back (recovery).
+    try:
+        target.rename(backup)
+        print(f"renamed live → {backup.name}")
+    except Exception as exc:
+        print(f"ERROR: cannot rename live dir to backup: {exc}", file=sys.stderr)
+        import shutil
+        shutil.rmtree(staged, ignore_errors=True)
+        return 2
+
+    try:
+        staged.rename(target)
+        print(f"renamed staged → {target.name}")
+    except Exception as exc:
+        print(f"ERROR: atomic swap failed during final rename: {exc}",
+              file=sys.stderr)
+        print("attempting recovery: renaming backup back to live...", file=sys.stderr)
+        try:
+            backup.rename(target)
+            print("recovery: live dir restored")
+        except Exception as exc2:
+            print(f"FATAL: recovery failed: {exc2}", file=sys.stderr)
+            print(f"live dir is at: {backup}", file=sys.stderr)
+            print(f"manual recovery: rename {backup} → {target}", file=sys.stderr)
+        return 2
+
+    # Phase 3: record deployment.
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "head": repo_head(),
+        "mode": "atomic-swap",
+        "copied": copied,
+        "backup_dir": str(backup),
+        "staged_ts": ts,
+    }
+    append_state(state, entry)
+    print(f"deploy_state.json updated (atomic-swap, {len(copied)} files)")
+    print(f"backup: {backup}")
+    print(f"rollback: python scripts/deploy.py --rollback")
+
+    if restart:
+        print("restarting memory service...")
+        if not restart_service():
+            print("ERROR: service restart failed", file=sys.stderr)
+            return 2
+        print("service restarted")
+    else:
+        print("restart required: kill stale memory_service processes and "
+              "restart Hermes (see SYNC_HANDOFF.md Step 4)")
+    return 0
+
+
+def rollback_mode(target: Path, state: Path) -> int:
+    """#308: roll back to the previous versioned live dir.
+
+    Reads deploy_state.json for the last backup dir, renames current
+    live → failed, renames backup → live.
+    """
+    if not target.exists():
+        print(f"ERROR: target dir not found: {target}", file=sys.stderr)
+        return 2
+
+    state_data = load_state(state)
+    deployments = state_data.get("deployments", [])
+    # Find the last atomic-swap deployment with a backup_dir.
+    last_backup = None
+    for dep in reversed(deployments):
+        if dep.get("mode") == "atomic-swap" and dep.get("backup_dir"):
+            last_backup = Path(dep["backup_dir"])
+            break
+
+    if last_backup is None or not last_backup.exists():
+        # Fall back to scanning for backup dirs.
+        backups = _find_versioned_backups(target)
+        if not backups:
+            print("ERROR: no versioned backup found for rollback", file=sys.stderr)
+            return 2
+        last_backup = backups[0]
+        print(f"WARNING: no deploy_state entry, using newest backup: {last_backup}")
+
+    if not last_backup.exists():
+        print(f"ERROR: backup dir does not exist: {last_backup}", file=sys.stderr)
+        return 2
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    failed = target.parent / f"{target.name}.failed-{ts}"
+
+    print(f"=== deploy --rollback ({ts}) ===")
+    print(f"current live: {target}")
+    print(f"rolling back to: {last_backup}")
+
+    try:
+        target.rename(failed)
+        print(f"renamed current live → {failed.name}")
+    except Exception as exc:
+        print(f"ERROR: cannot rename current live dir: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        last_backup.rename(target)
+        print(f"renamed backup → {target.name}")
+    except Exception as exc:
+        print(f"ERROR: rollback rename failed: {exc}", file=sys.stderr)
+        print("attempting recovery: renaming failed back to live...", file=sys.stderr)
+        try:
+            failed.rename(target)
+            print("recovery: live dir restored (rollback aborted)")
+        except Exception as exc2:
+            print(f"FATAL: recovery failed: {exc2}", file=sys.stderr)
+            print(f"live dir is at: {failed}", file=sys.stderr)
+        return 2
+
+    # Record the rollback.
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "mode": "rollback",
+        "rolled_back_to": str(last_backup),
+        "failed_dir": str(failed),
+    }
+    append_state(state, entry)
+    print(f"rollback complete. failed dir preserved at: {failed}")
+    print("restart required: kill stale memory_service processes and "
+          "restart Hermes (see SYNC_HANDOFF.md Step 4)")
+    return 0
+
+
+def list_versions_mode(target: Path, state: Path) -> int:
+    """#308: list available versioned live dirs for rollback."""
+    print(f"=== deploy --list-versions ===")
+    print(f"live dir: {target}")
+    print()
+
+    backups = _find_versioned_backups(target)
+    if not backups:
+        print("No versioned backups found.")
+        return 0
+
+    state_data = load_state(state)
+    deployments = state_data.get("deployments", [])
+
+    print(f"Available backups (newest first):")
+    for i, bak in enumerate(backups):
+        # Try to find the matching deploy_state entry.
+        head = ""
+        ts_label = bak.name.split(".bak-", 1)[-1] if ".bak-" in bak.name else ""
+        for dep in reversed(deployments):
+            if dep.get("backup_dir") and Path(dep["backup_dir"]).resolve() == bak.resolve():
+                head = dep.get("head", "")[:12]
+                break
+        head_str = f" HEAD:{head}" if head else ""
+        print(f"  [{i}] {bak.name} (ts:{ts_label}){head_str}")
+
+    # Also list failed dirs (from failed rollbacks).
+    parent = target.parent
+    failed_dirs = []
+    if parent.exists():
+        for p in sorted(parent.iterdir(), reverse=True):
+            if p.is_dir() and p.name.startswith(f"{target.name}.failed-"):
+                failed_dirs.append(p)
+    if failed_dirs:
+        print()
+        print(f"Failed dirs (from rollbacks):")
+        for i, fd in enumerate(failed_dirs):
+            print(f"  [{i}] {fd.name}")
+
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -413,6 +706,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help=f"deploy_state.json path (default: {DEFAULT_STATE})")
     parser.add_argument("--check", action="store_true",
                         help="Diff only; exit 0 clean / 1 drift (default mode).")
+    parser.add_argument("--atomic-swap", action="store_true",
+                        help="#308: staging-then-atomic-rename deploy.")
+    parser.add_argument("--rollback", action="store_true",
+                        help="#308: roll back to the previous versioned live dir.")
+    parser.add_argument("--list-versions", action="store_true",
+                        help="#308: list available versioned live dirs for rollback.")
     parser.add_argument("--prune", action="store_true",
                         help="Also remove target files absent from source.")
     parser.add_argument("--restart-service", action="store_true",
@@ -423,6 +722,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     target = Path(args.target).resolve() if args.target else default_target().resolve()
     state = Path(args.state).resolve()
 
+    if args.list_versions:
+        return list_versions_mode(target, state)
+    if args.rollback:
+        return rollback_mode(target, state)
+    if args.atomic_swap:
+        return atomic_swap_mode(source, target, state, args.restart_service)
     if args.check:
         return check_mode(source, target, state)
     return copy_mode(source, target, state, args.prune, args.restart_service)

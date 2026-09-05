@@ -146,6 +146,7 @@ Three independent phases, all ship OFF by default. All are reversible (quarantin
 | `compaction_enabled` | `false` | Schedule-aware self-compaction of stale/duplicate/low-value memories. Reversible quarantine (never hard-deletes). Zero-LLM. Runs on session-end, cooldown-gated by `compaction_interval_days`. **When to change:** enable to control injection token bloat on long-running stores. |
 | `compaction_interval_days` | `7` | Minimum days between compaction runs (cooldown gate). **When to change:** lower for more frequent compaction. |
 | `compaction_aggressiveness` | `1.0` | Compaction aggressiveness scalar: `1.0` = conservative (fewer candidates, higher dedup threshold), `2.0` = aggressive (more candidates, lower threshold). Interpolated between. **When to change:** raise toward `2.0` if token budget is tight. |
+| `compaction_auto_apply` | `false` | When `false` (default), compaction runs in dry-run (report-only) mode — candidates are identified but NOT quarantined. When `true`, compaction auto-quarantines candidates on each scheduled run. Mirrors the `consolidation_auto_apply` safety default. **When to change:** set to `true` once you've reviewed a dry-run report and are confident in the candidate selection. |
 
 ## Watcher (file-system monitoring)
 

@@ -393,6 +393,7 @@ class ProviderCoreMixin:
         self._compaction_enabled: bool = False
         self._compaction_interval_days: int = 7
         self._compaction_aggressiveness: float = 1.0
+        self._compaction_auto_apply: bool = False
         # LLM model/provider for auxiliary tasks (extraction, review, expansion)
         # Empty string = use the auxiliary client's default model
         self._llm_model: str = ""
@@ -770,6 +771,7 @@ class ProviderCoreMixin:
         self._compaction_enabled = cfg.compaction_enabled
         self._compaction_interval_days = cfg.compaction_interval_days
         self._compaction_aggressiveness = cfg.compaction_aggressiveness
+        self._compaction_auto_apply = cfg.compaction_auto_apply
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,

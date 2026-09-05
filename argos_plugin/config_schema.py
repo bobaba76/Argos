@@ -805,6 +805,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Lifecycle",
         ),
         ProviderField(
+            key="compaction_auto_apply",
+            label="Compaction auto-apply",
+            kind=KIND_BOOL,
+            default="false",
+            description="When ON, compaction auto-quarantines candidates. When OFF (default), compaction runs in dry-run (report-only) mode — the user must explicitly enable this to auto-quarantine. Mirrors the consolidation_auto_apply safety default.",
+            group="Lifecycle",
+        ),
+        ProviderField(
             key="local_only",
             label="Local-only mode",
             kind=KIND_BOOL,

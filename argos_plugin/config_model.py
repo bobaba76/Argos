@@ -156,6 +156,7 @@ class MemoryConfig(BaseModel):
     compaction_enabled: bool = False
     compaction_interval_days: int = Field(7, ge=1, le=365)
     compaction_aggressiveness: float = Field(1.0, ge=1.0, le=2.0)
+    compaction_auto_apply: bool = False
 
     # -- egress ----------------------------------------------------------------
     local_only: bool = False

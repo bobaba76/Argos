@@ -673,6 +673,28 @@ class SharedMemoryStore:
     def consolidate(self, **kwargs: Any) -> dict:
         return self._rpc.call("store", "consolidate", **kwargs) or {}
 
+    def run_compaction(
+        self,
+        *,
+        interval_days: int = 7,
+        aggressiveness: float = 1.0,
+        dry_run: bool = False,
+    ) -> dict:
+        """#281: run schedule-aware compaction SERVER-SIDE via RPC.
+
+        The compaction pass needs direct access to consolidate(),
+        set_state, _fetch_records, and connection — all of which are
+        in _FORBIDDEN_STORE_METHODS or private on the proxy. This
+        narrow RPC method executes run_compaction() inside the service
+        process and returns the report dict.
+        """
+        return self._rpc.call(
+            "store", "run_compaction",
+            interval_days=interval_days,
+            aggressiveness=aggressiveness,
+            dry_run=dry_run,
+        ) or {}
+
     def count(self) -> int:
         return int(self._rpc.call("store", "count") or 0)
 

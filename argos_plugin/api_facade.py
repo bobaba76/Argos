@@ -64,6 +64,7 @@ READ_OPERATIONS: Set[str] = {
     "fetch_history",
     "capabilities",
     "explain",
+    "explain_retrieval",
 }
 
 # Proposal tier: external caller → candidate → security scan → review queue.

@@ -703,6 +703,56 @@ class SharedMemoryStore:
         """
         return None
 
+    # -- access audit (#312) --------------------------------------------------
+
+    def write_access_audit(
+        self,
+        *,
+        user_id: str,
+        query_text: str,
+        granted_count: int,
+        denied_count: int,
+        denied_scopes: str | None = None,
+        excluded: bool = False,
+        tenant: str | None = None,
+    ) -> None:
+        """#312: Proxy for store.write_access_audit over RPC.
+
+        Appends a row to the durable access_audit table on the shared
+        service. Used by the facade (#300) to route denials to the
+        durable sink when the store handle is a SharedMemoryStore.
+
+        The store-side method hashes query_text (SHA-256, 16 chars) —
+        no raw query text crosses the RPC boundary in the persisted row.
+        """
+        self._rpc.call(
+            "store", "write_access_audit",
+            user_id=user_id,
+            query_text=query_text,
+            granted_count=int(granted_count),
+            denied_count=int(denied_count),
+            denied_scopes=denied_scopes,
+            excluded=bool(excluded),
+            tenant=tenant,
+        )
+
+    def export_access_audit(
+        self,
+        *,
+        limit: int = 10000,
+        format: str = "jsonl",
+    ) -> str:
+        """#312: Proxy for store.export_access_audit over RPC.
+
+        Returns the access audit log as JSONL or CSV. The service-side
+        dispatch (#128) restricts export to wheel/principals only when
+        an ACL config is active.
+        """
+        return self._rpc.call(
+            "store", "export_access_audit",
+            limit=limit, format=format,
+        ) or ""
+
     # -- entity aliases -------------------------------------------------------
 
     def add_alias(self, alias: str, canonical_entity: str) -> None:

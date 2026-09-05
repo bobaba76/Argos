@@ -2525,6 +2525,23 @@ class StoreWriteMixin:
                 }
             return out
 
+    def provenance(self, memory_id: str) -> dict:
+        """#280: Assemble the full provenance view for a memory.
+
+        Read-only, zero-LLM, fail-soft. Returns a dict with evidence,
+        version chain, conflict note (if any), blend score, confidence,
+        and gates fired. Delegates to provenance.explain_provenance.
+        """
+        try:
+            try:
+                from .provenance import explain_provenance
+            except ImportError:
+                from provenance import explain_provenance
+            return explain_provenance(self, memory_id)
+        except Exception as exc:
+            logger.warning("provenance() failed for %s: %s", memory_id, exc)
+            return {"memory_id": memory_id, "error": str(exc)}
+
     def get_chain_membership(self, memory_ids: List[str]) -> Dict[str, Dict[str, Any]]:
         """Batched chain-membership annotation for search results.
 

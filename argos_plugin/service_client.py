@@ -518,6 +518,10 @@ class SharedMemoryStore:
             "store", "get_chain_membership", memory_ids=list(memory_ids or [])
         ) or {}
 
+    def provenance(self, memory_id: str) -> dict:
+        """#280: Assemble the full provenance view for a memory (RPC proxy)."""
+        return self._rpc.call("store", "provenance", memory_id=memory_id) or {}
+
     def backfill_evidence(self, retention: str = "full") -> int:
         """Backfill memory_evidence from approved candidates (pre-Wave-2 memories)."""
         return int(

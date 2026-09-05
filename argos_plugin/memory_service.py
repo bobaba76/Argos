@@ -804,6 +804,21 @@ class MemoryService:
             ]
         if method == "count_rollup_candidates_since":
             return store.count_rollup_candidates_since(args.get("since"))
+        # #312: write_access_audit — proxy the durable audit write over RPC
+        # so SharedMemoryStore (and the facade via #300) can route denials
+        # to the durable access_audit table. The store-side method hashes
+        # query_text (SHA-256, 16 chars) — no raw query text is persisted.
+        if method == "write_access_audit":
+            store.write_access_audit(
+                user_id=user_id,
+                query_text=args.get("query_text", ""),
+                granted_count=int(args.get("granted_count", 0)),
+                denied_count=int(args.get("denied_count", 0)),
+                denied_scopes=args.get("denied_scopes"),
+                excluded=bool(args.get("excluded", False)),
+                tenant=args.get("tenant"),
+            )
+            return None
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str, graph) -> Any:

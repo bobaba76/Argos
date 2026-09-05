@@ -72,3 +72,20 @@ Thumbs.db
 
 # Deploy tooling state (deploy.py) — local sync audit trail, never commit.
 deploy_state.json
+
+# #309: Scratch clones in repo root (argos-batch*, argos-config-model,
+# argos-hygiene-a, etc.) — never commit. These are temporary work clones.
+argos-batch/
+argos-batch-*/
+argos-config-model/
+argos-hygiene-a/
+argos-hygiene-*/
+
+# #309: Scratch root files — alternative README drafts, temp scripts.
+README.md.current-spec
+_tmb_send_reqest.py
+
+# #309: Eval cost benchmark results — contain local filesystem paths
+# (C:\Users\...) in captured stdout. The harness code IS committed;
+# only the raw results are ignored.
+eval/repro/cost/results/

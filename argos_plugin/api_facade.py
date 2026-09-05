@@ -586,7 +586,13 @@ class ArgosAPIFacade:
         # fields that attempt to widen access. The caller may narrow
         # (e.g. filter to a subset of their allowed client_scope) but
         # never widen.
-        params = self._enforce_identity(ctx, params, request_id)
+        # #300: audit identity-narrowing rejections (previously uncaught).
+        try:
+            params = self._enforce_identity(ctx, params, request_id)
+        except APIError:
+            self._audit(ctx, operation, request_id, "denied",
+                        denied_reason="identity_narrowing_rejected")
+            raise
 
         # 4. Input validation per operation.
         try:
@@ -983,16 +989,16 @@ class ArgosAPIFacade:
         The audit is operational access telemetry, not a governance-grade
         ledger (that's Themis's role).
 
-        AF9: for v1, audit events are log-only (INFO level). The
-        ``api_audit`` table is future work — the store-level
-        ``access_audit`` table (store_core.py) covers store-level audit.
-        Log rotation or process restart loses facade audit events. This
-        is an accepted v1 limitation.
+        AF9: the INFO log is the fast path and always fires. #300:
+        denials are ALSO routed to the durable ``access_audit`` table
+        via ``store.write_access_audit(...)`` when the store handle
+        exposes it. In shared-service mode, ``SharedMemoryStore`` does
+        not yet expose ``write_access_audit`` (RPC threading is a
+        follow-up); in that case the log is the only record. When the
+        store is a direct ``DuckDBMemoryStore`` (tests, direct mode),
+        denials are durable and survive restarts.
         """
-        # For v1, audit events are logged at INFO level. The access_audit
-        # table (store_core.py) is the durable sink for store-level audit;
-        # the facade audit is a higher-level operation log. When the REST
-        # slice ships, this will write to a dedicated api_audit table.
+        # Fast path: always log at INFO level.
         logger.info(
             "api_audit principal=%s tenant=%s transport=%s operation=%s "
             "request_id=%s decision=%s denied_reason=%s error_code=%s "
@@ -1001,3 +1007,24 @@ class ArgosAPIFacade:
             request_id, decision, denied_reason, error_code,
             result_count, idempotency_replay,
         )
+        # #300: route denials to the durable access_audit table when
+        # the store handle exposes write_access_audit. Covers all deny
+        # classes: forbidden_operation, not_authorized_for_operation,
+        # invalid_input, identity_narrowing_rejected. Fail-soft: a
+        # durable-audit write failure must never block the response.
+        if decision == "denied" and hasattr(self._store, "write_access_audit"):
+            try:
+                self._store.write_access_audit(
+                    user_id=ctx.user_id,
+                    query_text=operation,  # hashed by write_access_audit
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes=denied_reason or "",
+                    excluded=True,
+                    tenant=ctx.tenant,
+                )
+            except Exception:
+                logger.debug(
+                    "durable access_audit write failed for denial %s",
+                    request_id, exc_info=True,
+                )

@@ -76,7 +76,6 @@ EXCLUDED_SOURCE_FILES = {
     "reembed_memories.py",
     "review_pending.py",
     "why_not_cli.py",
-    "run_tests.py",
     "backfill_graph.py",
 }
 

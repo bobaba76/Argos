@@ -707,6 +707,8 @@ class MemoryService:
             ]
         if method == "get_chain_membership":
             return store.get_chain_membership(args.get("memory_ids", []) or [])
+        if method == "provenance":
+            return store.provenance(args.get("memory_id", ""))
         if method == "backfill_evidence":
             return store.backfill_evidence(
                 retention=args.get("retention", "full")

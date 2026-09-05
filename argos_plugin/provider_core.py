@@ -1036,3 +1036,24 @@ class ProviderCoreMixin:
             "config_fingerprint": getattr(self, "_config_fingerprint", "unknown"),
             "self_test_results": getattr(self, "_self_test_results", {}),
         }
+
+    def explain(self, memory_id: str) -> dict:
+        """#280: Explain why a memory was retrieved — provenance view.
+
+        Read-only, zero-LLM, fail-soft. Returns a dict with:
+        - evidence: the evidence row (source/evidence reference)
+        - version_chain: the supersession chain
+        - conflict_note: conflict note (if any)
+        - blend_score: similarity + raw_similarity + reranker info
+        - confidence: the memory's confidence field
+        - gates_fired: retrieval gates that fired for this memory
+
+        Delegates to store.provenance() (DuckDB or SharedMemoryStore).
+        """
+        try:
+            if self._store is None:
+                return {"memory_id": memory_id, "error": "store not initialized"}
+            return self._store.provenance(memory_id)
+        except Exception as exc:
+            logger.warning("explain() failed for %s: %s", memory_id, exc)
+            return {"memory_id": memory_id, "error": str(exc)}

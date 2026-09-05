@@ -1154,6 +1154,13 @@ class StoreRetrievalMixin:
                     else:
                         ce_norm = 0.5
                     record.similarity = 0.8 * record.similarity + 0.2 * ce_norm
+                    # #280: explicit transient marker so the explainability
+                    # pack can distinguish an actual reranker pass from
+                    # graph boost / importance expansion (which also make
+                    # raw_similarity != similarity). Without this marker,
+                    # every graph-boosted record is misattributed to the
+                    # reranker.
+                    record._reranked = True
                 rerank_pool.sort(key=lambda r: r.similarity, reverse=True)
                 fused = rerank_pool + fused[reranker_top_n:]
 

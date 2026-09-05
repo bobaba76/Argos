@@ -222,18 +222,36 @@ class TestConflictNote:
 
     def test_conflict_note_on_two_active_versions(self, store):
         """If a chain has two active versions (both valid_to=None),
-        a conflict note is returned."""
+        a conflict note is returned with the expected text.
+
+        update_memory creates a proper supersession (old version gets
+        valid_to set), so we forge two active rows directly to test the
+        conflict detection on unlinked active records.
+        """
+        # Create two independent memories with the same subject but
+        # different values, both active (valid_to=None).
         v1 = store.remember(
             category="personal_fact",
             content="User likes coffee",
         )
-        v2 = store.update_memory(
-            v1.memory_id, content="User likes tea",
+        v2 = store.remember(
+            category="personal_fact",
+            content="User likes tea",
         )
+        # Forge a chain: make v1 superseded_by v2 but DON'T set valid_to
+        # on v1 (simulating a corrupt/unlinked chain with two active
+        # versions).
+        with store._state.lock:
+            store.connection.execute(
+                "UPDATE memory_records SET superseded_by = ? "
+                "WHERE memory_id = ?",
+                [v2.memory_id, v1.memory_id],
+            )
 
-        # Normal chain: v1 is superseded, v2 is current — no conflict
         result = store.provenance(v2.memory_id)
-        assert "conflict_note" in result
+        assert result["conflict_note"] is not None
+        assert "CONFLICT" in result["conflict_note"]
+        assert "2 active versions" in result["conflict_note"]
 
     def test_conflict_note_none_on_single_version(self, store):
         """A single-version memory has no conflict note."""
@@ -243,6 +261,21 @@ class TestConflictNote:
         )
 
         result = store.provenance(m.memory_id)
+        assert result["conflict_note"] is None
+
+    def test_conflict_note_none_on_proper_supersession(self, store):
+        """A properly superseded chain (old version has valid_to set)
+        has no conflict note — supersession is the resolution."""
+        v1 = store.remember(
+            category="personal_fact",
+            content="User likes coffee",
+        )
+        v2 = store.update_memory(
+            v1.memory_id, content="User likes tea",
+        )
+
+        result = store.provenance(v2.memory_id)
+        # Proper supersession: v1 has valid_to set, only v2 is active
         assert result["conflict_note"] is None
 
 
@@ -322,18 +355,34 @@ class TestGatesFired:
         assert any("injection_min_score" in g for g in gates)
 
     def test_gates_fired_on_reranker_adjusted(self, store):
-        """A record with raw_similarity != similarity has the reranker
-        gate listed."""
+        """A record with the _reranked marker has the reranker gate
+        listed — gated on the explicit marker, not raw != sim."""
         m = store.remember(
             category="personal_fact",
             content="User likes swimming",
         )
         m.similarity = 0.8
-        m.raw_similarity = 0.6  # Different → reranker adjusted
+        m.raw_similarity = 0.6
+        m._reranked = True  # explicit marker from the reranker block
 
         from provenance import _gates_fired
         gates = _gates_fired(m, injection_min_score=0.0)
         assert any("reranker" in g for g in gates)
+
+    def test_gates_fired_graph_boosted_no_reranker_gate(self, store):
+        """A graph-boosted record WITHOUT the _reranked marker does NOT
+        get the reranker gate — even though raw != sim."""
+        m = store.remember(
+            category="personal_fact",
+            content="User likes swimming",
+        )
+        m.similarity = 0.8
+        m.raw_similarity = 0.6  # raw != sim, but this is graph boost
+        # NO _reranked marker
+
+        from provenance import _gates_fired
+        gates = _gates_fired(m, injection_min_score=0.0)
+        assert not any("reranker" in g for g in gates)
 
     def test_gates_fired_empty_on_normal_record(self, store):
         """A normal record with no gates fired has an empty list."""
@@ -409,8 +458,9 @@ class TestBlendScoreMatch:
     """
 
     def test_blend_score_reflects_reranker_adjustment(self):
-        """explain_record with a reranker-adjusted record surfaces
-        real similarity, raw_similarity, and reranker_applied=True."""
+        """explain_record with a _reranked marker surfaces
+        reranker_applied=True — gated on the explicit marker, not
+        the raw != sim heuristic."""
         from provenance import explain_record
         from store_common import MemoryRecord
 
@@ -421,6 +471,7 @@ class TestBlendScoreMatch:
             similarity=0.85,
             raw_similarity=0.70,
         )
+        record._reranked = True  # explicit marker from the reranker block
 
         class MockStore:
             def get_evidence(self, mid):
@@ -435,9 +486,46 @@ class TestBlendScoreMatch:
         assert result["blend_score"]["reranker_applied"] is True
         assert result["blend_score"]["source"] == "retrieval-time"
 
+    def test_blend_score_graph_boosted_without_reranker(self):
+        """A graph-boosted record WITHOUT the _reranked marker must
+        surface reranker_applied=False — even though raw != sim.
+
+        This is the core fix: graph boost mutates similarity in place
+        (provider_retrieval.py:914-946) after raw_similarity is captured
+        (:887), so raw != sim holds for every graph-boosted record.
+        The _reranked marker is only set at the actual cross-encoder
+        blend loop (store_retrieval.py:1156-1162).
+        """
+        from provenance import explain_record
+        from store_common import MemoryRecord
+
+        # Simulate a graph-boosted record: raw=0.5, similarity=0.7 (boosted
+        # by 0.2), but NO _reranked marker (reranker didn't run).
+        record = MemoryRecord(
+            memory_id="test-graph-boost",
+            category="personal_fact",
+            content="User likes cooking",
+            similarity=0.7,
+            raw_similarity=0.5,  # raw != sim, but this is graph boost
+        )
+        # NO _reranked marker — graph boost only
+
+        class MockStore:
+            def get_evidence(self, mid):
+                return None
+            def get_memory_history(self, mid):
+                return [record]
+
+        result = explain_record(record, MockStore(), injection_min_score=0.3)
+
+        assert result["blend_score"]["similarity"] == 0.7
+        assert result["blend_score"]["raw_similarity"] == 0.5
+        # reranker_applied must be False — this is graph boost, not reranker
+        assert result["blend_score"]["reranker_applied"] is False
+
     def test_blend_score_no_reranker(self):
-        """explain_record with raw_similarity == similarity surfaces
-        reranker_applied=False."""
+        """explain_record with raw_similarity == similarity and no
+        _reranked marker surfaces reranker_applied=False."""
         from provenance import explain_record
         from store_common import MemoryRecord
 
@@ -569,3 +657,251 @@ class TestCrossUserACL:
         record = _fetch_record(store, m.memory_id)
         assert record is not None
         assert record.content == "Bob's fact"
+
+
+class TestFacadeExplain:
+    """REQUIRED: explain is wired through the canonical facade (spec-09
+    spine: auth-context → ACL → validation → audit → redaction).
+
+    Tests: facade explain returns provenance for own-scope memory;
+    cross-user explain → denied at facade (scope_check); REST route
+    smoke; MCP tool smoke; read-only; zero-LLM.
+    """
+
+    def test_facade_explain_returns_provenance(self):
+        """Facade explain returns provenance for an own-scope memory."""
+        from api_facade import ArgosAPIFacade, AuthContext
+        from store_common import MemoryRecord
+
+        record = MemoryRecord(
+            memory_id="facade-test-1",
+            category="personal_fact",
+            content="User likes Python",
+        )
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return [record]
+            def provenance(self, mid):
+                return {
+                    "memory_id": mid,
+                    "content": "User likes Python",
+                    "category": "personal_fact",
+                    "evidence": None,
+                    "version_chain": [],
+                    "conflict_note": None,
+                    "blend_score": {"similarity": None, "source": "id-based"},
+                    "confidence": None,
+                    "provenance_origin": "internal",
+                    "grounding": "observed",
+                    "gates_fired": [],
+                }
+
+        facade = ArgosAPIFacade(MockStore())
+        ctx = AuthContext(
+            principal="alice", tenant="t1", user_id="alice",
+            transport="test", allowed_operations={"explain"},
+        )
+        result = facade.execute(ctx, "explain", {"memory_id": "facade-test-1"})
+
+        assert result["memory_id"] == "facade-test-1"
+        assert result["content"] == "User likes Python"
+        assert "blend_score" in result
+
+    def test_facade_explain_cross_user_denied(self):
+        """Cross-user explain is denied at the FACADE (scope_check),
+        not just at the store. Returns not_found (doesn't leak existence).
+
+        The store-level user_scope filter in get_memories_by_ids returns
+        [] for cross-user IDs, so the facade sees 'not found'. This
+        test verifies the facade-level denial path via scope_check by
+        setting a max_project_id that doesn't match the record.
+        """
+        from api_facade import ArgosAPIFacade, AuthContext, APIError
+        from store_common import MemoryRecord
+
+        # A record with project_id="alice_project"
+        record = MemoryRecord(
+            memory_id="facade-test-2",
+            category="personal_fact",
+            content="Alice's secret",
+            project_id="alice_project",
+        )
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return [record]
+            def provenance(self, mid):
+                return {"memory_id": mid, "content": "Alice's secret"}
+
+        facade = ArgosAPIFacade(MockStore())
+        # Bob's context with max_project_id="bob_project" — scope_check
+        # should reject Alice's record.
+        ctx = AuthContext(
+            principal="bob", tenant="t1", user_id="bob",
+            transport="test", allowed_operations={"explain"},
+            max_project_id="bob_project",
+        )
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "explain", {"memory_id": "facade-test-2"})
+        assert exc_info.value.code == "not_found"
+
+    def test_facade_explain_cross_user_denied_at_store(self):
+        """Cross-user explain is denied at the STORE level too:
+        get_memories_by_ids returns [] for cross-user IDs (user_scope
+        filter), so the facade sees 'not found'."""
+        from api_facade import ArgosAPIFacade, AuthContext, APIError
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return []  # store-level user_scope filter → not found
+            def provenance(self, mid):
+                return {"memory_id": mid, "content": "should not reach"}
+
+        facade = ArgosAPIFacade(MockStore())
+        ctx = AuthContext(
+            principal="bob", tenant="t1", user_id="bob",
+            transport="test", allowed_operations={"explain"},
+        )
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "explain", {"memory_id": "alice-secret-id"})
+        assert exc_info.value.code == "not_found"
+
+    def test_facade_explain_not_found(self):
+        """Facade explain on a non-existent memory returns not_found."""
+        from api_facade import ArgosAPIFacade, AuthContext, APIError
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return []  # not found
+            def provenance(self, mid):
+                return {"memory_id": mid, "error": "not found"}
+
+        facade = ArgosAPIFacade(MockStore())
+        ctx = AuthContext(
+            principal="alice", tenant="t1", user_id="alice",
+            transport="test", allowed_operations={"explain"},
+        )
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "explain", {"memory_id": "nonexistent"})
+        assert exc_info.value.code == "not_found"
+
+    def test_facade_explain_is_read_only(self):
+        """Facade explain does not write to the store."""
+        from api_facade import ArgosAPIFacade, AuthContext
+        from store_common import MemoryRecord
+
+        record = MemoryRecord(
+            memory_id="facade-test-3",
+            category="personal_fact",
+            content="Test",
+        )
+        writes = []
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return [record]
+            def provenance(self, mid):
+                return {"memory_id": mid, "content": "Test"}
+            def remember(self, **kwargs):
+                writes.append(kwargs)
+                raise AssertionError("explain path must not write")
+
+        facade = ArgosAPIFacade(MockStore())
+        ctx = AuthContext(
+            principal="alice", tenant="t1", user_id="alice",
+            transport="test", allowed_operations={"explain"},
+        )
+        facade.execute(ctx, "explain", {"memory_id": "facade-test-3"})
+        assert writes == []
+
+    def test_facade_explain_in_capabilities(self):
+        """The explain operation is listed in READ_OPERATIONS and
+        appears in capabilities for principals with read access."""
+        from api_facade import ArgosAPIFacade, AuthContext, READ_OPERATIONS
+
+        assert "explain" in READ_OPERATIONS
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return []
+
+        facade = ArgosAPIFacade(MockStore())
+        ctx = AuthContext(
+            principal="alice", tenant="t1", user_id="alice",
+            transport="test",
+            allowed_operations=set(READ_OPERATIONS),
+        )
+        result = facade.execute(ctx, "capabilities", {})
+        assert "explain" in result["operations"]
+
+
+class TestRestExplainRoute:
+    """REST route smoke test: GET /v1/memories/{memory_id}/explain."""
+
+    def test_rest_explain_route_exists(self):
+        """The REST server has a GET /v1/memories/{id}/explain route."""
+        from rest_server import create_app
+        from api_facade import ArgosAPIFacade
+        from store_common import MemoryRecord
+
+        record = MemoryRecord(
+            memory_id="rest-test-1",
+            category="personal_fact",
+            content="Test",
+        )
+
+        class MockStore:
+            def get_memories_by_ids(self, ids):
+                return [record]
+            def provenance(self, mid):
+                return {"memory_id": mid, "content": "Test"}
+
+        facade = ArgosAPIFacade(MockStore())
+        app = create_app(facade, auth_token="test-token")
+
+        # Verify the route is registered
+        routes = [r.path for r in app.routes]
+        assert "/v1/memories/{memory_id}/explain" in routes
+
+
+class TestMcpExplainTool:
+    """MCP tool smoke test: memory_explain is in the registry."""
+
+    def test_mcp_explain_tool_in_registry(self):
+        """The MCP server has a memory_explain tool in TOOL_DEFINITIONS."""
+        from mcp_server import TOOL_DEFINITIONS, TOOL_TO_OPERATION
+
+        tool_names = [t["name"] for t in TOOL_DEFINITIONS]
+        assert "memory_explain" in tool_names
+
+        # The tool maps to the explain facade operation
+        assert TOOL_TO_OPERATION["memory_explain"] == "explain"
+
+    def test_mcp_explain_tool_strict_schema(self):
+        """The memory_explain tool has a strict inputSchema
+        (additionalProperties: false, required: memory_id)."""
+        from mcp_server import TOOL_DEFINITIONS
+
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "memory_explain")
+        schema = tool["inputSchema"]
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        assert "memory_id" in schema["required"]
+        assert "memory_id" in schema["properties"]
+
+    def test_mcp_explain_tool_output_schema(self):
+        """The memory_explain tool has a strict outputSchema."""
+        from mcp_server import TOOL_DEFINITIONS
+
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "memory_explain")
+        schema = tool["outputSchema"]
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        # Key provenance fields should be in the output schema
+        props = schema["properties"]
+        assert "memory_id" in props
+        assert "evidence" in props
+        assert "version_chain" in props
+        assert "blend_score" in props
+        assert "gates_fired" in props

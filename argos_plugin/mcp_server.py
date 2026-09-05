@@ -108,6 +108,21 @@ def _fetch_history_input_schema() -> Dict[str, Any]:
     }
 
 
+def _explain_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_explain (#280)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["memory_id"],
+        "properties": {
+            "memory_id": {
+                "type": "string",
+                "description": "The memory ID to explain (provenance view).",
+            },
+        },
+    }
+
+
 def _capabilities_input_schema() -> Dict[str, Any]:
     """Strict input schema for memory_capabilities (no params)."""
     return {
@@ -174,6 +189,33 @@ TOOL_DEFINITIONS: tuple = (
                 "operations": {"type": "array", "items": {"type": "string"}},
                 "transport": {"type": "string"},
                 "principal": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "memory_explain",
+        "description": (
+            "Explain why a memory was retrieved — provenance view. "
+            "Returns evidence row, version chain, conflict note (if any), "
+            "blend score, confidence, and gates fired. Read-only, zero-LLM, "
+            "fail-soft. ACL-enforced."
+        ),
+        "inputSchema": _explain_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "memory_id": {"type": "string"},
+                "content": {"type": "string"},
+                "category": {"type": "string"},
+                "evidence": {"type": "object"},
+                "version_chain": {"type": "array", "items": {"type": "object"}},
+                "conflict_note": {"type": "string"},
+                "blend_score": {"type": "object"},
+                "confidence": {"type": "number"},
+                "provenance_origin": {"type": "string"},
+                "grounding": {"type": "string"},
+                "gates_fired": {"type": "array", "items": {"type": "string"}},
             },
         },
     },
@@ -279,6 +321,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_search": "search",
     "memory_fetch": "fetch",
     "memory_fetch_history": "fetch_history",
+    "memory_explain": "explain",
     "memory_capabilities": "capabilities",
     "memory_propose": "memory_propose",
 }

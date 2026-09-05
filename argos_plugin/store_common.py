@@ -345,6 +345,12 @@ class MemoryRecord:
         "valid_from", "valid_to", "superseded_by",
         "provenance_origin", "grounding",
         "tier",
+        # #280: transient marker set by the cross-encoder reranker blend
+        # loop (store_retrieval.py). Not persisted — only lives on the
+        # in-memory record during a retrieval pass. Used by the
+        # explainability pack to distinguish an actual reranker pass
+        # from graph boost / importance expansion.
+        "_reranked",
     )
 
     def __init__(

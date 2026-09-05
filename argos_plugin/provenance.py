@@ -72,20 +72,17 @@ def explain_record(
     # --- Blend score (real retrieval-time values) ---
     similarity = _safe_get(record, "similarity", 0.0)
     raw_similarity = _safe_get(record, "raw_similarity", None)
-    # reranker_applied: only True if the reranker actually ran. The
-    # reranker sets raw_similarity to the pre-rerank score and adjusts
-    # similarity. Graph boost and importance expansion also change
-    # similarity but do NOT set raw_similarity to a different value
-    # from the pre-adjustment score — they modify similarity in place.
-    # The reranker path (store_retrieval.py:1135-1149) captures
-    # raw_similarity BEFORE the blend and sets similarity to the blend.
-    # So reranker_applied = raw_similarity is not None AND raw_similarity
-    # != similarity, which is only set by the reranker path.
-    reranker_applied = (
-        raw_similarity is not None
-        and similarity is not None
-        and raw_similarity != similarity
-    )
+    # #280: reranker_applied is gated on the explicit _reranked transient
+    # marker set at the ACTUAL reranker block (store_retrieval.py:1156-
+    # 1162), NOT on raw_similarity != similarity. The raw != sim
+    # heuristic is wrong because provider_retrieval.py:887 overwrites
+    # raw_similarity to the post-reranker/pre-boost value, and graph
+    # boost / importance expansion then mutate similarity in place
+    # (:914-946). So raw != sim holds for EVERY graph-boosted record
+    # whether or not the reranker ran. The _reranked marker is only set
+    # inside the cross-encoder blend loop, so it's the sole reliable
+    # signal that the reranker participated.
+    reranker_applied = bool(getattr(record, "_reranked", False))
     result["blend_score"] = {
         "similarity": similarity,
         "raw_similarity": raw_similarity,
@@ -411,11 +408,11 @@ def _gates_fired(record: Any, injection_min_score: float = 0.0) -> List[str]:
     if _safe_get(record, "category", "") == "system_note":
         gates.append("conflict_surfacing (injected conflict note)")
 
-    # reranker: only if raw_similarity was captured (pre-rerank) and
-    # differs from the final similarity. Graph boost and importance
-    # expansion modify similarity in place without setting raw_similarity
-    # to a different value, so this only fires for the actual reranker.
-    if raw is not None and sim is not None and raw != sim:
+    # reranker: gated on the explicit _reranked transient marker set at
+    # the actual cross-encoder blend loop (store_retrieval.py:1156-1162).
+    # The raw != sim heuristic is wrong because graph boost / importance
+    # expansion also make raw != sim (see explain_record comment above).
+    if getattr(record, "_reranked", False):
         gates.append("reranker (score adjusted)")
 
     return gates

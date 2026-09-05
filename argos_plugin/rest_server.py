@@ -415,6 +415,31 @@ def create_app(
             status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
             return _error_response(exc.code, exc.message, exc.request_id, status)
 
+    # -- Explain: GET /v1/memories/{memory_id}/explain (#280) ----------------
+
+    @app.get("/v1/memories/{memory_id}/explain")
+    async def explain(
+        memory_id: str,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """Explain why a memory was retrieved — provenance view.
+
+        Returns evidence row, version chain, conflict note (if any),
+        blend score, confidence, and gates fired. Read-only, zero-LLM,
+        fail-soft. ACL-enforced (cross-user explain returns not_found).
+        """
+        if len(memory_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "memory_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            result = facade.execute(ctx, "explain", {"memory_id": memory_id})
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
     # -- No list/export endpoint (by design) ---------------------------------
 
     return app

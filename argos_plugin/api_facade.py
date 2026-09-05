@@ -175,7 +175,7 @@ class AuthContext:
     max_project_id: Optional[str] = None
     max_client_scope: Optional[str] = None
     # AF1/R1: server-derived maximum namespace scope. Caller filters may
-    # only narrow. When set, _scope_matches rejects records whose
+    # only narrow. When set, scope_check rejects records whose
     # namespace field is present and != max_namespace.
     max_namespace: Optional[str] = None
     # Operations this principal is allowed to perform.
@@ -810,15 +810,27 @@ class ArgosAPIFacade:
             })
         return {"results": items, "count": len(items)}
 
-    def _scope_matches(self, ctx: AuthContext, record: Any) -> bool:
-        """AF1/AF2: check that a record is within the caller's ACL scope.
+    def scope_check(self, ctx: AuthContext, record: Any) -> bool:
+        """#303: unified scope check for all facade operations that
+        resolve a record by ID.
 
-        When ``max_project_id`` or ``max_client_scope`` is set on the
-        context, the record must match. When both are None (v1 open
-        scope), all records pass.
+        This is the single helper behind facade scoping. Every facade
+        operation that fetches a record (fetch, fetch_history,
+        record_feedback) calls this method to verify the record is
+        within the caller's ACL scope.
+
+        When ``max_project_id``, ``max_client_scope``, or
+        ``max_namespace`` is set on the context, the record must match.
+        When all are None (v1 open scope), all records pass.
 
         R1: also checks ``namespace`` when set on the context, closing
         the fetch authorization bypass for namespace-scoped records.
+
+        Note: the search path uses ``set_user_scope`` + store-level
+        filtering (not this helper) because search returns a list, not
+        a single record by ID. The RPC layer uses
+        ``filter_records_by_access`` in access_scoping.py (unchanged
+        in this batch).
         """
         if ctx.max_project_id is not None:
             rec_pid = getattr(record, "project_id", None)
@@ -848,7 +860,7 @@ class ArgosAPIFacade:
         r = results[0]
         # AF1: scope check — return not_found if out of scope (don't leak
         # existence to unauthorized callers).
-        if not self._scope_matches(ctx, r):
+        if not self.scope_check(ctx, r):
             raise APIError("not_found", "Memory not found.")
         item = r.to_dict() if hasattr(r, "to_dict") else dict(r)
         return {
@@ -873,7 +885,7 @@ class ArgosAPIFacade:
         current = self._store.get_memories_by_ids([params["memory_id"]])
         if not current:
             raise APIError("not_found", "Memory not found.")
-        if not self._scope_matches(ctx, current[0]):
+        if not self.scope_check(ctx, current[0]):
             raise APIError("not_found", "Memory not found.")
         history = self._store.get_memory_history(params["memory_id"])
         items = []
@@ -987,7 +999,7 @@ class ArgosAPIFacade:
         results = self._store.get_memories_by_ids([params["memory_id"]])
         if not results:
             raise APIError("not_found", "Memory not found.")
-        if not self._scope_matches(ctx, results[0]):
+        if not self.scope_check(ctx, results[0]):
             raise APIError("not_found", "Memory not found.")
         self._store.record_feedback(params["memory_id"], params["feedback"])
         return {"memory_id": params["memory_id"], "feedback": params["feedback"]}

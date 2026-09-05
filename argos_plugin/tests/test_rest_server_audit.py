@@ -34,7 +34,7 @@ for _path in (_plugin_dir.parent, _plugin_dir):
 
 class TestR1FetchScopeNamespace:
     def test_scope_matches_checks_namespace(self):
-        """R1: _scope_matches checks namespace when max_namespace is set."""
+        """R1: scope_check checks namespace when max_namespace is set."""
         from api_facade import ArgosAPIFacade, AuthContext
 
         # Build a facade without calling __init__ (no store needed).
@@ -53,7 +53,7 @@ class TestR1FetchScopeNamespace:
             client_scope = None
             namespace = "project_b"
 
-        assert not facade._scope_matches(ctx, FakeRecord())
+        assert not facade.scope_check(ctx, FakeRecord())
 
         # Same namespace passes.
         class FakeRecord2:
@@ -61,10 +61,10 @@ class TestR1FetchScopeNamespace:
             client_scope = None
             namespace = "project_a"
 
-        assert facade._scope_matches(ctx, FakeRecord2())
+        assert facade.scope_check(ctx, FakeRecord2())
 
     def test_scope_matches_no_namespace_restriction_when_unset(self):
-        """R1: when max_namespace is None, namespace is not checked."""
+        """R1: when max_namespace is None, namespace is not checked (scope_check)."""
         from api_facade import ArgosAPIFacade, AuthContext
 
         facade = ArgosAPIFacade.__new__(ArgosAPIFacade)
@@ -79,7 +79,7 @@ class TestR1FetchScopeNamespace:
             client_scope = None
             namespace = "anything"
 
-        assert facade._scope_matches(ctx, FakeRecord())
+        assert facade.scope_check(ctx, FakeRecord())
 
 
 # ---------------------------------------------------------------------------

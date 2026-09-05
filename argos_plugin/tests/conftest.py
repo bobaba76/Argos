@@ -185,6 +185,31 @@ _register_argos_alias()
 
 
 # ---------------------------------------------------------------------------
+# #304: top-level module aliases for store modules
+# ---------------------------------------------------------------------------
+# store.py uses package-relative imports only (from .store_common import ...).
+# Tests import these modules as top-level names (from store import ...).
+# We eagerly import argos.store (which triggers argos.store_common etc.)
+# and register top-level aliases so both import modes resolve to the same
+# module object. This eliminates the dual-branch try/except ImportError
+# fallback pattern in store.py.
+_STORE_MODULES = (
+    "store", "store_common", "store_core", "store_retrieval",
+    "store_write", "store_maintenance", "store_state",
+    "retriever", "value_extractor", "structural_loss",
+)
+for _name in _STORE_MODULES:
+    _full = f"argos.{_name}"
+    try:
+        if _full not in sys.modules:
+            importlib.import_module(_full)
+    except ImportError:
+        pass  # module not available — leave it unaliased
+    if _full in sys.modules and _name not in sys.modules:
+        sys.modules[_name] = sys.modules[_full]
+
+
+# ---------------------------------------------------------------------------
 # Deterministic embedder for hermetic, model-free tests (issues #90, #98)
 # ---------------------------------------------------------------------------
 

@@ -179,7 +179,7 @@ def _export_for_backup(
     dst_root: str | Path,
     *,
     source_db_path: Optional[str | Path] = None,
-) -> Tuple[Path, List[str], Dict[str, int], str]:
+) -> Tuple[Path, List[str], Dict[str, int], str, int]:
     """CHECKPOINT + EXPORT + record row counts + capture DuckDB version.
 
     This is the only part of the backup that needs the service's exclusive
@@ -187,7 +187,7 @@ def _export_for_backup(
     ``_finalize_backup`` *outside* the lock so verify + prune don't block
     the tenant's reads/writes (BK8).
 
-    Returns ``(snap_dir, tables, counts, duckdb_version)``.
+    Returns ``(snap_dir, tables, counts, duckdb_version, schema_version)``.
     """
     dst_root = Path(dst_root)
     dst_root.mkdir(parents=True, exist_ok=True)
@@ -214,7 +214,20 @@ def _export_for_backup(
             counts[t] = _table_row_count(conn, t)
 
         duckdb_version = _duckdb_version(conn)
-        return snap, tables, counts, duckdb_version
+
+        # #288: capture the store's schema_version from schema_meta
+        # so the manifest records the actual version, not a hardcoded 1.
+        schema_version = _SCHEMA_VERSION  # fallback
+        try:
+            row = conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if row and row[0] is not None:
+                schema_version = int(row[0])
+        except Exception:
+            pass
+
+        return snap, tables, counts, duckdb_version, schema_version
 
     except Exception:
         # Clean up the partial snapshot so a failed backup never looks
@@ -235,6 +248,7 @@ def _finalize_backup(
     dst_root: str | Path,
     retention_snapshots: int = 6,
     source_db_path: Optional[str | Path] = None,
+    schema_version: int = _SCHEMA_VERSION,
 ) -> Dict[str, Any]:
     """Verify the exported snapshot, write manifest + integrity anchor, prune.
 
@@ -271,7 +285,7 @@ def _finalize_backup(
                 }
 
         manifest: Dict[str, Any] = {
-            "schema_version": _SCHEMA_VERSION,
+            "schema_version": schema_version,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "duckdb_version": duckdb_version,
             "tables": tables,
@@ -335,7 +349,7 @@ def backup_store(
     Returns the manifest dict.  Raises on any failure (verify-reject,
     export error, etc.).
     """
-    snap, tables, counts, duckdb_version = _export_for_backup(
+    snap, tables, counts, duckdb_version, schema_version = _export_for_backup(
         conn, dst_root, source_db_path=source_db_path
     )
     return _finalize_backup(
@@ -343,6 +357,7 @@ def backup_store(
         dst_root=dst_root,
         retention_snapshots=retention_snapshots,
         source_db_path=source_db_path,
+        schema_version=schema_version,
     )
 
 

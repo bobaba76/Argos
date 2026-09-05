@@ -389,6 +389,10 @@ class ProviderCoreMixin:
         self._rollup_enabled: bool = False
         self._rollup_interval_days: int = 30
         self._rollup_max_records_per_run: int = 100
+        # Self-compaction (#281): schedule-aware token-budget control.
+        self._compaction_enabled: bool = False
+        self._compaction_interval_days: int = 7
+        self._compaction_aggressiveness: float = 1.0
         # LLM model/provider for auxiliary tasks (extraction, review, expansion)
         # Empty string = use the auxiliary client's default model
         self._llm_model: str = ""
@@ -762,6 +766,10 @@ class ProviderCoreMixin:
         self._rollup_enabled = cfg.rollup_enabled
         self._rollup_interval_days = cfg.rollup_interval_days
         self._rollup_max_records_per_run = cfg.rollup_max_records_per_run
+        # Self-compaction (#281)
+        self._compaction_enabled = cfg.compaction_enabled
+        self._compaction_interval_days = cfg.compaction_interval_days
+        self._compaction_aggressiveness = cfg.compaction_aggressiveness
         if self._query_expansion_enabled:
             self._query_expander = QueryExpander(
                 similarity_floor=self._query_expansion_similarity_floor,

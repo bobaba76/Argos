@@ -152,6 +152,10 @@ class MemoryConfig(BaseModel):
     rollup_enabled: bool = False
     rollup_interval_days: int = Field(30, ge=1, le=3650)
     rollup_max_records_per_run: int = Field(100, ge=10, le=1000)
+    # -- self-compaction (#281) ---------------------------------------------
+    compaction_enabled: bool = False
+    compaction_interval_days: int = Field(7, ge=1, le=365)
+    compaction_aggressiveness: float = Field(1.0, ge=1.0, le=2.0)
 
     # -- egress ----------------------------------------------------------------
     local_only: bool = False

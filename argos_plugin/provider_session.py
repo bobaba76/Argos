@@ -759,6 +759,9 @@ class ProviderSessionMixin:
             self._maybe_run_lifecycle_maintenance()
             # Rollup (P5.1 Phase 3): LLM proposals-only pass.
             self._maybe_run_rollup()
+            # Self-compaction (#281): schedule-aware token-budget control.
+            # Deterministic, zero LLM, reversible quarantine. Cooldown-gated.
+            self._maybe_run_compaction()
 
     def _maybe_run_lifecycle_maintenance(self) -> None:
         """Run the archival + forgetting pass at session end (P5.1, #6).
@@ -819,6 +822,39 @@ class ProviderSessionMixin:
                 )
         except Exception as e:
             logger.debug("Rollup failed: %s", e)
+
+    def _maybe_run_compaction(self) -> None:
+        """Run the gated self-compaction pass (#281).
+
+        Schedule-aware token-budget control: quarantines stale/duplicate/
+        low-value memories to reclaim injection token budget. Zero-LLM,
+        reversible (quarantine, never hard-delete). Cooldown-gated by
+        compaction_interval_days. Fail-soft: never blocks session lifecycle.
+        """
+        if not getattr(self, "_compaction_enabled", False):
+            return
+        if not self._store:
+            return
+        try:
+            try:
+                from .compaction import run_compaction
+            except ImportError:
+                from compaction import run_compaction
+            compaction_report = run_compaction(
+                self._store,
+                interval_days=getattr(self, "_compaction_interval_days", 7),
+                aggressiveness=getattr(self, "_compaction_aggressiveness", 1.0),
+            )
+            if compaction_report.get("ran"):
+                token_rpt = compaction_report.get("token_reduction", {})
+                logger.info(
+                    "Compaction: %d candidates, %d quarantined, ~%d tokens reclaimed",
+                    compaction_report.get("candidate_count", 0),
+                    compaction_report.get("quarantined_count", 0),
+                    token_rpt.get("estimated_tokens_reclaimed", 0),
+                )
+        except Exception as e:
+            logger.debug("Compaction failed: %s", e)
 
     def _maybe_run_distillation(self) -> None:
         """Run the gated distillation pass ("the dream") when enabled.

@@ -180,8 +180,10 @@ class RESTAuth:
                 }},
             )
         # Build the auth context. In v1 (trusted-local mode), the
-        # principal/tenant/user_id come from env vars. In #129, these
-        # would be derived from the credential itself.
+        # principal/tenant/user_id come from env vars and max_* scope
+        # fields are always None (open scope). Credential-derived
+        # max_project_id / max_client_scope / max_namespace is the
+        # follow-up that activates facade scope narrowing.
         return AuthContext(
             principal=os.environ.get("ARGOS_API_PRINCIPAL", "local"),
             tenant=os.environ.get("ARGOS_API_TENANT", "default"),

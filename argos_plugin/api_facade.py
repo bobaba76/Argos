@@ -32,7 +32,8 @@ Unknown principals are denied, never mapped to a default tenant.
 
 Idempotency (D5): every mutation carries an idempotency key. Same key +
 same request → return original result (no duplicate). Same key + different
-body → 409 conflict. The api_idempotency table is created on first use.
+body → 409 conflict. v1 uses an in-memory idempotency registry; a durable
+api_idempotency table ships with the REST write slice (see #302).
 
 Error envelopes (D7): store failures return a stable error code +
 request ID, never traceback/path/token/SQL detail.
@@ -173,6 +174,10 @@ class AuthContext:
     # Server-derived maximum data scope. Caller filters may only narrow.
     max_project_id: Optional[str] = None
     max_client_scope: Optional[str] = None
+    # AF1/R1: server-derived maximum namespace scope. Caller filters may
+    # only narrow. When set, scope_check rejects records whose
+    # namespace field is present and != max_namespace.
+    max_namespace: Optional[str] = None
     # Operations this principal is allowed to perform.
     allowed_operations: Set[str] = field(default_factory=lambda: set(READ_OPERATIONS))
     # Whether this principal can propose new memories (class A write).
@@ -581,7 +586,13 @@ class ArgosAPIFacade:
         # fields that attempt to widen access. The caller may narrow
         # (e.g. filter to a subset of their allowed client_scope) but
         # never widen.
-        params = self._enforce_identity(ctx, params, request_id)
+        # #300: audit identity-narrowing rejections (previously uncaught).
+        try:
+            params = self._enforce_identity(ctx, params, request_id)
+        except APIError:
+            self._audit(ctx, operation, request_id, "denied",
+                        denied_reason="identity_narrowing_rejected")
+            raise
 
         # 4. Input validation per operation.
         try:
@@ -690,9 +701,12 @@ class ArgosAPIFacade:
         or ``ctx.max_client_scope`` is not None. In the current REST
         deployment, both are None (v1 single-user open scope), so
         ``_enforce_identity`` does not narrow. This is correct for v1 —
-        scope enforcement requires credential-derived scopes (future
-        work, #129). The ``user_id`` and ``tenant`` checks are always
-        active regardless of scope settings.
+        scope enforcement requires credential-derived scopes: today
+        AuthContext is built from env vars only and max_* fields are
+        always None. Wiring max_project_id / max_client_scope /
+        max_namespace from the credential itself is the follow-up that
+        activates scope narrowing. The ``user_id`` and ``tenant``
+        checks are always active regardless of scope settings.
         """
         cleaned = dict(params)
         # user_id: always server-derived. Client may not set it.
@@ -741,18 +755,52 @@ class ArgosAPIFacade:
         searching, so results are scoped to the authenticated principal
         (not the store's default ``default_user``). ``set_user_scope`` is
         thread-local (#20), safe under the REST server's concurrency limiter.
+
+        #301: fail-loud and reset. The search is wrapped in try/finally so
+        the store's user scope is always restored to whatever it was BEFORE
+        the facade call, even on exception. A debug-level assertion verifies
+        the scope was correctly set before searching — if the store's scope
+        doesn't match ctx.user_id after set_user_scope, the assertion
+        fires loudly instead of silently returning cross-user data.
+
+        The pre-existing scope is captured via ``self._store.user_id``
+        (not ``_default_user_id``, which only exists on SharedMemoryStore —
+        DuckDBMemoryStore has no such attribute and would fall back to a
+        hardcoded "default_user", permanently re-scoping a store constructed
+        with a non-default user_id).
         """
         # AF6: scope the search to the caller's user_id.
-        if hasattr(self._store, "set_user_scope"):
-            self._store.set_user_scope(ctx.user_id)
-        results = self._store.search(
-            query=params["query"],
-            limit=params["limit"],
-            category_filter=params.get("category_filter"),
-            project_id=params.get("project_id"),
-            namespace=params.get("namespace"),
-            client_scope=params.get("client_scope"),
-        )
+        # #301: capture the pre-existing scope BEFORE setting it, so the
+        # finally block restores exactly what was there — not a hardcoded
+        # default. DuckDBMemoryStore has self.user_id (set by constructor,
+        # changed by set_user_scope) but no _default_user_id attribute.
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+                # #301: debug-level assertion that the scope was set correctly.
+                _current = getattr(self._store, "user_id", None)
+                if _current != ctx.user_id:
+                    logger.debug(
+                        "scope invariant violated after set_user_scope: "
+                        "expected=%s actual=%s — search may return cross-user data",
+                        ctx.user_id, _current,
+                    )
+            results = self._store.search(
+                query=params["query"],
+                limit=params["limit"],
+                category_filter=params.get("category_filter"),
+                project_id=params.get("project_id"),
+                namespace=params.get("namespace"),
+                client_scope=params.get("client_scope"),
+            )
+        finally:
+            # #301: always restore the store's user scope to what it was
+            # before the facade call, even on exception. This prevents a
+            # leaked scope from affecting subsequent operations on the
+            # same store handle — including non-facade use.
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
         # Redact: convert MemoryRecord to dicts, strip internal fields.
         items = []
         for r in results:
@@ -772,15 +820,27 @@ class ArgosAPIFacade:
             })
         return {"results": items, "count": len(items)}
 
-    def _scope_matches(self, ctx: AuthContext, record: Any) -> bool:
-        """AF1/AF2: check that a record is within the caller's ACL scope.
+    def scope_check(self, ctx: AuthContext, record: Any) -> bool:
+        """#303: unified scope check for all facade operations that
+        resolve a record by ID.
 
-        When ``max_project_id`` or ``max_client_scope`` is set on the
-        context, the record must match. When both are None (v1 open
-        scope), all records pass.
+        This is the single helper behind facade scoping. Every facade
+        operation that fetches a record (fetch, fetch_history,
+        record_feedback) calls this method to verify the record is
+        within the caller's ACL scope.
+
+        When ``max_project_id``, ``max_client_scope``, or
+        ``max_namespace`` is set on the context, the record must match.
+        When all are None (v1 open scope), all records pass.
 
         R1: also checks ``namespace`` when set on the context, closing
         the fetch authorization bypass for namespace-scoped records.
+
+        Note: the search path uses ``set_user_scope`` + store-level
+        filtering (not this helper) because search returns a list, not
+        a single record by ID. The RPC layer uses
+        ``filter_records_by_access`` in access_scoping.py (unchanged
+        in this batch).
         """
         if ctx.max_project_id is not None:
             rec_pid = getattr(record, "project_id", None)
@@ -810,7 +870,7 @@ class ArgosAPIFacade:
         r = results[0]
         # AF1: scope check — return not_found if out of scope (don't leak
         # existence to unauthorized callers).
-        if not self._scope_matches(ctx, r):
+        if not self.scope_check(ctx, r):
             raise APIError("not_found", "Memory not found.")
         item = r.to_dict() if hasattr(r, "to_dict") else dict(r)
         return {
@@ -835,7 +895,7 @@ class ArgosAPIFacade:
         current = self._store.get_memories_by_ids([params["memory_id"]])
         if not current:
             raise APIError("not_found", "Memory not found.")
-        if not self._scope_matches(ctx, current[0]):
+        if not self.scope_check(ctx, current[0]):
             raise APIError("not_found", "Memory not found.")
         history = self._store.get_memory_history(params["memory_id"])
         items = []
@@ -949,7 +1009,7 @@ class ArgosAPIFacade:
         results = self._store.get_memories_by_ids([params["memory_id"]])
         if not results:
             raise APIError("not_found", "Memory not found.")
-        if not self._scope_matches(ctx, results[0]):
+        if not self.scope_check(ctx, results[0]):
             raise APIError("not_found", "Memory not found.")
         self._store.record_feedback(params["memory_id"], params["feedback"])
         return {"memory_id": params["memory_id"], "feedback": params["feedback"]}
@@ -975,16 +1035,16 @@ class ArgosAPIFacade:
         The audit is operational access telemetry, not a governance-grade
         ledger (that's Themis's role).
 
-        AF9: for v1, audit events are log-only (INFO level). The
-        ``api_audit`` table is future work — the store-level
-        ``access_audit`` table (store_core.py) covers store-level audit.
-        Log rotation or process restart loses facade audit events. This
-        is an accepted v1 limitation.
+        AF9: the INFO log is the fast path and always fires. #300:
+        denials are ALSO routed to the durable ``access_audit`` table
+        via ``store.write_access_audit(...)`` when the store handle
+        exposes it. In shared-service mode, ``SharedMemoryStore`` does
+        not yet expose ``write_access_audit`` (RPC threading is a
+        follow-up); in that case the log is the only record. When the
+        store is a direct ``DuckDBMemoryStore`` (tests, direct mode),
+        denials are durable and survive restarts.
         """
-        # For v1, audit events are logged at INFO level. The access_audit
-        # table (store_core.py) is the durable sink for store-level audit;
-        # the facade audit is a higher-level operation log. When the REST
-        # slice ships, this will write to a dedicated api_audit table.
+        # Fast path: always log at INFO level.
         logger.info(
             "api_audit principal=%s tenant=%s transport=%s operation=%s "
             "request_id=%s decision=%s denied_reason=%s error_code=%s "
@@ -993,3 +1053,24 @@ class ArgosAPIFacade:
             request_id, decision, denied_reason, error_code,
             result_count, idempotency_replay,
         )
+        # #300: route denials to the durable access_audit table when
+        # the store handle exposes write_access_audit. Covers all deny
+        # classes: forbidden_operation, not_authorized_for_operation,
+        # invalid_input, identity_narrowing_rejected. Fail-soft: a
+        # durable-audit write failure must never block the response.
+        if decision == "denied" and hasattr(self._store, "write_access_audit"):
+            try:
+                self._store.write_access_audit(
+                    user_id=ctx.user_id,
+                    query_text=operation,  # hashed by write_access_audit
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes=denied_reason or "",
+                    excluded=True,
+                    tenant=ctx.tenant,
+                )
+            except Exception:
+                logger.debug(
+                    "durable access_audit write failed for denial %s",
+                    request_id, exc_info=True,
+                )

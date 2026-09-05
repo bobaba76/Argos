@@ -1038,15 +1038,19 @@ class ProviderCoreMixin:
         }
 
     def explain(self, memory_id: str) -> dict:
-        """#280: Explain why a memory was retrieved — provenance view.
+        """#280: Explain why a memory was retrieved — provenance view (by ID).
 
         Read-only, zero-LLM, fail-soft. Returns a dict with:
         - evidence: the evidence row (source/evidence reference)
         - version_chain: the supersession chain
         - conflict_note: conflict note (if any)
-        - blend_score: similarity + raw_similarity + reranker info
+        - blend_score: annotated as "retrieval-time only, not available"
+          (similarity/raw_similarity are per-query, not persisted on the
+          row — use explain_record() with a live search result for real
+          scores)
         - confidence: the memory's confidence field
-        - gates_fired: retrieval gates that fired for this memory
+        - gates_fired: only conflict_surfacing (score-based gates need
+          retrieval-time data)
 
         Delegates to store.provenance() (DuckDB or SharedMemoryStore).
         """
@@ -1057,3 +1061,27 @@ class ProviderCoreMixin:
         except Exception as exc:
             logger.warning("explain() failed for %s: %s", memory_id, exc)
             return {"memory_id": memory_id, "error": str(exc)}
+
+    def explain_record(self, record: Any) -> dict:
+        """#280: Explain a LIVE MemoryRecord from search results.
+
+        This is the preferred explain path: the record carries real
+        retrieval-time similarity/raw_similarity scores, so blend_score
+        and gates_fired reflect what actually happened at retrieval.
+
+        Uses the provider's configured injection_min_score for the
+        injection floor gate (not a hardcoded threshold).
+        """
+        try:
+            try:
+                from .provenance import explain_record as _explain_record
+            except ImportError:
+                from provenance import explain_record as _explain_record
+            return _explain_record(
+                record,
+                self._store,
+                injection_min_score=getattr(self, "_injection_min_score", 0.0),
+            )
+        except Exception as exc:
+            logger.warning("explain_record() failed: %s", exc)
+            return {"memory_id": getattr(record, "memory_id", "unknown"), "error": str(exc)}

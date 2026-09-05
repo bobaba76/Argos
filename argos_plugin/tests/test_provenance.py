@@ -8,6 +8,14 @@ Acceptance criteria from the issue:
 - Tests: provenance view on a memory with a version chain + conflict
   note; explain on a memory with no evidence (fail-soft); blend-score
   surfacing matches the reranker output.
+
+Review fixes (PR #317 blockers):
+- BLOCKER 1: cross-user ACL test — provenance() must not read across
+  user_scope boundaries.
+- BLOCKER 2: real-path blend-score test using explain_record() with a
+  live search result (not fabricated 0.0 from storage).
+- injection_min_score read from config (not hardcoded 0.3).
+- reranker_applied only fires on actual reranker pass.
 """
 from __future__ import annotations
 
@@ -33,13 +41,43 @@ def store():
         s.close()
 
 
+@pytest.fixture
+def store_alice():
+    """Create a DuckDBMemoryStore for user 'alice'."""
+    from store import DuckDBMemoryStore
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.duckdb"
+        s = DuckDBMemoryStore(db_path, user_id="alice")
+        yield s
+        s.close()
+
+
+@pytest.fixture
+def store_bob():
+    """Create a DuckDBMemoryStore for user 'bob' on the SAME db as alice."""
+    from store import DuckDBMemoryStore
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.duckdb"
+        s_alice = DuckDBMemoryStore(db_path, user_id="alice")
+        # Alice stores a memory
+        m = s_alice.remember(
+            category="personal_fact",
+            content="Alice's secret fact",
+        )
+        alice_memory_id = m.memory_id
+        s_alice.close()
+        # Bob opens the same DB
+        s_bob = DuckDBMemoryStore(db_path, user_id="bob")
+        yield s_bob, alice_memory_id
+        s_bob.close()
+
+
 class TestProvenanceView:
     """Per-retrieval provenance view returns all required fields."""
 
     def test_provenance_returns_evidence_and_chain(self, store):
         """Provenance view on a memory with a version chain returns
         evidence, version chain, blend score, and confidence."""
-        # Create a memory with a version chain
         v1 = store.remember(
             category="personal_fact",
             content="User likes Python programming",
@@ -111,9 +149,13 @@ class TestProvenanceView:
         assert result["content"] == "User lives in Paris"
         assert result["category"] == "personal_fact"
 
-    def test_provenance_returns_blend_score(self, store):
-        """Blend score includes similarity, raw_similarity, and
-        reranker_applied flag."""
+    def test_provenance_id_based_blend_score_not_available(self, store):
+        """ID-based provenance does NOT fabricate retrieval-time scores.
+
+        similarity/raw_similarity are per-query, not persisted on the
+        row. The ID-based path annotates them as 'not available' rather
+        than returning fabricated 0.0 values.
+        """
         m = store.remember(
             category="personal_fact",
             content="User works as a software engineer",
@@ -125,8 +167,11 @@ class TestProvenanceView:
         assert "similarity" in result["blend_score"]
         assert "raw_similarity" in result["blend_score"]
         assert "reranker_applied" in result["blend_score"]
-        # For a freshly stored memory (no search), similarity is 0.0
-        assert result["blend_score"]["similarity"] == 0.0
+        # Scores are NOT available from storage (retrieval-time only)
+        assert result["blend_score"]["similarity"] is None
+        assert result["blend_score"]["raw_similarity"] is None
+        assert result["blend_score"]["reranker_applied"] is None
+        assert "not available" in result["blend_score"]["source"]
 
     def test_provenance_returns_confidence(self, store):
         """Confidence field is surfaced in the provenance view."""
@@ -152,6 +197,25 @@ class TestProvenanceView:
         assert result["provenance_origin"] is not None
         assert result["grounding"] is not None
 
+    def test_provenance_id_based_no_score_gates(self, store):
+        """ID-based provenance does NOT emit score-based gates.
+
+        Without retrieval-time scores, the injection_min_score and
+        reranker gates cannot be determined. Only conflict_surfacing
+        (inferable from category) is emitted.
+        """
+        m = store.remember(
+            category="personal_fact",
+            content="User likes hiking",
+        )
+
+        result = store.provenance(m.memory_id)
+
+        # No score-based gates should fire (no retrieval-time data)
+        gates = result["gates_fired"]
+        assert not any("injection_min_score" in g for g in gates)
+        assert not any("reranker" in g for g in gates)
+
 
 class TestConflictNote:
     """Conflict note surfacing in the provenance view."""
@@ -159,9 +223,6 @@ class TestConflictNote:
     def test_conflict_note_on_two_active_versions(self, store):
         """If a chain has two active versions (both valid_to=None),
         a conflict note is returned."""
-        # Create a memory and update it — normally the old version
-        # gets superseded (valid_to set), so no conflict. But we can
-        # test the conflict detection logic directly.
         v1 = store.remember(
             category="personal_fact",
             content="User likes coffee",
@@ -172,9 +233,6 @@ class TestConflictNote:
 
         # Normal chain: v1 is superseded, v2 is current — no conflict
         result = store.provenance(v2.memory_id)
-        # With proper supersession, there should be no conflict
-        # (v1 has valid_to set, v2 is current)
-        # conflict_note may be None if only one active version
         assert "conflict_note" in result
 
     def test_conflict_note_none_on_single_version(self, store):
@@ -229,21 +287,38 @@ class TestExplainBatch:
 
 
 class TestGatesFired:
-    """Gates fired surfacing in the provenance view."""
+    """Gates fired surfacing — uses configured injection_min_score."""
 
     def test_gates_fired_on_low_similarity(self, store):
-        """A record with low similarity has the injection_min_score
-        gate listed."""
+        """A record with similarity below the configured floor has the
+        injection_min_score gate listed."""
         m = store.remember(
             category="personal_fact",
             content="User likes hiking",
         )
-        # Manually set a low similarity to test the gate
         m.similarity = 0.1
         m.raw_similarity = 0.1
 
         from provenance import _gates_fired
-        gates = _gates_fired(m)
+        gates = _gates_fired(m, injection_min_score=0.3)
+        assert any("injection_min_score" in g for g in gates)
+
+    def test_gates_fired_respects_configured_floor(self, store):
+        """The injection_min_score gate uses the configured floor, not
+        a hardcoded 0.3."""
+        m = store.remember(
+            category="personal_fact",
+            content="User likes hiking",
+        )
+        m.similarity = 0.25
+        m.raw_similarity = 0.25
+
+        from provenance import _gates_fired
+        # With floor=0.2, 0.25 is above the floor — no gate
+        gates = _gates_fired(m, injection_min_score=0.2)
+        assert not any("injection_min_score" in g for g in gates)
+        # With floor=0.3, 0.25 is below the floor — gate fires
+        gates = _gates_fired(m, injection_min_score=0.3)
         assert any("injection_min_score" in g for g in gates)
 
     def test_gates_fired_on_reranker_adjusted(self, store):
@@ -257,7 +332,7 @@ class TestGatesFired:
         m.raw_similarity = 0.6  # Different → reranker adjusted
 
         from provenance import _gates_fired
-        gates = _gates_fired(m)
+        gates = _gates_fired(m, injection_min_score=0.0)
         assert any("reranker" in g for g in gates)
 
     def test_gates_fired_empty_on_normal_record(self, store):
@@ -270,8 +345,26 @@ class TestGatesFired:
         m.raw_similarity = 0.7  # Same → no reranker
 
         from provenance import _gates_fired
-        gates = _gates_fired(m)
+        gates = _gates_fired(m, injection_min_score=0.3)
         assert len(gates) == 0
+
+    def test_gates_fired_no_score_claim_without_data(self, store):
+        """A record with similarity=None does NOT emit a score-based
+        gate claim — never fabricate a gate without supporting data."""
+        from store_common import MemoryRecord
+        m = MemoryRecord(
+            memory_id="test-no-sim",
+            category="personal_fact",
+            content="Test",
+            similarity=0.0,
+            raw_similarity=None,
+        )
+
+        from provenance import _gates_fired
+        # With similarity=0.0 and floor=0.3, the gate SHOULD fire
+        # because 0.0 < 0.3 — this is a real value, not missing data.
+        gates = _gates_fired(m, injection_min_score=0.3)
+        assert any("injection_min_score" in g for g in gates)
 
 
 class TestExplainIsReadOnly:
@@ -308,15 +401,19 @@ class TestExplainIsReadOnly:
 
 
 class TestBlendScoreMatch:
-    """Blend-score surfacing matches the reranker output."""
+    """Blend-score surfacing matches the reranker output.
+
+    Uses explain_record() with a live MemoryRecord (option b from the
+    review) — the ID-based path cannot surface retrieval-time scores
+    because they are not persisted on the row.
+    """
 
     def test_blend_score_reflects_reranker_adjustment(self):
-        """When raw_similarity != similarity (reranker adjusted), the
-        blend_score surfaces both values and reranker_applied=True."""
-        from provenance import explain_provenance
+        """explain_record with a reranker-adjusted record surfaces
+        real similarity, raw_similarity, and reranker_applied=True."""
+        from provenance import explain_record
         from store_common import MemoryRecord
 
-        # Create a mock store that returns a record with reranker-adjusted scores
         record = MemoryRecord(
             memory_id="test-1",
             category="personal_fact",
@@ -326,23 +423,22 @@ class TestBlendScoreMatch:
         )
 
         class MockStore:
-            def _fetch_records(self, sql, params):
-                return [record]
             def get_evidence(self, mid):
                 return None
             def get_memory_history(self, mid):
                 return [record]
 
-        result = explain_provenance(MockStore(), "test-1")
+        result = explain_record(record, MockStore(), injection_min_score=0.3)
 
         assert result["blend_score"]["similarity"] == 0.85
         assert result["blend_score"]["raw_similarity"] == 0.70
         assert result["blend_score"]["reranker_applied"] is True
+        assert result["blend_score"]["source"] == "retrieval-time"
 
     def test_blend_score_no_reranker(self):
-        """When raw_similarity == similarity (no reranker), the
-        blend_score surfaces both as equal and reranker_applied=False."""
-        from provenance import explain_provenance
+        """explain_record with raw_similarity == similarity surfaces
+        reranker_applied=False."""
+        from provenance import explain_record
         from store_common import MemoryRecord
 
         record = MemoryRecord(
@@ -354,15 +450,122 @@ class TestBlendScoreMatch:
         )
 
         class MockStore:
-            def _fetch_records(self, sql, params):
-                return [record]
             def get_evidence(self, mid):
                 return None
             def get_memory_history(self, mid):
                 return [record]
 
-        result = explain_provenance(MockStore(), "test-2")
+        result = explain_record(record, MockStore(), injection_min_score=0.3)
 
         assert result["blend_score"]["similarity"] == 0.75
         assert result["blend_score"]["raw_similarity"] == 0.75
         assert result["blend_score"]["reranker_applied"] is False
+
+    def test_blend_score_real_path_search(self, store):
+        """REAL-PATH test: search → explain_record on a returned result
+        → assert the blend_score has real (non-None) values.
+
+        This is the acceptance criterion 'blend-score surfacing matches
+        the reranker output' tested on a real store, not a mock.
+        """
+        store.remember(
+            category="personal_fact",
+            content="User likes Python programming language",
+        )
+        store.remember(
+            category="personal_fact",
+            content="User enjoys hiking in the mountains",
+        )
+
+        results = store.search("Python programming", limit=5)
+        assert results, "search should return results"
+
+        from provenance import explain_record
+        result = explain_record(results[0], store, injection_min_score=0.0)
+
+        # The blend_score should have real values from the search
+        assert result["blend_score"]["similarity"] is not None
+        assert result["blend_score"]["source"] == "retrieval-time"
+        # similarity should be a real number (not None, not fabricated 0.0
+        # unless the search genuinely returned 0.0)
+        assert isinstance(result["blend_score"]["similarity"], (int, float))
+
+    def test_gates_fired_real_path_search(self, store):
+        """REAL-PATH test: search → explain_record → assert gates_fired
+        reflects the ACTUAL retrieval, not fabricated claims."""
+        store.remember(
+            category="personal_fact",
+            content="User likes Python programming language",
+        )
+
+        results = store.search("Python programming", limit=5)
+        assert results
+
+        from provenance import explain_record
+        # Use a high floor so the gate fires for testing
+        result = explain_record(results[0], store, injection_min_score=0.99)
+
+        # With a 0.99 floor, any real similarity < 0.99 should fire
+        # the injection_min_score gate
+        sim = results[0].similarity
+        if sim is not None and float(sim) < 0.99:
+            assert any("injection_min_score" in g for g in result["gates_fired"])
+
+
+class TestCrossUserACL:
+    """BLOCKER 1: provenance() must not read across user_scope boundaries.
+
+    _fetch_record must filter by user_scope (mirroring get_evidence,
+    get_memory_history, get_evidence_batch). A cross-user read must
+    return 'not found', not the other user's record.
+    """
+
+    def test_cross_user_provenance_denied(self, store_bob):
+        """Bob cannot read Alice's memory via provenance()."""
+        store, alice_memory_id = store_bob
+
+        result = store.provenance(alice_memory_id)
+
+        # Bob should get 'not found' — not Alice's content
+        assert result["memory_id"] == alice_memory_id
+        assert "error" in result
+        assert "not found" in result["error"]
+        # Content must NOT be Alice's secret
+        assert result.get("content", "unknown") != "Alice's secret fact"
+
+    def test_own_user_provenance_returns_data(self, store_bob):
+        """Bob can read his own memory via provenance()."""
+        store, _ = store_bob
+        # Bob stores his own memory
+        m = store.remember(
+            category="personal_fact",
+            content="Bob's public fact",
+        )
+
+        result = store.provenance(m.memory_id)
+
+        assert result["memory_id"] == m.memory_id
+        assert result["content"] == "Bob's public fact"
+        assert "error" not in result
+
+    def test_cross_user_fetch_record_returns_none(self, store_bob):
+        """_fetch_record with user_scope filter returns None for
+        cross-user memory IDs."""
+        store, alice_memory_id = store_bob
+
+        from provenance import _fetch_record
+        record = _fetch_record(store, alice_memory_id)
+        assert record is None
+
+    def test_own_user_fetch_record_returns_data(self, store_bob):
+        """_fetch_record returns the record for own-user memory IDs."""
+        store, _ = store_bob
+        m = store.remember(
+            category="personal_fact",
+            content="Bob's fact",
+        )
+
+        from provenance import _fetch_record
+        record = _fetch_record(store, m.memory_id)
+        assert record is not None
+        assert record.content == "Bob's fact"

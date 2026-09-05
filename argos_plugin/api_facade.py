@@ -63,6 +63,7 @@ READ_OPERATIONS: Set[str] = {
     "fetch",
     "fetch_history",
     "capabilities",
+    "explain",
 }
 
 # Proposal tier: external caller → candidate → security scan → review queue.
@@ -602,6 +603,8 @@ class ArgosAPIFacade:
                 validated = _validate_fetch_params(params)
             elif operation == "fetch_history":
                 validated = _validate_fetch_params(params)
+            elif operation == "explain":
+                validated = _validate_fetch_params(params)
             elif operation == "capabilities":
                 validated = {}
             elif operation == "memory_propose":
@@ -640,6 +643,8 @@ class ArgosAPIFacade:
                 result = self._op_fetch(ctx, validated)
             elif operation == "fetch_history":
                 result = self._op_fetch_history(ctx, validated)
+            elif operation == "explain":
+                result = self._op_explain(ctx, validated)
             elif operation == "capabilities":
                 result = self._op_capabilities(ctx)
             elif operation == "memory_propose":
@@ -918,6 +923,24 @@ class ArgosAPIFacade:
             "transport": ctx.transport,
             "principal": ctx.principal,
         }
+
+    def _op_explain(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Read tier: #280 — explain why a memory was retrieved.
+
+        AF1: enforce ACL scope — the caller may only explain memories
+        within their scope. Returns not_found if out of scope (don't
+        leak existence to unauthorized callers).
+        """
+        # AF1: first fetch the current record to check scope.
+        results = self._store.get_memories_by_ids([params["memory_id"]])
+        if not results:
+            raise APIError("not_found", "Memory not found.")
+        if not self.scope_check(ctx, results[0]):
+            raise APIError("not_found", "Memory not found.")
+        # Delegate to store.provenance() — the store's _fetch_record
+        # enforces user_scope, and we've already verified ACL scope
+        # via get_memories_by_ids + scope_check above.
+        return self._store.provenance(params["memory_id"])
 
     def _op_memory_propose(
         self, ctx: AuthContext, params: Dict[str, Any], idempotency_key: str | None,

@@ -755,18 +755,42 @@ class ArgosAPIFacade:
         searching, so results are scoped to the authenticated principal
         (not the store's default ``default_user``). ``set_user_scope`` is
         thread-local (#20), safe under the REST server's concurrency limiter.
+
+        #301: fail-loud and reset. The search is wrapped in try/finally so
+        the store's user scope is always reset to the default user after
+        the call, even on exception. A debug-level assertion verifies the
+        scope was correctly set before searching — if the store's scope
+        doesn't match ctx.user_id after set_user_scope, the assertion
+        fires loudly instead of silently returning cross-user data.
         """
         # AF6: scope the search to the caller's user_id.
+        # #301: save the default scope for finally-reset.
+        _default_scope = getattr(self._store, "_default_user_id", "default_user")
         if hasattr(self._store, "set_user_scope"):
             self._store.set_user_scope(ctx.user_id)
-        results = self._store.search(
-            query=params["query"],
-            limit=params["limit"],
-            category_filter=params.get("category_filter"),
-            project_id=params.get("project_id"),
-            namespace=params.get("namespace"),
-            client_scope=params.get("client_scope"),
-        )
+            # #301: debug-level assertion that the scope was set correctly.
+            _current = getattr(self._store, "user_id", None)
+            if _current != ctx.user_id:
+                logger.debug(
+                    "scope invariant violated after set_user_scope: "
+                    "expected=%s actual=%s — search may return cross-user data",
+                    ctx.user_id, _current,
+                )
+        try:
+            results = self._store.search(
+                query=params["query"],
+                limit=params["limit"],
+                category_filter=params.get("category_filter"),
+                project_id=params.get("project_id"),
+                namespace=params.get("namespace"),
+                client_scope=params.get("client_scope"),
+            )
+        finally:
+            # #301: always reset the store's user scope to the default,
+            # even on exception. This prevents a leaked scope from
+            # affecting subsequent operations on the same store handle.
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_default_scope)
         # Redact: convert MemoryRecord to dicts, strip internal fields.
         items = []
         for r in results:

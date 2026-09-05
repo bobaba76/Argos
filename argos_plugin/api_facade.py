@@ -64,6 +64,7 @@ READ_OPERATIONS: Set[str] = {
     "fetch_history",
     "capabilities",
     "explain",
+    "explain_retrieval",
 }
 
 # Proposal tier: external caller → candidate → security scan → review queue.
@@ -307,6 +308,7 @@ class IdempotencyRegistry:
 # Strict bounds for API input. The facade rejects anything outside these
 # bounds before it reaches the store.
 MAX_QUERY_LENGTH = 2000
+MAX_MEMORY_ID_LENGTH = 256
 MAX_CONTENT_LENGTH = 10000
 MAX_MEMORY_IDS = 50
 MAX_LIMIT = 50
@@ -430,6 +432,52 @@ def _validate_fetch_params(params: Dict[str, Any]) -> Dict[str, Any]:
     if not memory_id:
         raise APIError("invalid_input", "memory_id is required")
     cleaned["memory_id"] = memory_id
+    return cleaned
+
+
+def _validate_explain_retrieval_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate explain_retrieval (why-not diagnostic) parameters.
+
+    Read-tier diagnostic: query + memory_id + optional diagnostic
+    window. Mirrors search's bounds; no internal flags, no provenance
+    claims (D4).
+    """
+    cleaned: Dict[str, Any] = {}
+    query = str(params.get("query", "")).strip()
+    if not query:
+        raise APIError("invalid_input", "query is required")
+    if len(query) > MAX_QUERY_LENGTH:
+        raise APIError(
+            "request_too_large",
+            f"query exceeds max length {MAX_QUERY_LENGTH}",
+        )
+    cleaned["query"] = query
+    memory_id = str(params.get("memory_id", "")).strip()
+    if not memory_id:
+        raise APIError("invalid_input", "memory_id is required")
+    if len(memory_id) > MAX_MEMORY_ID_LENGTH:
+        raise APIError(
+            "request_too_large",
+            f"memory_id exceeds max length {MAX_MEMORY_ID_LENGTH}",
+        )
+    cleaned["memory_id"] = memory_id
+    top_k = params.get("top_k", 20)
+    try:
+        top_k = int(top_k)
+    except (TypeError, ValueError):
+        raise APIError("invalid_input", "top_k must be an integer")
+    if top_k < MIN_LIMIT or top_k > MAX_LIMIT:
+        raise APIError(
+            "invalid_input", f"top_k must be between {MIN_LIMIT} and {MAX_LIMIT}",
+        )
+    cleaned["top_k"] = top_k
+    # Reject forbidden client flags (same rule as search).
+    for flag in FORBIDDEN_CLIENT_FLAGS:
+        if params.get(flag):
+            raise APIError(
+                "forbidden",
+                f"Parameter {flag} is not available on the public API.",
+            )
     return cleaned
 
 
@@ -603,6 +651,8 @@ class ArgosAPIFacade:
                 validated = _validate_fetch_params(params)
             elif operation == "fetch_history":
                 validated = _validate_fetch_params(params)
+            elif operation == "explain_retrieval":
+                validated = _validate_explain_retrieval_params(params)
             elif operation == "explain":
                 validated = _validate_fetch_params(params)
             elif operation == "capabilities":
@@ -643,6 +693,8 @@ class ArgosAPIFacade:
                 result = self._op_fetch(ctx, validated)
             elif operation == "fetch_history":
                 result = self._op_fetch_history(ctx, validated)
+            elif operation == "explain_retrieval":
+                result = self._op_explain_retrieval(ctx, validated)
             elif operation == "explain":
                 result = self._op_explain(ctx, validated)
             elif operation == "capabilities":
@@ -941,6 +993,37 @@ class ArgosAPIFacade:
         # enforces user_scope, and we've already verified ACL scope
         # via get_memories_by_ids + scope_check above.
         return self._store.provenance(params["memory_id"])
+
+    def _op_explain_retrieval(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier: diagnose why a memory did NOT surface in retrieval.
+
+        Deterministic, zero-LLM, strictly read-only. The store's
+        ``explain_retrieval`` runs a diagnostic pass with retrieval
+        suppressed — it never touches production ranking or writes.
+
+        ACL: the caller may only explain memories within their scope
+        (existence not leaked — not_found for out-of-scope IDs). The
+        store additionally filters by user_scope server-side (SM1).
+        """
+        results = self._store.get_memories_by_ids([params["memory_id"]])
+        if not results:
+            raise APIError("not_found", "Memory not found.")
+        if not self.scope_check(ctx, results[0]):
+            raise APIError("not_found", "Memory not found.")
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            return self._store.explain_retrieval(
+                query=params["query"],
+                expected_memory_id=params["memory_id"],
+                top_k=params["top_k"],
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
 
     def _op_memory_propose(
         self, ctx: AuthContext, params: Dict[str, Any], idempotency_key: str | None,

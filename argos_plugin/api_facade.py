@@ -173,6 +173,10 @@ class AuthContext:
     # Server-derived maximum data scope. Caller filters may only narrow.
     max_project_id: Optional[str] = None
     max_client_scope: Optional[str] = None
+    # AF1/R1: server-derived maximum namespace scope. Caller filters may
+    # only narrow. When set, _scope_matches rejects records whose
+    # namespace field is present and != max_namespace.
+    max_namespace: Optional[str] = None
     # Operations this principal is allowed to perform.
     allowed_operations: Set[str] = field(default_factory=lambda: set(READ_OPERATIONS))
     # Whether this principal can propose new memories (class A write).

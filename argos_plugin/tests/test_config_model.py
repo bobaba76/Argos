@@ -72,7 +72,7 @@ class TestConfigParity:
     def test_chain_unfold_defaults(self):
         from config_model import MemoryConfig
         c = MemoryConfig()
-        assert c.chain_unfold == "off"
+        assert c.chain_unfold == "auto"
         assert c.chain_unfold_min_similarity == 0.30
         assert c.chain_unfold_arc_min_similarity == 0.15
         assert c.chain_max_versions == 3

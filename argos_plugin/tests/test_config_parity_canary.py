@@ -140,6 +140,72 @@ REALISTIC_CONFIG: dict = {
 assert len(REALISTIC_CONFIG) >= 75, f"fixture must have >=75 keys, has {len(REALISTIC_CONFIG)}"
 
 
+class TestT1bDefaultValueParity:
+    """T1b: every ProviderField default in config_schema.py equals the
+    corresponding MemoryConfig model_fields default (after coercion).
+
+    The config UI writes schema defaults on save, so a mismatch means a
+    user saving any unrelated setting gets the schema default written,
+    silently flipping the runtime behavior. This is the exact
+    behavior-flip family #274/#275 exist to kill.
+
+    Coercion: bools via str().lower(), numerics via float(), strings
+    exact. This matches how the loader normalizes values.
+    """
+
+    @staticmethod
+    def _schema_defaults() -> dict:
+        """Extract {key: default_str} from config_schema.py via regex."""
+        import re
+        schema_path = Path(__file__).resolve().parent.parent / "config_schema.py"
+        text = schema_path.read_text(encoding="utf-8")
+        pattern = r'ProviderField\(\s*key="(\w+)"[^)]*?default=("[^"]*"|True|False|None|[\d.]+)[^)]*?\)'
+        matches = re.findall(pattern, text, re.DOTALL)
+        result = {}
+        for key, default in matches:
+            if default.startswith('"'):
+                result[key] = default[1:-1]
+            elif default in ('True', 'False'):
+                result[key] = default.lower()
+            elif default == 'None':
+                continue
+            else:
+                result[key] = default
+        return result
+
+    def test_schema_defaults_match_model_defaults(self):
+        """Every ProviderField default equals the MemoryConfig default
+        (after coercion). CI fails on any mismatch."""
+        from config_model import MemoryConfig
+        schema_defaults = self._schema_defaults()
+        model_fields = MemoryConfig.model_fields
+        mismatches = []
+        for key, schema_str in schema_defaults.items():
+            if key not in model_fields:
+                continue  # T1 covers missing keys
+            model_default = model_fields[key].default
+            # Coerce based on model default type
+            if isinstance(model_default, bool):
+                schema_cmp = schema_str.lower()
+                model_cmp = str(model_default).lower()
+            elif isinstance(model_default, (int, float)):
+                schema_cmp = float(schema_str)
+                model_cmp = float(model_default)
+            else:
+                schema_cmp = str(schema_str)
+                model_cmp = str(model_default)
+            if schema_cmp != model_cmp:
+                mismatches.append(
+                    f"  {key}: schema default={schema_str!r}, "
+                    f"model default={model_default!r}"
+                )
+        assert not mismatches, (
+            "Schema/model default-value mismatch (the config UI writes "
+            "schema defaults on save, so a mismatch silently flips "
+            "runtime behavior):\n" + "\n".join(mismatches)
+        )
+
+
 class TestT2LoaderModelParity:
     """T2: every model field can be loaded by _load_config and read via .get()."""
 
@@ -198,16 +264,21 @@ class TestT2LoaderModelParity:
                     assert actual is expected, \
                         f"{name}: expected {expected}, got {actual}"
                 # For numeric fields, clamping may have changed the value,
-                # but it should NOT be the default (unless the default
-                # equals the clamped value, which means our test value
-                # was out of bounds — skip those).
+                # but it should NOT be silently reverted to the default
+                # (unless the clamped value happens to equal the default,
+                # which means our test value was out of bounds and clamped
+                # back — that's acceptable and rare).
                 elif isinstance(expected, (int, float)):
                     field_default = field_info.default
-                    if actual != field_default:
-                        # The value survived (wasn't reverted to default).
-                        pass
-                    # If actual == default, the test value may have been
-                    # out of bounds and clamped back — that's acceptable.
+                    if actual == field_default and expected != field_default:
+                        # The value was reverted to default — this is the
+                        # silent-wipe bug. Fail loudly.
+                        pytest.fail(
+                            f"{name}: expected {expected} (non-default), "
+                            f"got {actual} (default) — value was silently wiped"
+                        )
+                    # If actual != default, the value survived (possibly
+                    # clamped, but not wiped). That's acceptable.
                 # For string fields, the value should survive.
                 elif isinstance(expected, str):
                     if expected and expected != field_info.default:
@@ -236,7 +307,7 @@ class TestT2LoaderModelParity:
             assert cfg.conflict_surfacing is True  # default is True (but test it)
             assert cfg.router_enabled is True  # default is False
             assert cfg.router_smart_model == "deepseek/deepseek-v4-pro"
-            assert cfg.chain_unfold == "auto"  # default is "off"
+            assert cfg.chain_unfold == "auto"  # default is "auto"
 
 
 class TestT3RealisticFixtureCanary:

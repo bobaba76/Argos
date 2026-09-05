@@ -1135,6 +1135,15 @@ class StoreRetrievalMixin:
         if self.reranker and len(fused) > 1:
             rerank_pool = fused[:reranker_top_n]
             documents = [r.content for r in rerank_pool]
+            # #275 LP2: increment the rerank_calls counter.
+            try:
+                try:
+                    from .liveness import increment_counter
+                except ImportError:
+                    from liveness import increment_counter
+                increment_counter("rerank_calls")
+            except Exception:
+                pass
             scores = self.reranker.score(query, documents)
             if scores and len(scores) == len(rerank_pool):
                 min_s, max_s = min(scores), max(scores)

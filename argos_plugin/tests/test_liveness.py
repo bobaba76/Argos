@@ -73,18 +73,21 @@ class TestLP2FeatureCounters:
         fc = FeatureCounters()
         snap = fc.snapshot()
         assert all(v == 0 for v in snap.values())
-        assert "router" in snap
+        assert "router_calls" in snap
         assert "injection_min_score" in snap
         assert "conflict_surfacing" in snap
-        assert "chain_unfold" in snap
+        assert "chain_unfold_calls" in snap
+        assert "rerank_calls" in snap
+        assert "graph_injections" in snap
+        assert "extraction_facts" in snap
 
     def test_increment(self):
         from liveness import FeatureCounters
         fc = FeatureCounters()
-        fc.increment("router")
-        fc.increment("router")
-        fc.increment("router", 3)
-        assert fc.get("router") == 5
+        fc.increment("router_calls")
+        fc.increment("router_calls")
+        fc.increment("router_calls", 3)
+        assert fc.get("router_calls") == 5
 
     def test_increment_unknown_feature(self):
         from liveness import FeatureCounters
@@ -96,9 +99,9 @@ class TestLP2FeatureCounters:
     def test_reset(self):
         from liveness import FeatureCounters
         fc = FeatureCounters()
-        fc.increment("router", 10)
+        fc.increment("router_calls", 10)
         fc.reset()
-        assert fc.get("router") == 0
+        assert fc.get("router_calls") == 0
 
     def test_snapshot_is_sorted(self):
         from liveness import FeatureCounters
@@ -293,12 +296,72 @@ class TestStatusSurface:
         from config_model import MemoryConfig
         # Reset counters for a clean test.
         get_counters().reset()
-        get_counters().increment("router", 5)
+        get_counters().increment("router_calls", 5)
         get_counters().increment("conflict_surfacing", 3)
         fp = config_fingerprint(MemoryConfig())
         # The status() function in liveness.py returns feature_counters.
         from liveness import status
         s = status()
         assert "feature_counters" in s
-        assert s["feature_counters"]["router"] == 5
+        assert s["feature_counters"]["router_calls"] == 5
         assert s["feature_counters"]["conflict_surfacing"] == 3
+
+
+class TestCounterWiringAtCallSites:
+    """#275 LP2 BLOCKER fix: assert counters increment when real
+    feature paths run (not fakes)."""
+
+    def test_router_counter_increments_on_real_route(self):
+        """route_answerer with a temporal question and router_enabled
+        increments the router_calls counter."""
+        from liveness import get_counters
+        from config_model import MemoryConfig
+        from intent_router import route_answerer
+        get_counters().reset()
+        cfg = MemoryConfig.model_validate({
+            "router_enabled": "true",
+            "router_smart_model": "test-smart-model",
+        })
+        # A temporal question should trigger a route.
+        route = route_answerer(cfg, "What did I do last week?")
+        assert route is not None
+        assert route["model"] == "test-smart-model"
+        # The counter must have incremented.
+        assert get_counters().get("router_calls") >= 1
+
+    def test_router_counter_does_not_increment_when_disabled(self):
+        """route_answerer with router disabled does not increment."""
+        from liveness import get_counters
+        from config_model import MemoryConfig
+        from intent_router import route_answerer
+        get_counters().reset()
+        cfg = MemoryConfig()  # router_enabled defaults to False
+        route = route_answerer(cfg, "What did I do last week?")
+        assert route is None
+        assert get_counters().get("router_calls") == 0
+
+    def test_extraction_counter_increments_on_real_extraction(self):
+        """extract_from_turn with a factual statement increments the
+        extraction_facts counter."""
+        from liveness import get_counters
+        from extractor import extract_from_turn
+        get_counters().reset()
+        facts = extract_from_turn(
+            "My name is Alice and I live in Paris.",
+            "",
+            use_llm_fallback=False,
+        )
+        # The extractor should find at least one fact.
+        assert len(facts) > 0
+        # The counter must have incremented by the number of facts.
+        assert get_counters().get("extraction_facts") >= 1
+
+    def test_extraction_counter_does_not_increment_on_empty(self):
+        """extract_from_turn with no facts does not increment."""
+        from liveness import get_counters
+        from extractor import extract_from_turn
+        get_counters().reset()
+        facts = extract_from_turn("ok", "", use_llm_fallback=False)
+        # Trivial content should produce no facts.
+        assert len(facts) == 0
+        assert get_counters().get("extraction_facts") == 0

@@ -1588,6 +1588,18 @@ def _extract_from_turn_impl(
         fact.setdefault("scope", "profile")
         normalized.append(fact)
 
+    # #275 LP2: increment the extraction_facts counter by the number of
+    # normalized facts emitted. Cheap: in-memory, no I/O.
+    if normalized:
+        try:
+            try:
+                from .liveness import increment_counter
+            except ImportError:
+                from liveness import increment_counter
+            increment_counter("extraction_facts", len(normalized))
+        except Exception:
+            pass
+
     return normalized
 
 

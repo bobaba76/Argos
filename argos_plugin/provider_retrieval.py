@@ -522,6 +522,15 @@ class ProviderRetrievalMixin:
             return None
         self._chain_unfolded_stats["count"] += 1
         self._chain_unfolded_stats["tokens_injected"] += token_cost
+        # #275 LP2: increment the chain_unfold_calls counter.
+        try:
+            try:
+                from .liveness import increment_counter
+            except ImportError:
+                from liveness import increment_counter
+            increment_counter("chain_unfold_calls")
+        except Exception:
+            pass
         return arc
 
     def _arc_clears_similarity_floor(self, query: str, versions: List[Any]) -> bool:
@@ -725,6 +734,17 @@ class ProviderRetrievalMixin:
                         limit=max(10, candidate_limit),
                     )
                     logger.debug("traversal: %d candidate ids for %r", len(traversal_ids), effective_query[:40])
+                    # #275 LP2: increment the graph_injections counter
+                    # when traversal produces candidates.
+                    if traversal_ids:
+                        try:
+                            try:
+                                from .liveness import increment_counter
+                            except ImportError:
+                                from liveness import increment_counter
+                            increment_counter("graph_injections")
+                        except Exception:
+                            pass
                     if traversal_ids:
                         seen = set(graph_ids)
                         for tid in traversal_ids:

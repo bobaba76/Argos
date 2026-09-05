@@ -1,7 +1,7 @@
 """Config schema/model/loader parity + realistic-fixture canary (#274).
 
 The #272 review caught a SILENT CONFIG WIPE: extra="forbid" + catch-all
-fallback reverted the real hybrid_memory.json (55 keys) to defaults, and
+fallback reverted the real hybrid_memory.json (75 keys) to defaults, and
 .get() dropped router_* keys, silently disabling the LLM router. That
 catch was manual. These tests make it a CI failure.
 
@@ -12,7 +12,7 @@ T1: schema↔model parity — every config_schema.py key is a MemoryConfig field
 T2: loader↔model parity — every model field can be loaded by _load_config
     from a JSON file and read back via .get() with the configured value.
 T3: realistic-fixture canary — load a real-shaped hybrid_memory.json
-    fixture (55 keys incl. router_*, phrase_lift_alpha,
+    fixture (75 keys incl. router_*, phrase_lift_alpha,
     injection_min_score, skip_retrieval_on_trivial, conflict_surfacing)
     and assert every key survives a full load→save→load round-trip with
     NO reversion to defaults and NO dropped keys.
@@ -37,7 +37,7 @@ if str(_plugin_dir) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# Realistic 55-key fixture — mirrors the maintainer's live hybrid_memory.json
+# Realistic 75-key fixture — mirrors the maintainer's live hybrid_memory.json
 # shape (tuned values, NOT defaults, so a reversion is detectable).
 # ---------------------------------------------------------------------------
 
@@ -125,13 +125,19 @@ REALISTIC_CONFIG: dict = {
     "router_subcall_enabled": "true",
     "router_temporal_threshold": "0.6",
     "router_multihop_threshold": "0.4",
+    # distillation (1)
+    "distillation_enabled": "false",
+    # lifecycle — rollup (3)
+    "rollup_enabled": "false",
+    "rollup_interval_days": "30",
+    "rollup_max_records_per_run": "100",
     # misc (3)
     "evidence_retention": "full",
     "entity_aliases": "",
     "role_words": "",
 }
 
-assert len(REALISTIC_CONFIG) >= 55, f"fixture must have >=55 keys, has {len(REALISTIC_CONFIG)}"
+assert len(REALISTIC_CONFIG) >= 75, f"fixture must have >=75 keys, has {len(REALISTIC_CONFIG)}"
 
 
 class TestT2LoaderModelParity:
@@ -234,12 +240,12 @@ class TestT2LoaderModelParity:
 
 
 class TestT3RealisticFixtureCanary:
-    """T3: realistic-fixture canary — load a real-shaped 55-key config,
+    """T3: realistic-fixture canary — load a real-shaped 75-key config,
     assert every key survives a full load→save→load round-trip with NO
     reversion to defaults and NO dropped keys."""
 
-    def test_all_55_keys_survive_load(self):
-        """Every key in the 55-key fixture survives _load_config with the
+    def test_all_75_keys_survive_load(self):
+        """Every key in the 75-key fixture survives _load_config with the
         configured value (not reverted to default, not dropped to None)."""
         from provider_core import _load_config
         from config_model import MemoryConfig

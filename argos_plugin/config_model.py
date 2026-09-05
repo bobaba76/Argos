@@ -81,7 +81,7 @@ class MemoryConfig(BaseModel):
     conflict_surfacing: bool = True
 
     # -- chain unfold ----------------------------------------------------------
-    chain_unfold: str = "off"
+    chain_unfold: str = "auto"
     chain_unfold_min_similarity: float = Field(0.30, ge=0.0, le=1.0)
     chain_unfold_arc_min_similarity: float = Field(0.15, ge=0.0, le=1.0)
     chain_max_versions: int = Field(3, ge=1, le=10)

@@ -462,8 +462,8 @@ class TestEvolutionChains:
 
     # -- chain-unfold accounting ----------------------------------------------
 
-    def test_chain_unfold_off_by_default(self, tmp_path):
-        """chain_unfold defaults to off — no unfold, no counter change."""
+    def test_chain_unfold_no_results_no_unfold(self, tmp_path):
+        """chain_unfold with empty results — no unfold, no counter change."""
         provider, store, graph = self._make_provider(tmp_path)
         v1 = store.remember(category="personal_fact", content="User used to like PHP")
         store.update_memory(v1.memory_id, content="User now likes Python")

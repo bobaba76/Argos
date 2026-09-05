@@ -933,6 +933,27 @@ class ProviderCoreMixin:
             pass
 
         self._initialized = True
+
+        # #275: LP1 — startup self-smoke test. Run a tiny canned probe
+        # through each "can silently die" feature and log ERROR per
+        # failure. LP3 — config fingerprint for drift detection.
+        try:
+            try:
+                from .liveness import run_startup_self_test, config_fingerprint
+            except ImportError:
+                from liveness import run_startup_self_test, config_fingerprint
+            self._self_test_results = run_startup_self_test(cfg)
+            self._config_fingerprint = config_fingerprint(cfg)
+            logger.info(
+                "LP3 config fingerprint: %s (compare this after config "
+                "changes to detect drift)",
+                self._config_fingerprint,
+            )
+        except Exception as exc:
+            logger.warning("LP1/LP3 liveness probe failed: %s", exc)
+            self._self_test_results = {}
+            self._config_fingerprint = "unknown"
+
         logger.info(
             "Argos initialized: %d memories, graph=%s, embeddings=%s, "
             "auto_extract=%s, auto_review=%s, paused=%s, storage=%s, proposals=on",
@@ -994,3 +1015,24 @@ class ProviderCoreMixin:
             except Exception as exc:
                 logger.warning("watcher thread start failed: %s", exc)
                 self._watcher_thread = None
+
+    def status(self) -> dict:
+        """#275: bounded status/health surface.
+
+        Returns feature hit counters (LP2), config fingerprint (LP3),
+        and the last startup self-test results (LP1). A feature that
+        stops firing is visible as a counter that stops incrementing.
+        """
+        try:
+            try:
+                from .liveness import get_counters
+            except ImportError:
+                from liveness import get_counters
+            counters = get_counters().snapshot()
+        except Exception:
+            counters = {}
+        return {
+            "feature_counters": counters,
+            "config_fingerprint": getattr(self, "_config_fingerprint", "unknown"),
+            "self_test_results": getattr(self, "_self_test_results", {}),
+        }

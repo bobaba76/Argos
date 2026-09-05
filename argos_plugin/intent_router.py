@@ -451,6 +451,15 @@ def route_answerer(config: Dict[str, Any], user_message: str) -> Optional[Dict[s
             provider = str(config.get("router_smart_provider") or "").strip()
         else:
             return None
+        # #275 LP2: increment the router_calls counter.
+        try:
+            try:
+                from .liveness import increment_counter
+            except ImportError:
+                from liveness import increment_counter
+            increment_counter("router_calls")
+        except Exception:
+            pass
         result: Dict[str, str] = {"model": pick}
         if provider:
             result["provider"] = provider

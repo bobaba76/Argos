@@ -21,3 +21,32 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 ### Fixed
 
 - **BM25-lite** (#26): substring token counting replaced with exact word-boundary token counting; text search and phrase-lift share one tokenizer regex.
+
+## [2026-09-04]
+
+### Added
+
+- **RPC wire versioning** (#246, de2171b): v:1 envelope on RPC messages; stale-service self-heal (reject + respawn-once). The shared service and its clients negotiate a protocol version; a stale service is detected and respawned once automatically.
+- **StoreMixinState refactor** (#249, c7d602f): cross-mixin shared state extracted into a `StoreMixinState` dataclass. Documented, no behavior change. Reduces implicit coupling between StoreCoreMixin, StoreWriteMixin, StoreRetrievalMixin, and StoreMaintenanceMixin.
+- **Config model** (#244, e44fa29): Pydantic-backed `MemoryConfig` replaces the per-attribute slurp in `provider_core.initialize()`. `extra="forbid"`, fail-soft clamping, bool coercion, backward-compat `.get()`. Follow-up (#285, 86001dc): 19 model-only keys declared as `_INTERNAL_KEYS`; schema⊆model parity + internal-keys allowlist (T1a/T1b tests).
+- **Hygiene batch A** (#247 #248, 459115a): test-suite hygiene and cleanup.
+- **Audit batches 4–8** (#208 #214 #213, #226, #227, #223, #264 #265 #266): store core SC1-SC7, store write SW1-SW12, store retrieval SR1-SR12, provider core, memory service, and additional audit findings across the codebase.
+
+### Fixed
+
+- **Store retrieval** (#245, 1096625): WHERE-clause builder extracted and tested.
+
+## [2026-09-05]
+
+### Added
+
+- **Facade hardening** (#311, 480ac34): fixes #222 #299 #300 #301 #303 — API facade auth-context + ACL + validation + audit hardening.
+- **RPC audit-path hardening** (#313, 26d95bd): fix #312 — `write_access_audit` + `export_access_audit` threaded through `SharedMemoryStore` RPC proxy.
+- **Repo hardening** (#314, 8f4c860): fixes #304 #305 #307 #308 #309 — collapse dual-branch mixin re-export shells in store.py (#304), periodic DuckDB-Kuzu reconciliation probe for graph drift (#305), split test_hybrid_memory.py mega-file + retire run_tests.py (#307), deploy atomic swap / versioned rollback (#308), clean untracked strays + .gitignore (#309).
+
+### Fixed
+
+- **Config parity canary** (#274): schema/model/loader parity tests + realistic-fixture canary — CI fails if schema/model/loader drift or any silent config wipe.
+- **Liveness probes** (#275): startup self-smoke test (LP1), per-feature hit counters (LP2), config fingerprint (LP3) — silent feature death is now a boot ERROR, not a silent degradation.
+- **Stale docs** (#306): README test count, CHANGELOG, CLAIMS-AUDIT pin, .project_readme, MEMORY_SYSTEM updated to match master.
+- **CONFIG_REFERENCE** (#310): full config surface documented, per-key descriptions expanded, schema/reference parity test.

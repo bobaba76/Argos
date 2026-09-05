@@ -219,9 +219,9 @@ cd argos_plugin
 python -m pytest tests/ -v
 ```
 
-Test files:
+Test files (130 modules, ~2,267 test functions as of 2026-09-05):
 
-- `test_hybrid_memory.py` — store CRUD, search, dedup, version chains, cycle guards, scope isolation, graph extraction, alias resolution, chain-unfold trigger precision/recall.
+- `test_hybrid_store.py`, `test_hybrid_embeddings.py`, `test_hybrid_ranking.py`, `test_hybrid_graph.py`, `test_hybrid_candidates.py`, `test_hybrid_extraction.py`, `test_hybrid_extractor.py`, `test_hybrid_insight_log.py`, `test_hybrid_kuzu_graph.py`, `test_hybrid_plugin_discovery.py`, `test_hybrid_provider_init.py`, `test_hybrid_routing.py`, `test_hybrid_shared_store.py`, `test_hybrid_update_path.py`, `test_hybrid_evolution.py` — split from the former `test_hybrid_memory.py` mega-file (#307): store CRUD, search, dedup, version chains, cycle guards, scope isolation, graph extraction, alias resolution, chain-unfold trigger precision/recall.
 - `test_shared_service.py` — shared-service RPC path.
 - `test_candidate_review_integration.py` — candidate review + supersede flow.
 - `test_semantic_dedup.py` — semantic merge / duplicate consolidation.

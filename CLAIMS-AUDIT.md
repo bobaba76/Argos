@@ -1,7 +1,7 @@
 # Claims Audit — Argos
 
-**Date:** 2026-08-28 · **Audited:** README.md and docs vs `src/` and committed eval
-artifacts on `master` · **Branch HEAD:** `7d14697`
+**Date:** 2026-09-05 · **Audited:** README.md and docs vs `src/` and committed eval
+artifacts on `master` · **Branch HEAD:** `8f4c860`
 
 This file is the living index of every claim Argos makes. The rule: **anything
 quoted publicly must map to a committed, re-runnable artifact — or be marked

@@ -709,6 +709,16 @@ class MemoryService:
             return store.get_chain_membership(args.get("memory_ids", []) or [])
         if method == "provenance":
             return store.provenance(args.get("memory_id", ""))
+        if method == "explain_retrieval":
+            # Read-only diagnostic (Spec 2): why-not for a memory.
+            # No writes, no retrieval side-effects — safe on the RPC
+            # boundary. user_scope is enforced server-side by the store.
+            return store.explain_retrieval(
+                query=str(args.get("query", "")),
+                expected_memory_id=str(args.get("expected_memory_id", "")),
+                top_k=int(args.get("top_k", 20)),
+                project_id=args.get("project_id"),
+            )
         if method == "backfill_evidence":
             return store.backfill_evidence(
                 retention=args.get("retention", "full")
@@ -821,6 +831,25 @@ class MemoryService:
                 tenant=args.get("tenant"),
             )
             return None
+        # #281: run_compaction — execute the schedule-aware compaction
+        # pass SERVER-SIDE so it has direct access to the DuckDB store
+        # (consolidate, set_state, _fetch_records, connection). The
+        # client-side SharedMemoryStore proxy cannot reach these because
+        # they are in _FORBIDDEN_STORE_METHODS (MS2/MS7 security model).
+        # This narrow RPC method is NOT in the forbidden set — it runs
+        # the compaction module's run_compaction() helper inside the
+        # service process, returning the report dict.
+        if method == "run_compaction":
+            try:
+                from compaction import run_compaction as _run_compaction
+            except ImportError:
+                from argos_plugin.compaction import run_compaction as _run_compaction
+            return _run_compaction(
+                store,
+                interval_days=int(args.get("interval_days", 7)),
+                aggressiveness=float(args.get("aggressiveness", 1.0)),
+                dry_run=bool(args.get("dry_run", False)),
+            )
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str, graph) -> Any:

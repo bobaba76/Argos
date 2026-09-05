@@ -15,10 +15,16 @@ Modes:
   --atomic-swap       #308: staging-then-atomic-rename. Copy ALL runtime
                       files to a versioned staged dir
                       (``hybrid_memory.staged-<ts>``), verify byte-parity,
-                      then atomically swap the live directory reference
+                      preserve live-only artifacts (extractor_patterns/,
+                      skills/, eval/, tests/, state files) into the staged
+                      dir, then atomically swap the live directory reference
                       (rename old live → ``hybrid_memory.bak-<ts>``,
                       rename staged → ``hybrid_memory``). The previous
                       live dir is preserved for rollback.
+                      HARD PRECONDITION: Hermes and the memory service
+                      MUST be stopped — the service's CWD is the live
+                      plugin dir, and renaming it while the process is
+                      alive fails on Windows (WinError 32).
   --rollback          #308: roll back to the previous versioned live dir.
                       Reads deploy_state.json for the last backup dir,
                       renames current live → ``hybrid_memory.failed-<ts>``,
@@ -459,6 +465,117 @@ def _find_versioned_backups(target: Path) -> List[Path]:
     return backups
 
 
+def _is_service_running() -> bool:
+    """Check if a memory_service.py process is alive."""
+    if os.name == "nt":
+        cmd = (
+            "Get-CimInstance Win32_Process | Where-Object { "
+            "$_.CommandLine -match 'hybrid_memory\\\\memory_service\\.py' } | "
+            "Measure-Object | Select-Object -ExpandProperty Count"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", cmd],
+                capture_output=True, text=True, timeout=15,
+            )
+            return result.returncode == 0 and int(result.stdout.strip()) > 0
+        except Exception:
+            return False
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "memory_service\\.py"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def _preserve_live_only_artifacts(target: Path, staged: Path) -> List[str]:
+    """Copy live-only artifacts from the current live dir into the staged dir.
+
+    Live-only artifacts are files/dirs that exist in the live install but
+    are NOT in the repo source: extractor_patterns/ (loaded at runtime by
+    extractor.py:112), skills/ (insight-log), eval/, tests/, .bak-* backups,
+    local plugin.yaml edits, state files, etc.
+
+    Without this, the atomic swap would evacuate these artifacts —
+    extractor.py would silently degrade, skills would vanish, etc.
+    """
+    import shutil
+    preserved: List[str] = []
+    if not target.exists():
+        return preserved
+
+    # Items to skip during preservation — these are either regenerated
+    # on import (__pycache__, .pytest_cache) or are deploy artifacts
+    # (backup dirs, staged dirs, failed dirs). Unlike EXCLUDED_TARGET_NAMES,
+    # this does NOT skip skills/, hybrid_memory.json, etc. — those ARE
+    # preserved by the atomic swap.
+    _PRESERVE_SKIP = {
+        "__pycache__", ".pytest_cache",
+        "hybrid_memory_service.json", "hybrid_memory_service.starting",
+    }
+
+    for item in sorted(target.iterdir()):
+        name = item.name
+        # Skip regenerated/cache dirs and deploy-internal files.
+        if name in _PRESERVE_SKIP:
+            continue
+        # Skip .bak-* and .pre_* artifacts (backup dirs from previous swaps).
+        if _is_backup_artifact(name):
+            continue
+        # Skip .staged-* dirs (from in-progress deploys).
+        if ".staged-" in name:
+            continue
+        # Skip .failed-* dirs (from failed rollbacks).
+        if ".failed-" in name:
+            continue
+        # Skip files that are in the source set — they'll be overwritten
+        # by the source copy. We only preserve live-ONLY artifacts.
+        # Source files are .py, plugin.yaml, system_prompt_template.txt.
+        is_source_file = (
+            item.is_file() and (
+                name.endswith(".py") or name == "plugin.yaml" or
+                name == "system_prompt_template.txt"
+            )
+        )
+        if is_source_file:
+            continue  # source will provide the new version
+        # extractor_patterns/ is a source data dir, but it may also have
+        # live-only locale files not in the repo. Preserve the whole dir
+        # by merging: copy live-only files that aren't in the staged dir.
+        if item.is_dir() and name == "extractor_patterns":
+            staged_sub = staged / name
+            if staged_sub.exists():
+                # Merge: copy any live files not already staged.
+                for jp in sorted(item.iterdir()):
+                    if jp.is_file() and jp.name.endswith(".json"):
+                        dst = staged_sub / jp.name
+                        if not dst.exists():
+                            shutil.copy2(jp, dst)
+                            preserved.append(f"{name}/{jp.name}")
+            else:
+                # Not in source — copy the whole dir.
+                shutil.copytree(item, staged_sub)
+                preserved.append(name)
+            continue
+        # All other dirs (skills/, eval/, tests/, cron/, etc.) and
+        # non-source files (state.db, *.json, etc.) are live-only.
+        dst = staged / name
+        if not dst.exists():
+            try:
+                if item.is_dir():
+                    shutil.copytree(item, dst)
+                else:
+                    shutil.copy2(item, dst)
+                preserved.append(name)
+            except Exception as exc:
+                print(f"WARNING: could not preserve {name}: {exc}",
+                      file=sys.stderr)
+    return preserved
+
+
 def atomic_swap_mode(
     source: Path,
     target: Path,
@@ -467,16 +584,37 @@ def atomic_swap_mode(
 ) -> int:
     """#308: staging-then-atomic-rename deploy.
 
-    1. Copy ALL runtime files to a versioned staged dir.
-    2. Verify byte-parity between staged and source.
-    3. Atomically swap: rename old live → backup, rename staged → live.
-    4. Record the deployment + backup dir in deploy_state.json.
+    1. Check that the memory service is NOT running (hard precondition:
+       on Windows, renaming a dir that is a running process's CWD fails
+       with WinError 32. The service runs with cwd=plugin_dir.)
+    2. Copy ALL runtime files to a versioned staged dir.
+    3. Verify byte-parity between staged and source.
+    4. Preserve live-only artifacts (extractor_patterns/, skills/, eval/,
+       tests/, .bak-*, state files) by copying them into the staged dir.
+    5. Atomically swap: rename old live → backup, rename staged → live.
+    6. Record the deployment + backup dir in deploy_state.json.
+
+    Hard precondition: Hermes MUST be stopped before --atomic-swap.
+    The service's CWD is the live plugin dir; renaming it while the
+    service is alive fails on Windows (WinError 32).
     """
     if not source.exists():
         print(f"ERROR: source dir not found: {source}", file=sys.stderr)
         return 2
     if not target.exists():
         print(f"ERROR: target dir not found: {target}", file=sys.stderr)
+        return 2
+
+    # Hard precondition: service must be stopped before swap.
+    if _is_service_running():
+        print(
+            "ERROR: memory_service.py is running. --atomic-swap renames the\n"
+            "  live plugin dir, which is the service's CWD — on Windows this\n"
+            "  fails with WinError 32 (sharing violation). Stop Hermes and\n"
+            "  the memory service first, then re-run:\n"
+            "    python scripts/deploy.py --atomic-swap",
+            file=sys.stderr,
+        )
         return 2
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -520,7 +658,17 @@ def atomic_swap_mode(
 
     print(f"staged {len(copied)} files (byte-parity verified)")
 
-    # Phase 2: atomic swap.
+    # Phase 2: preserve live-only artifacts into the staged dir.
+    # Without this, the swap would evacuate extractor_patterns/ (loaded
+    # at runtime by extractor.py:112), skills/ (insight-log), eval/,
+    # tests/, local state files, etc.
+    preserved = _preserve_live_only_artifacts(target, staged)
+    if preserved:
+        print(f"preserved {len(preserved)} live-only artifacts: "
+              f"{', '.join(preserved[:10])}"
+              + (" ..." if len(preserved) > 10 else ""))
+
+    # Phase 3: atomic swap.
     # On Windows, os.replace works for dirs on the same volume but only
     # if the target dir is empty or doesn't exist. We rename instead:
     #   target → backup, staged → target
@@ -532,6 +680,8 @@ def atomic_swap_mode(
         print(f"renamed live → {backup.name}")
     except Exception as exc:
         print(f"ERROR: cannot rename live dir to backup: {exc}", file=sys.stderr)
+        print("  Hint: ensure Hermes and the memory service are stopped.",
+              file=sys.stderr)
         import shutil
         shutil.rmtree(staged, ignore_errors=True)
         return 2
@@ -552,17 +702,19 @@ def atomic_swap_mode(
             print(f"manual recovery: rename {backup} → {target}", file=sys.stderr)
         return 2
 
-    # Phase 3: record deployment.
+    # Phase 4: record deployment.
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "head": repo_head(),
         "mode": "atomic-swap",
         "copied": copied,
+        "preserved": preserved,
         "backup_dir": str(backup),
         "staged_ts": ts,
     }
     append_state(state, entry)
-    print(f"deploy_state.json updated (atomic-swap, {len(copied)} files)")
+    print(f"deploy_state.json updated (atomic-swap, {len(copied)} files, "
+          f"{len(preserved)} preserved)")
     print(f"backup: {backup}")
     print(f"rollback: python scripts/deploy.py --rollback")
 

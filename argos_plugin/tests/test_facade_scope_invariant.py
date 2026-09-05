@@ -236,3 +236,79 @@ class TestWorkerThreadScopeLeakFailsLoud:
         assert "alice" in results["alice"]["results"][0]["content"]
         assert results["bob"]["count"] == 1
         assert "bob" in results["bob"]["results"][0]["content"]
+
+
+class TestRealStoreScopeRestore:
+    """Real-store test: DuckDBMemoryStore constructed with a non-default
+    user_id must have its scope restored after a facade search.
+
+    This catches the bug where the finally-reset used getattr(store,
+    '_default_user_id', 'default_user') — DuckDBMemoryStore has no
+    _default_user_id attribute, so the fallback hardcoded 'default_user'
+    would permanently re-scope a store built with user_id='service_acct'.
+    """
+
+    def test_facade_search_restores_non_default_constructor_scope(self, tmp_path):
+        """A DuckDBMemoryStore built with user_id='service_acct' must have
+        its scope restored to 'service_acct' after a facade search — not
+        reset to the hardcoded 'default_user'."""
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(
+            tmp_path / "scope_restore.duckdb", user_id="service_acct",
+        )
+        try:
+            assert store.user_id == "service_acct"
+
+            facade = ArgosAPIFacade(store)
+            ctx = _ctx(user_id="alice")
+            # Run a facade search — this sets scope to "alice" then
+            # should restore it to "service_acct" in the finally block.
+            result = facade.execute(ctx, "search", {"query": "anything"})
+            assert result["count"] == 0  # empty store
+
+            # The store's scope must be restored to the constructor value,
+            # NOT the hardcoded "default_user".
+            assert store.user_id == "service_acct", (
+                f"Expected scope restored to 'service_acct', "
+                f"got '{store.user_id}' — the finally-reset is using a "
+                f"hardcoded default instead of the pre-existing scope."
+            )
+        finally:
+            store.close()
+
+    def test_facade_search_restores_scope_on_exception(self, tmp_path):
+        """Scope is restored to the constructor value even when search
+        raises an exception through the facade."""
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(
+            tmp_path / "scope_restore_exc.duckdb", user_id="service_acct",
+        )
+        try:
+            facade = ArgosAPIFacade(store)
+
+            # Force an error by searching with an invalid query type —
+            # the facade's input validation will raise invalid_input
+            # BEFORE reaching _op_search, so we need to trigger an error
+            # inside _op_search itself. We do this by making the store's
+            # search raise.
+            original_search = store.search
+
+            def failing_search(**kwargs):
+                raise RuntimeError("simulated DB failure")
+
+            store.search = failing_search
+
+            ctx = _ctx(user_id="alice")
+            with pytest.raises(APIError):
+                facade.execute(ctx, "search", {"query": "test"})
+
+            # Restore original and verify scope was reset despite exception.
+            store.search = original_search
+            assert store.user_id == "service_acct", (
+                f"Expected scope restored to 'service_acct' after exception, "
+                f"got '{store.user_id}'"
+            )
+        finally:
+            store.close()

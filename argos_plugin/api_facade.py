@@ -757,26 +757,35 @@ class ArgosAPIFacade:
         thread-local (#20), safe under the REST server's concurrency limiter.
 
         #301: fail-loud and reset. The search is wrapped in try/finally so
-        the store's user scope is always reset to the default user after
-        the call, even on exception. A debug-level assertion verifies the
-        scope was correctly set before searching — if the store's scope
+        the store's user scope is always restored to whatever it was BEFORE
+        the facade call, even on exception. A debug-level assertion verifies
+        the scope was correctly set before searching — if the store's scope
         doesn't match ctx.user_id after set_user_scope, the assertion
         fires loudly instead of silently returning cross-user data.
+
+        The pre-existing scope is captured via ``self._store.user_id``
+        (not ``_default_user_id``, which only exists on SharedMemoryStore —
+        DuckDBMemoryStore has no such attribute and would fall back to a
+        hardcoded "default_user", permanently re-scoping a store constructed
+        with a non-default user_id).
         """
         # AF6: scope the search to the caller's user_id.
-        # #301: save the default scope for finally-reset.
-        _default_scope = getattr(self._store, "_default_user_id", "default_user")
-        if hasattr(self._store, "set_user_scope"):
-            self._store.set_user_scope(ctx.user_id)
-            # #301: debug-level assertion that the scope was set correctly.
-            _current = getattr(self._store, "user_id", None)
-            if _current != ctx.user_id:
-                logger.debug(
-                    "scope invariant violated after set_user_scope: "
-                    "expected=%s actual=%s — search may return cross-user data",
-                    ctx.user_id, _current,
-                )
+        # #301: capture the pre-existing scope BEFORE setting it, so the
+        # finally block restores exactly what was there — not a hardcoded
+        # default. DuckDBMemoryStore has self.user_id (set by constructor,
+        # changed by set_user_scope) but no _default_user_id attribute.
+        _scope_before = getattr(self._store, "user_id", None)
         try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+                # #301: debug-level assertion that the scope was set correctly.
+                _current = getattr(self._store, "user_id", None)
+                if _current != ctx.user_id:
+                    logger.debug(
+                        "scope invariant violated after set_user_scope: "
+                        "expected=%s actual=%s — search may return cross-user data",
+                        ctx.user_id, _current,
+                    )
             results = self._store.search(
                 query=params["query"],
                 limit=params["limit"],
@@ -786,11 +795,12 @@ class ArgosAPIFacade:
                 client_scope=params.get("client_scope"),
             )
         finally:
-            # #301: always reset the store's user scope to the default,
-            # even on exception. This prevents a leaked scope from
-            # affecting subsequent operations on the same store handle.
-            if hasattr(self._store, "set_user_scope"):
-                self._store.set_user_scope(_default_scope)
+            # #301: always restore the store's user scope to what it was
+            # before the facade call, even on exception. This prevents a
+            # leaked scope from affecting subsequent operations on the
+            # same store handle — including non-facade use.
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
         # Redact: convert MemoryRecord to dicts, strip internal fields.
         items = []
         for r in results:

@@ -32,7 +32,8 @@ Unknown principals are denied, never mapped to a default tenant.
 
 Idempotency (D5): every mutation carries an idempotency key. Same key +
 same request → return original result (no duplicate). Same key + different
-body → 409 conflict. The api_idempotency table is created on first use.
+body → 409 conflict. v1 uses an in-memory idempotency registry; a durable
+api_idempotency table ships with the REST write slice (see #302).
 
 Error envelopes (D7): store failures return a stable error code +
 request ID, never traceback/path/token/SQL detail.
@@ -694,9 +695,12 @@ class ArgosAPIFacade:
         or ``ctx.max_client_scope`` is not None. In the current REST
         deployment, both are None (v1 single-user open scope), so
         ``_enforce_identity`` does not narrow. This is correct for v1 —
-        scope enforcement requires credential-derived scopes (future
-        work, #129). The ``user_id`` and ``tenant`` checks are always
-        active regardless of scope settings.
+        scope enforcement requires credential-derived scopes: today
+        AuthContext is built from env vars only and max_* fields are
+        always None. Wiring max_project_id / max_client_scope /
+        max_namespace from the credential itself is the follow-up that
+        activates scope narrowing. The ``user_id`` and ``tenant``
+        checks are always active regardless of scope settings.
         """
         cleaned = dict(params)
         # user_id: always server-derived. Client may not set it.

@@ -519,6 +519,35 @@ class StoreCoreMixin:
             except Exception as exc:
                 logger.warning("system_state table creation failed: %s", exc)
 
+            # #288: Ordered schema migrations + versioning. Runs AFTER
+            # the additive layer (above). The additive layer (ALTER
+            # TABLE ADD COLUMN IF NOT EXISTS, CREATE TABLE IF NOT EXISTS,
+            # backfill UPDATEs) keeps running first as always — it's the
+            # "additive patch" layer that brings every DB to the v1
+            # baseline. The migration runner then stamps user_version=1
+            # and applies any future ordered migrations (1→2, 2→3, …).
+            # Each migration is transactional + idempotent; a failure
+            # rolls back and raises loudly (not warn-and-continue).
+            # Skip in read-only mode (can't write user_version).
+            if not self._state.read_only:
+                try:
+                    try:
+                        from .schema_migrations import run_migrations
+                    except ImportError:
+                        from schema_migrations import run_migrations
+                    self._migration_report = run_migrations(self.connection)
+                except Exception as exc:
+                    logger.error(
+                        "Schema migration failed at init: %s. "
+                        "The store may be in a pre-migration state. "
+                        "See schema_migrations.py for recovery steps.",
+                        exc,
+                    )
+                    # Fail loudly — do NOT silently continue with a
+                    # half-migrated store. The caller (DuckDBMemoryStore
+                    # __init__) will see this raise and propagate.
+                    raise
+
     # -- helpers --------------------------------------------------------------
 
     def set_user_scope(self, user_id: str | None) -> None:
@@ -530,6 +559,23 @@ class StoreCoreMixin:
         # already invalidated on add_alias/remove_alias; this closes the
         # scope-switch path (every RPC request calls set_user_scope first).
         self._state.alias_cache = None
+
+    def get_schema_version(self) -> int:
+        """#288: return the persisted schema version (PRAGMA user_version).
+
+        Read at init by the migration runner. Exposed for diagnostics
+        and the backup manifest.
+        """
+        try:
+            from .schema_migrations import get_schema_version as _gsv
+        except ImportError:
+            from schema_migrations import get_schema_version as _gsv
+        return _gsv(self.connection)
+
+    def get_migration_report(self) -> dict | None:
+        """#288: return the migration report from the last init, or None
+        if migrations haven't run yet."""
+        return getattr(self, "_migration_report", None)
 
     @staticmethod
     def _now() -> str:

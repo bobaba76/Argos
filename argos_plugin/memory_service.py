@@ -1155,7 +1155,7 @@ class MemoryService:
         # BK8: EXPORT under the store lock (needs the service's exclusive
         # DB connection); verify + manifest + prune outside it.
         with tenant.store_lock:
-            snap, tables, counts, duckdb_version = _export_for_backup(
+            snap, tables, counts, duckdb_version, schema_version = _export_for_backup(
                 tenant.store.connection,
                 dst_root,
                 source_db_path=tenant.store.db_path,
@@ -1165,6 +1165,7 @@ class MemoryService:
             dst_root=dst_root,
             retention_snapshots=retention,
             source_db_path=tenant.store.db_path,
+            schema_version=schema_version,
         )
         manifest["tenant"] = tenant_name
         return manifest

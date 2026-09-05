@@ -81,7 +81,9 @@ def test_backup_round_trip_preserves_embeddings_and_counts(tmp_path):
     # Restore (service is not running — no lock).
     report = restore_store(snap_dir, db_path)
     assert report["status"] == "restored"
-    assert report["rows_restored"] == 5
+    # #288: rows_restored includes the schema_meta table (1 row for
+    # schema_version), so the total is 5 memory_records + 1 schema_meta.
+    assert report["rows_restored"] == 6
 
     # Verify all 5 rows are back with their original embeddings.
     conn = duckdb.connect(str(db_path), read_only=True)
@@ -664,7 +666,7 @@ def test_export_and_finalize_split(tmp_path):
     dst_root = tmp_path / "backups"
 
     # Split path: export, then finalize.
-    snap, tables, counts, duckdb_version = _export_for_backup(
+    snap, tables, counts, duckdb_version, schema_version = _export_for_backup(
         store.connection, dst_root, source_db_path=store.db_path
     )
     manifest = _finalize_backup(
@@ -672,6 +674,7 @@ def test_export_and_finalize_split(tmp_path):
         dst_root=dst_root,
         retention_snapshots=6,
         source_db_path=store.db_path,
+        schema_version=schema_version,
     )
     assert manifest["row_counts"]["memory_records"] == 3
     snap_dir = Path(manifest["snapshot_dir"])

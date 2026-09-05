@@ -759,6 +759,9 @@ class ProviderSessionMixin:
             self._maybe_run_lifecycle_maintenance()
             # Rollup (P5.1 Phase 3): LLM proposals-only pass.
             self._maybe_run_rollup()
+            # Self-compaction (#281): schedule-aware token-budget control.
+            # Deterministic, zero LLM, reversible quarantine. Cooldown-gated.
+            self._maybe_run_compaction()
 
     def _maybe_run_lifecycle_maintenance(self) -> None:
         """Run the archival + forgetting pass at session end (P5.1, #6).
@@ -819,6 +822,81 @@ class ProviderSessionMixin:
                 )
         except Exception as e:
             logger.debug("Rollup failed: %s", e)
+
+    def _maybe_run_compaction(self) -> None:
+        """Run the gated self-compaction pass (#281).
+
+        Schedule-aware token-budget control: quarantines stale/duplicate/
+        low-value memories to reclaim injection token budget. Zero-LLM,
+        reversible (quarantine, never hard-delete). Cooldown-gated by
+        compaction_interval_days. Fail-soft: never blocks session lifecycle.
+
+        SKIP when consolidation_enabled is on — on_session_end already
+        runs store.consolidate() at :719-738 with a different param set;
+        running compaction too would double-pass the same candidates.
+
+        APPLY GATE: compaction_auto_apply (default false) — when False,
+        compaction runs in dry_run mode (report only). The user must
+        explicitly set compaction_auto_apply=true to auto-quarantine.
+        This mirrors the consolidation_auto_apply safety default.
+
+        RPC PATH: in shared-service mode, self._store is a
+        SharedMemoryStore proxy. The proxy's run_compaction() method
+        forwards to the server-side run_compaction RPC, which executes
+        inside the service process with direct DuckDB access. This is
+        necessary because consolidate/set_state/_fetch_records are in
+        _FORBIDDEN_STORE_METHODS (MS2/MS7) and cannot be called through
+        the proxy directly.
+        """
+        if not getattr(self, "_compaction_enabled", False):
+            return
+        if not self._store:
+            return
+        # Don't run compaction when consolidation is already on —
+        # on_session_end already runs consolidate() above with its own
+        # param set. Running both double-passes the same candidates.
+        if getattr(self, "_consolidation_enabled", False):
+            logger.debug(
+                "Compaction skipped: consolidation_enabled is on "
+                "(on_session_end already runs consolidate)"
+            )
+            return
+        try:
+            auto_apply = bool(
+                getattr(self, "_compaction_auto_apply", False)
+            )
+            # Call the proxy method — works for both SharedMemoryStore
+            # (RPC → server-side run_compaction) and DuckDBMemoryStore
+            # (direct method, see below). The proxy path executes
+            # server-side; the direct path is used in tests.
+            if hasattr(self._store, "run_compaction"):
+                compaction_report = self._store.run_compaction(
+                    interval_days=getattr(self, "_compaction_interval_days", 7),
+                    aggressiveness=getattr(self, "_compaction_aggressiveness", 1.0),
+                    dry_run=not auto_apply,
+                )
+            else:
+                # Fallback: direct DuckDBMemoryStore (test path).
+                try:
+                    from .compaction import run_compaction
+                except ImportError:
+                    from compaction import run_compaction
+                compaction_report = run_compaction(
+                    self._store,
+                    interval_days=getattr(self, "_compaction_interval_days", 7),
+                    aggressiveness=getattr(self, "_compaction_aggressiveness", 1.0),
+                    dry_run=not auto_apply,
+                )
+            if compaction_report.get("ran"):
+                token_rpt = compaction_report.get("token_reduction", {})
+                logger.info(
+                    "Compaction: %d candidates, %d quarantined, ~%d tokens reclaimed",
+                    compaction_report.get("candidate_count", 0),
+                    compaction_report.get("quarantined_count", 0),
+                    token_rpt.get("estimated_tokens_reclaimed", 0),
+                )
+        except Exception as e:
+            logger.debug("Compaction failed: %s", e)
 
     def _maybe_run_distillation(self) -> None:
         """Run the gated distillation pass ("the dream") when enabled.

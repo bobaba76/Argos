@@ -945,6 +945,60 @@ class MemoryService:
                         memory_id, exc,
                     )
             return result
+        # -- #200 Spec-10 PR 2/3: Collections dispatch -----------------------
+        # All collection methods delegate to the store's StoreCollectionsMixin.
+        # Identity is server-resolved (dispatch already ran
+        # store.set_user_scope(user_id)); client-supplied user_scope/tenant
+        # are stripped by _sanitize_args (in _FORBIDDEN_CLIENT_ARGS).
+        if method == "list_collections":
+            return store.list_collections(
+                status=args.get("status"),
+                limit=int(args.get("limit", 200)),
+            )
+        if method == "list_collection_items":
+            return store.list_collection_items(
+                collection_id=args.get("collection_id", ""),
+                status=args.get("status"),
+                include_archived=bool(args.get("include_archived", False)),
+                limit=int(args.get("limit", 0)),
+            )
+        if method == "count_collection_items":
+            return store.count_collection_items(
+                collection_id=args.get("collection_id", ""),
+                status=args.get("status"),
+            )
+        if method == "get_collection":
+            return store.get_collection(args.get("collection_id", ""))
+        if method == "create_collection":
+            args = _sanitize_args(args)
+            return store.create_collection(
+                name=args.get("name", ""),
+                template=args.get("template"),
+                schema=args.get("schema"),
+                tenant=tenant.name if tenant else "default",
+            )
+        if method == "add_collection_item":
+            args = _sanitize_args(args)
+            return store.add_collection_item(
+                collection_id=args.get("collection_id", ""),
+                fields=args.get("fields", {}),
+                status=args.get("status", "open"),
+                tenant=tenant.name if tenant else "default",
+            )
+        if method == "update_collection_item":
+            args = _sanitize_args(args)
+            return store.update_collection_item(
+                item_id=args.get("item_id", ""),
+                fields=args.get("fields"),
+                status=args.get("status"),
+                expected_version=args.get("expected_version"),
+            )
+        if method == "remove_collection_item":
+            args = _sanitize_args(args)
+            return store.remove_collection_item(
+                item_id=args.get("item_id", ""),
+                expected_version=args.get("expected_version"),
+            )
         # -- deletion tombstones (read-only visibility + escape hatch) ---------
         if method == "list_tombstones":
             return store.list_tombstones(

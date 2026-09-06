@@ -48,6 +48,7 @@ if __package__:
     _retrieval_mod = importlib.import_module(".store_retrieval", __package__)
     _maintenance_mod = importlib.import_module(".store_maintenance", __package__)
     _write_mod = importlib.import_module(".store_write", __package__)
+    _collections_mod = importlib.import_module(".store_collections", __package__)
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     _sc = importlib.import_module("store_common")
@@ -58,6 +59,7 @@ else:
     _retrieval_mod = importlib.import_module("store_retrieval")
     _maintenance_mod = importlib.import_module("store_maintenance")
     _write_mod = importlib.import_module("store_write")
+    _collections_mod = importlib.import_module("store_collections")
 
 DuckDBRetriever = _retriever_mod.DuckDBRetriever
 extract_values = _value_ext_mod.extract_values
@@ -128,5 +130,5 @@ StoreWriteMixin = _write_mod.StoreWriteMixin
 
 
 
-class DuckDBMemoryStore(StoreCoreMixin, StoreWriteMixin, StoreRetrievalMixin, StoreMaintenanceMixin):
+class DuckDBMemoryStore(StoreCoreMixin, StoreWriteMixin, StoreRetrievalMixin, StoreMaintenanceMixin, _collections_mod.StoreCollectionsMixin):
     """DuckDB-backed memory store with vector + text search."""

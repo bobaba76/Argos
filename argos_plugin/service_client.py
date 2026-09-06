@@ -736,6 +736,32 @@ class SharedMemoryStore:
             return False
         return value
 
+    # -- #200 Spec-10 PR 2/3: Collections proxies ---------------------------
+
+    def list_collections(self, **kwargs: Any) -> List[Dict[str, Any]]:
+        return list(self._rpc.call("store", "list_collections", **kwargs) or [])
+
+    def list_collection_items(self, **kwargs: Any) -> List[Dict[str, Any]]:
+        return list(self._rpc.call("store", "list_collection_items", **kwargs) or [])
+
+    def count_collection_items(self, **kwargs: Any) -> int:
+        return int(self._rpc.call("store", "count_collection_items", **kwargs) or 0)
+
+    def get_collection(self, **kwargs: Any) -> Dict[str, Any] | None:
+        return self._rpc.call("store", "get_collection", **kwargs)
+
+    def create_collection(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._rpc.call("store", "create_collection", **kwargs)
+
+    def add_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._rpc.call("store", "add_collection_item", **kwargs)
+
+    def update_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._rpc.call("store", "update_collection_item", **kwargs)
+
+    def remove_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
+        return self._rpc.call("store", "remove_collection_item", **kwargs)
+
     def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Read-only census of deletion tombstones (hash+metadata, newest first)."""
         return list(self._rpc.call("store", "list_tombstones", limit=limit) or [])

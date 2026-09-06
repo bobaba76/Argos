@@ -34,25 +34,27 @@ def _make_store(tmp_path, user_id="alice"):
 class TestSchemaVersionField:
     """1. schema_version is persisted via schema_meta table."""
 
-    def test_fresh_db_starts_at_version_1(self, tmp_path):
-        """A fresh DB is migrated to version 1 (the baseline) at init."""
+    def test_fresh_db_starts_at_latest_version(self, tmp_path):
+        """A fresh DB is migrated to the latest version at init."""
+        from schema_migrations import LATEST_SCHEMA_VERSION
         store = _make_store(tmp_path)
         try:
-            assert store.get_schema_version() == 1
+            assert store.get_schema_version() == LATEST_SCHEMA_VERSION
         finally:
             store.close()
 
     def test_schema_version_persists_across_restarts(self, tmp_path):
-        """user_version persists in the DB header across close/reopen."""
+        """schema_version persists in schema_meta across close/reopen."""
+        from schema_migrations import LATEST_SCHEMA_VERSION
         store = _make_store(tmp_path)
         try:
-            assert store.get_schema_version() == 1
+            assert store.get_schema_version() == LATEST_SCHEMA_VERSION
         finally:
             store.close()
         # Reopen the same DB.
         store2 = _make_store(tmp_path)
         try:
-            assert store2.get_schema_version() == 1
+            assert store2.get_schema_version() == LATEST_SCHEMA_VERSION
         finally:
             store2.close()
 
@@ -86,12 +88,13 @@ class TestFreshDbMigratesToLatest:
 
     def test_migration_report_recorded(self, tmp_path):
         """The store records a migration report at init."""
+        from schema_migrations import LATEST_SCHEMA_VERSION
         store = _make_store(tmp_path)
         try:
             report = store.get_migration_report()
             assert report is not None
             assert report["from_version"] == 0
-            assert report["to_version"] == 1
+            assert report["to_version"] == LATEST_SCHEMA_VERSION
             assert 1 in report["applied"]
         finally:
             store.close()
@@ -101,8 +104,9 @@ class TestOldVersionFixtureMigrates:
     """3. Old-version fixture DB migrates forward."""
 
     def test_old_version_db_migrates_forward(self, tmp_path):
-        """A DB stamped at version 0 migrates to version 1 on init."""
+        """A DB stamped at version 0 migrates to latest on init."""
         import duckdb
+        from schema_migrations import LATEST_SCHEMA_VERSION
         db_path = tmp_path / "old.duckdb"
         # Create a DB with the memory_records table but schema_version=0
         # (simulating a pre-migration DB). No schema_meta table → version 0.
@@ -120,22 +124,23 @@ class TestOldVersionFixtureMigrates:
 
         # Now open it through DuckDBMemoryStore — the additive layer
         # adds all missing columns, then the migration runner stamps
-        # schema_version=1.
+        # schema_version=latest.
         from store import DuckDBMemoryStore
         store = DuckDBMemoryStore(db_path, user_id="alice")
         try:
-            assert store.get_schema_version() == 1
+            assert store.get_schema_version() == LATEST_SCHEMA_VERSION
             report = store.get_migration_report()
             assert report["from_version"] == 0
-            assert report["to_version"] == 1
+            assert report["to_version"] == LATEST_SCHEMA_VERSION
             assert 1 in report["applied"]
         finally:
             store.close()
 
-    def test_version_1_db_stays_at_1(self, tmp_path):
-        """A DB already at version 1 stays at 1 (no re-migration)."""
+    def test_version_latest_db_stays_at_latest(self, tmp_path):
+        """A DB already at the latest version stays there (no re-migration)."""
         import duckdb
-        db_path = tmp_path / "v1.duckdb"
+        from schema_migrations import LATEST_SCHEMA_VERSION, _ensure_schema_meta_table, _set_schema_version
+        db_path = tmp_path / "vlatest.duckdb"
         conn = duckdb.connect(str(db_path))
         try:
             conn.execute("""
@@ -145,21 +150,19 @@ class TestOldVersionFixtureMigrates:
                     content VARCHAR
                 )
             """)
-            # Stamp at version 1 via schema_meta.
-            from schema_migrations import _ensure_schema_meta_table, _set_schema_version
+            # Stamp at latest version via schema_meta.
             _ensure_schema_meta_table(conn)
-            _set_schema_version(conn, 1)
+            _set_schema_version(conn, LATEST_SCHEMA_VERSION)
         finally:
             conn.close()
 
         from store import DuckDBMemoryStore
         store = DuckDBMemoryStore(db_path, user_id="alice")
         try:
-            assert store.get_schema_version() == 1
+            assert store.get_schema_version() == LATEST_SCHEMA_VERSION
             report = store.get_migration_report()
-            assert report["from_version"] == 1
-            assert report["to_version"] == 1
-            assert 1 in report["skipped"]
+            assert report["from_version"] == LATEST_SCHEMA_VERSION
+            assert report["to_version"] == LATEST_SCHEMA_VERSION
             assert len(report["applied"]) == 0
         finally:
             store.close()
@@ -171,7 +174,7 @@ class TestIdempotency:
     def test_run_migrations_twice_is_noop(self, tmp_path):
         """run_migrations() called twice: second call applies nothing."""
         import duckdb
-        from schema_migrations import run_migrations
+        from schema_migrations import run_migrations, LATEST_SCHEMA_VERSION
 
         conn = duckdb.connect(str(tmp_path / "idempotent.duckdb"))
         try:
@@ -184,29 +187,28 @@ class TestIdempotency:
             """)
             r1 = run_migrations(conn)
             assert r1["from_version"] == 0
-            assert r1["to_version"] == 1
+            assert r1["to_version"] == LATEST_SCHEMA_VERSION
             assert 1 in r1["applied"]
 
             r2 = run_migrations(conn)
-            assert r2["from_version"] == 1
-            assert r2["to_version"] == 1
-            assert 1 in r2["skipped"]
+            assert r2["from_version"] == LATEST_SCHEMA_VERSION
+            assert r2["to_version"] == LATEST_SCHEMA_VERSION
             assert len(r2["applied"]) == 0
         finally:
             conn.close()
 
     def test_store_init_twice_is_noop(self, tmp_path):
         """Opening a store twice: second init skips migrations."""
+        from schema_migrations import LATEST_SCHEMA_VERSION
         store = _make_store(tmp_path)
         store.close()
 
         store2 = _make_store(tmp_path)
         try:
-            assert store2.get_schema_version() == 1
+            assert store2.get_schema_version() == LATEST_SCHEMA_VERSION
             report = store2.get_migration_report()
-            assert report["from_version"] == 1
+            assert report["from_version"] == LATEST_SCHEMA_VERSION
             assert len(report["applied"]) == 0
-            assert 1 in report["skipped"]
         finally:
             store2.close()
 
@@ -346,14 +348,15 @@ class TestPreMigrationHealthCheck:
             """)
             # A healthy DB should pass the health check and migrate.
             r = run_migrations(conn)
-            assert r["to_version"] == 1
+            from schema_migrations import LATEST_SCHEMA_VERSION
+            assert r["to_version"] == LATEST_SCHEMA_VERSION
         finally:
             conn.close()
 
     def test_health_check_can_be_skipped(self, tmp_path):
         """skip_health_check=True bypasses the check (for testing)."""
         import duckdb
-        from schema_migrations import run_migrations
+        from schema_migrations import run_migrations, LATEST_SCHEMA_VERSION
 
         conn = duckdb.connect(str(tmp_path / "skip.duckdb"))
         try:
@@ -365,7 +368,7 @@ class TestPreMigrationHealthCheck:
                 )
             """)
             r = run_migrations(conn, skip_health_check=True)
-            assert r["to_version"] == 1
+            assert r["to_version"] == LATEST_SCHEMA_VERSION
         finally:
             conn.close()
 
@@ -387,8 +390,9 @@ class TestBackupManifestRecordsSchemaVersion:
     """8. Backup manifest records the actual schema_version."""
 
     def test_backup_manifest_has_schema_version(self, tmp_path):
-        """A backup of a v1 store records schema_version=1 in the manifest."""
+        """A backup of a store records the actual schema_version in the manifest."""
         from backup import backup_store
+        from schema_migrations import LATEST_SCHEMA_VERSION
         store = _make_store(tmp_path)
         try:
             store.remember(category="personal_fact", content="test fact")
@@ -397,7 +401,7 @@ class TestBackupManifestRecordsSchemaVersion:
                 tmp_path / "backups",
                 source_db_path=store.db_path,
             )
-            assert manifest["schema_version"] == 1
+            assert manifest["schema_version"] == LATEST_SCHEMA_VERSION
         finally:
             store.close()
 
@@ -413,8 +417,9 @@ class TestPerTenantMigrations:
 
     def test_each_tenant_store_migrated_independently(self, tmp_path):
         """Two DuckDBMemoryStore instances (simulating two tenants)
-        each migrate independently and have their own user_version."""
+        each migrate independently and have their own schema_version."""
         from store import DuckDBMemoryStore
+        from schema_migrations import LATEST_SCHEMA_VERSION
 
         store_a = DuckDBMemoryStore(
             tmp_path / "tenant_a.duckdb", user_id="alice",
@@ -423,8 +428,8 @@ class TestPerTenantMigrations:
             tmp_path / "tenant_b.duckdb", user_id="bob",
         )
         try:
-            assert store_a.get_schema_version() == 1
-            assert store_b.get_schema_version() == 1
+            assert store_a.get_schema_version() == LATEST_SCHEMA_VERSION
+            assert store_b.get_schema_version() == LATEST_SCHEMA_VERSION
 
             # Each has its own migration report.
             report_a = store_a.get_migration_report()
@@ -436,14 +441,14 @@ class TestPerTenantMigrations:
             store_b.close()
 
     def test_tenant_at_different_versions_migrates_independently(self, tmp_path):
-        """A tenant DB at version 0 and one at version 1 both end up at 1."""
+        """A tenant DB at version 0 and one at latest both end up at latest."""
         import duckdb
         from store import DuckDBMemoryStore
-        from schema_migrations import _ensure_schema_meta_table, _set_schema_version
+        from schema_migrations import LATEST_SCHEMA_VERSION, _ensure_schema_meta_table, _set_schema_version
 
         # Tenant A: fresh DB (version 0).
         db_a = tmp_path / "a.duckdb"
-        # Tenant B: pre-stamped at version 1.
+        # Tenant B: pre-stamped at latest version.
         db_b = tmp_path / "b.duckdb"
         conn_b = duckdb.connect(str(db_b))
         try:
@@ -455,21 +460,21 @@ class TestPerTenantMigrations:
                 )
             """)
             _ensure_schema_meta_table(conn_b)
-            _set_schema_version(conn_b, 1)
+            _set_schema_version(conn_b, LATEST_SCHEMA_VERSION)
         finally:
             conn_b.close()
 
         store_a = DuckDBMemoryStore(db_a, user_id="alice")
         store_b = DuckDBMemoryStore(db_b, user_id="bob")
         try:
-            assert store_a.get_schema_version() == 1
-            assert store_b.get_schema_version() == 1
+            assert store_a.get_schema_version() == LATEST_SCHEMA_VERSION
+            assert store_b.get_schema_version() == LATEST_SCHEMA_VERSION
 
-            # Tenant A migrated 0→1, Tenant B was already at 1.
+            # Tenant A migrated from 0, Tenant B was already at latest.
             report_a = store_a.get_migration_report()
             report_b = store_b.get_migration_report()
             assert 1 in report_a["applied"]
-            assert 1 in report_b["skipped"]
+            assert len(report_b["applied"]) == 0
         finally:
             store_a.close()
             store_b.close()

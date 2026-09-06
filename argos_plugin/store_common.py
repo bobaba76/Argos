@@ -345,6 +345,8 @@ class MemoryRecord:
         "valid_from", "valid_to", "superseded_by",
         "provenance_origin", "grounding",
         "tier",
+        # #286: dimension-generic vector provenance.
+        "embedding_dim", "embedder_id", "embedded_at",
         # #280: transient marker set by the cross-encoder reranker blend
         # loop (store_retrieval.py). Not persisted — only lives on the
         # in-memory record during a retrieval pass. Used by the
@@ -394,6 +396,9 @@ class MemoryRecord:
         provenance_origin: str = PROVENANCE_INTERNAL,
         grounding: str = GROUNDING_OBSERVED,
         tier: str = "active",
+        embedding_dim: int | None = None,
+        embedder_id: str | None = None,
+        embedded_at: str | None = None,
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -453,6 +458,10 @@ class MemoryRecord:
         # P5.1 (#6): lifecycle tier — 'active' (in injection pool) or
         # 'archived' (out of pool, searchable via include_archived).
         self.tier = tier or "active"
+        # #286: dimension-generic vector provenance.
+        self.embedding_dim = embedding_dim
+        self.embedder_id = embedder_id
+        self.embedded_at = embedded_at
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -493,6 +502,9 @@ class MemoryRecord:
             "provenance_origin": self.provenance_origin,
             "grounding": self.grounding,
             "tier": self.tier,
+            "embedding_dim": self.embedding_dim,
+            "embedder_id": self.embedder_id,
+            "embedded_at": self.embedded_at,
         }
 
 

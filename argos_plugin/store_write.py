@@ -291,8 +291,15 @@ class StoreWriteMixin:
                     datetime.now(timezone.utc) + timedelta(days=ttl_days)
                 ).isoformat()
         emb: List[float] = []
+        embedder_id: str | None = None
         if self.embedder and hasattr(self.embedder, "embed"):
             emb = self.embedder.embed(content)
+            # #286: stamp embedding provenance (source embedder + dim + timestamp).
+            embedder_id = getattr(self.embedder, "_model_name", None) or getattr(
+                self.embedder, "model_name", None
+            )
+        embedding_dim = len(emb) if emb else None
+        embedded_at = self._now() if emb else None
         # Issue #83: a record stored without an embedding can never be
         # similarity-scored (the vector leg filters `embedding IS NOT NULL`
         # and graph-boost retrieval scores NULL-embedding records 0.0).
@@ -314,8 +321,9 @@ class StoreWriteMixin:
                  source_doc_id, source_loc, extraction_method, extracted_at,
                  verified_state, verified_at,
                  retrieval_count, helpful_count, dismissed_count,
-                 valid_from, provenance_origin, grounding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
+                 valid_from, provenance_origin, grounding,
+                 embedding_dim, embedder_id, embedded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?)
         """
         with self._state.lock:
             assert self.connection is not None
@@ -331,6 +339,7 @@ class StoreWriteMixin:
                 verified_state or "current", verified_at,
                 created_ts,  # valid_from = in-world creation time (issue #8)
                 prov, ground,
+                embedding_dim, embedder_id, embedded_at,
             ])
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]

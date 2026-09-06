@@ -28,6 +28,15 @@ Safety:
     - Skips rows whose content is empty.
     - Reports progress every batch.
     - Never deletes rows; only updates the embedding column.
+
+#286: dimension-generic vector store + re-embed orchestration.
+This module now exposes a reusable ``reembed_store()`` function that:
+  - Stamps provenance on every re-embedded record (embedder_id + embedded_at
+    + embedding_dim).
+  - Produces a report dict (count, source embedder, dims, before/after state)
+    so a bench run can verify the before/after state (bench gate).
+  - Text-search fallback remains available during re-embed (the text leg of
+    _hybrid_search is always-on and does not depend on embeddings).
 """
 from __future__ import annotations
 
@@ -38,6 +47,7 @@ import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, List
 
 
 def _get_hermes_home() -> Path:
@@ -85,6 +95,160 @@ def _resolve_db_path(home: Path, override: str | None = None) -> Path:
         except Exception:
             pass
     return home / db_name
+
+
+def reembed_store(
+    conn,
+    embedder,
+    *,
+    batch_size: int = 64,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """#286: Re-embed all memory records with the given embedder.
+
+    Reusable orchestration function (the CLI ``main()`` wraps this).
+    Stamps provenance on every re-embedded record: embedder_id,
+    embedded_at, embedding_dim. Produces a report dict for bench gate
+    verification.
+
+    Args:
+        conn: open DuckDB connection (must have exclusive access).
+        embedder: an object with ``embed_batch(texts, is_query=False)``
+            and a ``_model_name`` or ``model_name`` attribute.
+        batch_size: rows per embedding batch.
+        dry_run: if True, count and report without writing.
+
+    Returns:
+        report dict with:
+        - total_rows: total memory_records count
+        - re_embedded: count of rows actually re-embedded
+        - skipped: count of rows skipped (empty content or embed failure)
+        - source_embedder: the embedder model name
+        - embedding_dim: the dimension of the new embeddings
+        - before_dims: list of distinct embedding_dim values before re-embed
+        - after_dims: list of distinct embedding_dim values after re-embed
+        - dry_run: bool
+        - timestamp: ISO timestamp of the run
+
+    Text-search fallback: this function does NOT disable text search.
+    The text leg of _hybrid_search is always-on and does not depend on
+    embeddings. During a re-embed, text search continues to serve
+    results (the embedding column is updated in-place; rows that haven't
+    been updated yet still have their old embeddings, and the mixed-dim
+    check in _vector_search_raw will fall back to text for mismatched
+    dims).
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    # Get embedder identity.
+    embedder_id = getattr(embedder, "_model_name", None) or getattr(
+        embedder, "model_name", None
+    ) or "unknown"
+
+    # Count rows.
+    total = conn.execute("SELECT COUNT(*) FROM memory_records").fetchone()[0]
+    with_emb = conn.execute(
+        "SELECT COUNT(*) FROM memory_records WHERE embedding IS NOT NULL"
+    ).fetchone()[0]
+
+    # Capture before_dims for the bench gate report.
+    before_dims = []
+    try:
+        before_dims = [
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT embedding_dim FROM memory_records "
+                "WHERE embedding_dim IS NOT NULL ORDER BY embedding_dim"
+            ).fetchall()
+        ]
+    except Exception:
+        pass  # column may not exist (pre-#286)
+
+    if total == 0 or dry_run:
+        return {
+            "total_rows": total,
+            "re_embedded": 0,
+            "skipped": 0,
+            "source_embedder": embedder_id,
+            "embedding_dim": None,
+            "before_dims": before_dims,
+            "after_dims": before_dims,
+            "dry_run": dry_run,
+            "timestamp": timestamp,
+        }
+
+    # Probe the embedder dimension.
+    probe = embedder.embed("dimension probe")
+    if not probe:
+        raise RuntimeError(f"Embedder '{embedder_id}' failed to produce a probe vector")
+    embedding_dim = len(probe)
+
+    # Re-embed in batches.
+    re_embedded = 0
+    skipped = 0
+    offset = 0
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    while offset < total:
+        rows = conn.execute(
+            "SELECT memory_id, content FROM memory_records "
+            "ORDER BY memory_id LIMIT ? OFFSET ?",
+            [batch_size, offset],
+        ).fetchall()
+        if not rows:
+            break
+
+        ids_to_update = []
+        texts_to_embed = []
+        for memory_id, content in rows:
+            if content and content.strip():
+                ids_to_update.append(memory_id)
+                texts_to_embed.append(content)
+            else:
+                skipped += 1
+
+        if texts_to_embed:
+            embeddings = embedder.embed_batch(texts_to_embed, is_query=False)
+            for mid, emb in zip(ids_to_update, embeddings):
+                if emb:
+                    # #286: stamp provenance on every re-embedded record.
+                    conn.execute(
+                        """UPDATE memory_records
+                           SET embedding = ?,
+                               embedding_dim = ?,
+                               embedder_id = ?,
+                               embedded_at = ?
+                           WHERE memory_id = ?""",
+                        [emb, len(emb), embedder_id, now_ts, mid],
+                    )
+                    re_embedded += 1
+                else:
+                    skipped += 1
+
+        offset += len(rows)
+
+    # Capture after_dims for the bench gate report.
+    after_dims = []
+    try:
+        after_dims = [
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT embedding_dim FROM memory_records "
+                "WHERE embedding_dim IS NOT NULL ORDER BY embedding_dim"
+            ).fetchall()
+        ]
+    except Exception:
+        pass
+
+    return {
+        "total_rows": total,
+        "re_embedded": re_embedded,
+        "skipped": skipped,
+        "source_embedder": embedder_id,
+        "embedding_dim": embedding_dim,
+        "before_dims": before_dims,
+        "after_dims": after_dims,
+        "dry_run": False,
+        "timestamp": timestamp,
+    }
 
 
 def main() -> int:

@@ -64,15 +64,62 @@ def _migration_0_to_1(conn) -> None:
     already brings every DB to the v1 schema. This migration is a
     deliberate no-op that exists only so the runner can stamp
     schema_version=1 and know the baseline is established.
-
-    Future migrations (1→2, 2→3, …) will do real work here.
     """
-    # No schema changes — the additive layer already did them.
     pass
+
+
+def _migration_1_to_2(conn) -> None:
+    """#286: dimension-generic vector provenance.
+
+    The additive layer already added ``embedding_dim``, ``embedder_id``,
+    and ``embedded_at`` columns via ALTER TABLE ADD COLUMN IF NOT EXISTS.
+    This migration backfills ``embedding_dim`` for existing rows that
+    have embeddings but no dim stamp (legacy rows from before #286).
+
+    The backfill computes ``len(embedding)`` for each row with a non-
+    NULL embedding and NULL embedding_dim. This is a data transform
+    (not just a schema stamp) — it reads every embedded row and writes
+    its dimension. Idempotent: rows with a non-NULL embedding_dim are
+    skipped (WHERE embedding_dim IS NULL).
+
+    embedder_id and embedded_at remain NULL for legacy rows (we don't
+    know which model produced them). The re-embed orchestration stamps
+    them on future re-embeds.
+
+    Defensive: if the ``embedding_dim`` column doesn't exist yet (e.g.
+    when run_migrations is called directly on a minimal test DB without
+    the additive layer), the migration is a no-op. The additive layer
+    in store_core._init_db() adds the column before the runner executes.
+    """
+    # Check if embedding_dim and embedding columns exist. If not, skip
+    # (the additive layer will add them on a real store init).
+    try:
+        cols = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = 'memory_records' "
+            "AND column_name IN ('embedding_dim', 'embedding')"
+        ).fetchall()
+        col_names = {r[0] for r in cols}
+        if "embedding_dim" not in col_names or "embedding" not in col_names:
+            # Columns don't exist — nothing to backfill. The additive
+            # layer will add them on a real store init.
+            return
+    except Exception:
+        return
+
+    # Backfill embedding_dim for existing rows with embeddings.
+    # DuckDB's len() returns the length of a list column.
+    conn.execute("""
+        UPDATE memory_records
+        SET embedding_dim = len(embedding)
+        WHERE embedding IS NOT NULL
+          AND embedding_dim IS NULL
+    """)
 
 
 MIGRATIONS: List[Migration] = [
     (0, 1, _migration_0_to_1),
+    (1, 2, _migration_1_to_2),
 ]
 
 # The latest schema version = the last migration's version_to.

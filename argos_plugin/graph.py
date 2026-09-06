@@ -1222,15 +1222,29 @@ class KuzuGraphStore:
             # round-trips); the incoming evidence's window overwrites its
             # own entry (last write wins per memory — a re-indexed record
             # updates its window, e.g. closes it on supersede).
+            #
+            # Blocker fix (PR #323 review): a legacy-shape re-index
+            # (memory evidence, NO temporal args — valid_from and
+            # valid_to both None) must NOT overwrite the existing entry.
+            # Overwriting with [None, None] would flip the recomputed
+            # valid_to from its closed value back to NULL, reopening the
+            # edge and making it live after its evidence record closed —
+            # exactly the silent disagreement #287 exists to prevent.
+            # Preserve the existing entry in that case; only an explicit
+            # window (either bound provided) updates it.
             memory_windows = existing.get("memory_windows")
             if not isinstance(memory_windows, dict):
                 memory_windows = {}
             effective_from = valid_from if valid_from is not None else created_at
             if memory_id:
-                memory_windows[str(memory_id)] = [
-                    str(effective_from) if effective_from else None,
-                    str(valid_to) if valid_to is not None else None,
-                ]
+                existing_entry = memory_windows.get(str(memory_id))
+                if existing_entry is None or (
+                    valid_from is not None or valid_to is not None
+                ):
+                    memory_windows[str(memory_id)] = [
+                        str(effective_from) if effective_from else None,
+                        str(valid_to) if valid_to is not None else None,
+                    ]
             if memory_windows:
                 merged["memory_windows"] = memory_windows
 
@@ -1338,12 +1352,14 @@ class KuzuGraphStore:
         #287: ``valid_from``/``valid_to`` mirror the source record's valid
         window (ISO-8601 strings) so the graph answers "as-of T" the same
         way the flat store does. An edge contributed by this memory is
-        valid only while the record's version window is valid. When
-        ``valid_from`` is None it defaults to ``created_at`` (observation
-        time); ``valid_to`` stays NULL (open) unless the caller passes a
-        closed window (superseded record). The re-index/backfill path
-        (rebuild_graph.py / backfill_graph.py) passes the record's actual
-        windows — provenance is preserved, never invented.
+        valid only while the record's version window is valid. When the
+        caller provides no temporal args (legacy shape), edges keep their
+        existing windows (preservation — a plain re-index never reopens a
+        closed edge); NEW edges get observation-time stamping
+        (valid_from = created_at, valid_to = NULL/open). The
+        re-index/backfill path (rebuild_graph.py / backfill_graph.py)
+        passes the record's actual windows — provenance is preserved,
+        never invented.
 
         Extraction is regex-first, LLM-supplemented when regex finds few
         relations and the content is substantial. All entities pass through
@@ -1373,6 +1389,13 @@ class KuzuGraphStore:
             valid_from=valid_from if valid_from is not None else created_at,
             valid_to=valid_to,
         )
+        # Edge calls PASS THROUGH the caller's temporal args (no
+        # created_at defaulting here): a legacy-shape re-index (no
+        # temporal args) arrives at upsert_edge as [None, None], which
+        # preserves the edge's existing per-evidence window instead of
+        # overwriting it with an open one (blocker fix, PR #323 review).
+        # New edges still get observation-time stamping via upsert_edge's
+        # effective_from = valid_from or created_at.
         self.add_relationship(
             memory_node,
             "memory",
@@ -1381,7 +1404,7 @@ class KuzuGraphStore:
             "person",
             {"memory_id": str(memory_id), "category": category},
             created_at=created_at,
-            valid_from=valid_from if valid_from is not None else created_at,
+            valid_from=valid_from,
             valid_to=valid_to,
         )
 
@@ -1409,7 +1432,7 @@ class KuzuGraphStore:
                 created_at=created_at,
                 # #287: the edge is valid only while its source record's
                 # version window is valid.
-                valid_from=valid_from if valid_from is not None else created_at,
+                valid_from=valid_from,
                 valid_to=valid_to,
             )
             # Link the source memory to the entity so graph traversal can
@@ -1422,7 +1445,7 @@ class KuzuGraphStore:
                 relation["target_type"],
                 {"memory_id": str(memory_id), "category": category},
                 created_at=created_at,
-                valid_from=valid_from if valid_from is not None else created_at,
+                valid_from=valid_from,
                 valid_to=valid_to,
             )
         if flush:

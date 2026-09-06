@@ -570,7 +570,10 @@ def run_graph_migrations(
     Each migration runs inside BEGIN/COMMIT (managed jointly by the
     runner and the migration fn — see the Kuzu constraint note above).
     A failure rolls back and raises — the graph is NOT left
-    half-migrated. The version stamp is written INSIDE the transaction.
+    half-migrated. The version stamp is written AFTER the migration fn
+    commits (a separate implicit transaction — Kuzu DDL pre-checks must
+    run inside the migration fn's txn, so the runner cannot own the
+    txn boundary).
 
     Returns a report dict: from_version, to_version, applied, skipped.
     """

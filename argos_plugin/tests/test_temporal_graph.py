@@ -309,6 +309,74 @@ class TestGraphWritesStampTimestamps:
         finally:
             graph.close()
 
+    def test_reindex_preserves_closed_edge_window(self, tmp_path):
+        """Regression (PR #323 review blocker): a legacy-shape re-index
+        (memory evidence, NO temporal args) must NOT reopen a closed
+        edge. Mirrors the node-path preservation test: index closed →
+        plain re-index → valid_to still T1 AND as-of after closure
+        excludes the edge. Uses the deterministic about_user edge
+        (memory node → user) rather than extractor-dependent relations.
+        """
+        graph = _make_graph(tmp_path, "edge_preserve")
+        try:
+            # Index with a CLOSED window [T0, T1].
+            graph.index_memory(
+                memory_id="mem-4",
+                category="personal_fact",
+                content="Eve holds a pilot licence",
+                created_at=T0,
+                use_llm=False,
+                valid_from=T0,
+                valid_to=T1,
+            )
+            mem_node = graph._internal_id("memory:mem-4")
+
+            # Verification probe BEFORE re-index: as-of after closure
+            # excludes the about_user edge.
+            edges_before = graph.query_graph("memory:mem-4", as_of=T2)
+            assert not any(
+                e["relation"] == "about_user" for e in edges_before
+            ), "closed edge should be excluded before re-index"
+
+            # Plain legacy-shape re-index — no temporal args (the exact
+            # shape that used to NULL out the closed window).
+            graph.index_memory(
+                memory_id="mem-4",
+                category="personal_fact",
+                content="Eve holds a pilot licence",
+                created_at=T0,
+                use_llm=False,
+            )
+
+            # The about_user edge's valid_to must still be T1 (not reopened).
+            with graph._shared_conn_lock:
+                result = graph.conn.execute(
+                    """MATCH (:Entity {id: $id})-[r:RelatesTo {relation_type: 'about_user'}]->(:Entity)
+                       RETURN r.valid_from, r.valid_to""",
+                    parameters={"id": mem_node},
+                )
+                row = result.get_next()
+                assert row[1] == T1, (
+                    f"closed edge window reopened by plain re-index: "
+                    f"valid_to={row[1]} (expected {T1})"
+                )
+
+            # Verification probe AFTER re-index: as-of after closure
+            # still excludes the edge.
+            edges_after = graph.query_graph("memory:mem-4", as_of=T2)
+            assert not any(
+                e["relation"] == "about_user" for e in edges_after
+            ), "closed edge leaked past valid_to after plain re-index"
+
+            # And as-of BEFORE the closure, the edge is still visible
+            # (temporal provenance preserved).
+            edges_hist = graph.query_graph("memory:mem-4", as_of=T0)
+            assert any(e["relation"] == "about_user" for e in edges_hist), (
+                "historical edge lost by plain re-index"
+            )
+        finally:
+            graph.close()
+
     def test_multi_evidence_edge_union_window(self, tmp_path):
         """An edge with two evidence memories: open evidence keeps the
         edge open; closing the last open evidence closes the edge."""

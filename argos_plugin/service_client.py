@@ -133,6 +133,21 @@ def _read_endpoint(home: Path) -> dict | None:
     return None
 
 
+def _compute_gate_hmac(gate_secret: str, request: dict) -> str:
+    """#200 PR-2 fix: compute HMAC-SHA256 over the request (minus
+    _gate_hmac and token) using the boot-time gate_secret. The service
+    verifies this before honoring _confirmed — a raw RPC caller without
+    the gate_secret cannot forge it."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    body = {k: v for k, v in request.items() if k not in ("_gate_hmac", "token")}
+    return _hmac.new(
+        gate_secret.encode("utf-8"),
+        json.dumps(body, sort_keys=True).encode("utf-8"),
+        _hashlib.sha256,
+    ).hexdigest()
+
+
 def _record_from_dict(value: dict | None) -> MemoryRecord | None:
     if not value:
         return None
@@ -241,6 +256,15 @@ class _SharedRPC:
         request["v"] = _PROTOCOL_VERSION
         request["token"] = endpoint["token"]
         request.setdefault("user_id", self.user_id)
+        # #200 PR-2 fix: if this is a gated call, compute the HMAC over
+        # the final request (all envelope fields added) using the
+        # boot-time gate_secret. The service verifies this before
+        # honoring _confirmed. The _needs_gate_hmac flag is stripped
+        # from the request before sending (it's a client-side marker).
+        if request.pop("_needs_gate_hmac", False):
+            gate_secret = endpoint.get("gate_secret", "")
+            if gate_secret:
+                request["_gate_hmac"] = _compute_gate_hmac(gate_secret, request)
         try:
             with socket.create_connection(
                 (str(endpoint["host"]), int(endpoint["port"])), timeout=timeout
@@ -382,17 +406,21 @@ class _SharedRPC:
         return self._request({"component": component, "method": method, "args": args})
 
     def call_gated(self, component: str, method: str, **args: Any) -> Any:
-        """Like call(), but marks the request as facade-confirmed.
+        """Like call(), but marks the request as facade-confirmed with
+        an HMAC proof the server verifies.
 
         #200 PR-2 fix: the _confirmed flag goes in the request ENVELOPE,
-        NOT in args. A raw RPC caller using call() cannot set it —
-        _sanitize_args strips 'confirm' from args (it's in
-        _FORBIDDEN_CLIENT_ARGS), and the service only trusts
-        _confirmed from the envelope, not from args. This closes the
-        client-spoofable confirm=True gap.
+        NOT in args. But _confirmed alone is still client-asserted — so
+        call_gated also sets _needs_gate_hmac=True, which _request_once
+        uses to compute an HMAC-SHA256 over the final request (after all
+        envelope fields like v, token, user_id are added) using the
+        boot-time gate_secret. The service verifies the HMAC before
+        honoring _confirmed. A raw RPC caller with the endpoint token
+        but without the gate_secret cannot forge the HMAC.
         """
         request = {"component": component, "method": method, "args": args}
         request["_confirmed"] = True
+        request["_needs_gate_hmac"] = True
         return self._request(request)
 
     def stop_service(self) -> Any:

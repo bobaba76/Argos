@@ -246,7 +246,9 @@ class TestCollectionWriteRpcGating:
 
     Tests:
       - raw RPC via call() without _confirmed → denied + audit
-      - raw RPC via call() WITH forged confirm=True in args → DENIED (spoof closed)
+      - raw RPC via call() WITH forged confirm=True in args → DENIED
+      - **forged _confirmed=true in envelope without HMAC → DENIED** (the real spoof-closing test)
+      - forged _confirmed=true WITH forged _gate_hmac → DENIED (HMAC verification)
       - forged client user_id/tenant → stripped, service-resolved identity in audit
       - facade-mediated write → succeeds + audit granted row
       - CAS conflict → audit denial row, no write
@@ -270,6 +272,94 @@ class TestCollectionWriteRpcGating:
                 and "not_confirmed" in (r.get("denied_scopes") or "")
             ]
             assert len(denial_rows) >= 1, "raw RPC denial not audited"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirmed_in_envelope_denied(self, tmp_path):
+        """THE REAL SPOOF-CLOSING TEST: a raw RPC caller forges
+        _confirmed=true in the envelope WITHOUT a valid HMAC → DENIED.
+
+        This proves the gate authority is the server-verified HMAC, not
+        the client-asserted _confirmed boolean. A raw caller with the
+        endpoint token can set _confirmed=true in the JSON, but without
+        the boot-time gate_secret they cannot compute the correct HMAC.
+        The service strips _confirmed when the HMAC doesn't match.
+        """
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            # Forge _confirmed=true in the envelope with NO HMAC.
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc._request_once(
+                    {
+                        "component": "store",
+                        "method": "create_collection",
+                        "args": {"name": "Forged Envelope"},
+                        "_confirmed": True,
+                    },
+                    timeout=10.0,
+                )
+            # Audit denial row written.
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1, "forged _confirmed denial not audited"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirmed_with_forged_hmac_denied(self, tmp_path):
+        """Forged _confirmed=true WITH a forged _gate_hmac (wrong secret)
+        → DENIED. The HMAC verification catches a caller who tries to
+        guess the gate_secret."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            import hashlib as _hashlib
+            import hmac as _hmac
+            # Compute an HMAC with the WRONG secret.
+            fake_secret = "wrong-secret-not-the-real-one"
+            body = {
+                "component": "store",
+                "method": "create_collection",
+                "args": {"name": "Forged HMAC"},
+                "_confirmed": True,
+                "v": 1,
+                "user_id": "test_user",
+            }
+            fake_hmac = _hmac.new(
+                fake_secret.encode("utf-8"),
+                json.dumps(body, sort_keys=True).encode("utf-8"),
+                _hashlib.sha256,
+            ).hexdigest()
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc._request_once(
+                    {
+                        "component": "store",
+                        "method": "create_collection",
+                        "args": {"name": "Forged HMAC"},
+                        "_confirmed": True,
+                        "_gate_hmac": fake_hmac,
+                    },
+                    timeout=10.0,
+                )
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1, "forged HMAC denial not audited"
         finally:
             try:
                 store._rpc.stop_service()

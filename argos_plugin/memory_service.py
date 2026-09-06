@@ -1697,6 +1697,34 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 token = str(request.pop("token", ""))
                 if not hmac.compare_digest(token, server.auth_token):
                     raise PermissionError("invalid service token")
+                # #200 PR-2 fix: verify the gate HMAC before honoring
+                # _confirmed. The facade's call_gated() computes an
+                # HMAC-SHA256 over the request (minus _gate_hmac and
+                # token) using the boot-time gate_secret. A raw RPC
+                # caller with the endpoint token but without the
+                # gate_secret cannot forge this HMAC. Without this
+                # verification, _confirmed is just another client-
+                # asserted boolean — the same spoof one layer up.
+                gate_hmac = request.pop("_gate_hmac", "")
+                client_confirmed = request.get("_confirmed", False) is True
+                if client_confirmed:
+                    # _confirmed is only honored if backed by a valid
+                    # HMAC. Compute the expected HMAC over the request
+                    # dict (token and _gate_hmac already removed).
+                    expected_hmac = hmac.new(
+                        server.gate_secret.encode("utf-8"),
+                        json.dumps(request, sort_keys=True).encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    if not isinstance(gate_hmac, str) or not hmac.compare_digest(
+                        gate_hmac, expected_hmac
+                    ):
+                        # The HMAC doesn't match — _confirmed is forged.
+                        # Strip it so the gate denies.
+                        request["_confirmed"] = False
+                else:
+                    # No _confirmed claimed — ensure it's False.
+                    request["_confirmed"] = False
                 result = server.memory_service.dispatch(request)
                 self._write({"ok": True, "result": result})
             except Exception as exc:
@@ -1735,11 +1763,12 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         self.wfile.flush()
 
 
-def _write_endpoint(path: Path, port: int, token: str) -> None:
+def _write_endpoint(path: Path, port: int, token: str, gate_secret: str) -> None:
     payload = {
         "host": "127.0.0.1",
         "port": port,
         "token": token,
+        "gate_secret": gate_secret,
         "pid": os.getpid(),
         "version": 1,
     }
@@ -1811,12 +1840,20 @@ def serve(home: Path, port: int = 0) -> None:
 
     service = MemoryService(home)
     token = secrets.token_urlsafe(32)
+    # #200 PR-2 fix: gate_secret is a separate boot-time secret used by
+    # the facade to HMAC-sign gated requests (collection writes,
+    # facade_delete_memory). The service verifies the HMAC before
+    # honoring _confirmed — a raw RPC caller with the endpoint token
+    # but without the gate_secret cannot forge the HMAC. This closes
+    # the client-spoofable _confirmed gap.
+    gate_secret = secrets.token_urlsafe(32)
     server = _ThreadingTCPServer(("127.0.0.1", port), _RequestHandler)
     server.auth_token = token
+    server.gate_secret = gate_secret
     server.memory_service = service
     service.server = server
 
-    _write_endpoint(endpoint, int(server.server_address[1]), token)
+    _write_endpoint(endpoint, int(server.server_address[1]), token, gate_secret)
 
     # Opportunistic one-time graph hygiene at startup: quarantine junk/leak
     # entity nodes so noise fades from graph-aware recall. Runs off the hot

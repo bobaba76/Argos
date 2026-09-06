@@ -1,0 +1,44 @@
+{
+  "all_top1": true,
+  "all_top5": true,
+  "deterministic": true,
+  "expectations": [
+    {
+      "in_top5": true,
+      "memory_id": "smoke-01",
+      "top1": true
+    },
+    {
+      "in_top5": true,
+      "memory_id": "smoke-02",
+      "top1": true
+    },
+    {
+      "in_top5": true,
+      "memory_id": "smoke-03",
+      "top1": true
+    },
+    {
+      "in_top5": true,
+      "memory_id": "smoke-04",
+      "top1": true
+    },
+    {
+      "in_top5": true,
+      "memory_id": "smoke-05",
+      "top1": true
+    },
+    {
+      "in_top5": true,
+      "memory_id": "smoke-06",
+      "top1": true
+    }
+  ],
+  "ladder": [
+    1,
+    5
+  ],
+  "no_empty": true,
+  "probe_count": 6,
+  "tier": 0
+}

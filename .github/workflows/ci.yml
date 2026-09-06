@@ -61,11 +61,67 @@ jobs:
 
       - name: Run relevant tests
         run: |
+          # Tier 0 (#292): the deterministic retrieval smoke runs on EVERY
+          # PR (seconds, no LLM/embedder/network) — always appended.
           if [ -n "$TESTS" ]; then
-            python -m pytest $TESTS -q --timeout 300 -p no:cacheprovider
+            python -m pytest $TESTS argos_plugin/tests/test_retrieval_smoke_gate.py -q --timeout 300 -p no:cacheprovider
           else
-            echo "No test files affected — skipping pytest."
+            python -m pytest argos_plugin/tests/test_retrieval_smoke_gate.py -q --timeout 300 -p no:cacheprovider
           fi
+        env:
+          HF_HUB_OFFLINE: "1"
+          PYTHONPATH: "."
+
+  tier1-slice:
+    name: Tier 1 — curated retrieval slice (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # #292: runs ONLY on retrieval/embedding-touching PRs (path trigger
+    # list: argos_plugin/eval/ci_retrieval_paths.txt). Non-blocking
+    # background check — the delta-vs-baseline report is visible, but an
+    # env flake cannot block the merge.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Detect retrieval-touching paths
+        id: trigger
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ]; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+          fi
+          if [ -z "$BASE" ]; then
+            echo "No base SHA — skipping tier 1."
+            echo "RUN=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD || true)
+          # The trigger list is the checked-in ci_retrieval_paths.txt —
+          # one source of truth shared with the test suite.
+          RUN=$(python argos_plugin/eval/ci_tier1_slice.py --paths $CHANGED \
+            | grep -oE 'True|False' | tail -1)
+          echo "tier1 trigger: $RUN"
+          echo "RUN=$RUN" >> "$GITHUB_ENV"
+
+      - name: Run the curated slice (delta vs recorded baseline)
+        if: env.RUN == 'True'
+        run: |
+          # ~12 curated probes (temporal / conflict / provenance /
+          # injection / negation / entity) on a deterministic synthetic
+          # store — no LLM, no embedder, no snapshot. Regression =
+          # DELTA vs the recorded baseline (never absolute).
+          python -m pytest argos_plugin/tests/test_ci_tier1_slice.py -q --timeout 600 -p no:cacheprovider
         env:
           HF_HUB_OFFLINE: "1"
           PYTHONPATH: "."

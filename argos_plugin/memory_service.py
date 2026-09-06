@@ -60,11 +60,25 @@ _FORBIDDEN_CLIENT_ARGS = frozenset({
     "user_scope",
     "confidence",
     "review_mode",  # policy is server-derived (#127)
+    "requested_by",  # #293: erase-receipt attribution is server-derived —
+                     # a client-supplied requested_by would forge the
+                     # audit trail of a provable deletion.
 })
 
 # MS2: destructive/admin methods forbidden on the RPC boundary (same as
 # the facade's FORBIDDEN_OPERATIONS). Any local process with the endpoint
 # token should NOT be able to call these.
+#
+# DELIBERATE EXCEPTION (#293): ``erase_subject`` is NOT in this set.
+# It is destructive, but it is the SANCTIONED POPIA path — the RPC
+# handler enforces the same controls as the facade: strict confirm
+# (only literal True), preview-first, per-record report, tenant scoping
+# from the service-resolved identity, legal-hold hook, and an
+# append-only deletion receipt per erased record. Blocking it here
+# would break the RPC-backed REST facade (rest_server constructs the
+# facade over SharedMemoryStore). The raw destructive ops above stay
+# forbidden — erasure must go through the gated workflow, not ad-hoc
+# deletes. Mirrors the run_compaction precedent (#281).
 _FORBIDDEN_STORE_METHODS = frozenset({
     "delete_memory",
     "quarantine_memory",
@@ -647,6 +661,44 @@ class MemoryService:
                 client_scope=args.get("client_scope"),
                 doc_class=args.get("doc_class"),
                 project_id=args.get("project_id"),
+            )
+        if method == "erase_subject":
+            # #293: POPIA erase-request workflow (provable deletion).
+            # Identity is server-derived: user_scope comes from the
+            # service-resolved identity (dispatch already ran
+            # store.set_user_scope(user_id)); requested_by is ALWAYS the
+            # service-resolved caller — the client cannot claim it
+            # ("requested_by" is in _FORBIDDEN_CLIENT_ARGS, stripped
+            # above), so the receipt's audit trail cannot be forged over
+            # RPC. STRICT confirm (bool("false") is True — only literal
+            # True passes).
+            args = _sanitize_args(args)
+            confirm = args.get("confirm", False) is True
+            return store.erase_subject(
+                subject=str(args.get("subject", "")),
+                mode=str(args.get("mode", "preview")),
+                confirm=confirm,
+                categories=args.get("categories"),
+                client_scope=args.get("client_scope"),
+                doc_class=args.get("doc_class"),
+                namespace=args.get("namespace"),
+                requested_by=user_id,
+            )
+        if method == "list_deletion_receipts":
+            args = _sanitize_args(args)
+            try:
+                limit = max(1, int(args.get("limit", 100)))
+            except (TypeError, ValueError):
+                limit = 100
+            return store.list_deletion_receipts(
+                request_id=args.get("request_id"),
+                subject=args.get("subject"),
+                memory_id=args.get("memory_id"),
+                limit=limit,
+            )
+        if method == "verify_erase_receipt":
+            return store.verify_erase_receipt(
+                receipt_id=str(args.get("receipt_id", "")),
             )
         if method == "find_semantic_duplicate":
             return _record_to_dict(

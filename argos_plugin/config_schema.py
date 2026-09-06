@@ -806,6 +806,25 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Maximum records sampled per rollup run (oldest active low-retrieval first).",
             group="Lifecycle",
         ),
+        # -- POPIA retention (#293) ------------------------------------------
+        ProviderField(
+            key="retention_enabled",
+            label="POPIA retention enforcement",
+            kind=KIND_BOOL,
+            default="false",
+            description="At session end, expire records whose record-class retention period has passed (expires_at stamped to the retention deadline; expired records drop out of retrieval). Deletion itself happens via the erase-request workflow with a deletion receipt.",
+            info="Ships OFF. Deterministic, zero LLM. Policies are a JSON object mapping category to retention days, e.g. {\"context_note\": 730}. Extends the existing TTL machinery — no new scheduler.",
+            inline=True,
+            group="Lifecycle",
+        ),
+        ProviderField(
+            key="retention_policies",
+            label="Retention policies (JSON)",
+            kind=KIND_TEXT,
+            default="{}",
+            description="JSON object mapping record category to retention period in days, e.g. {\"context_note\": 730, \"event\": 1825}. Categories without a policy are never expired by retention.",
+            group="Lifecycle",
+        ),
         ProviderField(
             key="compaction_enabled",
             label="Self-compaction",

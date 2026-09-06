@@ -118,9 +118,51 @@ def _migration_1_to_2(conn) -> None:
     """)
 
 
+def _migration_2_to_3(conn) -> None:
+    """#293: POPIA deletion receipts — append-only erase evidence.
+
+    Creates the ``deletion_receipts`` table: an append-only log of what
+    was deleted, when, by whom, and at whose request. This is the
+    "provable" part of the erase-request workflow:
+
+    - One row per erased record: receipt_id (PK), request_id (the erase
+      batch), subject (who the erase was for), memory_id, content_hash
+      (verifiable proof of WHAT was deleted without retaining the
+      content), category, user_scope, requested_by, reason, outcome,
+      created_at.
+    - APPEND-ONLY: the codebase only ever INSERTs into this table —
+      there is no UPDATE/DELETE path, and the erase flow itself cannot
+      touch it (it matches memory_records, not receipts). Receipts
+      survive the deletion they prove.
+    - Content is NOT retained in the receipt (POPIA minimality): the
+      hash + memory_id + category prove the deletion; the tombstone
+      table independently blocks re-feeding the content.
+
+    Idempotent (CREATE TABLE IF NOT EXISTS) and transactional via the
+    runner.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deletion_receipts (
+            receipt_id   VARCHAR PRIMARY KEY,
+            request_id   VARCHAR,
+            subject      VARCHAR,
+            memory_id    VARCHAR,
+            content_hash VARCHAR,
+            category     VARCHAR,
+            user_scope   VARCHAR,
+            requested_by VARCHAR,
+            reason       VARCHAR DEFAULT 'erase_request',
+            outcome      VARCHAR,
+            details      VARCHAR,
+            created_at   VARCHAR
+        )
+    """)
+
+
 MIGRATIONS: List[Migration] = [
     (0, 1, _migration_0_to_1),
     (1, 2, _migration_1_to_2),
+    (2, 3, _migration_2_to_3),
 ]
 
 # The latest schema version = the last migration's version_to.

@@ -757,6 +757,9 @@ class ProviderSessionMixin:
             # Lifecycle maintenance (P5.1, #6): archival + forgetting.
             # Deterministic, zero LLM. Both phases independently gated.
             self._maybe_run_lifecycle_maintenance()
+            # POPIA retention (#293): per-class retention enforcement.
+            # Deterministic, zero LLM, extends the TTL machinery.
+            self._maybe_run_retention()
             # Rollup (P5.1 Phase 3): LLM proposals-only pass.
             self._maybe_run_rollup()
             # Self-compaction (#281): schedule-aware token-budget control.
@@ -795,6 +798,44 @@ class ProviderSessionMixin:
                 )
         except Exception as e:
             logger.debug("Lifecycle maintenance failed: %s", e)
+
+    def _maybe_run_retention(self) -> None:
+        """Run the POPIA retention pass at session end (#293).
+
+        Per-record-class retention enforcement: expires records whose
+        class retention period has passed (expires_at stamped to the
+        retention deadline — extends the TTL machinery, no new
+        scheduler). Deterministic, zero LLM. Gated by
+        retention_enabled + a non-empty retention_policies JSON.
+        Fail-soft: never blocks session lifecycle.
+        """
+        if not getattr(self, "_retention_enabled", False):
+            return
+        if not self._store:
+            return
+        raw = getattr(self, "_retention_policies", "") or ""
+        try:
+            policies = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError) as e:
+            logger.debug("Retention: unparseable retention_policies: %s", e)
+            return
+        if not isinstance(policies, dict) or not policies:
+            return
+        try:
+            report = self._store.enforce_retention_policies(policies)
+            if report.get("expired_count"):
+                logger.info(
+                    "Retention: expired %d record(s) past class retention",
+                    report["expired_count"],
+                )
+            try:
+                self._store.set_state(
+                    "retention_last_run", self._store._now(),
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug("Retention enforcement failed: %s", e)
 
     def _maybe_run_rollup(self) -> None:
         """Run the gated long-horizon rollup pass (P5.1 Phase 3, #6).

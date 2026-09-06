@@ -583,6 +583,26 @@ class SharedMemoryStore:
             "rows": [], "errors": [],
         }
 
+    def erase_subject(self, **kwargs: Any) -> dict:
+        """#293: POPIA erase-request workflow (provable deletion)."""
+        result = self._rpc.call("store", "erase_subject", **kwargs)
+        return result or {
+            "mode": kwargs.get("mode", "preview"), "wrote": False,
+            "records": [],
+        }
+
+    def list_deletion_receipts(self, **kwargs: Any) -> list:
+        """#293: query the append-only deletion-receipt log."""
+        return self._rpc.call(
+            "store", "list_deletion_receipts", **kwargs,
+        ) or []
+
+    def verify_erase_receipt(self, receipt_id: str) -> dict:
+        """#293: verify a deletion receipt against the live store."""
+        return self._rpc.call(
+            "store", "verify_erase_receipt", receipt_id=receipt_id,
+        ) or {"valid": False, "reason": "receipt not found"}
+
     def find_semantic_duplicate(
         self, content: str, min_similarity: float = 0.88,
     ) -> MemoryRecord | None:

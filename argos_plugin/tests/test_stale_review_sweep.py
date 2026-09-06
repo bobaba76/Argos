@@ -80,9 +80,79 @@ class TestConfigConsumption:
         assert sweep_enabled is False
 
 
-# ---------------------------------------------------------------------------
-# 2. Min-age filter
-# ---------------------------------------------------------------------------
+class TestNeverConfirmedStates:
+    """#74/Simon Q4: the sweep must also re-review candidates stranded in
+    'reviewed_approved' or 'pending_user_confirmation' (never-confirmed),
+    preserving no-auto-promotion and the pending_user_confirmation staple."""
+
+    def _candidate(self, cid, ts):
+        return {"candidate_id": cid, "created_at": ts, "category": "personal_fact",
+                "content": f"fact {cid}", "payload": {}}
+
+    def _old_ts(self):
+        return (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+
+    def test_reviewed_approved_stale_candidate_is_swept(self):
+        """A stale 'reviewed_approved' (never human-confirmed) candidate is re-reviewed."""
+        candidates = [self._candidate("c1", self._old_ts())]
+        store = MagicMock()
+        # First call (pending) → empty; second (reviewed_approved) → the candidate.
+        store.list_candidates.side_effect = [[], candidates, []]
+        with patch("reviewer.review_candidate_with_llm",
+                   return_value={"decision": "approve", "reason": "stale"}):
+            counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
+        assert counts.get("reviewed_approved") == 1
+        # It was re-reviewed; the decision stayed reviewed_approved (no promotion).
+        kwargs = store.review_candidate.call_args.kwargs
+        assert kwargs["decision"] == "reviewed_approved"
+
+    def test_reviewed_approved_fresh_candidate_not_swept(self):
+        """A fresh 'reviewed_approved' candidate is not re-reviewed."""
+        fresh_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        candidates = [self._candidate("c1", fresh_ts)]
+        store = MagicMock()
+        store.list_candidates.side_effect = [[], candidates, []]
+        with patch("reviewer.review_candidate_with_llm",
+                   return_value={"decision": "approve", "reason": "ok"}):
+            counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
+        assert store.review_candidate.call_count == 0
+
+    def test_pending_user_confirmation_stale_candidate_is_swept(self):
+        """A stale 'pending_user_confirmation' candidate is re-reviewed and
+        the decision map preserves the rung (no promotion to approved)."""
+        candidates = [self._candidate("c1", self._old_ts())]
+        store = MagicMock()
+        store.list_candidates.side_effect = [[], [], candidates]
+        with patch("reviewer.review_candidate_with_llm",
+                   return_value={"decision": "pending_user_confirmation",
+                                 "reason": "still needs human"}):
+            counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
+        assert counts.get("pending_user_confirmation") == 1
+        kwargs = store.review_candidate.call_args.kwargs
+        assert kwargs["decision"] == "pending_user_confirmation"
+
+    def test_dedupe_across_statuses(self):
+        """The same candidate_id appearing in multiple statuses is swept once."""
+        c = self._candidate("c1", self._old_ts())
+        store = MagicMock()
+        store.list_candidates.side_effect = [[c], [c], [c]]
+        with patch("reviewer.review_candidate_with_llm",
+                   return_value={"decision": "approve", "reason": "ok"}):
+            counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
+        assert store.review_candidate.call_count == 1
+        assert counts.get("reviewed_approved") == 1
+
+    def test_no_auto_promotion_to_approved(self):
+        """No path ever writes the 'approved' status (invariant)."""
+        candidates = [self._candidate("c1", self._old_ts())]
+        store = MagicMock()
+        store.list_candidates.side_effect = [[], candidates, []]
+        with patch("reviewer.review_candidate_with_llm",
+                   return_value={"decision": "approve", "reason": "ok"}):
+            run_stale_review_sweep(store, min_age_min=30, max_batch=25)
+        decisions = [call.kwargs["decision"] for call in store.review_candidate.call_args_list]
+        assert "approved" not in decisions
+        assert "reviewed_approved" in decisions
 
 
 class TestMinAgeFilter:
@@ -156,7 +226,7 @@ class TestBatchCap:
             for i in range(50)
         ]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         # Mock the reviewer to always approve.
         with patch("reviewer.review_candidate_with_llm",
                    return_value={"decision": "approve", "reason": "ok"}):
@@ -173,7 +243,7 @@ class TestBatchCap:
         old_ts = (now - timedelta(minutes=60)).isoformat()
         candidates = [{"candidate_id": "c1", "created_at": old_ts}]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         with patch("reviewer.review_candidate_with_llm",
                    return_value={"decision": "approve"}):
             counts = run_stale_review_sweep(
@@ -199,7 +269,7 @@ class TestNoAutoPromotion:
                        "category": "personal_fact", "content": "fact",
                        "payload": {}}]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         with patch("reviewer.review_candidate_with_llm",
                    return_value={"decision": "approve", "reason": "low risk"}):
             counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
@@ -215,7 +285,7 @@ class TestNoAutoPromotion:
                        "category": "personal_fact", "content": "fact",
                        "payload": {}}]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         with patch("reviewer.review_candidate_with_llm",
                    return_value={"decision": "reject", "reason": "bad"}):
             counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
@@ -228,7 +298,7 @@ class TestNoAutoPromotion:
                        "category": "personal_fact", "content": "fact",
                        "payload": {}}]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         with patch("reviewer.review_candidate_with_llm",
                    return_value={"decision": "quarantine", "reason": "junk"}):
             counts = run_stale_review_sweep(store, min_age_min=30, max_batch=25)
@@ -241,7 +311,7 @@ class TestNoAutoPromotion:
                        "category": "personal_fact", "content": "fact",
                        "payload": {}}]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         with patch("reviewer.review_candidate_with_llm",
                    return_value={"decision": "pending_user_confirmation",
                                  "reason": "needs human"}):
@@ -269,7 +339,7 @@ class TestFailSoft:
              "category": "personal_fact", "content": "fact 2", "payload": {}},
         ]
         store = MagicMock()
-        store.list_candidates.return_value = candidates
+        store.list_candidates.side_effect = [candidates, [], []]
         call_count = [0]
         def mock_review(candidate, **kwargs):
             call_count[0] += 1

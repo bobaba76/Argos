@@ -1,5 +1,8 @@
 """Stale-pending review sweep (#10): periodically re-review memory proposals
-stranded in 'pending' after a failed/rate-limited reviewer call.
+stranded in 'pending' after a failed/rate-limited reviewer call, plus
+never-confirmed candidates stranded in 'reviewed_approved' or
+'pending_user_confirmation' (which the auto-reviewer can leave unconfirmed
+indefinitely).
 
 Consumes the four ``stale_review_*`` config keys that were previously
 parsed but never read:
@@ -68,7 +71,7 @@ def run_stale_review_sweep(
     llm_model: str = "",
     llm_provider: str = "",
 ) -> Dict[str, int]:
-    """Run one sweep pass: re-review stale pending candidates.
+    """Run one sweep pass: re-review stale never-finalized candidates.
 
     Args:
         store: the memory store (DuckDBMemoryStore or SharedMemoryStore).
@@ -76,6 +79,12 @@ def run_stale_review_sweep(
         max_batch: maximum candidates to re-review per sweep.
         llm_model: model for the LLM review call.
         llm_provider: provider for the LLM review call.
+
+    The sweep covers the three never-finalized candidate states —
+    'pending', 'reviewed_approved', and 'pending_user_confirmation' —
+    deduped across statuses, so a strand in any of them is eventually
+    re-examined (fixes the atlas Q4 gap: auto-approved-never-confirmed
+    candidates sat forever).
 
     Returns:
         Dict mapping outcome status to count (e.g.
@@ -99,7 +108,13 @@ def run_stale_review_sweep(
     # the batch. Cap at 500 to bound the query cost.
     fetch_limit = min(max_batch * 4, 500)
     try:
-        candidates = store.list_candidates(status="pending", limit=fetch_limit)
+        candidates = []
+        seen = set()
+        for status in ("pending", "reviewed_approved", "pending_user_confirmation"):
+            for candidate in store.list_candidates(status=status, limit=fetch_limit):
+                if candidate.get("candidate_id") not in seen:
+                    candidates.append(candidate)
+                    seen.add(candidate.get("candidate_id"))
     except Exception as exc:
         logger.debug("sweep: list_candidates failed: %s", exc)
         return counts

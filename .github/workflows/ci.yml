@@ -93,12 +93,20 @@ jobs:
 
       - name: Install deps (minimal — text-only slice)
         # MINIMAL install (PR #337 re-review): the slice store is
-        # embedder=None (text-leg only), so duckdb + pytest suffice.
-        # The full requirements.txt (torch + sentence-transformers)
-        # would make this job slow enough that the workflow-level
-        # concurrency cancel (cancel-in-progress on iterative PRs)
-        # would routinely kill it mid-run.
-        run: pip install duckdb==1.5.5 pytest==9.1.1 pytest-timeout==2.3.1
+        # embedder=None (text-leg only), so torch + sentence-transformers
+        # are NOT needed. The full requirements.txt would make this job
+        # slow enough that the workflow-level concurrency cancel
+        # (cancel-in-progress on iterative PRs) would routinely kill it
+        # mid-run.
+        # The slice IS a real store-path test: the conftest registers an
+        # 'argos' alias that imports argos_plugin/__init__.py, whose
+        # import chain pulls service_client → memory_service →
+        # config_model → pydantic. store_common.py imports numpy at
+        # module level (with a try/except fallback, but we include it so
+        # the slice matches production behaviour). duckdb is the store
+        # backend. kuzu/sentence-transformers are lazy-imported inside
+        # methods and are NOT needed at collection time.
+        run: pip install duckdb==1.5.5 pydantic==2.13.4 numpy pytest==9.1.1 pytest-timeout==2.3.1
 
       - name: Detect retrieval-touching paths
         id: trigger

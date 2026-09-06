@@ -212,7 +212,7 @@ class TestTier2Workflow:
         """The tier1 slice is text-only (embedder=None) — installing the
         full requirements.txt (torch + sentence-transformers) makes the
         job slow enough that concurrency-cancel kills it on iterative
-        PRs. Minimal install: duckdb + pytest."""
+        PRs. Minimal install: duckdb + pydantic + numpy + pytest."""
         wf = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml")
                             .read_text(encoding="utf-8"))
         job = wf["jobs"]["tier1-slice"]
@@ -225,6 +225,69 @@ class TestTier2Workflow:
             "sentence-transformers) — the slice is text-only"
         )
         assert "duckdb" in joined and "pytest" in joined
+        # pydantic is pulled by the conftest's argos alias registration
+        # (argos_plugin/__init__.py → service_client → memory_service →
+        # config_model → from pydantic import BaseModel). Without it the
+        # job dies at collection with ModuleNotFoundError.
+        assert "pydantic" in joined, (
+            "tier1 minimal install must include pydantic — the conftest "
+            "imports argos_plugin/__init__.py whose chain pulls config_model"
+        )
+
+    def test_tier1_minimal_install_covers_import_chain(self):
+        """The minimal install must satisfy the argos_plugin/__init__.py
+        import chain — not just the slice's own file.  This is the
+        regression that caused the CI collection failure: the conftest
+        registers an 'argos' alias that execs __init__.py, whose chain
+        pulls service_client → memory_service → config_model → pydantic.
+        Without pydantic in the minimal install, the job dies at
+        collection with ModuleNotFoundError."""
+        wf = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml")
+                            .read_text(encoding="utf-8"))
+        job = wf["jobs"]["tier1-slice"]
+        install_run = " ".join(
+            s.get("run", "") for s in job["steps"]
+            if "pip install" in (s.get("run") or "")
+        )
+        # Packages named in the workflow's pip install line (strip
+        # version pins so 'pydantic==2.13.4' → 'pydantic').
+        raw = re.findall(r'pip install\s+(.+)', install_run)[0].split()
+        installed = {pkg.split("==")[0].split(">=")[0] for pkg in raw}
+        # Heavy packages that must NOT be in the minimal install.
+        heavy = {"sentence-transformers", "torch", "pandas",
+                 "fastapi", "uvicorn", "PyPDF2", "openpyxl",
+                 "python-docx", "PyYAML", "winsdk"}
+        assert not (installed & heavy), (
+            f"tier1 minimal install must exclude heavy deps, found: "
+            f"{installed & heavy}"
+        )
+        # config_model.py is the file that triggered the regression —
+        # it imports pydantic at module level (no try/except guard).
+        # The minimal install MUST include pydantic so the conftest's
+        # argos alias registration (which execs __init__.py) succeeds.
+        config_model = (_REPO_ROOT / "argos_plugin" / "config_model.py")
+        assert "from pydantic import" in config_model.read_text(
+            encoding="utf-8"), (
+            "config_model.py no longer imports pydantic at module level "
+            "— the regression anchor may need updating"
+        )
+        assert "pydantic" in installed, (
+            "tier1 minimal install must include pydantic — "
+            "config_model.py imports it at module level and the "
+            "conftest's argos alias registration execs __init__.py"
+        )
+        # store_common.py imports numpy at module level (with a
+        # try/except fallback). Include it so the slice matches
+        # production behaviour rather than silently skipping dedup.
+        store_common = (_REPO_ROOT / "argos_plugin" / "store_common.py")
+        assert "import numpy" in store_common.read_text(encoding="utf-8"), (
+            "store_common.py no longer imports numpy — the regression "
+            "anchor may need updating"
+        )
+        assert "numpy" in installed, (
+            "tier1 minimal install must include numpy — "
+            "store_common.py imports it at module level"
+        )
 
     def test_drift_scan_finds_a_written_scores_file(self, tmp_path):
         """Functional: a gate_scores file written into the scanned dir

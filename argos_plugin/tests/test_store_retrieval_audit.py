@@ -228,12 +228,19 @@ class TestSR8RecordRetrievalGuard:
 # ---------------------------------------------------------------------------
 
 class TestSR9TextSearchLimit:
-    def test_limit_reduced_from_2000(self):
-        """SR9: _text_search_raw LIMIT is reduced from 2000."""
+    def test_pool_limit_exceeds_corpus_size(self):
+        """SR9/#342: _text_search_raw pool LIMIT must exceed corpus size.
+
+        The text arm BM25-ranks the fetched pool in Python, so a hard LIMIT
+        below the corpus size silently drops matches from the text arm and
+        collapses RRF hybrid ranking (recall@5 0.9719 -> 0.8844, #342).
+        The cap is a performance bound, never a ranking filter.
+        """
         from store_retrieval import StoreRetrievalMixin
         src = inspect.getsource(StoreRetrievalMixin._text_search_raw)
-        # The SQL LIMIT clause should be 500, not 2000.
-        assert "LIMIT 500" in src
+        # 2000 > 1227 (current personal-store corpus); keeps headroom.
+        assert "LIMIT 2000" in src
+        assert "LIMIT 500" not in src
 
 
 # ---------------------------------------------------------------------------

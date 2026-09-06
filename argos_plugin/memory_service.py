@@ -852,7 +852,7 @@ class MemoryService:
             )
         raise ValueError(f"Unsupported store method: {method}")
 
-    def _call_graph(self, method: str, args: dict, user_id: str, graph) -> Any:
+    def _call_graph(self, method: str, args: dict, user_id: str, graph, store=None) -> Any:
         if graph is None:
             raise RuntimeError("Relationship graph is unavailable")
         graph.set_user_scope(user_id)
@@ -860,6 +860,7 @@ class MemoryService:
             return graph.search_graph(
                 args.get("term", ""),
                 limit=int(args.get("limit", 100)),
+                as_of=args.get("as_of"),
             )
         if method == "memory_ids_for_query":
             return graph.memory_ids_for_query(
@@ -867,12 +868,16 @@ class MemoryService:
                 limit=int(args.get("limit", 100)),
             )
         if method == "query_graph":
-            return graph.query_graph(args.get("entity_id", ""))
+            return graph.query_graph(
+                args.get("entity_id", ""),
+                as_of=args.get("as_of"),
+            )
         if method == "traverse_graph":
             return graph.traverse_graph(
                 args.get("entity_id", ""),
                 depth=args.get("depth", 2),
                 limit=args.get("limit", 100),
+                as_of=args.get("as_of"),
             )
         if method == "count_nodes":
             return graph.count_nodes()
@@ -888,7 +893,32 @@ class MemoryService:
             return graph.add_relationship(**_sanitize_args(args))
         if method == "index_memory":
             # MS9: strip server-set fields from client args.
-            return graph.index_memory(**_sanitize_args(args))
+            args = _sanitize_args(args)
+            # #287 (PR #323 review): derive the temporal windows
+            # SERVER-SIDE from the source record — a client must not be
+            # able to claim arbitrary valid_from/valid_to and forge graph
+            # provenance. The record layer is the source of truth for
+            # valid windows. When the record does not exist in the store,
+            # client-supplied windows are stripped (fail-safe to NULL —
+            # permissive as-of inclusion, no invented provenance).
+            mid = args.get("memory_id")
+            if mid is not None:
+                args.pop("valid_from", None)
+                args.pop("valid_to", None)
+                if store is not None:
+                    try:
+                        recs = store.get_memories_by_ids(
+                            [str(mid)], include_quarantined=True,
+                        )
+                        if recs:
+                            args["valid_from"] = recs[0].valid_from
+                            args["valid_to"] = recs[0].valid_to
+                    except Exception as exc:
+                        logger.debug(
+                            "index_memory window derivation failed for %s: %s",
+                            mid, exc,
+                        )
+            return graph.index_memory(**args)
         if method == "remove_memory":
             # MS9: strip server-set fields from client args.
             return graph.remove_memory(**_sanitize_args(args))
@@ -1137,7 +1167,7 @@ class MemoryService:
             self._lock_wait_count += 1
             if component == "store":
                 return self._call_store(method, args, user_id, tenant.store, tenant.policy, tenant)
-            return self._call_graph(method, args, user_id, tenant.graph)
+            return self._call_graph(method, args, user_id, tenant.graph, tenant.store)
 
     def _backup(self, args: dict) -> Any:
         """Service-coordinated backup via EXPORT DATABASE (FORMAT PARQUET).

@@ -38,6 +38,7 @@ Scope guard:
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Callable, List, Tuple
 
@@ -318,4 +319,324 @@ def run_migrations(
         "applied": applied,
         "skipped": skipped,
         "health_check": health_check_ok,
+    }
+
+
+# ===========================================================================
+# Graph migrations (Kuzu) — #287
+# ===========================================================================
+# The Kuzu graph has its own ordered migration list, mirroring the DuckDB
+# runner's model (#288): ordered, idempotent, transactional, fail-loud.
+# The graph version persists in a ``GraphMeta`` node table inside the Kuzu
+# DB itself (key='graph_schema_version') — the DuckDB schema_meta table is
+# not visible from the Kuzu connection.
+#
+# Kuzu-specific constraint: a FAILED statement inside an explicit
+# transaction kills the transaction ("No active transaction for COMMIT").
+# Migration functions must therefore pre-check preconditions (e.g. column
+# existence via ``CALL table_info``) and only execute statements that are
+# known to succeed — never rely on catching a failed statement inside the
+# transaction.
+#
+# The runner is invoked from KuzuGraphStore._init_db() after the base DDL
+# and the G4 memory_ids migration.
+
+# Timestamp columns added to Entity nodes and RelatesTo edges (#287).
+# ISO-8601 strings — lexicographic order == chronological order, matching
+# the record layer's valid_from/valid_to VARCHAR comparison semantics.
+_GRAPH_NODE_TEMPORAL_COLUMNS = ("created_at", "valid_from", "valid_to")
+_GRAPH_EDGE_TEMPORAL_COLUMNS = ("created_at", "valid_from", "valid_to")
+
+_GRAPH_META_DDL = (
+    "CREATE NODE TABLE GraphMeta("
+    "key STRING, value STRING, PRIMARY KEY(key))"
+)
+
+
+def _ensure_graph_meta_table(conn) -> None:
+    """Create the GraphMeta node table if it doesn't exist (auto-commit)."""
+    try:
+        conn.execute(_GRAPH_META_DDL)
+    except RuntimeError as exc:
+        if not _is_kuzu_already_exists_error(exc):
+            raise
+
+
+def _is_kuzu_already_exists_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "already exists" in msg or "catalog exception" in msg
+
+
+def _kuzu_table_columns(conn, table_name: str) -> set:
+    """Return the set of column names for a Kuzu table."""
+    cols = set()
+    result = conn.execute(
+        f"CALL table_info('{table_name}') RETURN *"
+    )
+    while result.has_next():
+        row = result.get_next()
+        # table_info row: [cid, name, type, default_val, primary_key]
+        if len(row) > 1 and row[1]:
+            cols.add(str(row[1]))
+    return cols
+
+
+def get_graph_schema_version(conn) -> int:
+    """Read the persisted graph schema version from the GraphMeta table.
+
+    Returns 0 for a fresh graph (no GraphMeta table or no row).
+    """
+    try:
+        result = conn.execute(
+            "MATCH (m:GraphMeta {key: 'graph_schema_version'}) "
+            "RETURN m.value"
+        )
+        if result.has_next():
+            return int(result.get_next()[0])
+        return 0
+    except Exception:
+        # GraphMeta table doesn't exist yet — fresh graph, version 0.
+        return 0
+
+
+def _set_graph_schema_version(conn, version: int) -> None:
+    """Persist the graph schema version in the GraphMeta table (upsert).
+
+    Must be called inside the migration's transaction (or auto-commit —
+    both fine; MERGE is a single statement).
+    """
+    conn.execute(
+        """
+        MERGE (m:GraphMeta {key: 'graph_schema_version'})
+        ON MATCH SET m.value = $value
+        ON CREATE SET m.value = $value
+        """,
+        parameters={"value": str(int(version))},
+    )
+
+
+def _graph_migration_0_to_1(conn) -> None:
+    """#287: temporal-aware graph — timestamp columns on nodes and edges.
+
+    Adds ``created_at`` / ``valid_from`` / ``valid_to`` (ISO-8601 STRING)
+    to the Entity node table and the RelatesTo edge table, then backfills
+    from each row's own attributes JSON provenance:
+
+    - ``created_at`` / ``valid_from`` ← attributes.observed_at (edges,
+      stamped by index_memory since #138) or attributes.created_at
+      (memory nodes). Rows with no temporal provenance in their JSON
+      stay NULL — provenance is never invented.
+    - ``valid_to`` stays NULL (open) — the graph cannot know a record's
+      closure on its own; the authoritative window backfill runs through
+      the re-index path (rebuild_graph.py / backfill_graph.py), which
+      reads valid_from/valid_to from the DuckDB source records.
+
+    Idempotent: pre-checks column existence via table_info and only
+    ALTERs missing columns, so a second run executes nothing. All DDL +
+    backfill + version stamp run inside ONE transaction — a failure
+    rolls back cleanly (no half-migrated graph).
+
+    Kuzu constraint: a failed statement kills the transaction, so the
+    column checks happen FIRST (reads are safe inside a txn) and only
+    missing columns are ALTERed.
+    """
+    # Pre-check (safe reads) which columns are missing.
+    node_cols = _kuzu_table_columns(conn, "Entity")
+    edge_cols = _kuzu_table_columns(conn, "RelatesTo")
+    node_alters = [
+        f"ALTER TABLE Entity ADD {col} STRING"
+        for col in _GRAPH_NODE_TEMPORAL_COLUMNS
+        if col not in node_cols
+    ]
+    edge_alters = [
+        f"ALTER TABLE RelatesTo ADD {col} STRING"
+        for col in _GRAPH_EDGE_TEMPORAL_COLUMNS
+        if col not in edge_cols
+    ]
+
+    conn.execute("BEGIN TRANSACTION")
+    try:
+        for stmt in node_alters:
+            conn.execute(stmt)
+        for stmt in edge_alters:
+            conn.execute(stmt)
+
+        # Backfill created_at/valid_from from the row's own attributes
+        # JSON provenance (Python-side parse — Kuzu has no JSON functions
+        # at personal-store scale this scan is cheap, mirroring the G4
+        # backfill pattern).
+        _backfill_graph_timestamps(conn)
+
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+
+
+def _backfill_graph_timestamps(conn) -> int:
+    """Stamp created_at/valid_from on nodes/edges from attributes JSON.
+
+    Provenance-preserving: only stamps from temporal evidence already in
+    the row's own attributes JSON (observed_at on edges since #138,
+    created_at on memory nodes). Never invents timestamps. Rows with no
+    provenance stay NULL until the re-index path backfills them from the
+    DuckDB source records.
+
+    Returns the number of rows stamped.
+    """
+    stamped = 0
+
+    # Edges: observed_at lives in the attributes JSON (stamped by
+    # index_memory since #138).
+    result = conn.execute(
+        """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+           WHERE r.created_at IS NULL AND r.valid_from IS NULL
+           RETURN a.id, r.relation_type, b.id, r.attributes"""
+    )
+    rows = []
+    while result.has_next():
+        rows.append(result.get_next())
+    for src, rel, dst, raw_attrs in rows:
+        try:
+            attrs = json.loads(raw_attrs) if raw_attrs else {}
+        except Exception:
+            attrs = {}
+        observed = attrs.get("observed_at") or attrs.get("created_at")
+        if not observed:
+            continue
+        conn.execute(
+            """MATCH (a:Entity {id: $src})-[r:RelatesTo {relation_type: $rel}]->(b:Entity {id: $dst})
+               SET r.created_at = $ts, r.valid_from = $ts""",
+            parameters={"src": src, "rel": rel, "dst": dst, "ts": str(observed)},
+        )
+        stamped += 1
+
+    # Nodes: memory nodes carry created_at in their attributes JSON.
+    result = conn.execute(
+        """MATCH (n:Entity)
+           WHERE n.created_at IS NULL AND n.entity_type = 'memory'
+           RETURN n.id, n.attributes"""
+    )
+    rows = []
+    while result.has_next():
+        rows.append(result.get_next())
+    for nid, raw_attrs in rows:
+        try:
+            attrs = json.loads(raw_attrs) if raw_attrs else {}
+        except Exception:
+            attrs = {}
+        created = attrs.get("created_at")
+        if not created:
+            continue
+        conn.execute(
+            "MATCH (n:Entity {id: $id}) SET n.created_at = $ts, n.valid_from = $ts",
+            parameters={"id": nid, "ts": str(created)},
+        )
+        stamped += 1
+
+    if stamped:
+        logger.info(
+            "Graph temporal backfill: stamped timestamps on %d row(s) "
+            "from attributes provenance",
+            stamped,
+        )
+    return stamped
+
+
+GRAPH_MIGRATIONS: List[Migration] = [
+    (0, 1, _graph_migration_0_to_1),
+]
+
+# The latest graph schema version = the last graph migration's version_to.
+LATEST_GRAPH_SCHEMA_VERSION = (
+    GRAPH_MIGRATIONS[-1][1] if GRAPH_MIGRATIONS else 0
+)
+
+
+def run_graph_migrations(
+    conn,
+    *,
+    migrations: List[Migration] | None = None,
+) -> dict:
+    """Run ordered graph (Kuzu) migrations on *conn*.
+
+    Mirrors the DuckDB ``run_migrations`` model (#288): ordered,
+    idempotent, transactional, fail-loud. Called from
+    ``KuzuGraphStore._init_db()`` after the base DDL.
+
+    Each migration runs inside BEGIN/COMMIT (managed jointly by the
+    runner and the migration fn — see the Kuzu constraint note above).
+    A failure rolls back and raises — the graph is NOT left
+    half-migrated. The version stamp is written AFTER the migration fn
+    commits (a separate implicit transaction — Kuzu DDL pre-checks must
+    run inside the migration fn's txn, so the runner cannot own the
+    txn boundary).
+
+    Returns a report dict: from_version, to_version, applied, skipped.
+    """
+    migs = migrations if migrations is not None else GRAPH_MIGRATIONS
+
+    # Ensure the GraphMeta table exists before reading from it
+    # (auto-commit DDL — safe outside a transaction).
+    _ensure_graph_meta_table(conn)
+
+    from_version = get_graph_schema_version(conn)
+    applied: List[int] = []
+    skipped: List[int] = []
+
+    logger.info(
+        "Graph schema migration: starting from version %d, target %d",
+        from_version, LATEST_GRAPH_SCHEMA_VERSION,
+    )
+
+    current = from_version
+    for v_from, v_to, apply_fn in migs:
+        if v_to <= current:
+            skipped.append(v_to)
+            continue
+        if v_from != current:
+            raise RuntimeError(
+                f"Graph migration gap: expected version_from={current} "
+                f"but migration says version_from={v_from} "
+                f"(version_to={v_to}). The migration list is broken "
+                f"or a migration was inserted out of order."
+            )
+        logger.info("Graph schema migration: applying %d → %d", v_from, v_to)
+        try:
+            # The migration fn manages its own transaction (BEGIN/
+            # COMMIT/ROLLBACK) because Kuzu pre-checks must happen
+            # inside the txn but failed statements kill it — see the
+            # module comment. The fn raises on failure after rolling
+            # back, so the graph is never half-migrated.
+            apply_fn(conn)
+            _set_graph_schema_version(conn, v_to)
+            applied.append(v_to)
+            current = v_to
+            logger.info("Graph schema migration: %d → %d complete", v_from, v_to)
+        except Exception as exc:
+            logger.error(
+                "Graph schema migration FAILED at %d → %d: %s. "
+                "Transaction rolled back. graph_schema_version remains %d. "
+                "The graph is NOT half-migrated — fix the migration "
+                "and restart.",
+                v_from, v_to, exc, current,
+            )
+            raise RuntimeError(
+                f"Graph schema migration {v_from}→{v_to} failed: {exc}"
+            ) from exc
+
+    to_version = get_graph_schema_version(conn)
+    logger.info(
+        "Graph schema migration: complete. %d → %d (applied=%s, skipped=%s)",
+        from_version, to_version, applied, skipped,
+    )
+
+    return {
+        "from_version": from_version,
+        "to_version": to_version,
+        "applied": applied,
+        "skipped": skipped,
     }

@@ -850,26 +850,33 @@ class SharedGraphStore:
         self.user_id = user_id
         self._rpc.user_id = user_id
 
-    def search_graph(self, term: str, limit: int = 100) -> List[dict]:
-        return self._rpc.call("graph", "search_graph", term=term, limit=limit) or []
+    def search_graph(
+        self, term: str, limit: int = 100, as_of: str | None = None,
+    ) -> List[dict]:
+        return self._rpc.call(
+            "graph", "search_graph", term=term, limit=limit, as_of=as_of,
+        ) or []
 
     def memory_ids_for_query(self, query: str, limit: int = 100) -> List[str]:
         return self._rpc.call(
             "graph", "memory_ids_for_query", query=query, limit=limit,
         ) or []
 
-    def query_graph(self, entity_id: str) -> List[dict]:
-        return self._rpc.call("graph", "query_graph", entity_id=entity_id) or []
+    def query_graph(self, entity_id: str, as_of: str | None = None) -> List[dict]:
+        return self._rpc.call(
+            "graph", "query_graph", entity_id=entity_id, as_of=as_of,
+        ) or []
 
     def traverse_graph(
         self,
         entity_id: str,
         depth: int = 2,
         limit: int = 100,
+        as_of: str | None = None,
     ) -> Dict[str, Any]:
         return self._rpc.call(
             "graph", "traverse_graph",
-            entity_id=entity_id, depth=depth, limit=limit,
+            entity_id=entity_id, depth=depth, limit=limit, as_of=as_of,
         ) or {"entity_id": entity_id, "depth": depth, "nodes": [], "edges": []}
 
     def count_nodes(self) -> int:

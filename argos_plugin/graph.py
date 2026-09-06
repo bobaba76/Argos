@@ -965,6 +965,26 @@ class KuzuGraphStore:
                 # One-time idempotent migration (see _backfill_memory_ids).
                 _backfill_memory_ids(conn)
 
+                # #287: ordered graph schema migrations (temporal columns).
+                # Runs AFTER the base DDL + G4 migration, mirroring the
+                # DuckDB runner model (#288): ordered, idempotent,
+                # transactional, fail-loud. Version tracked in the
+                # GraphMeta node table inside the Kuzu DB.
+                try:
+                    try:
+                        from .schema_migrations import run_graph_migrations
+                    except ImportError:
+                        from schema_migrations import run_graph_migrations
+                    run_graph_migrations(conn)
+                except Exception as exc:
+                    logger.error(
+                        "Graph schema migration failed at init: %s. "
+                        "The graph may be in a pre-migration state. "
+                        "See schema_migrations.py for recovery steps.",
+                        exc,
+                    )
+                    raise
+
             # Reuse the shared connection. G1: self.conn is now a property
             # that reads from the shared pool, so we don't cache it here.
             self.database, _shared_conn, self._shared_conn_lock, ref_count = shared
@@ -1028,7 +1048,19 @@ class KuzuGraphStore:
         node_type: str,
         attributes: Dict[str, Any] | None = None,
         user_scope: str | None = None,
+        created_at: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
     ) -> None:
+        """Create or update a node.
+
+        #287: optional temporal columns (ISO-8601 strings) mirroring the
+        record layer's valid windows. ``created_at`` is first-seen (never
+        overwritten on match). ``valid_from``/``valid_to`` are stamped
+        when explicitly provided — memory nodes mirror their source
+        record's window (last write wins); entity nodes are cumulative
+        and normally stay open (valid_to=NULL).
+        """
         incoming = dict(attributes or {})
         scope = user_scope or self.user_id
         node_id = self._internal_id(node_id)
@@ -1037,8 +1069,9 @@ class KuzuGraphStore:
                 "MATCH (n:Entity {id: $id}) RETURN n.attributes",
                 parameters={"id": node_id},
             )
+            node_exists = existing_result.has_next()
             existing: Dict[str, Any] = {}
-            if existing_result.has_next():
+            if node_exists:
                 existing = self._parse_attributes(existing_result.get_next()[0])
             merged = dict(existing)
             merged.update(incoming)
@@ -1064,14 +1097,42 @@ class KuzuGraphStore:
             effective_type = node_type
             if existing_type == "person" and node_type != "person":
                 effective_type = "person"
+            # #287: temporal columns. created_at is first-seen (an existing
+            # value is never overwritten); the valid window is last-write-
+            # wins when the caller explicitly provides one (memory nodes
+            # mirror their source record's window exactly). Existing values
+            # are ALWAYS preserved when the caller passes nothing — a
+            # plain re-index must never NULL out backfilled provenance.
+            node_created = created_at
+            node_valid_from = valid_from
+            node_valid_to = valid_to
+            if node_exists:
+                cur = self.conn.execute(
+                    "MATCH (n:Entity {id: $id}) "
+                    "RETURN n.created_at, n.valid_from, n.valid_to",
+                    parameters={"id": node_id},
+                )
+                if cur.has_next():
+                    row = cur.get_next()
+                    if node_created is None:
+                        node_created = row[0]
+                    if node_valid_from is None:
+                        node_valid_from = row[1]
+                    if node_valid_to is None:
+                        node_valid_to = row[2]
             query = """
             MERGE (n:Entity {id: $id})
-            ON MATCH SET n.entity_type = $type, n.attributes = $attrs
-            ON CREATE SET n.entity_type = $type, n.attributes = $attrs, n.user_scope = $scope
+            ON MATCH SET n.entity_type = $type, n.attributes = $attrs,
+                         n.created_at = $cat, n.valid_from = $vf, n.valid_to = $vt
+            ON CREATE SET n.entity_type = $type, n.attributes = $attrs, n.user_scope = $scope,
+                          n.created_at = $cat, n.valid_from = $vf, n.valid_to = $vt
             """
             self.conn.execute(query, parameters={
                 "id": node_id, "type": effective_type,
                 "attrs": json.dumps(merged), "scope": scope,
+                "cat": str(node_created) if node_created else None,
+                "vf": str(node_valid_from) if node_valid_from else None,
+                "vt": str(node_valid_to) if node_valid_to else None,
             })
 
     def upsert_edge(
@@ -1081,8 +1142,29 @@ class KuzuGraphStore:
         relation_type: str,
         attributes: Dict[str, Any] | None = None,
         user_scope: str | None = None,
+        created_at: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
     ) -> None:
-        """Create or update an edge while preserving multi-memory evidence."""
+        """Create or update an edge while preserving multi-memory evidence.
+
+        #287: temporal columns mirror the contributing records' valid
+        windows. An edge aggregates evidence from multiple memories, so
+        its window is the UNION of its evidence windows: valid at T iff
+        ANY contributing memory is valid at T. The per-evidence windows
+        live in the attributes JSON ``memory_windows`` map
+        ({memory_id: [valid_from, valid_to-or-null]}); the queryable
+        ``valid_from``/``valid_to`` columns are recomputed from the map
+        on every upsert:
+
+        - valid_from = min over evidence windows
+        - valid_to   = NULL if ANY evidence window is open, else max
+
+        This gives exact union semantics AND correct closure: when the
+        only open evidence for an edge is re-indexed with a closed
+        window (its record was superseded), the edge's valid_to column
+        closes too — a superseded record's edge stops being live.
+        """
         incoming = dict(attributes or {})
         scope = user_scope or self.user_id
         source_id = self._internal_id(source_id)
@@ -1091,15 +1173,22 @@ class KuzuGraphStore:
             existing_result = self.conn.execute(
                 """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
                    WHERE r.relation_type = $rel_type
-                   RETURN r.attributes""",
+                   RETURN r.attributes, r.created_at, r.valid_from, r.valid_to""",
                 parameters={
                     "source": source_id, "target": target_id,
                     "rel_type": relation_type,
                 },
             )
             existing: Dict[str, Any] = {}
+            existing_created = None
+            existing_valid_from = None
+            existing_valid_to = None
             if existing_result.has_next():
-                raw = existing_result.get_next()[0]
+                row = existing_result.get_next()
+                raw = row[0]
+                existing_created = row[1]
+                existing_valid_from = row[2]
+                existing_valid_to = row[3]
                 try:
                     parsed = json.loads(raw) if raw else {}
                     if isinstance(parsed, dict):
@@ -1126,6 +1215,62 @@ class KuzuGraphStore:
                 merged["status"] = "active"
                 merged.pop("quarantine_reason", None)
                 merged.pop("quarantined_at", None)
+
+            # #287: per-evidence valid windows + column recompute.
+            # memory_windows: {memory_id: [valid_from, valid_to|None]}.
+            # Existing windows come from the edge's own JSON (survives
+            # round-trips); the incoming evidence's window overwrites its
+            # own entry (last write wins per memory — a re-indexed record
+            # updates its window, e.g. closes it on supersede).
+            #
+            # Blocker fix (PR #323 review): a legacy-shape re-index
+            # (memory evidence, NO temporal args — valid_from and
+            # valid_to both None) must NOT overwrite the existing entry.
+            # Overwriting with [None, None] would flip the recomputed
+            # valid_to from its closed value back to NULL, reopening the
+            # edge and making it live after its evidence record closed —
+            # exactly the silent disagreement #287 exists to prevent.
+            # Preserve the existing entry in that case; only an explicit
+            # window (either bound provided) updates it.
+            memory_windows = existing.get("memory_windows")
+            if not isinstance(memory_windows, dict):
+                memory_windows = {}
+            effective_from = valid_from if valid_from is not None else created_at
+            if memory_id:
+                existing_entry = memory_windows.get(str(memory_id))
+                if existing_entry is None or (
+                    valid_from is not None or valid_to is not None
+                ):
+                    memory_windows[str(memory_id)] = [
+                        str(effective_from) if effective_from else None,
+                        str(valid_to) if valid_to is not None else None,
+                    ]
+            if memory_windows:
+                merged["memory_windows"] = memory_windows
+
+            # Recompute the edge's window columns as the union of the
+            # per-evidence windows (NULL valid_to dominates = open).
+            # When there is NO temporal info at all (legacy edge, caller
+            # passed nothing), preserve the existing columns — a plain
+            # re-index must never NULL out backfilled provenance.
+            edge_created = created_at if created_at is not None else existing_created
+            if memory_windows:
+                froms = [w[0] for w in memory_windows.values() if w[0]]
+                tos = [w[1] for w in memory_windows.values() if w[1]]
+                edge_valid_from = min(froms) if froms else (
+                    str(effective_from) if effective_from else existing_valid_from
+                )
+                # Open evidence (valid_to NULL) keeps the whole edge open.
+                has_open = any(w[1] is None for w in memory_windows.values())
+                edge_valid_to = None if has_open else (max(tos) if tos else None)
+            else:
+                edge_valid_from = (
+                    str(effective_from) if effective_from else existing_valid_from
+                )
+                edge_valid_to = (
+                    str(valid_to) if valid_to is not None else existing_valid_to
+                )
+
             attrs_json = json.dumps(merged)
             # G4: also set the memory_ids column (mirrors the JSON list) so
             # remove_memory can use list_contains instead of a full scan.
@@ -1133,13 +1278,18 @@ class KuzuGraphStore:
             query = """
             MATCH (a:Entity {id: $source}), (b:Entity {id: $target})
             MERGE (a)-[r:RelatesTo {relation_type: $rel_type}]->(b)
-            ON MATCH SET r.attributes = $attrs, r.user_scope = $scope, r.memory_ids = $mids
-            ON CREATE SET r.attributes = $attrs, r.user_scope = $scope, r.memory_ids = $mids
+            ON MATCH SET r.attributes = $attrs, r.user_scope = $scope, r.memory_ids = $mids,
+                         r.created_at = $cat, r.valid_from = $vf, r.valid_to = $vt
+            ON CREATE SET r.attributes = $attrs, r.user_scope = $scope, r.memory_ids = $mids,
+                          r.created_at = $cat, r.valid_from = $vf, r.valid_to = $vt
             """
             self.conn.execute(query, parameters={
                 "source": source_id, "target": target_id,
                 "rel_type": relation_type, "attrs": attrs_json, "scope": scope,
                 "mids": edge_memory_ids,
+                "cat": str(edge_created) if edge_created else None,
+                "vf": str(edge_valid_from) if edge_valid_from else None,
+                "vt": str(edge_valid_to) if edge_valid_to else None,
             })
 
     def add_relationship(
@@ -1150,6 +1300,9 @@ class KuzuGraphStore:
         target: str,
         target_type: str,
         attributes: Dict[str, Any] | None = None,
+        created_at: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
     ) -> None:
         """Convenience: upsert both nodes then the edge.
 
@@ -1157,6 +1310,10 @@ class KuzuGraphStore:
         upserts so that re-indexing a memory clears any prior quarantine
         on the entity nodes (the quarantine-clear guard in upsert_node
         requires incoming memory evidence to fire).
+
+        #287: temporal params pass through to the edge upsert (the edge
+        mirrors its source record's valid window). Entity nodes are
+        cumulative — they get created_at only, never a closed window.
         """
         node_attrs: Dict[str, Any] = {}
         if attributes:
@@ -1164,9 +1321,15 @@ class KuzuGraphStore:
                 node_attrs["memory_id"] = attributes["memory_id"]
             if "memory_ids" in attributes:
                 node_attrs["memory_ids"] = attributes["memory_ids"]
-        self.upsert_node(source, source_type, node_attrs)
-        self.upsert_node(target, target_type, node_attrs)
-        self.upsert_edge(source, target, relation, attributes)
+        self.upsert_node(source, source_type, node_attrs,
+                         created_at=created_at, valid_from=valid_from,
+                         valid_to=valid_to)
+        self.upsert_node(target, target_type, node_attrs,
+                         created_at=created_at, valid_from=valid_from,
+                         valid_to=valid_to)
+        self.upsert_edge(source, target, relation, attributes,
+                         created_at=created_at, valid_from=valid_from,
+                         valid_to=valid_to)
 
     def index_memory(
         self,
@@ -1177,12 +1340,26 @@ class KuzuGraphStore:
         created_at: str | None = None,
         use_llm: bool = True,
         flush: bool = True,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
     ) -> int:
         """Index one memory and its extracted entities in the graph.
 
         A memory node provides an explicit bridge back to the source record;
         shared entity nodes provide cross-memory linking. Re-indexing the
         same memory is safe because edges retain a memory-id evidence list.
+
+        #287: ``valid_from``/``valid_to`` mirror the source record's valid
+        window (ISO-8601 strings) so the graph answers "as-of T" the same
+        way the flat store does. An edge contributed by this memory is
+        valid only while the record's version window is valid. When the
+        caller provides no temporal args (legacy shape), edges keep their
+        existing windows (preservation — a plain re-index never reopens a
+        closed edge); NEW edges get observation-time stamping
+        (valid_from = created_at, valid_to = NULL/open). The
+        re-index/backfill path (rebuild_graph.py / backfill_graph.py)
+        passes the record's actual windows — provenance is preserved,
+        never invented.
 
         Extraction is regex-first, LLM-supplemented when regex finds few
         relations and the content is substantial. All entities pass through
@@ -1204,7 +1381,21 @@ class KuzuGraphStore:
             "created_at": created_at,
             "status": "active",
         }
-        self.upsert_node(memory_node, "memory", memory_attrs)
+        # #287: the memory node mirrors its source record's valid window
+        # exactly (last write wins on re-index).
+        self.upsert_node(
+            memory_node, "memory", memory_attrs,
+            created_at=created_at,
+            valid_from=valid_from if valid_from is not None else created_at,
+            valid_to=valid_to,
+        )
+        # Edge calls PASS THROUGH the caller's temporal args (no
+        # created_at defaulting here): a legacy-shape re-index (no
+        # temporal args) arrives at upsert_edge as [None, None], which
+        # preserves the edge's existing per-evidence window instead of
+        # overwriting it with an open one (blocker fix, PR #323 review).
+        # New edges still get observation-time stamping via upsert_edge's
+        # effective_from = valid_from or created_at.
         self.add_relationship(
             memory_node,
             "memory",
@@ -1212,6 +1403,9 @@ class KuzuGraphStore:
             "user",
             "person",
             {"memory_id": str(memory_id), "category": category},
+            created_at=created_at,
+            valid_from=valid_from,
+            valid_to=valid_to,
         )
 
         # Phase 1: relation extraction (may call the LLM), BEFORE any graph
@@ -1235,6 +1429,11 @@ class KuzuGraphStore:
                 relation["target"],
                 relation["target_type"],
                 attributes,
+                created_at=created_at,
+                # #287: the edge is valid only while its source record's
+                # version window is valid.
+                valid_from=valid_from,
+                valid_to=valid_to,
             )
             # Link the source memory to the entity so graph traversal can
             # explain which stored memories support a relationship.
@@ -1245,6 +1444,9 @@ class KuzuGraphStore:
                 relation["target"],
                 relation["target_type"],
                 {"memory_id": str(memory_id), "category": category},
+                created_at=created_at,
+                valid_from=valid_from,
+                valid_to=valid_to,
             )
         if flush:
             self._flush()
@@ -1396,6 +1598,7 @@ class KuzuGraphStore:
         depth: int = 2,
         limit: int = 100,
         require_specific_seed: bool = True,
+        as_of: str | None = None,
     ) -> List[str]:
         """Traversal-based retrieval: walk TYPED relations from seed entities.
 
@@ -1412,6 +1615,8 @@ class KuzuGraphStore:
         relationships personal context") ground only to generic concepts —
         their traversal output is hub-adjacent noise that regresses
         precision, so the caller skips the boost floor for them.
+
+        #287: ``as_of`` (ISO-8601) — only edges valid at T are walked.
 
         Returns memory IDs ordered by traversal weight (desc).
         """
@@ -1439,7 +1644,7 @@ class KuzuGraphStore:
         seed_types: Dict[str, str] = {}
         for term in terms:
             try:
-                for edge in self.search_graph(term, limit=20):
+                for edge in self.search_graph(term, limit=20, as_of=as_of):
                     for endpoint in (edge["source"], edge["target"]):
                         eid = str(endpoint)
                         if eid != "user" and not eid.startswith("memory:"):
@@ -1481,7 +1686,7 @@ class KuzuGraphStore:
                 break
             if len(frontier) > 40:  # keep per-hop queries bounded
                 frontier = frontier[:40]
-            edges = self._query_edges_for_nodes(frontier)
+            edges = self._query_edges_for_nodes(frontier, as_of=as_of)
             next_frontier = []
             for edge in edges:
                 rel = edge.get("relation")
@@ -1522,6 +1727,7 @@ class KuzuGraphStore:
         dense_prior: float = 0.05,
         max_iterations: int = 20,
         convergence_threshold: float = 1e-4,
+        as_of: str | None = None,
     ) -> List[str]:
         """Personalized PageRank diffusion from query-grounded seed entities.
 
@@ -1578,7 +1784,7 @@ class KuzuGraphStore:
         seeds: Dict[str, float] = {}
         for term in terms:
             try:
-                for edge in self.search_graph(term, limit=20):
+                for edge in self.search_graph(term, limit=20, as_of=as_of):
                     for endpoint in (edge.get("source"), edge.get("target")):
                         eid = str(endpoint)
                         if eid == "user" or eid.startswith("memory:"):
@@ -1618,7 +1824,7 @@ class KuzuGraphStore:
 
         # Hop 1: edges touching seeds.
         seed_list = list(seeds.keys())
-        hop1_edges = self._query_edges_for_nodes(seed_list)
+        hop1_edges = self._query_edges_for_nodes(seed_list, as_of=as_of)
         for edge in hop1_edges:
             src = str(edge.get("source", ""))
             tgt = str(edge.get("target", ""))
@@ -1633,7 +1839,7 @@ class KuzuGraphStore:
         # Hop 2: edges touching hop-1 neighbors.
         hop1_neighbors = [n for n in all_nodes if n not in seeds]
         if hop1_neighbors:
-            hop2_edges = self._query_edges_for_nodes(hop1_neighbors[:50])
+            hop2_edges = self._query_edges_for_nodes(hop1_neighbors[:50], as_of=as_of)
             for edge in hop2_edges:
                 src = str(edge.get("source", ""))
                 tgt = str(edge.get("target", ""))
@@ -1736,7 +1942,7 @@ class KuzuGraphStore:
         ordered = sorted(scores, key=lambda mid: (-scores[mid], mid))
         return ordered[:max(1, min(int(limit), 500))]
 
-    def query_graph(self, entity_id: str) -> List[Dict[str, Any]]:
+    def query_graph(self, entity_id: str, as_of: str | None = None) -> List[Dict[str, Any]]:
         """Find visible edges touching an entity id (bidirectional).
 
         Matches both outgoing (entity as source) and incoming (entity as
@@ -1744,19 +1950,30 @@ class KuzuGraphStore:
         "shame" in a memory->concept mentions edge) are found. Without
         the incoming half, query_graph under-reports because the extractor
         mostly creates edges as memory -> concept.
+
+        #287: ``as_of`` (ISO-8601) restricts to edges valid at T —
+        "connections as of <date>". Default (None) is unfiltered.
         """
         query = """
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
-        WHERE a.id = $id OR b.id = $id
+        WHERE (a.id = $id OR b.id = $id)
+        """
+        params: Dict[str, Any] = {"id": self._internal_id(entity_id)}
+        if as_of:
+            query += (
+                "AND (r.valid_from IS NULL OR r.valid_from <= $as_of) "
+                "AND (r.valid_to IS NULL OR r.valid_to > $as_of) "
+            )
+            params["as_of"] = str(as_of)
+        query += """
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
                b.attributes AS target_attrs, r.attributes AS relation_attrs
         """
-        internal_id = self._internal_id(entity_id)
         # #76: consume the full result set inside the lock.
         with self._shared_conn_lock:
-            results = self.conn.execute(query, parameters={"id": internal_id})
+            results = self.conn.execute(query, parameters=params)
             rows = []
             while results.has_next():
                 rows.append(results.get_next())
@@ -1772,7 +1989,9 @@ class KuzuGraphStore:
             })
         return edges
 
-    def search_graph(self, term: str, limit: int = 100) -> List[Dict[str, Any]]:
+    def search_graph(
+        self, term: str, limit: int = 100, as_of: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Bidirectional fuzzy search over visible entity edges.
 
         Filtering is pushed into Kuzu (WHERE CONTAINS + LIMIT) so the
@@ -1784,6 +2003,8 @@ class KuzuGraphStore:
         filter_graph_neighbours logic as traverse_graph. Without this,
         a user with a restricted client_scope mask can see graph entities
         from other client scopes within the same tenant.
+
+        #287: ``as_of`` (ISO-8601) restricts to edges valid at T.
 
         Architecture note (issue #11): Kùzu is deliberately used as a
         derived re-ranker / adjacency store at current personal-store scale
@@ -1810,6 +2031,17 @@ class KuzuGraphStore:
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
         WHERE a.user_scope = $scope AND b.user_scope = $scope
           AND (toLower(a.id) CONTAINS $term OR toLower(b.id) CONTAINS $term)
+        """
+        params: Dict[str, Any] = {
+            "term": term_lower, "scope": self.user_id, "limit": limit * 3,
+        }
+        if as_of:
+            query += (
+                "AND (r.valid_from IS NULL OR r.valid_from <= $as_of) "
+                "AND (r.valid_to IS NULL OR r.valid_to > $as_of) "
+            )
+            params["as_of"] = str(as_of)
+        query += """
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
@@ -1828,7 +2060,7 @@ class KuzuGraphStore:
             # multiplier is the pragmatic trade-off.
             results = self.conn.execute(
                 query,
-                parameters={"term": term_lower, "scope": self.user_id, "limit": limit * 3},
+                parameters=params,
             )
             rows = []
             while results.has_next():
@@ -1876,11 +2108,18 @@ class KuzuGraphStore:
         return edges
 
     def _query_edges_for_nodes(
-        self, node_ids: List[str]
+        self, node_ids: List[str], as_of: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Fetch all visible edges touching any of the given node ids.
 
         Uses a parameterized IN-list so Kuzu does the filtering, not Python.
+
+        #287: ``as_of`` (ISO-8601 string) restricts results to edges whose
+        valid window covers T — mirroring the record layer's temporal
+        filter (valid_from <= T AND (valid_to IS NULL OR valid_to > T)).
+        Edges with NULL valid_from (legacy, no provenance) are included
+        permissively; the default (as_of=None) is unfiltered and preserves
+        the existing traversal shape exactly.
         """
         if not node_ids:
             return []
@@ -1908,10 +2147,20 @@ class KuzuGraphStore:
         # single hub from flooding the adjacency dict.
         edge_limit = max(50, len(node_ids) * 50)
         params["edge_limit"] = edge_limit
+        # #287: temporal filter — same semantics as the record layer's
+        # as_of WHERE fragment (store_retrieval._build_memory_where).
+        as_of_sql = ""
+        if as_of:
+            params["as_of"] = str(as_of)
+            as_of_sql = (
+                "AND (r.valid_from IS NULL OR r.valid_from <= $as_of) "
+                "AND (r.valid_to IS NULL OR r.valid_to > $as_of) "
+            )
         query = f"""
         MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
         WHERE (a.id IN [{ph_list}] OR b.id IN [{ph_list}])
           AND a.user_scope = $scope AND b.user_scope = $scope
+          {as_of_sql}
         RETURN a.id AS source, a.entity_type AS source_type,
                r.relation_type AS relation, b.id AS target,
                b.entity_type AS target_type, a.attributes AS source_attrs,
@@ -2014,12 +2263,19 @@ class KuzuGraphStore:
         entity_id: str,
         depth: int = 2,
         limit: int = 100,
+        as_of: str | None = None,
     ) -> Dict[str, Any]:
         """Return a bounded bidirectional neighborhood around an entity.
 
         Uses targeted per-hop queries (WHERE node IN frontier) instead of
         loading all edges. This keeps each query O(frontier edges) rather
         than O(all edges), making traversal practical as the graph grows.
+
+        #287: ``as_of`` (ISO-8601) — version-consistent traversal: only
+        edges whose valid window covers T are walked, so the graph answers
+        "connections as of T" the same way the flat store answers as-of
+        record queries. Default (None) preserves the existing traversal
+        shape exactly.
         """
         requested = str(entity_id or "").strip()
         if not requested:
@@ -2040,7 +2296,7 @@ class KuzuGraphStore:
         # Verify the seed has at least one visible edge. A node with all
         # edges quarantined (e.g. after remove_memory) should not appear
         # in traversal results, matching the old edge-driven behavior.
-        seed_edges = self._query_edges_for_nodes([seed["id"]])
+        seed_edges = self._query_edges_for_nodes([seed["id"]], as_of=as_of)
         if not seed_edges:
             return {"entity_id": seed["id"], "depth": depth, "nodes": [], "edges": []}
 
@@ -2054,7 +2310,7 @@ class KuzuGraphStore:
         for hop in range(depth):
             if not frontier or len(node_data) >= limit:
                 break
-            edges = self._query_edges_for_nodes(frontier)
+            edges = self._query_edges_for_nodes(frontier, as_of=as_of)
             next_frontier: List[str] = []
             # G5: collect newly discovered endpoints and batch-fetch them
             # in one query instead of per-node _query_node calls.
@@ -2138,6 +2394,18 @@ class KuzuGraphStore:
             )
             row = results.get_next()
             return int(row[0]) if row else 0
+
+    def get_graph_schema_version(self) -> int:
+        """#287: introspect the persisted graph schema version (GraphMeta)."""
+        try:
+            try:
+                from .schema_migrations import get_graph_schema_version
+            except ImportError:
+                from schema_migrations import get_graph_schema_version
+            with self._shared_conn_lock:
+                return int(get_graph_schema_version(self.conn))
+        except Exception:
+            return 0
 
     def count_edges(self) -> int:
         with self._shared_conn_lock:

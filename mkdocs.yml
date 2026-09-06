@@ -1,0 +1,86 @@
+site_name: Argos
+site_description: Persistent memory for AI agents, on your own machine. Local-first, evidence-oriented, auditable.
+site_url: https://bobaba76.github.io/Argos/
+repo_url: https://github.com/bobaba76/Argos
+repo_name: bobaba76/Argos
+edit_uri: edit/master/docs/
+docs_dir: docs
+site_dir: site
+
+# Exclude pre-existing internal governance/POPIA documents that live
+# in docs/ but are NOT part of the public docs site. These were placed
+# by other issues (#72 POPIA annex, engineering notes) before the docs
+# site existed. They are excluded from the build so they don't ship to
+# GitHub Pages as unlinked orphan pages.
+exclude_docs: |
+  annexure-a-processing-annex.md
+  procedure-outcome-records.md
+  provider-due-diligence-checklist.md
+  archive/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Installation: installation.md
+  - Configuration: configuration.md
+  - API reference:
+      - Overview: api/index.md
+      - MCP (stdio): api/mcp.md
+      - REST (HTTP): api/rest.md
+  - Tuning: tuning.md
+  - Integration guides: integration.md
+  - FAQ: faq.md
+
+markdown_extensions:
+  - admonition
+  - codehilite:
+      guess_lang: false
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.details
+  - pymdownx.snippets
+  - attr_list
+  - md_in_html
+  - tables
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/bobaba76/Argos
+
+copyright:
+  Business Source License 1.1 — free for personal and non-production use.

@@ -850,6 +850,7 @@ class MemoryService:
             return graph.search_graph(
                 args.get("term", ""),
                 limit=int(args.get("limit", 100)),
+                as_of=args.get("as_of"),
             )
         if method == "memory_ids_for_query":
             return graph.memory_ids_for_query(
@@ -857,12 +858,16 @@ class MemoryService:
                 limit=int(args.get("limit", 100)),
             )
         if method == "query_graph":
-            return graph.query_graph(args.get("entity_id", ""))
+            return graph.query_graph(
+                args.get("entity_id", ""),
+                as_of=args.get("as_of"),
+            )
         if method == "traverse_graph":
             return graph.traverse_graph(
                 args.get("entity_id", ""),
                 depth=args.get("depth", 2),
                 limit=args.get("limit", 100),
+                as_of=args.get("as_of"),
             )
         if method == "count_nodes":
             return graph.count_nodes()

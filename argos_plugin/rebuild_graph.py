@@ -172,6 +172,10 @@ def main() -> int:
                 tags=tags,
                 created_at=created_at,
                 use_llm=use_llm,
+                # #287: mirror the record's valid window onto the graph
+                # node/edges — provenance preserved from the source record.
+                valid_from=getattr(rec, "valid_from", None) or created_at,
+                valid_to=getattr(rec, "valid_to", None),
             )
             indexed += 1
         except Exception as e:

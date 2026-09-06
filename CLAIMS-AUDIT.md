@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 59 test modules in `argos_plugin/tests/` (1169 `def test_` definitions; full suite green 2026-08-30 via `pytest tests/ -q -n 4`). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
+| Test suite | ✓ | 137 test modules in `argos_plugin/tests/` (2,493 `def test_` definitions; counts generated via AST 2026-09-06 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -149,6 +149,13 @@ committed, re-runnable artifact:
       history entry above is left as-is (it records the *filing*); this entry records the
       *resolution* so the audit no longer implies either gap is open.
   No code behavior changed — this is a documentation-only refresh of the living index.
+- **2026-09-06 (#325)** — §2 test-suite row refreshed: was 59 modules / 1169 tests (01/9);
+  now 137 modules / 2,493 `def test_` definitions, counted via AST (`ast.walk`, UTF-8 BOM
+  tolerated) by the new `scripts/count_test_fns.py`. The README Verification section quotes
+  2,350 / 131 (as of 2026-09-05). To stop this row rotting again,
+  `tests/test_claims_audit_parity.py` parses the row and fails when the quoted counts drift
+  more than 5% from the on-disk counts. `pytest --collect-only -q` remains authoritative for
+  parametrized totals; the AST count is the definition floor.
 - **2026-09-02** — `graph_traversal_enabled` A/B (#139): added `traversal_on` arm to
   `run_eval_provider.py`, ran on the self-corpus snapshot (1201 records, 300 queries)
   vs `baseline`. Result: **flat** — all 10 metrics identical (MRR 0.9, nDCG@5 0.9119,

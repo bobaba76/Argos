@@ -517,17 +517,20 @@ class StoreWriteMixin:
           "rows": [ {row_number, outcome, content, memory_id?,
                      candidate_id?, existing_memory_id?, errors?} ... ],
           "errors": [ {row_number, errors: [...]} ... ],   # validation
-          "wrote": bool,                                   # False in preview
+          "wrote": bool,   # True only when apply wrote ≥1 row
+                           # (inserted or superseded); False in preview
         }
         """
         try:
             try:
                 from .structured_ingest import (
-                    IngestError, map_rows, mapping_id, parse_rows,
+                    IngestError, IngestValidationError,
+                    map_rows, mapping_id, parse_rows,
                 )
             except ImportError:
                 from structured_ingest import (
-                    IngestError, map_rows, mapping_id, parse_rows,
+                    IngestError, IngestValidationError,
+                    map_rows, mapping_id, parse_rows,
                 )
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
@@ -570,12 +573,15 @@ class StoreWriteMixin:
         }
 
         # Fail loud: ANY validation error aborts an apply batch before
-        # any write (no partial silent skip). The per-row error list is
-        # the report.
+        # any write (no partial silent skip). The report — per-row errors
+        # included — travels on the exception so the caller does not have
+        # to re-run preview to see what failed.
         if mode == "apply" and validation_errors:
-            raise ValueError(
+            raise IngestValidationError(
                 f"ingest validation failed for {len(validation_errors)} "
-                f"row(s) — nothing written. See errors in the report."
+                f"row(s) — nothing written. Per-row errors are attached "
+                f"as exc.report.",
+                report=report,
             )
         if not facts:
             return report
@@ -587,17 +593,25 @@ class StoreWriteMixin:
         #    keyless rows: content-based three-layer scan.
         def _find_existing(fact: Dict[str, Any]) -> tuple[str | None, str]:
             if fact.get("key_value"):
+                # Scope-aware doc-identity lookup (#289 fix): the keyed
+                # path must honor the same client_scope/doc_class
+                # narrowing as the keyless _find_current_similar path —
+                # otherwise a keyed re-ingest under one client_scope
+                # dedupes against (or supersedes) another scope's
+                # records. IS NOT DISTINCT FROM keeps NULL matching NULL.
+                scope_sql, scope_params = self._doc_identity_scope_clause(
+                    namespace, client_scope, doc_class, fact["source_doc_id"],
+                )
                 with self._state.lock:
                     assert self.connection is not None
                     row = self.connection.execute(
-                        """SELECT memory_id, content FROM memory_records
-                           WHERE namespace = ? AND source_doc_id = ?
-                             AND category = ?
+                        f"""SELECT memory_id, content FROM memory_records
+                           WHERE category = ?
                              AND valid_to IS NULL
                              AND (user_scope IS NULL OR user_scope = ?)
+                             {scope_sql}
                            LIMIT 1""",
-                        [namespace, fact["source_doc_id"], fact["category"],
-                         self.user_id],
+                        [fact["category"], self.user_id, *scope_params],
                     ).fetchone()
                 if row:
                     return row[0], "row_key"
@@ -609,13 +623,28 @@ class StoreWriteMixin:
             return existing_id, (reason or "")
 
         resolved = []
-        seen_contents: Dict[str, int] = {}
+        seen_batch_keys: Dict[tuple, int] = {}
         for fact in facts:
             existing_id, match_reason = _find_existing(fact)
-            content_key = fact["content"].strip().lower()
-            in_batch_dup = seen_contents.get(content_key)
+            if fact.get("key_value"):
+                # Keyed mode: dedupe in-batch by document identity
+                # (namespace + category + source_doc_id), NOT content —
+                # two rows with identical rendered content but different
+                # key values are DISTINCT documents and must both be
+                # stored (#289 fix; content-keyed dedupe silently dropped
+                # the second row).
+                batch_key: tuple = (
+                    "key", fact["category"], fact["source_doc_id"],
+                )
+            else:
+                # Keyless mode: content-based in-batch dedupe (all rows
+                # share one source_doc_id, so content is the identity).
+                batch_key = (
+                    "content", fact["content"].strip().lower(),
+                )
+            in_batch_dup = seen_batch_keys.get(batch_key)
             resolved.append((fact, existing_id, match_reason, in_batch_dup))
-            seen_contents[content_key] = fact["row_number"]
+            seen_batch_keys[batch_key] = fact["row_number"]
 
         # 3. Per-row outcomes.
         for fact, existing_id, match_reason, in_batch_dup in resolved:
@@ -746,7 +775,11 @@ class StoreWriteMixin:
             else:
                 report["inserted"] += 1
 
-        report["wrote"] = mode == "apply"
+        # "wrote" reflects ACTUAL applied rows — an apply batch where
+        # every row ended duplicate/blocked/quarantined wrote nothing.
+        report["wrote"] = mode == "apply" and bool(
+            report["inserted"] or report["superseded"]
+        )
         return report
 
     # -- value-supersession (stale-number detection) -------------------------

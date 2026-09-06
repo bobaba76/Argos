@@ -236,6 +236,104 @@ class TestDedupeOnIngest:
         assert report["inserted"] == 1
         assert report["duplicates"] == 1
 
+    def test_keyed_same_content_different_keys_both_stored(self, store):
+        """Regression (#289): in-batch dedupe keyed on CONTENT dropped
+        distinct keyed rows. Two rows with identical rendered content but
+        different key values are distinct documents — both must store."""
+        data = json.dumps([
+            {"employee_id": "E1", "name": "Alice", "employer": "Acme", "role": "engineer"},
+            {"employee_id": "E2", "name": "Alice", "employer": "Acme", "role": "engineer"},
+        ])
+        report = store.ingest_structured(
+            data, "json", EMPLOYEE_MAPPING, "twins.json",
+            mode="apply", confirm=True,
+        )
+        assert report["inserted"] == 2
+        assert report["duplicates"] == 0
+        recs = store.list_recent(limit=100)
+        assert len(recs) == 2
+        doc_ids = {r.source_doc_id for r in recs}
+        assert doc_ids == {"twins.json#E1", "twins.json#E2"}
+
+    def test_keyless_in_batch_content_dedupe(self, store):
+        """Keyless mode keeps content-based in-batch dedupe (all rows
+        share one source_doc_id, so content IS the identity)."""
+        mapping = {
+            "category": "personal_fact",
+            "content_template": "{name} works at {employer}",
+            "fields": {
+                "name": {"type": "str", "required": True},
+                "employer": {"type": "str", "required": True},
+            },
+        }
+        data = json.dumps([
+            {"name": "Zed", "employer": "Acme"},
+            {"name": "Zed", "employer": "Acme"},
+        ])
+        report = store.ingest_structured(
+            data, "json", mapping, "keyless.json",
+            mode="apply", confirm=True,
+        )
+        assert report["inserted"] == 1
+        assert report["duplicates"] == 1
+
+
+class TestKeyedLookupScopeAware:
+    """Regression (#289): the keyed existing-record lookup must honor
+    client_scope/doc_class — same contract as the keyless path. Without
+    this, a keyed ingest under one client_scope deduped against (or with
+    changed content SUPERSEDED) another scope's records."""
+
+    def test_keyed_changed_content_other_scope_inserts_not_supersedes(
+        self, store,
+    ):
+        r1 = store.ingest_structured(
+            EMPLOYEE_JSON, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True, client_scope="client-a",
+        )
+        assert r1["inserted"] == 2
+        changed = json.dumps([
+            {"employee_id": "E1", "name": "Alice", "employer": "Globex",
+             "role": "engineer"},
+            {"employee_id": "E2", "name": "Bob", "employer": "Globex",
+             "role": "designer"},
+        ])
+        r2 = store.ingest_structured(
+            changed, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True, client_scope="client-b",
+        )
+        # client-b rows are NEW documents — never supersede client-a's.
+        assert r2["inserted"] == 2
+        assert r2["superseded"] == 0
+        assert r2["duplicates"] == 0
+        # client-a records are untouched and still current.
+        with store._state.lock:
+            rows = store.connection.execute(
+                "SELECT client_scope, valid_to FROM memory_records "
+                "WHERE namespace = 'ingest:employees.json'"
+            ).fetchall()
+        by_scope = {}
+        for scope, valid_to in rows:
+            by_scope.setdefault(scope, []).append(valid_to)
+        assert len(by_scope.get("client-a", [])) == 2
+        assert all(v is None for v in by_scope["client-a"])
+        assert len(by_scope.get("client-b", [])) == 2
+        assert all(v is None for v in by_scope["client-b"])
+
+    def test_keyed_identical_content_other_scope_inserts(self, store):
+        """Identical content under a different client_scope is NOT a
+        duplicate — the keyed lookup is scope-narrowed."""
+        store.ingest_structured(
+            EMPLOYEE_JSON, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True, client_scope="client-a",
+        )
+        r2 = store.ingest_structured(
+            EMPLOYEE_JSON, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True, client_scope="client-b",
+        )
+        assert r2["inserted"] == 2
+        assert r2["duplicates"] == 0
+
 
 class TestSupersessionOnIngest:
     """5. Re-ingest with changed value supersedes; valid_to closes old."""
@@ -298,6 +396,31 @@ class TestSupersessionOnIngest:
             x["content"] == "Alice works at Acme as engineer"
             for x in blocked_rows
         )
+
+    def test_wrote_false_when_every_row_blocked(self, store):
+        """Regression (#289): "wrote" must reflect ACTUAL applied rows —
+        an apply batch where every row ended duplicate/blocked wrote
+        nothing and must not claim otherwise."""
+        store.ingest_structured(
+            EMPLOYEE_JSON, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True,
+        )
+        changed = EMPLOYEE_JSON.replace('"employer": "Acme"', '"employer": "Globex"')
+        r2 = store.ingest_structured(
+            changed, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True,
+        )
+        assert r2["wrote"] is True  # the supersession DID write
+        # Re-ingest the ORIGINAL values: the superseded row is tombstone-
+        # blocked, the unchanged row is a duplicate — nothing applied.
+        r3 = store.ingest_structured(
+            EMPLOYEE_JSON, "json", EMPLOYEE_MAPPING, "employees.json",
+            mode="apply", confirm=True,
+        )
+        assert r3["inserted"] == 0
+        assert r3["superseded"] == 0
+        assert r3["blocked"] >= 1
+        assert r3["wrote"] is False
 
 
 class TestDryRunPreview:
@@ -432,6 +555,26 @@ class TestValidationFailLoud:
         recs = store.list_recent(limit=100)
         assert all("Frank" not in r.content for r in recs)
 
+    def test_apply_validation_failure_attaches_report(self, store):
+        """Regression (#289): the apply-mode validation failure carries
+        the full report (per-row errors included) on exc.report, so the
+        caller does not have to re-run preview to see what failed."""
+        data = json.dumps([
+            {"employee_id": "E5", "name": "Eve", "employer": "Acme"},  # bad
+            {"employee_id": "E6", "name": "Frank", "employer": "Acme", "role": "ops"},
+        ])
+        with pytest.raises(ValueError) as excinfo:
+            store.ingest_structured(
+                data, "json", EMPLOYEE_MAPPING, "partial.json",
+                mode="apply", confirm=True,
+            )
+        report = getattr(excinfo.value, "report", None)
+        assert report is not None, "exception carries no report"
+        assert report["wrote"] is False
+        assert report["error_rows"] == 1
+        assert report["errors"][0]["row_number"] == 1
+        assert any("role" in e for e in report["errors"][0]["errors"])
+
     def test_bad_mapping_spec_fails_loud(self, store):
         bad_mapping = {"category": "personal_fact", "content_template": "{nope}"}
         report = store.ingest_structured(
@@ -535,6 +678,42 @@ class TestFacadeIngestOperation:
                 "source_name": "employees.json",
                 "mode": "apply",
             })
+
+    def test_facade_string_confirm_rejected(self, facade):
+        """Regression (#289): bool("false") is True — a client sending
+        the STRING "false" must not pass the human-in-loop gate. Only
+        the literal boolean True confirms."""
+        f, store = facade
+        ctx = self._ctx()
+        with pytest.raises(Exception):
+            f.execute(ctx, "ingest", {
+                "data": EMPLOYEE_JSON,
+                "fmt": "json",
+                "mapping": EMPLOYEE_MAPPING,
+                "source_name": "employees.json",
+                "mode": "apply",
+                "confirm": "false",
+            })
+        # Nothing written.
+        assert len(store.list_recent(limit=100)) == 0
+
+    def test_facade_ingest_size_limit_counts_bytes(self, facade):
+        """Regression (#289): the size limit must count UTF-8 BYTES, not
+        characters — multibyte content can exceed the wire limit while
+        passing a character count."""
+        f, _store = facade
+        ctx = self._ctx()
+        # ~200k chars but ~400k UTF-8 bytes (> 256 KiB limit).
+        data = json.dumps([{"name": "é" * 200_000}])
+        with pytest.raises(Exception) as excinfo:
+            f.execute(ctx, "ingest", {
+                "data": data,
+                "fmt": "json",
+                "mapping": EMPLOYEE_MAPPING,
+                "source_name": "big.json",
+                "mode": "preview",
+            })
+        assert getattr(excinfo.value, "code", "") == "request_too_large"
 
     def test_facade_rejects_provenance_claims(self, facade):
         """D4: the caller may not claim server-set provenance fields."""

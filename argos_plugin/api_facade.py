@@ -448,7 +448,10 @@ def _validate_ingest_params(params: Dict[str, Any]) -> Dict[str, Any]:
     data = params.get("data")
     if not isinstance(data, str) or not data.strip():
         raise APIError("invalid_input", "data is required (JSON or CSV text)")
-    if len(data) > MAX_INGEST_BYTES:
+    # Byte-count limit (#289 fix): len(str) counts characters, but the
+    # limit is a wire-size bound — UTF-8 multibyte content can exceed it
+    # while passing a character count. Count encoded bytes.
+    if len(data.encode("utf-8")) > MAX_INGEST_BYTES:
         raise APIError(
             "request_too_large",
             f"data exceeds max ingest size {MAX_INGEST_BYTES} bytes",
@@ -482,7 +485,10 @@ def _validate_ingest_params(params: Dict[str, Any]) -> Dict[str, Any]:
         raise APIError("invalid_input", "mode must be 'preview' or 'apply'")
     cleaned["mode"] = mode
     # Human-in-loop gate: apply requires an explicit confirm flag.
-    confirm = bool(params.get("confirm", False))
+    # Strict bool check (#289 fix): bool("false") is True in Python, so a
+    # client sending the STRING "false" must not pass the human-in-loop
+    # gate — only the literal boolean True confirms.
+    confirm = params.get("confirm", False) is True
     if mode == "apply" and not confirm:
         raise APIError(
             "invalid_input",

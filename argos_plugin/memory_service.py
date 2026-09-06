@@ -634,7 +634,9 @@ class MemoryService:
             # the facade when present; over raw RPC they are accepted
             # as-is (trusted-local boundary, same as save_candidate).
             args = _sanitize_args(args)
-            confirm = bool(args.get("confirm", False))
+            # Strict bool (#289 fix): bool("false") is True — only the
+            # literal boolean True passes the human-in-loop gate.
+            confirm = args.get("confirm", False) is True
             return store.ingest_structured(
                 data=str(args.get("data", "")),
                 fmt=str(args.get("fmt", "")),

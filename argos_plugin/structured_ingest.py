@@ -49,6 +49,19 @@ class IngestError(Exception):
     """
 
 
+class IngestValidationError(ValueError):
+    """Apply-mode batch aborted by per-row validation errors.
+
+    Subclasses ValueError (callers match on ValueError) and carries the
+    full ingest report — including the per-row ``errors`` list — so the
+    caller does not have to re-run preview to see what failed.
+    """
+
+    def __init__(self, message: str, report: Dict[str, Any]) -> None:
+        super().__init__(message)
+        self.report = report
+
+
 # {field} placeholder in content_template — safe subset (identifier chars
 # only; no attribute access, no format specs, no indexing).
 _TEMPLATE_REF_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")

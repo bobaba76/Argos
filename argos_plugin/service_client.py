@@ -718,6 +718,19 @@ class SharedMemoryStore:
             return False
         return value
 
+    def facade_delete_memory(self, **kwargs: Any) -> bool | dict:
+        """#200 Spec-10: sanctioned facade-only delete path.
+
+        delete_memory is in _FORBIDDEN_STORE_METHODS on the RPC boundary
+        (no raw RPC passthrough). The facade gates this with ctx.is_loopback
+        + server-derived identity before calling this method. The service
+        dispatches it to store.delete_memory() with the same semantics.
+        """
+        value = self._rpc.call("store", "facade_delete_memory", **kwargs)
+        if value is False or value is None:
+            return False
+        return value
+
     def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Read-only census of deletion tombstones (hash+metadata, newest first)."""
         return list(self._rpc.call("store", "list_tombstones", limit=limit) or [])

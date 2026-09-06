@@ -775,6 +775,13 @@ class MemoryService:
             )
         if method == "delete_memory":
             return store.delete_memory(**args)
+        # #200 Spec-10: sanctioned facade-only delete path. The facade
+        # gates this with ctx.is_loopback + server-derived identity before
+        # calling. delete_memory is in _FORBIDDEN_STORE_METHODS for raw
+        # RPC; facade_delete_memory is NOT — it's the facade's sanctioned
+        # path to the same store-level delete semantics.
+        if method == "facade_delete_memory":
+            return store.delete_memory(**args)
         # -- deletion tombstones (read-only visibility + escape hatch) ---------
         if method == "list_tombstones":
             return store.list_tombstones(

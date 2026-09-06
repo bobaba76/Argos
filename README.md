@@ -36,6 +36,27 @@ python -m argos_plugin.mcp_server --home <hermes-home>
 
 Writes over the API (propose → human-approve classes) are on the roadmap behind the same facade.
 
+## Admin Console (#295)
+
+A local web UI for browsing, searching, reviewing candidates, and triggering ops (erase/export) — all through the same `ArgosAPIFacade` (auth → ACL → validation → audit). Loopback-only, same bearer token as the REST server.
+
+```bash
+# One-command start (same token as REST, one port above):
+ARGOS_REST_TOKEN=<token> ARGOS_API_CAN_PROPOSE=1 \
+  python -m argos_plugin.admin_console --home <hermes-home> --port 8733
+```
+
+Then open `http://127.0.0.1:8733` in your browser.
+
+- **Browse** — list memories by category/namespace, scoped to your user/tenant.
+- **Search** — full-text + semantic search through the facade.
+- **Provenance** — evidence chain, version chain, conflict notes per record (#280 walk).
+- **Review queue** — approve/reject pending candidates through the existing approval-ledger flow (no bypass; `review_source="tool"`, audit row written).
+- **Erase** — POPIA erase-request with preview-first and strict confirm (#293).
+- **Export** — portable JSONL + Markdown export (#294).
+
+Security: bound to `127.0.0.1` only (never `0.0.0.0`); server-derived identity (no client-supplied user identity); read-only by default (set `ARGOS_API_CAN_PROPOSE=1` to enable mutation actions); `Cache-Control: no-store` on all responses; no tokens in HTML output.
+
 ## Tools
 
 Sixteen `memory_*` tools, grouped:

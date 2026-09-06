@@ -16,7 +16,7 @@ ARGOS_REST_TOKEN=<token> python -m argos_plugin.rest_server --home <hermes-home>
 | `--port` | no | `8732` | Port to bind. |
 | `--max-concurrent` | no | `20` | Maximum concurrent requests. |
 
-The token is loaded from `ARGOS_REST_TOKEN` (env var) or `rest_token` in the Hermes home config. The server refuses to start without a token (fail-closed).
+The token is loaded from `ARGOS_REST_TOKEN` (env var) or `{home}/api_credential.json` (key `token`) in the Hermes home directory. The server refuses to start without a token (fail-closed).
 
 ## Auth
 

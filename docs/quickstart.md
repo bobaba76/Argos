@@ -1,6 +1,6 @@
 # Quickstart
 
-Get Argos running in five minutes. This assumes you already have [Hermes](https://github.com/cognition-ai/hermes) installed. If not, see [Installation](installation.md) for the full path.
+Get Argos running in five minutes. This assumes you already have [Hermes](https://github.com/NousResearch/hermes-agent) installed. If not, see [Installation](installation.md) for the full path.
 
 ## 1. Install the plugin
 

@@ -89,3 +89,8 @@ _tmb_send_reqest.py
 # (C:\Users\...) in captured stdout. The harness code IS committed;
 # only the raw results are ignored.
 eval/repro/cost/results/
+
+# #296: MkDocs build output — local `mkdocs build` leaves this dir.
+# The GitHub Pages workflow builds in CI and uploads the artifact; the
+# local build output should never be committed.
+site/

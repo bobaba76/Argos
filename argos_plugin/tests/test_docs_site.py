@@ -392,3 +392,82 @@ class TestNoPersonalInfo:
         assert not meds, (
             f"medication references found in {doc_file}: {meds}"
         )
+
+
+# -- Regression: REST token filename must match live code -------------------
+
+class TestRESTTokenFilename:
+    """#296 webhook review: the docs must reference api_credential.json
+    (key 'token') + ARGOS_REST_TOKEN — NOT 'rest_token' in config.
+
+    The live code (rest_server.py:_load_rest_token) loads from
+    {home}/api_credential.json (key 'token') OR ARGOS_REST_TOKEN env var.
+    A previous version of the docs said 'rest_token in the Hermes home
+    config', which is a key the server never reads — a user following
+    those docs would create a config key that does nothing.
+    """
+
+    @pytest.mark.parametrize("doc_file", ["api/rest.md", "faq.md"])
+    def test_no_rest_token_key_in_docs(self, doc_file):
+        """The docs must NOT reference 'rest_token' as a config key."""
+        text = _read_doc(doc_file)
+        # 'rest_token' as a config key (not as an env var or filename).
+        # Match it in contexts like "rest_token in the Hermes home config"
+        # or "Set rest_token" — but not "ARGOS_REST_TOKEN" (the env var).
+        # Strip the env var name first to avoid false positives.
+        stripped = text.replace("ARGOS_REST_TOKEN", "")
+        assert "rest_token" not in stripped.lower(), (
+            f"'rest_token' found in {doc_file} — the live code loads "
+            f"api_credential.json (key 'token'), not a 'rest_token' "
+            f"config key. See rest_server.py:_load_rest_token."
+        )
+
+    @pytest.mark.parametrize("doc_file", ["api/rest.md", "faq.md"])
+    def test_api_credential_json_in_docs(self, doc_file):
+        """The docs must reference api_credential.json as the token file."""
+        text = _read_doc(doc_file)
+        assert "api_credential.json" in text, (
+            f"'api_credential.json' not found in {doc_file} — the live "
+            f"code (rest_server.py:_load_rest_token) loads the token from "
+            f"this file. The docs must mention it."
+        )
+
+    def test_rest_token_loading_matches_live_code(self):
+        """The docs must not contradict rest_server.py:_load_rest_token."""
+        source = _read_source("rest_server.py")
+        # The live code loads api_credential.json with key 'token'.
+        assert "api_credential.json" in source
+        assert 'data.get("token"' in source
+        assert "ARGOS_REST_TOKEN" in source
+
+
+# -- Regression: no dead links to 404 repos ---------------------------------
+
+class TestNoDeadLinks:
+    """#296 webhook review: no links to 404 GitHub repos.
+
+    A previous version of quickstart.md linked to
+    github.com/cognition-ai/hermes, which 404s. Hermes lives at
+    NousResearch/hermes-agent.
+    """
+
+    @pytest.mark.parametrize("doc_file", [
+        "index.md", "quickstart.md", "installation.md", "configuration.md",
+        "api/index.md", "api/mcp.md", "api/rest.md",
+        "tuning.md", "integration.md", "faq.md",
+    ])
+    def test_no_cognition_ai_hermes_link(self, doc_file):
+        """The docs must not link to the dead cognition-ai/hermes repo."""
+        text = _read_doc(doc_file)
+        assert "cognition-ai/hermes" not in text, (
+            f"dead link 'cognition-ai/hermes' found in {doc_file} — "
+            f"Hermes lives at NousResearch/hermes-agent."
+        )
+
+    def test_quickstart_links_to_correct_hermes_repo(self):
+        """quickstart.md must link to the correct Hermes repo."""
+        text = _read_doc("quickstart.md")
+        assert "NousResearch/hermes-agent" in text, (
+            "quickstart.md must link to NousResearch/hermes-agent "
+            "(the correct Hermes repo), not the dead cognition-ai/hermes."
+        )

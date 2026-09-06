@@ -7,6 +7,17 @@ edit_uri: edit/master/docs/
 docs_dir: docs
 site_dir: site
 
+# Exclude pre-existing internal governance/POPIA documents that live
+# in docs/ but are NOT part of the public docs site. These were placed
+# by other issues (#72 POPIA annex, engineering notes) before the docs
+# site existed. They are excluded from the build so they don't ship to
+# GitHub Pages as unlinked orphan pages.
+exclude_docs: |
+  annexure-a-processing-annex.md
+  procedure-outcome-records.md
+  provider-due-diligence-checklist.md
+  archive/
+
 theme:
   name: material
   features:

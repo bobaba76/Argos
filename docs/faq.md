@@ -80,7 +80,7 @@ Another Hermes process is holding the DuckDB file. Use `shared_service` mode (de
 
 ### The REST server won't start
 
-It needs a token. Set `ARGOS_REST_TOKEN` or `rest_token` in the Hermes home config. The server refuses to start without one (fail-closed).
+It needs a token. Set `ARGOS_REST_TOKEN` (env var) or create `{home}/api_credential.json` with a `token` key in the Hermes home directory. The server refuses to start without one (fail-closed).
 
 ## More help
 

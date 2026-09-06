@@ -31,13 +31,16 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 r = requests.post(f"{BASE}/v1/memory/search",
                   headers=HEADERS,
                   json={"query": "where does the user live?", "limit": 5})
-for hit in r.json()["results"]:
+results = r.json()["results"]
+for hit in results:
     print(hit["memory_id"], hit["content"], hit["similarity"])
 
-# Fetch provenance
-r = requests.get(f"{BASE}/v1/memories/{hit['memory_id']}/explain",
-                 headers=HEADERS)
-print(r.json())
+# Fetch provenance for the first result (if any)
+if results:
+    first = results[0]
+    r = requests.get(f"{BASE}/v1/memories/{first['memory_id']}/explain",
+                     headers=HEADERS)
+    print(r.json())
 ```
 
 ### curl

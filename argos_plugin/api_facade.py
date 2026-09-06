@@ -2356,7 +2356,13 @@ class ArgosAPIFacade:
     def _op_collection_create(
         self, ctx: AuthContext, params: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Class C write: create a collection. Server-mints ID."""
+        """Class C write: create a collection. Server-mints ID.
+
+        #200 PR-2 fix: passes confirm=True as the RPC-seam capability
+        marker. The service dispatch (memory_service.py) denies raw RPC
+        calls without confirm=True and writes an audit row. In
+        direct-store mode (tests), confirm is accepted and ignored.
+        """
         _scope_before = getattr(self._store, "user_id", None)
         try:
             if hasattr(self._store, "set_user_scope"):
@@ -2366,6 +2372,7 @@ class ArgosAPIFacade:
                 template=params.get("template"),
                 schema=params.get("schema"),
                 tenant=ctx.tenant,
+                confirm=True,
             )
         finally:
             if _scope_before is not None and hasattr(self._store, "set_user_scope"):
@@ -2376,7 +2383,10 @@ class ArgosAPIFacade:
     def _op_collection_add_item(
         self, ctx: AuthContext, params: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Class C write: add an item to a collection. Server-mints ID."""
+        """Class C write: add an item to a collection. Server-mints ID.
+
+        #200 PR-2 fix: passes confirm=True (RPC-seam capability marker).
+        """
         _scope_before = getattr(self._store, "user_id", None)
         try:
             if hasattr(self._store, "set_user_scope"):
@@ -2386,6 +2396,7 @@ class ArgosAPIFacade:
                 fields=params["fields"],
                 status=params.get("status", "open"),
                 tenant=ctx.tenant,
+                confirm=True,
             )
         except ValueError as exc:
             raise APIError("invalid_input", str(exc))
@@ -2398,7 +2409,10 @@ class ArgosAPIFacade:
     def _op_collection_update_item(
         self, ctx: AuthContext, params: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Class C write: update a collection item. CAS via expected_version."""
+        """Class C write: update a collection item. CAS via expected_version.
+
+        #200 PR-2 fix: passes confirm=True (RPC-seam capability marker).
+        """
         _scope_before = getattr(self._store, "user_id", None)
         try:
             if hasattr(self._store, "set_user_scope"):
@@ -2408,6 +2422,7 @@ class ArgosAPIFacade:
                 fields=params.get("fields"),
                 status=params.get("status"),
                 expected_version=params.get("expected_version"),
+                confirm=True,
             )
         except ValueError as exc:
             if "CAS conflict" in str(exc):
@@ -2426,7 +2441,10 @@ class ArgosAPIFacade:
         self, ctx: AuthContext, params: Dict[str, Any],
     ) -> Dict[str, Any]:
         """Class C write: remove (archive) a collection item. CAS via
-        expected_version. Sets archived_at; does not delete the row."""
+        expected_version. Sets archived_at; does not delete the row.
+
+        #200 PR-2 fix: passes confirm=True (RPC-seam capability marker).
+        """
         _scope_before = getattr(self._store, "user_id", None)
         try:
             if hasattr(self._store, "set_user_scope"):
@@ -2434,6 +2452,7 @@ class ArgosAPIFacade:
             item = self._store.remove_collection_item(
                 item_id=params["item_id"],
                 expected_version=params.get("expected_version"),
+                confirm=True,
             )
         except ValueError as exc:
             if "CAS conflict" in str(exc):

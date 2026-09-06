@@ -235,8 +235,15 @@ class StoreCollectionsMixin:
         template: str | None = None,
         schema: Dict[str, Any] | None = None,
         tenant: str | None = None,
+        confirm: bool = False,
     ) -> Dict[str, Any]:
-        """Create a new collection. Server-mints the collection_id."""
+        """Create a new collection. Server-mints the collection_id.
+
+        ``confirm`` is a capability marker for the RPC seam
+        (memory_service.py dispatch) — ignored in direct-store mode.
+        See #200 PR-2 fix: raw RPC collection writes without
+        confirm=True are denied at the service dispatch.
+        """
         if not name or not name.strip():
             raise ValueError("collection name is required")
         collection_id = _mint_id("col")
@@ -271,11 +278,15 @@ class StoreCollectionsMixin:
         fields: Dict[str, Any],
         status: str = "open",
         tenant: str | None = None,
+        confirm: bool = False,
     ) -> Dict[str, Any]:
         """Add an item to a collection. Server-mints the item_id.
 
         Validates fields against the collection's schema if one is set
         (minimal name/type/required check). Free-form JSON when no schema.
+
+        ``confirm`` is a capability marker for the RPC seam — ignored
+        in direct-store mode. See #200 PR-2 fix.
         """
         if not collection_id:
             raise ValueError("collection_id is required")
@@ -323,12 +334,16 @@ class StoreCollectionsMixin:
         fields: Dict[str, Any] | None = None,
         status: str | None = None,
         expected_version: str | None = None,
+        confirm: bool = False,
     ) -> Dict[str, Any]:
         """Update a collection item. CAS via expected_version: if provided,
         must match the item's current item_id (compare+update in one call).
 
         Returns the updated item dict. Raises ValueError on not found or
         CAS conflict.
+
+        ``confirm`` is a capability marker for the RPC seam — ignored
+        in direct-store mode. See #200 PR-2 fix.
         """
         if not item_id:
             raise ValueError("item_id is required")
@@ -403,12 +418,16 @@ class StoreCollectionsMixin:
         *,
         item_id: str,
         expected_version: str | None = None,
+        confirm: bool = False,
     ) -> Dict[str, Any]:
         """Remove (archive) a collection item. Sets archived_at; does NOT
         delete the row (audit trail). CAS via expected_version.
 
         Returns the archived item dict. Raises ValueError on not found or
         CAS conflict.
+
+        ``confirm`` is a capability marker for the RPC seam — ignored
+        in direct-store mode. See #200 PR-2 fix.
         """
         if not item_id:
             raise ValueError("item_id is required")

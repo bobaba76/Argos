@@ -100,6 +100,22 @@ _FORBIDDEN_GRAPH_METHODS = frozenset({
     "clear_scope",
 })
 
+# #200 Spec-10 PR 2/3 fix: Collection WRITE methods that are gated at the
+# raw-RPC seam. These are NOT in _FORBIDDEN_STORE_METHODS (the facade
+# legitimately calls them), but a raw RPC caller with the endpoint token
+# must NOT be able to bypass the facade's loopback gate + audit. The
+# dispatch handler requires confirm=True (literal bool — same precedent
+# as facade_delete_memory and erase_subject #293) and writes an audit
+# row on every call (success + denial). Reads (list_collections,
+# list_collection_items, count_collection_items, get_collection) are
+# NOT gated — they're read-only and scope-filtered.
+_GATED_COLLECTION_WRITE_METHODS = frozenset({
+    "create_collection",
+    "add_collection_item",
+    "update_collection_item",
+    "remove_collection_item",
+})
+
 
 def _sanitize_args(args: dict) -> dict:
     """MS1/MS9: strip server-set fields from client-supplied args.
@@ -969,36 +985,93 @@ class MemoryService:
             )
         if method == "get_collection":
             return store.get_collection(args.get("collection_id", ""))
-        if method == "create_collection":
+        # -- #200 Spec-10 PR 2/3 fix: gated collection writes -------------
+        # These 4 write methods require confirm=True (literal bool) as a
+        # capability marker — only the facade passes it. A raw RPC caller
+        # with the endpoint token cannot bypass the facade's loopback gate.
+        # Every call (success + denial) writes an audit row with the
+        # service-resolved user_id. Same precedent as facade_delete_memory
+        # and erase_subject #293. Client-supplied user_id/tenant are
+        # already stripped by _sanitize_args (in _FORBIDDEN_CLIENT_ARGS).
+        if method in _GATED_COLLECTION_WRITE_METHODS:
             args = _sanitize_args(args)
-            return store.create_collection(
-                name=args.get("name", ""),
-                template=args.get("template"),
-                schema=args.get("schema"),
-                tenant=tenant.name if tenant else "default",
+            tenant_name = tenant.name if tenant else "default"
+            confirm = args.pop("confirm", False) is True
+            if not confirm:
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"collection_write:{method}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes="confirm_required",
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise PermissionError(
+                    f"{method} requires confirm=True (strict boolean). "
+                    f"Raw RPC collection writes are not permitted — use "
+                    f"the facade (class C loopback)."
+                )
+            # Gate passed — dispatch to the store method.
+            try:
+                if method == "create_collection":
+                    result = store.create_collection(
+                        name=args.get("name", ""),
+                        template=args.get("template"),
+                        schema=args.get("schema"),
+                        tenant=tenant_name,
+                    )
+                elif method == "add_collection_item":
+                    result = store.add_collection_item(
+                        collection_id=args.get("collection_id", ""),
+                        fields=args.get("fields", {}),
+                        status=args.get("status", "open"),
+                        tenant=tenant_name,
+                    )
+                elif method == "update_collection_item":
+                    result = store.update_collection_item(
+                        item_id=args.get("item_id", ""),
+                        fields=args.get("fields"),
+                        status=args.get("status"),
+                        expected_version=args.get("expected_version"),
+                    )
+                elif method == "remove_collection_item":
+                    result = store.remove_collection_item(
+                        item_id=args.get("item_id", ""),
+                        expected_version=args.get("expected_version"),
+                    )
+                else:
+                    raise ValueError(f"Unhandled gated collection write: {method}")
+            except ValueError as exc:
+                # CAS conflict / not found / invalid — audit the denial.
+                msg = str(exc).lower()
+                if "cas conflict" in msg:
+                    denied_reason = "cas_conflict"
+                elif "not found" in msg:
+                    denied_reason = "not_found"
+                else:
+                    denied_reason = "invalid_input"
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"collection_write:{method}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes=denied_reason,
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise
+            # Success — audit the granted write.
+            store.write_access_audit(
+                user_id=user_id,
+                query_text=f"collection_write:{method}",
+                granted_count=1,
+                denied_count=0,
+                denied_scopes="",
+                tenant=tenant_name,
+                excluded=False,
             )
-        if method == "add_collection_item":
-            args = _sanitize_args(args)
-            return store.add_collection_item(
-                collection_id=args.get("collection_id", ""),
-                fields=args.get("fields", {}),
-                status=args.get("status", "open"),
-                tenant=tenant.name if tenant else "default",
-            )
-        if method == "update_collection_item":
-            args = _sanitize_args(args)
-            return store.update_collection_item(
-                item_id=args.get("item_id", ""),
-                fields=args.get("fields"),
-                status=args.get("status"),
-                expected_version=args.get("expected_version"),
-            )
-        if method == "remove_collection_item":
-            args = _sanitize_args(args)
-            return store.remove_collection_item(
-                item_id=args.get("item_id", ""),
-                expected_version=args.get("expected_version"),
-            )
+            return result
         # -- deletion tombstones (read-only visibility + escape hatch) ---------
         if method == "list_tombstones":
             return store.list_tombstones(

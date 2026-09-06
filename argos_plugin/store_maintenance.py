@@ -1162,6 +1162,12 @@ class StoreMaintenanceMixin:
                  client_scope, doc_class) in rows:
                 try:
                     created = datetime.fromisoformat(str(created_at))
+                    # Defensive tz guard (#293 review): a naive created_at
+                    # (no tzinfo) would make `deadline > now` raise
+                    # TypeError against the aware clock — coerce to UTC
+                    # rather than crash the pass or silently skip.
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
                 except (TypeError, ValueError):
                     continue  # unparseable clock — never guess
                 deadline = created + timedelta(days=days)
@@ -1282,11 +1288,18 @@ class StoreMaintenanceMixin:
         Returns a report dict:
         {
           "mode", "subject", "request_id", "confirm",
-          "matched_count", "erased_count", "blocked_count",
+          "matched_count", "total_matched", "has_more", "truncated_count",
+          "erased_count", "blocked_count",
           "records": [ {memory_id, category, outcome, reason?,
                         receipt_id?} ... ],
           "wrote": bool,   # True only when apply erased >= 1 record
         }
+
+        Truncation (#293): the batch processes at most *limit* records.
+        ``total_matched``/``has_more``/``truncated_count`` surface any
+        truncation; apply mode REFUSES a truncated batch (never a
+        partial erasure that looks complete) — narrow the scope or pass
+        an explicit higher limit.
         """
         import uuid as _uuid
 
@@ -1343,6 +1356,15 @@ class StoreMaintenanceMixin:
             params.append(namespace)
         with self._state.lock:
             assert self.connection is not None
+            # Total match count (no LIMIT) — drives the truncation signal
+            # so a POPIA request matching more than the batch limit can
+            # never silently under-erase while its receipt log looks
+            # complete.
+            total_matched = int(self.connection.execute(
+                f"""SELECT COUNT(*) FROM memory_records
+                    WHERE {' AND '.join(clauses)}""",
+                params,
+            ).fetchone()[0])
             rows = self.connection.execute(
                 f"""SELECT memory_id, content, category, client_scope,
                            doc_class
@@ -1353,6 +1375,20 @@ class StoreMaintenanceMixin:
                 [*params, max(1, int(limit))],
             ).fetchall()
         report["matched_count"] = len(rows)
+        report["total_matched"] = total_matched
+        report["has_more"] = total_matched > len(rows)
+        report["truncated_count"] = max(0, total_matched - len(rows))
+        # Never silently under-erase: an apply batch that would leave
+        # matched records unprocessed is refused with a clear error —
+        # narrow the scope (categories/client_scope/doc_class/namespace)
+        # or pass an explicit higher limit. Preview reports the
+        # truncation so the operator sees it BEFORE confirming.
+        if mode == "apply" and report["has_more"]:
+            raise ValueError(
+                f"erase request matches {total_matched} record(s) but the "
+                f"batch limit is {limit} — refusing PARTIAL erasure. "
+                f"Narrow the scope or pass an explicit higher limit."
+            )
 
         for (memory_id, content, category, rec_scope, rec_doc_class) in rows:
             entry: Dict[str, Any] = {

@@ -548,3 +548,131 @@ class TestSchemaMigrationReceipts:
             "content_hash", "category", "user_scope", "requested_by",
             "reason", "outcome", "details", "created_at",
         } <= names
+
+
+class TestEraseTruncation:
+    """PR #335 review W3: a POPIA request matching more records than the
+    batch limit must never silently under-erase — the truncation signal
+    fires and apply REFUSES a partial erasure."""
+
+    def test_preview_reports_truncation_signal(self, store):
+        for i in range(8):
+            _seed(store, f"m-t-{i}", "personal_fact",
+                  f"Trunc subject {i} tok-{i}", NOW)
+        rep = store.erase_subject("Trunc subject", mode="preview", limit=5)
+        assert rep["total_matched"] == 8
+        assert rep["matched_count"] == 5
+        assert rep["has_more"] is True
+        assert rep["truncated_count"] == 3
+        # Preview writes nothing.
+        with store._state.lock:
+            n = store.connection.execute(
+                "SELECT COUNT(*) FROM memory_records "
+                "WHERE content LIKE '%Trunc subject%'"
+            ).fetchone()[0]
+        assert n == 8
+
+    def test_no_truncation_when_under_limit(self, store):
+        for i in range(4):
+            _seed(store, f"m-u-{i}", "personal_fact",
+                  f"Small subject {i} tok-{i}", NOW)
+        rep = store.erase_subject("Small subject", mode="preview", limit=500)
+        assert rep["total_matched"] == 4
+        assert rep["has_more"] is False
+        assert rep["truncated_count"] == 0
+
+    def test_apply_refuses_partial_erasure(self, store):
+        """>500 matches with the default limit: apply refuses with a
+        clear error — never a partial erase that looks complete."""
+        for i in range(505):
+            _seed(store, f"m-bulk-{i}", "personal_fact",
+                  f"Bulk subject row {i} uniq-{i}", NOW)
+        with pytest.raises(ValueError, match="PARTIAL erasure"):
+            store.erase_subject("Bulk subject", mode="apply", confirm=True)
+        # Nothing deleted by the refused batch.
+        with store._state.lock:
+            n = store.connection.execute(
+                "SELECT COUNT(*) FROM memory_records "
+                "WHERE content LIKE '%Bulk subject%'"
+            ).fetchone()[0]
+        assert n == 505
+        # And the receipt log has no entries for the refused request.
+        assert store.list_deletion_receipts(subject="Bulk subject") == []
+
+    def test_apply_with_explicit_higher_limit_completes(self, store):
+        for i in range(8):
+            _seed(store, f"m-hl-{i}", "personal_fact",
+                  f"Limit subject {i} tok-{i}", NOW)
+        rep = store.erase_subject(
+            "Limit subject", mode="apply", confirm=True, limit=10,
+        )
+        assert rep["erased_count"] == 8
+        assert rep["has_more"] is False
+        assert rep["wrote"] is True
+
+
+class TestRPCBoundaryHardening:
+    """PR #335 review W1/W2: the RPC boundary must not let a client
+    forge the receipt's audit trail, and the deliberate erase_subject
+    exception must be pinned by a test."""
+
+    def test_requested_by_is_a_forbidden_client_arg(self):
+        """W1: requested_by is server-set — stripped from client args."""
+        from memory_service import _sanitize_args, _FORBIDDEN_CLIENT_ARGS
+        assert "requested_by" in _FORBIDDEN_CLIENT_ARGS
+        cleaned = _sanitize_args({
+            "subject": "X", "confirm": True, "requested_by": "attacker",
+        })
+        assert "requested_by" not in cleaned
+
+    def test_erase_subject_deliberately_rpc_allowed(self):
+        """W2: erase_subject is a DOCUMENTED exception to
+        _FORBIDDEN_STORE_METHODS (run_compaction precedent): the
+        RPC-backed REST facade needs it, and the RPC handler enforces
+        the same controls as the facade (strict confirm, preview-first,
+        server-derived identity, receipts)."""
+        from memory_service import _FORBIDDEN_STORE_METHODS
+        assert "erase_subject" not in _FORBIDDEN_STORE_METHODS, (
+            "erase_subject must stay RPC-reachable — the REST facade "
+            "runs over SharedMemoryStore; blocking it here breaks the "
+            "deployed POPIA path. The handler enforces the gates."
+        )
+
+    def test_rpc_requested_by_uses_service_identity(self, tmp_path):
+        """W1 end-to-end over the real RPC boundary: a client-supplied
+        requested_by is stripped; the receipt records the
+        service-resolved user, never the client's claim."""
+        import json
+        import time as _time
+        from service_client import SharedMemoryStore
+
+        (tmp_path / "hybrid_memory.json").write_text(
+            json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+            encoding="utf-8",
+        )
+        store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+        try:
+            store.remember(
+                category="personal_fact",
+                content="Forged attribution data for erase",
+            )
+            rep = store.erase_subject(
+                subject="Forged attribution", mode="apply", confirm=True,
+                requested_by="attacker",  # must be stripped over RPC
+            )
+            assert rep["erased_count"] == 1
+            receipts = store.list_deletion_receipts(subject="Forged attribution")
+            assert receipts
+            assert receipts[0]["requested_by"] == "test_user", (
+                f"receipt requested_by was forged over RPC: "
+                f"{receipts[0]['requested_by']!r}"
+            )
+            # Hardened receipts query: a non-numeric limit must not
+            # crash the RPC branch (falls back to the default).
+            receipts2 = store.list_deletion_receipts(limit="not-a-number")
+            assert isinstance(receipts2, list)
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                _time.sleep(0.5)

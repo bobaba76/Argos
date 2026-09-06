@@ -82,6 +82,16 @@ PROPOSAL_OPERATIONS: Set[str] = {
     # erased and writes nothing; apply requires a strict confirm (only
     # the literal boolean True) and produces an append-only deletion
     # receipt per erased record — provable deletion, scoped per tenant.
+    #
+    # Tier note (#293 review): erase_request is destructive (class A)
+    # but shares the proposal TIER for mechanics only — idempotency
+    # registry + per-principal authorization. It is NOT implicitly
+    # granted by can_propose: a principal can erase only if its
+    # credential's allowed_operations includes "erase_request" (the
+    # transport builds that set per principal). The destructive-action
+    # controls live in the operation itself: strict confirm gate,
+    # preview-first, per-record report, append-only receipts, and
+    # server-derived identity (D4).
     "erase_request",
 }
 

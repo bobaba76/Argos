@@ -203,6 +203,9 @@ class StoreRetrievalMixin:
             provenance_origin=row.get("provenance_origin", PROVENANCE_INTERNAL),
             grounding=row.get("grounding", GROUNDING_OBSERVED),
             tier=row.get("tier", "active"),
+            embedding_dim=row.get("embedding_dim"),
+            embedder_id=row.get("embedder_id"),
+            embedded_at=row.get("embedded_at"),
         )
 
     def _fetch_records(
@@ -375,6 +378,35 @@ class StoreRetrievalMixin:
                 len(emb) if emb else 0,
             )
             return []
+        # #286: mixed-dimension detection. If the store has vectors with a
+        # different dimension than the query vector, list_cosine_similarity
+        # will throw "list dimensions must be equal". Detect this BEFORE
+        # the SQL call and fail loud with a clear message (not a silent
+        # DuckDB error). Text search fallback remains available — the
+        # caller (_hybrid_search) catches the exception and continues with
+        # text results only.
+        query_dim = len(emb)
+        try:
+            assert self.connection is not None
+            # No LIMIT — with >=3 distinct dims, LIMIT 2 can miss the real
+            # mismatch or false-positive. Fetch ALL distinct dims and
+            # compare against a set.
+            dim_rows = self.connection.execute(
+                "SELECT DISTINCT embedding_dim FROM memory_records "
+                "WHERE embedding IS NOT NULL AND embedding_dim IS NOT NULL"
+            ).fetchall()
+            stored_dims = {r[0] for r in dim_rows}
+            if stored_dims and query_dim not in stored_dims:
+                raise ValueError(
+                    f"Dimension mismatch: query vector has dim {query_dim} "
+                    f"but stored vectors have dim(s) {sorted(stored_dims)}. "
+                    f"Run reembed_memories.py to re-embed with the current model. "
+                    f"Text search fallback remains available."
+                )
+        except ValueError:
+            raise  # fail loud — let _hybrid_search catch and fall back to text
+        except Exception:
+            pass  # embedding_dim column may not exist yet (pre-#286) — skip check
         vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
         expiry_ref = as_of if as_of else self._now()
         # #245: shared WHERE-clause builder — single canonical composition

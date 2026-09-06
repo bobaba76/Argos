@@ -135,7 +135,15 @@ class StoreCoreMixin:
                     -- in injection pool) or 'archived' (out of injection
                     -- pool, searchable via include_archived=True). Zero-
                     -- migration: existing rows default 'active'.
-                    tier               VARCHAR DEFAULT 'active'
+                    tier               VARCHAR DEFAULT 'active',
+                    -- #286: dimension-generic vector provenance. embedding_dim
+                    -- records the dimension of the stored vector (so the query
+                    -- path can detect mixed-dim stores). embedder_id records
+                    -- which model produced the vector. embedded_at records
+                    -- when the vector was (re-)embedded. NULL on legacy rows.
+                    embedding_dim      INTEGER,
+                    embedder_id        VARCHAR,
+                    embedded_at        VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -302,6 +310,13 @@ class StoreCoreMixin:
                 # from CREATE TABLE but pre-existing stores never did, so every
                 # search binder-errored on COALESCE(tier,...). Additive ALTER.
                 "tier": "VARCHAR DEFAULT 'active'",
+                # #286: dimension-generic vector provenance. Additive ALTER
+                # for pre-existing stores. NULL on legacy rows (the query
+                # path handles NULL embedding_dim by falling back to text
+                # search or computing dim from the stored vector).
+                "embedding_dim": "INTEGER",
+                "embedder_id": "VARCHAR",
+                "embedded_at": "VARCHAR",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",

@@ -152,6 +152,15 @@ class MemoryConfig(BaseModel):
     rollup_enabled: bool = False
     rollup_interval_days: int = Field(30, ge=1, le=3650)
     rollup_max_records_per_run: int = Field(100, ge=10, le=1000)
+    # -- POPIA retention (#293) ------------------------------------------------
+    # Per-record-class retention periods, e.g. {"context_note": 730}.
+    # JSON object mapping category -> retention days. At session end,
+    # records whose class retention has passed get their expires_at
+    # stamped to the retention deadline (extends the TTL machinery —
+    # expired records drop out of retrieval; deletion itself happens via
+    # the erase-request workflow). Ships OFF.
+    retention_enabled: bool = False
+    retention_policies: str = "{}"
     # -- self-compaction (#281) ---------------------------------------------
     compaction_enabled: bool = False
     compaction_interval_days: int = Field(7, ge=1, le=365)

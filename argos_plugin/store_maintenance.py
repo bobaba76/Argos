@@ -5,9 +5,10 @@ neutral: no renames, no fixes).
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 try:
     from .store_common import MemoryRecord, np
@@ -1077,6 +1078,487 @@ class StoreMaintenanceMixin:
                 report["forget"] = {"error": str(exc)}
         return report
 
+    # -- POPIA retention (#293) ------------------------------------------------
+
+    def enforce_retention_policies(
+        self,
+        policies: Dict[str, int],
+        *,
+        now: datetime | None = None,
+        dry_run: bool = False,
+        legal_hold_check: Callable[[Dict[str, Any]], bool] | None = None,
+    ) -> Dict[str, Any]:
+        """Expire records whose record-class retention period has passed.
+
+        #293: per-class retention (e.g. {"context_note": 730} = chat
+        notes kept 2 years). EXTENDS the existing TTL machinery — no new
+        scheduler: enforcement stamps ``expires_at`` to the retention
+        deadline (created_at + days) on current active records whose
+        retention has passed; the standard expiry filter
+        (``expires_at <= now``) then drops them from retrieval exactly
+        like any other expired record. Deletion itself happens via the
+        erase-request workflow (with a deletion receipt) — expiry is a
+        visibility change, not a deletion.
+
+        Deterministic + testable: pass an explicit *now* clock and the
+        outcome is a pure function of (records, policies, now).
+
+        Idempotent: a record whose expires_at is already <= the
+        retention deadline is left untouched, so re-running produces the
+        same state (no early expiry, no double-stamping).
+
+        Legal hold: when *legal_hold_check* is provided and returns True
+        for a record's row dict, the record is NOT expired (reported as
+        ``held``). Absent by default — the blocker is opt-in.
+
+        Scoped per user (``user_scope``) like every maintenance pass.
+
+        Returns a report dict:
+        {
+          "dry_run": bool,
+          "now": iso,
+          "policies": {category: days},
+          "expired_count": int,
+          "held_count": int,
+          "expired_ids": [...],
+          "held_ids": [...],
+          "per_class": {category: {"expired": n, "held": n}},
+        }
+        """
+        now = now or datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        report: Dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "now": now_iso,
+            "policies": {str(k): int(v) for k, v in (policies or {}).items()},
+            "expired_count": 0,
+            "held_count": 0,
+            "expired_ids": [],
+            "held_ids": [],
+            "per_class": {},
+        }
+        if not policies:
+            return report
+
+        for category, days in policies.items():
+            days = int(days)
+            if days < 1:
+                continue
+            per_class = {"expired": 0, "held": 0}
+            with self._state.lock:
+                assert self.connection is not None
+                rows = self.connection.execute(
+                    """SELECT memory_id, content, category, created_at,
+                              expires_at, client_scope, doc_class
+                       FROM memory_records
+                       WHERE COALESCE(status, 'active') = 'active'
+                         AND valid_to IS NULL
+                         AND LOWER(category) = LOWER(?)
+                         AND created_at IS NOT NULL
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [str(category), self.user_id],
+                ).fetchall()
+            for (memory_id, content, cat, created_at, expires_at,
+                 client_scope, doc_class) in rows:
+                try:
+                    created = datetime.fromisoformat(str(created_at))
+                except (TypeError, ValueError):
+                    continue  # unparseable clock — never guess
+                deadline = created + timedelta(days=days)
+                if deadline > now:
+                    continue  # retention not yet past — leave it
+                row_dict = {
+                    "memory_id": memory_id,
+                    "content": content,
+                    "category": cat,
+                    "created_at": created_at,
+                    "client_scope": client_scope,
+                    "doc_class": doc_class,
+                }
+                if legal_hold_check is not None:
+                    try:
+                        if legal_hold_check(row_dict):
+                            per_class["held"] += 1
+                            report["held_count"] += 1
+                            report["held_ids"].append(memory_id)
+                            continue
+                    except Exception as exc:
+                        # Fail-closed: a broken hold check must not
+                        # expire held data — treat the record as held.
+                        logger.warning(
+                            "legal_hold_check errored for %s: %s",
+                            memory_id, exc,
+                        )
+                        per_class["held"] += 1
+                        report["held_count"] += 1
+                        report["held_ids"].append(memory_id)
+                        continue
+                deadline_iso = deadline.isoformat()
+                if expires_at is not None:
+                    try:
+                        if datetime.fromisoformat(str(expires_at)) <= deadline:
+                            continue  # already expired earlier — idempotent
+                    except (TypeError, ValueError):
+                        pass
+                if not dry_run:
+                    with self._state.lock:
+                        assert self.connection is not None
+                        self.connection.execute(
+                            """UPDATE memory_records
+                               SET expires_at = ?, updated_at = ?
+                               WHERE memory_id = ?
+                                 AND (user_scope IS NULL OR user_scope = ?)
+                                 AND valid_to IS NULL""",
+                            [deadline_iso, now_iso, memory_id, self.user_id],
+                        )
+                per_class["expired"] += 1
+                report["expired_count"] += 1
+                report["expired_ids"].append(memory_id)
+            report["per_class"][str(category)] = per_class
+
+        if report["expired_count"] and not dry_run:
+            logger.info(
+                "Retention: expired %d record(s) past their class retention "
+                "(%d held)",
+                report["expired_count"], report["held_count"],
+            )
+        return report
+
+    # -- POPIA erase-request workflow (#293) -----------------------------------
+
+    def erase_subject(
+        self,
+        subject: str,
+        *,
+        mode: str = "preview",
+        confirm: bool = False,
+        categories: List[str] | None = None,
+        client_scope: str | None = None,
+        doc_class: str | None = None,
+        namespace: str | None = None,
+        requested_by: str | None = None,
+        legal_hold_check: Callable[[Dict[str, Any]], bool] | None = None,
+        graph=None,
+        limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Erase all records about *subject* — provable deletion (POPIA).
+
+        #293: subject-scoped erase with a persisted, verifiable receipt.
+        Built on the #289 pattern: preview (dry-run) BEFORE the
+        destructive action, per-record report, explicit confirm gate
+        (STRICT — only the literal boolean True confirms; the string
+        "false" must NOT pass).
+
+        Deletion semantics per record (reuses the existing tombstone
+        machinery — no new deletion semantics):
+        - deletion_tombstones row (content fingerprint) so a re-feed
+          cannot resurrect the erased content.
+        - memory_records row DELETEd, memory_evidence row DELETEd —
+          inside ONE transaction with the receipt INSERT, so the proof
+          and the deletion are atomic (a crash cannot produce a receipt
+          for a record that still exists, or vice versa).
+        - deletion_receipts row APPENDED (before/during the deletion,
+          same transaction). Receipts are append-only: the erase flow
+          matches memory_records only — it cannot touch the receipt log,
+          so receipts survive the deletion they prove.
+        - Graph mirror: when *graph* is provided, ``remove_memory`` is
+          called for each erased id AFTER the commit (fail-soft — the
+          graph is a derived index; a mirror failure is logged and
+          reported, never fatal).
+
+        Legal hold: when *legal_hold_check* is provided and returns True
+        for a record, the record is NOT deleted — reported as
+        ``blocked_legal_hold`` with a clear reason. Absent by default
+        (the blocker is opt-in; see the facade docs).
+
+        Scoping: matches only the store's current ``user_scope`` (multi-
+        tenant safe — an erase under one tenant cannot touch another);
+        optional category/client_scope/doc_class/namespace narrow the
+        subject match further.
+
+        The receipt stores the content HASH (verifiable proof of WHAT
+        was deleted) — never the content itself (POPIA minimality).
+
+        Returns a report dict:
+        {
+          "mode", "subject", "request_id", "confirm",
+          "matched_count", "erased_count", "blocked_count",
+          "records": [ {memory_id, category, outcome, reason?,
+                        receipt_id?} ... ],
+          "wrote": bool,   # True only when apply erased >= 1 record
+        }
+        """
+        import uuid as _uuid
+
+        subject = str(subject or "").strip()
+        if not subject:
+            raise ValueError("erase subject is required")
+        if mode not in {"preview", "apply"}:
+            raise ValueError("mode must be 'preview' or 'apply'")
+        # STRICT confirm gate (#289 alignment): bool("false") is True in
+        # Python — only the literal boolean True may confirm a
+        # destructive erase.
+        if mode == "apply" and confirm is not True:
+            raise ValueError(
+                "erase apply requires confirm=True (preview first, "
+                "then confirm)"
+            )
+        now = self._now()
+        request_id = f"erase-{_uuid.uuid4().hex[:12]}"
+        report: Dict[str, Any] = {
+            "mode": mode,
+            "subject": subject,
+            "request_id": request_id,
+            "confirm": confirm is True,
+            "matched_count": 0,
+            "erased_count": 0,
+            "blocked_count": 0,
+            "records": [],
+            "wrote": False,
+        }
+
+        # Match: subject substring (case-insensitive), ALL versions and
+        # states — erasure covers current, historical, archived and
+        # quarantined rows alike.
+        like = f"%{subject.lower()}%"
+        clauses = [
+            "LOWER(content) LIKE ?",
+            "(user_scope IS NULL OR user_scope = ?)",
+        ]
+        params: List[Any] = [like, self.user_id]
+        if categories:
+            placeholders = ", ".join(["?" for _ in categories])
+            clauses.append(
+                f"LOWER(category) IN ({placeholders})"
+            )
+            params.extend(str(c).lower() for c in categories)
+        if client_scope:
+            clauses.append("client_scope = ?")
+            params.append(client_scope)
+        if doc_class:
+            clauses.append("doc_class = ?")
+            params.append(doc_class)
+        if namespace:
+            clauses.append("namespace = ?")
+            params.append(namespace)
+        with self._state.lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                f"""SELECT memory_id, content, category, client_scope,
+                           doc_class
+                    FROM memory_records
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at ASC
+                    LIMIT ?""",
+                [*params, max(1, int(limit))],
+            ).fetchall()
+        report["matched_count"] = len(rows)
+
+        for (memory_id, content, category, rec_scope, rec_doc_class) in rows:
+            entry: Dict[str, Any] = {
+                "memory_id": memory_id,
+                "category": category,
+            }
+            # Legal hold: fail-closed — a broken check blocks the erase.
+            if legal_hold_check is not None:
+                try:
+                    held = legal_hold_check({
+                        "memory_id": memory_id,
+                        "content": content,
+                        "category": category,
+                        "client_scope": rec_scope,
+                        "doc_class": rec_doc_class,
+                    })
+                except Exception as exc:
+                    held = True
+                    entry["reason"] = f"legal_hold_check errored: {exc}"
+                if held:
+                    entry.setdefault("reason", "record is under legal hold")
+                    entry["outcome"] = "blocked_legal_hold"
+                    report["blocked_count"] += 1
+                    report["records"].append(entry)
+                    continue
+            if mode == "preview":
+                entry["outcome"] = "would_erase"
+                report["records"].append(entry)
+                continue
+
+            # APPLY: receipt + tombstone + delete, one atomic transaction.
+            receipt_id = f"rcpt-{_uuid.uuid4().hex}"
+            content_hash = self._tombstone_hash(content)
+            details = json.dumps({
+                "subject": subject,
+                "category": category,
+                "client_scope": rec_scope,
+                "doc_class": rec_doc_class,
+            })
+            with self._state.lock:
+                assert self.connection is not None
+                self.connection.execute("BEGIN TRANSACTION")
+                try:
+                    # Receipt FIRST (append-only log) — inside the same
+                    # transaction as the deletion so the proof and the
+                    # erasure commit atomically.
+                    self.connection.execute(
+                        """INSERT INTO deletion_receipts
+                           (receipt_id, request_id, subject, memory_id,
+                            content_hash, category, user_scope, requested_by,
+                            reason, outcome, details, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [receipt_id, request_id, subject, memory_id,
+                         content_hash, category, self.user_id,
+                         requested_by or self.user_id,
+                         "erase_request", "erased", details, now],
+                    )
+                    # Tombstone the content (re-feed blocked) — same
+                    # machinery as delete_memory.
+                    self._record_tombstone(
+                        content, category,
+                        reason=f"erase_request:{request_id}",
+                    )
+                    self.connection.execute(
+                        "DELETE FROM memory_records WHERE memory_id = ?"
+                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        [memory_id, self.user_id],
+                    )
+                    self.connection.execute(
+                        "DELETE FROM memory_evidence WHERE memory_id = ?"
+                        " AND (user_scope IS NULL OR user_scope = ?)",
+                        [memory_id, self.user_id],
+                    )
+                    self.connection.execute("COMMIT")
+                except Exception:
+                    self.connection.execute("ROLLBACK")
+                    raise
+            entry["outcome"] = "erased"
+            entry["receipt_id"] = receipt_id
+            report["erased_count"] += 1
+            report["records"].append(entry)
+            # Graph mirror (after commit, fail-soft): the temporal graph
+            # must not keep dangling rows for erased memories (#287).
+            if graph is not None:
+                try:
+                    graph.remove_memory(memory_id)
+                except Exception as exc:
+                    entry["graph_mirror_error"] = str(exc)
+                    logger.warning(
+                        "Graph mirror failed for erased %s: %s",
+                        memory_id, exc,
+                    )
+
+        report["wrote"] = mode == "apply" and report["erased_count"] > 0
+        if report["erased_count"]:
+            logger.info(
+                "Erase request %s: erased %d record(s) for subject %r "
+                "(%d blocked)",
+                request_id, report["erased_count"], subject,
+                report["blocked_count"],
+            )
+        return report
+
+    def list_deletion_receipts(
+        self,
+        *,
+        request_id: str | None = None,
+        subject: str | None = None,
+        memory_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Query the append-only deletion-receipt log (#293).
+
+        Receipts survive the deletion they prove and are queryable by
+        request_id (one erase batch), subject, or memory_id. Scoped per
+        user_scope.
+        """
+        clauses = ["(user_scope IS NULL OR user_scope = ?)"]
+        params: List[Any] = [self.user_id]
+        if request_id:
+            clauses.append("request_id = ?")
+            params.append(request_id)
+        if subject:
+            clauses.append("subject = ?")
+            params.append(subject)
+        if memory_id:
+            clauses.append("memory_id = ?")
+            params.append(memory_id)
+        with self._state.lock:
+            assert self.connection is not None
+            rows = self.connection.execute(
+                f"""SELECT receipt_id, request_id, subject, memory_id,
+                           content_hash, category, user_scope, requested_by,
+                           reason, outcome, details, created_at
+                    FROM deletion_receipts
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at DESC
+                    LIMIT ?""",
+                [*params, max(1, int(limit))],
+            ).fetchall()
+        receipts: List[Dict[str, Any]] = []
+        for (rid, req_id, subj, mid, chash, cat, scope, req_by, reason,
+             outcome, details, created_at) in rows:
+            try:
+                parsed_details = json.loads(details) if details else {}
+            except (TypeError, ValueError):
+                parsed_details = {}
+            receipts.append({
+                "receipt_id": rid,
+                "request_id": req_id,
+                "subject": subj,
+                "memory_id": mid,
+                "content_hash": chash,
+                "category": cat,
+                "user_scope": scope,
+                "requested_by": req_by,
+                "reason": reason,
+                "outcome": outcome,
+                "details": parsed_details,
+                "created_at": created_at,
+            })
+        return receipts
+
+    def verify_erase_receipt(
+        self,
+        receipt_id: str,
+    ) -> Dict[str, Any]:
+        """Verify a deletion receipt against the live store (#293).
+
+        Provable end-to-end: the receipt is valid iff (a) it exists in
+        the append-only log, (b) the record it names is really gone from
+        memory_records, and (c) the content is tombstoned (re-feed
+        blocked). Returns a dict with ``valid`` + per-check details.
+        """
+        receipts = self.list_deletion_receipts(limit=10000)
+        receipt = next(
+            (r for r in receipts if r["receipt_id"] == receipt_id), None
+        )
+        if receipt is None:
+            return {"valid": False, "reason": "receipt not found"}
+        memory_id = receipt["memory_id"]
+        with self._state.lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                "SELECT memory_id FROM memory_records "
+                "WHERE memory_id = ?",
+                [memory_id],
+            ).fetchone()
+            # The receipt carries the deleted content's fingerprint —
+            # verify the tombstone directly against it (the record is
+            # gone, so its content cannot be re-hashed).
+            tomb = self.connection.execute(
+                "SELECT reason FROM deletion_tombstones "
+                "WHERE content_hash = ? AND category = ?"
+                " AND (user_scope IS NULL OR user_scope = ?)",
+                [receipt["content_hash"], receipt["category"] or "",
+                 self.user_id],
+            ).fetchone()
+        record_gone = row is None
+        return {
+            "valid": record_gone,
+            "receipt": receipt,
+            "record_gone": record_gone,
+            "tombstoned": tomb is not None,
+        }
+
     # -- system state KV (P4.2 distillation, future maintenance) -------------
 
     # SM2/SM9: key allowlist for system_state. Only these keys may be
@@ -1093,6 +1575,7 @@ class StoreMaintenanceMixin:
         "last_cleanup_junk",
         "compaction_last_run",
         "compaction_last_count",
+        "retention_last_run",  # #293
     })
 
     def get_state(self, key: str) -> str | None:

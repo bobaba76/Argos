@@ -389,6 +389,9 @@ class ProviderCoreMixin:
         self._rollup_enabled: bool = False
         self._rollup_interval_days: int = 30
         self._rollup_max_records_per_run: int = 100
+        # POPIA retention (#293): per-class retention enforcement.
+        self._retention_enabled: bool = False
+        self._retention_policies: str = "{}"
         # Self-compaction (#281): schedule-aware token-budget control.
         self._compaction_enabled: bool = False
         self._compaction_interval_days: int = 7
@@ -764,6 +767,9 @@ class ProviderCoreMixin:
         self._archive_after_days = cfg.archive_after_days
         self._forget_enabled = cfg.forget_enabled
         self._forget_after_days = cfg.forget_after_days
+        # POPIA retention (#293)
+        self._retention_enabled = cfg.retention_enabled
+        self._retention_policies = cfg.retention_policies
         self._rollup_enabled = cfg.rollup_enabled
         self._rollup_interval_days = cfg.rollup_interval_days
         self._rollup_max_records_per_run = cfg.rollup_max_records_per_run

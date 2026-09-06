@@ -78,6 +78,11 @@ PROPOSAL_OPERATIONS: Set[str] = {
     # every write is an approved, evidenced candidate — never a raw
     # unprovenanced insert.
     "ingest",
+    # #293: POPIA erase-request workflow. Preview reports what WOULD be
+    # erased and writes nothing; apply requires a strict confirm (only
+    # the literal boolean True) and produces an append-only deletion
+    # receipt per erased record — provable deletion, scoped per tenant.
+    "erase_request",
 }
 
 # Feedback tier: separately scoped.
@@ -517,6 +522,67 @@ def _validate_ingest_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def _validate_erase_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate erase_request (#293) parameters.
+
+    Destructive tier: subject-scoped provable deletion. Preview mode
+    (default) reports what WOULD be erased and writes nothing; apply
+    mode requires a STRICT confirm (only the literal boolean True —
+    bool("false") is True in Python, so a client sending the string
+    "false" must NOT pass the human-in-loop gate; mirrors #289).
+    """
+    cleaned: Dict[str, Any] = {}
+    subject = str(params.get("subject", "")).strip()
+    if not subject:
+        raise APIError("invalid_input", "subject is required")
+    if len(subject) > MAX_QUERY_LENGTH:
+        raise APIError(
+            "request_too_large",
+            f"subject exceeds max length {MAX_QUERY_LENGTH}",
+        )
+    cleaned["subject"] = subject
+    mode = str(params.get("mode", "preview")).strip().lower()
+    if mode not in {"preview", "apply"}:
+        raise APIError("invalid_input", "mode must be 'preview' or 'apply'")
+    cleaned["mode"] = mode
+    # STRICT human-in-loop gate: only the literal boolean True confirms.
+    confirm = params.get("confirm", False) is True
+    if mode == "apply" and not confirm:
+        raise APIError(
+            "invalid_input",
+            "apply mode requires confirm=true (preview first, then confirm)",
+        )
+    cleaned["confirm"] = confirm
+    # Optional scope narrowing (never widened — enforced in _op_erase).
+    for opt_key in ("categories", "client_scope", "doc_class", "namespace"):
+        val = params.get(opt_key)
+        if val is None:
+            continue
+        if opt_key == "categories":
+            if not isinstance(val, list) or not all(
+                isinstance(c, str) and c.strip() for c in val
+            ):
+                raise APIError(
+                    "invalid_input", "categories must be a list of strings"
+                )
+            cleaned[opt_key] = [c.strip() for c in val]
+        else:
+            if not isinstance(val, str) or not val.strip():
+                raise APIError(
+                    "invalid_input", f"{opt_key} must be a non-empty string"
+                )
+            cleaned[opt_key] = val.strip()
+    # The caller may NOT claim server-derived identity fields (D4).
+    for provenance_key in ("user_scope", "requested_by"):
+        if params.get(provenance_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {provenance_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
 def _validate_fetch_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Validate fetch (by ID) parameters."""
     cleaned: Dict[str, Any] = {}
@@ -753,6 +819,8 @@ class ArgosAPIFacade:
                 validated = _validate_propose_params(params)
             elif operation == "ingest":
                 validated = _validate_ingest_params(params)
+            elif operation == "erase_request":
+                validated = _validate_erase_params(params)
             elif operation == "record_feedback":
                 validated = _validate_feedback_params(params)
             else:
@@ -797,6 +865,8 @@ class ArgosAPIFacade:
                 result = self._op_memory_propose(ctx, validated, idempotency_key)
             elif operation == "ingest":
                 result = self._op_ingest(ctx, validated)
+            elif operation == "erase_request":
+                result = self._op_erase_request(ctx, validated)
             elif operation == "record_feedback":
                 result = self._op_record_feedback(ctx, validated, idempotency_key)
             else:
@@ -1241,6 +1311,51 @@ class ArgosAPIFacade:
                 client_scope=client_scope,
                 doc_class=params.get("doc_class"),
                 project_id=params.get("project_id"),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+
+    def _op_erase_request(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Destructive tier (class A): #293 POPIA erase-request workflow.
+
+        Subject-scoped provable deletion. Preview mode (default) reports
+        what WOULD be erased and writes nothing; apply mode (strict
+        confirm) erases and appends an append-only deletion receipt per
+        record — the receipt survives the deletion and is queryable.
+
+        Server-derived identity (D4): the erase runs under ctx.user_id
+        (tenant/user scoping — one tenant's erase never touches
+        another's); requested_by is the authenticated principal, not a
+        client claim. Legal hold: no legal-hold registry ships by
+        default — the blocker is absent-by-default; the hook is the
+        store-level ``legal_hold_check`` callable (documented in
+        store.erase_subject). Scope narrowing: client_scope/doc_class/
+        namespace/categories may only narrow the caller's reach.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            # D3: client_scope may only narrow the credential clearance.
+            client_scope = params.get("client_scope")
+            if ctx.max_client_scope is not None:
+                if client_scope is not None and client_scope != ctx.max_client_scope:
+                    raise APIError(
+                        "forbidden",
+                        "client_scope may not differ from the credential's "
+                        "clearance.",
+                    )
+                client_scope = ctx.max_client_scope
+            return self._store.erase_subject(
+                subject=params["subject"],
+                mode=params["mode"],
+                confirm=params.get("confirm", False),
+                categories=params.get("categories"),
+                client_scope=client_scope,
+                doc_class=params.get("doc_class"),
+                namespace=params.get("namespace"),
+                requested_by=ctx.principal,
             )
         finally:
             if _scope_before is not None and hasattr(self._store, "set_user_scope"):

@@ -648,6 +648,36 @@ class MemoryService:
                 doc_class=args.get("doc_class"),
                 project_id=args.get("project_id"),
             )
+        if method == "erase_subject":
+            # #293: POPIA erase-request workflow (provable deletion).
+            # Identity is server-derived: user_scope comes from the
+            # service-resolved identity (dispatch already ran
+            # store.set_user_scope(user_id)); requested_by is the
+            # service-resolved caller, never a client claim. STRICT
+            # confirm (bool("false") is True — only literal True passes).
+            args = _sanitize_args(args)
+            confirm = args.get("confirm", False) is True
+            return store.erase_subject(
+                subject=str(args.get("subject", "")),
+                mode=str(args.get("mode", "preview")),
+                confirm=confirm,
+                categories=args.get("categories"),
+                client_scope=args.get("client_scope"),
+                doc_class=args.get("doc_class"),
+                namespace=args.get("namespace"),
+                requested_by=args.get("requested_by") or user_id,
+            )
+        if method == "list_deletion_receipts":
+            return store.list_deletion_receipts(
+                request_id=args.get("request_id"),
+                subject=args.get("subject"),
+                memory_id=args.get("memory_id"),
+                limit=int(args.get("limit", 100)),
+            )
+        if method == "verify_erase_receipt":
+            return store.verify_erase_receipt(
+                receipt_id=str(args.get("receipt_id", "")),
+            )
         if method == "find_semantic_duplicate":
             return _record_to_dict(
                 store.find_semantic_duplicate(

@@ -69,6 +69,13 @@ _FORBIDDEN_CLIENT_ARGS = frozenset({
     # endpoint token delete another user's memories.
     "user_id",
     "tenant",
+    # #200 PR-2 fix: confirm is NOT a client-supplied gate authority.
+    # A raw RPC caller can pass confirm=True and bypass the gate. The
+    # real gate authority is the _confirmed flag in the RPC request
+    # ENVELOPE (set by _SharedRPC._call_gated, NOT from client args).
+    # Stripping confirm here ensures a client-supplied confirm never
+    # reaches the gate logic.
+    "confirm",
 })
 
 # MS2: destructive/admin methods forbidden on the RPC boundary (same as
@@ -594,7 +601,7 @@ class MemoryService:
             return self._tenants[user_id]
         return self._tenants[self._default_tenant]
 
-    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None, tenant: "_Tenant | None" = None) -> Any:
+    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None, tenant: "_Tenant | None" = None, confirmed: bool = False) -> Any:
         store.set_user_scope(user_id)
         if method == "search":
             records = store.search(
@@ -862,24 +869,28 @@ class MemoryService:
             args = _sanitize_args(args)
             memory_id = str(args.get("memory_id", ""))
             expected_version = args.get("expected_version")
-            confirm = args.get("confirm", False) is True
             tenant_name = tenant.name if tenant else "default"
-            # Gate 1: strict confirm (bool("false") is True — only
-            # literal True passes, same as erase_subject).
-            if not confirm:
+            # Gate 1: _confirmed envelope flag (NOT client-supplied confirm).
+            # #200 PR-2 fix: confirm is now in _FORBIDDEN_CLIENT_ARGS and
+            # stripped by _sanitize_args. The gate authority is the
+            # _confirmed flag in the RPC envelope (set by call_gated),
+            # which a raw RPC caller cannot forge. Same fix as collection
+            # writes — closes the client-spoofable confirm=True gap.
+            if not confirmed:
                 store.write_access_audit(
                     user_id=user_id,
                     query_text=f"facade_delete:{memory_id}",
                     granted_count=0,
                     denied_count=1,
-                    denied_scopes="confirm_required",
+                    denied_scopes="not_confirmed",
                     tenant=tenant_name,
                     excluded=True,
                 )
                 raise PermissionError(
-                    "facade_delete_memory requires confirm=True "
-                    "(strict boolean). Preview is not supported for "
-                    "deletion — use the facade's memory_delete operation."
+                    "facade_delete_memory requires a facade-confirmed "
+                    "request (_confirmed in the RPC envelope). Raw RPC "
+                    "deletes are not permitted — use the facade's "
+                    "memory_delete operation."
                 )
             # Gate 2: strict CAS — expected_version is REQUIRED. The
             # caller must send the last-seen memory_id (each update mints
@@ -986,31 +997,33 @@ class MemoryService:
         if method == "get_collection":
             return store.get_collection(args.get("collection_id", ""))
         # -- #200 Spec-10 PR 2/3 fix: gated collection writes -------------
-        # These 4 write methods require confirm=True (literal bool) as a
-        # capability marker — only the facade passes it. A raw RPC caller
-        # with the endpoint token cannot bypass the facade's loopback gate.
-        # Every call (success + denial) writes an audit row with the
-        # service-resolved user_id. Same precedent as facade_delete_memory
-        # and erase_subject #293. Client-supplied user_id/tenant are
-        # already stripped by _sanitize_args (in _FORBIDDEN_CLIENT_ARGS).
+        # These 4 write methods require _confirmed=True from the RPC
+        # request ENVELOPE (set by _SharedRPC.call_gated), NOT a client-
+        # supplied confirm in args. A raw RPC caller using call() cannot
+        # set _confirmed — it's in the envelope, not in args. And
+        # _sanitize_args strips 'confirm' from args (it's in
+        # _FORBIDDEN_CLIENT_ARGS), so even a forged confirm=True in args
+        # never reaches this gate. Every call (success + denial) writes
+        # an audit row with the service-resolved user_id. Same precedent
+        # as facade_delete_memory and erase_subject #293.
         if method in _GATED_COLLECTION_WRITE_METHODS:
             args = _sanitize_args(args)
             tenant_name = tenant.name if tenant else "default"
-            confirm = args.pop("confirm", False) is True
-            if not confirm:
+            if not confirmed:
                 store.write_access_audit(
                     user_id=user_id,
                     query_text=f"collection_write:{method}",
                     granted_count=0,
                     denied_count=1,
-                    denied_scopes="confirm_required",
+                    denied_scopes="not_confirmed",
                     tenant=tenant_name,
                     excluded=True,
                 )
                 raise PermissionError(
-                    f"{method} requires confirm=True (strict boolean). "
-                    f"Raw RPC collection writes are not permitted — use "
-                    f"the facade (class C loopback)."
+                    f"{method} requires a facade-confirmed request "
+                    f"(_confirmed in the RPC envelope). Raw RPC "
+                    f"collection writes are not permitted — use the "
+                    f"facade (class C loopback)."
                 )
             # Gate passed — dispatch to the store method.
             try:
@@ -1564,7 +1577,12 @@ class MemoryService:
             self._lock_wait_total_s += time.monotonic() - t0
             self._lock_wait_count += 1
             if component == "store":
-                return self._call_store(method, args, user_id, tenant.store, tenant.policy, tenant)
+                # #200 PR-2 fix: pass the _confirmed envelope flag to
+                # _call_store. This is the gate authority for collection
+                # writes — it comes from the RPC envelope (set by
+                # _SharedRPC.call_gated), NOT from client-supplied args.
+                confirmed = request.get("_confirmed", False) is True
+                return self._call_store(method, args, user_id, tenant.store, tenant.policy, tenant, confirmed)
             return self._call_graph(method, args, user_id, tenant.graph, tenant.store)
 
     def _backup(self, args: dict) -> Any:

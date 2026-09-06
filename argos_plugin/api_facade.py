@@ -2281,13 +2281,15 @@ class ArgosAPIFacade:
             # audit server-side. For direct DuckDBMemoryStore (tests),
             # the facade does the CAS check itself.
             if hasattr(self._store, "facade_delete_memory"):
-                # Service-side gating: pass confirm + expected_version.
+                # Service-side gating: the proxy (SharedMemoryStore) uses
+                # call_gated() which sets _confirmed in the RPC envelope.
                 # The service strips client identity, resolves user_id
                 # from its own context, enforces CAS atomically under
                 # the tenant lock, and writes the audit row.
+                # #200 PR-2 fix: confirm is no longer passed — the gate
+                # authority is the _confirmed envelope flag.
                 delete_kwargs: Dict[str, Any] = {
                     "memory_id": memory_id,
-                    "confirm": True,
                 }
                 if expected_version is not None:
                     delete_kwargs["expected_version"] = expected_version

@@ -679,14 +679,19 @@ class TestT9FacadeDeleteGating:
         return svc, store
 
     def test_raw_rpc_without_confirm_denied(self, tmp_path):
-        """(i) Raw RPC facade_delete_memory without confirm → denied,
-        audit row records the denial."""
+        """(i) Raw RPC facade_delete_memory without _confirmed → denied,
+        audit row records the denial.
+
+        #200 PR-2 fix: the gate authority is the _confirmed envelope flag
+        (set by call_gated), NOT a client-supplied confirm in args. A
+        direct _call_store call without confirmed=True is denied.
+        """
         svc, store = self._make_service_and_store(tmp_path)
         # Seed a memory
         rec = store.remember(content="to delete", category="context_note")
         mid = rec.memory_id
-        # Call the handler directly without confirm
-        with pytest.raises(PermissionError, match="confirm"):
+        # Call the handler directly without confirmed (simulates raw RPC)
+        with pytest.raises(PermissionError, match="confirmed"):
             svc._call_store(
                 "facade_delete_memory",
                 {"memory_id": mid, "expected_version": mid},
@@ -707,11 +712,12 @@ class TestT9FacadeDeleteGating:
         with pytest.raises(PermissionError, match="expected_version"):
             svc._call_store(
                 "facade_delete_memory",
-                {"memory_id": mid, "confirm": True},
+                {"memory_id": mid},
                 "test_user",
                 store,
                 None,
                 svc._tenants.get("default"),
+                confirmed=True,
             )
         records = store.get_memories_by_ids([mid])
         assert len(records) == 1
@@ -725,18 +731,19 @@ class TestT9FacadeDeleteGating:
         assert "tenant" in _FORBIDDEN_CLIENT_ARGS
 
     def test_valid_cas_confirm_deletes(self, tmp_path):
-        """(iii) Valid CAS + confirm → deletes exactly the expected version,
-        audit written."""
+        """(iii) Valid CAS + confirmed envelope → deletes exactly the
+        expected version, audit written."""
         svc, store = self._make_service_and_store(tmp_path)
         rec = store.remember(content="to delete", category="context_note")
         mid = rec.memory_id
         result = svc._call_store(
             "facade_delete_memory",
-            {"memory_id": mid, "confirm": True, "expected_version": mid},
+            {"memory_id": mid, "expected_version": mid},
             "test_user",
             store,
             None,
             svc._tenants.get("default"),
+            confirmed=True,
         )
         # Memory is gone
         records = store.get_memories_by_ids([mid])
@@ -750,12 +757,12 @@ class TestT9FacadeDeleteGating:
         with pytest.raises((ValueError, PermissionError), match="CAS"):
             svc._call_store(
                 "facade_delete_memory",
-                {"memory_id": mid, "confirm": True,
-                 "expected_version": "stale-version"},
+                {"memory_id": mid, "expected_version": "stale-version"},
                 "test_user",
                 store,
                 None,
                 svc._tenants.get("default"),
+                confirmed=True,
             )
         # Memory still exists
         records = store.get_memories_by_ids([mid])
@@ -842,11 +849,12 @@ class TestT10PostWriteGraphHook:
         tenant.graph.reset_mock()
         svc._call_store(
             "facade_delete_memory",
-            {"memory_id": mid, "confirm": True, "expected_version": mid},
+            {"memory_id": mid, "expected_version": mid},
             "test_user",
             store,
             None,
             tenant,
+            confirmed=True,
         )
         tenant.graph.remove_memory.assert_called_once_with(mid)
 

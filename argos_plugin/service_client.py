@@ -381,6 +381,20 @@ class _SharedRPC:
     def call(self, component: str, method: str, **args: Any) -> Any:
         return self._request({"component": component, "method": method, "args": args})
 
+    def call_gated(self, component: str, method: str, **args: Any) -> Any:
+        """Like call(), but marks the request as facade-confirmed.
+
+        #200 PR-2 fix: the _confirmed flag goes in the request ENVELOPE,
+        NOT in args. A raw RPC caller using call() cannot set it —
+        _sanitize_args strips 'confirm' from args (it's in
+        _FORBIDDEN_CLIENT_ARGS), and the service only trusts
+        _confirmed from the envelope, not from args. This closes the
+        client-spoofable confirm=True gap.
+        """
+        request = {"component": component, "method": method, "args": args}
+        request["_confirmed"] = True
+        return self._request(request)
+
     def stop_service(self) -> Any:
         return self._request({"method": "shutdown"})
 
@@ -724,19 +738,28 @@ class SharedMemoryStore:
         delete_memory is in _FORBIDDEN_STORE_METHODS on the RPC boundary
         (no raw RPC passthrough). The facade gates this with ctx.is_loopback
         + server-derived identity before calling this method. The service
-        handler enforces the SAME controls server-side: strict confirm
-        (literal True only), strict CAS (expected_version required,
-        compare+delete atomically under the tenant lock), identity stripped
-        + service-resolved, and an audit row for every call (denied
-        included). A raw RPC caller with the endpoint token cannot skip
-        these gates.
+        handler enforces the SAME controls server-side: strict
+        _confirmed (envelope flag, not client-supplied confirm), strict
+        CAS (expected_version required, compare+delete atomically under
+        the tenant lock), identity stripped + service-resolved, and an
+        audit row for every call (denied included). A raw RPC caller
+        with the endpoint token cannot skip these gates.
+
+        #200 PR-2 fix: uses call_gated() to set _confirmed in the RPC
+        envelope — same mechanism as collection writes. A client-supplied
+        confirm in args is stripped by _sanitize_args and NOT trusted.
         """
-        value = self._rpc.call("store", "facade_delete_memory", **kwargs)
+        kwargs.pop("confirm", None)  # strip — gate authority is in the envelope
+        value = self._rpc.call_gated("store", "facade_delete_memory", **kwargs)
         if value is False or value is None:
             return False
         return value
 
     # -- #200 Spec-10 PR 2/3: Collections proxies ---------------------------
+    # Read proxies use call() (un-gated). Write proxies use call_gated()
+    # which sets _confirmed in the RPC envelope — the service checks
+    # this envelope flag (NOT a client-supplied confirm in args) as the
+    # gate authority for collection writes.
 
     def list_collections(self, **kwargs: Any) -> List[Dict[str, Any]]:
         return list(self._rpc.call("store", "list_collections", **kwargs) or [])
@@ -751,16 +774,20 @@ class SharedMemoryStore:
         return self._rpc.call("store", "get_collection", **kwargs)
 
     def create_collection(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._rpc.call("store", "create_collection", **kwargs)
+        kwargs.pop("confirm", None)  # strip — gate authority is in the envelope
+        return self._rpc.call_gated("store", "create_collection", **kwargs)
 
     def add_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._rpc.call("store", "add_collection_item", **kwargs)
+        kwargs.pop("confirm", None)
+        return self._rpc.call_gated("store", "add_collection_item", **kwargs)
 
     def update_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._rpc.call("store", "update_collection_item", **kwargs)
+        kwargs.pop("confirm", None)
+        return self._rpc.call_gated("store", "update_collection_item", **kwargs)
 
     def remove_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
-        return self._rpc.call("store", "remove_collection_item", **kwargs)
+        kwargs.pop("confirm", None)
+        return self._rpc.call_gated("store", "remove_collection_item", **kwargs)
 
     def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Read-only census of deletion tombstones (hash+metadata, newest first)."""

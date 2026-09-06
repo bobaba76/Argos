@@ -448,6 +448,340 @@ class StoreWriteMixin:
         )
         return new_head, "superseded" if new_head is not None else "blocked"
 
+    # -- structured ingestion (#289) ------------------------------------------
+
+    def ingest_structured(
+        self,
+        data: str,
+        fmt: str,
+        mapping: Dict[str, Any],
+        source_name: str,
+        *,
+        mode: str = "preview",
+        confirm: bool = False,
+        client_scope: str | None = None,
+        doc_class: str | None = None,
+        project_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """#289: Structured ingestion — JSON/CSV rows → memory with provenance.
+
+        Accepts tabular data (JSON array of objects, or CSV with a header
+        row), validates it against a field-mapping spec, and maps each
+        row to a memory fact. Structured numeric/tabular data ONLY —
+        this is not a document-extraction path (the watcher covers docs).
+
+        NO RAW UNPROVENANCED WRITES: every applied row flows through the
+        existing evidence/review/candidate machinery —
+        ``save_candidate(external=True)`` (inbound security scan at the
+        boundary) → ``review_candidate(decision="approved",
+        review_source="tool")`` (the explicit confirm IS the approval).
+        The candidate row, the approval decision, and the resulting
+        ``memory_evidence`` row all carry the row's provenance: source
+        file, row number, and the mapping spec id — queryable via
+        ``get_evidence`` / ``provenance()``.
+
+        Dedupe + supersession reuse the record layer:
+        - With a ``key_field`` in the mapping, each row gets a stable
+          doc identity (``<source>#<key>``); re-ingesting the same row
+          with identical content is a duplicate (no write), and a row
+          with changed content SUPERSEDES the old version (the
+          candidate is approved with ``supersedes_memory_id``, which
+          chains ``valid_to``/``superseded_by`` and writes the
+          supersession tombstone — the same machinery as manual
+          conflict resolution).
+        - Without a ``key_field``, content-based dedupe via
+          ``_find_current_similar`` applies (exact/substring/semantic).
+
+        Modes:
+        - ``mode="preview"`` (dry-run): reports what WOULD be stored —
+          per-row outcomes (would_insert / would_supersede / duplicate),
+          dedupe collisions, and validation errors — WITHOUT writing
+          anything. Human-in-loop: the report is what the operator
+          confirms.
+        - ``mode="apply"``: requires ``confirm=True`` (explicit gate —
+          approval-ledger alignment). Writes via the candidate path.
+          Validation errors abort the WHOLE batch before any write
+          (fail loud, no partial silent skip).
+
+        Scoping: rows are written under the store's current ``user_id``
+        (set via ``set_user_scope`` — multi-tenant safe); ``client_scope``
+        / ``doc_class`` / ``project_id`` are optional ACL metadata
+        stamped on every row. Namespace is ``ingest:<source_name>`` so
+        dedupe is file-scoped and ingested facts remain searchable.
+
+        Returns a report dict:
+        {
+          "mode", "source", "mapping_id", "total_rows",
+          "valid_rows", "error_rows",
+          "inserted", "superseded", "duplicates", "quarantined", "blocked",
+          "rows": [ {row_number, outcome, content, memory_id?,
+                     candidate_id?, existing_memory_id?, errors?} ... ],
+          "errors": [ {row_number, errors: [...]} ... ],   # validation
+          "wrote": bool,   # True only when apply wrote ≥1 row
+                           # (inserted or superseded); False in preview
+        }
+        """
+        try:
+            try:
+                from .structured_ingest import (
+                    IngestError, IngestValidationError,
+                    map_rows, mapping_id, parse_rows,
+                )
+            except ImportError:
+                from structured_ingest import (
+                    IngestError, IngestValidationError,
+                    map_rows, mapping_id, parse_rows,
+                )
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError(
+                "structured_ingest module unavailable"
+            ) from exc
+
+        if mode not in {"preview", "apply"}:
+            raise ValueError("mode must be 'preview' or 'apply'")
+        if mode == "apply" and not confirm:
+            raise ValueError(
+                "ingest apply requires confirm=True (human-in-loop gate)"
+            )
+        source_name = str(source_name or "ingest").strip() or "ingest"
+        mid = mapping_id(mapping)
+
+        # 1. Parse + validate + map (pure, no writes). Malformed input
+        #    raises IngestError here — fail loud, nothing written.
+        try:
+            rows = parse_rows(data, fmt)
+        except IngestError as exc:
+            return {
+                "mode": mode, "source": source_name, "mapping_id": mid,
+                "total_rows": 0, "valid_rows": 0, "error_rows": 0,
+                "inserted": 0, "superseded": 0, "duplicates": 0,
+                "quarantined": 0, "blocked": 0, "rows": [],
+                "errors": [{"row_number": None, "errors": [str(exc)]}],
+                "wrote": False,
+            }
+        facts, validation_errors = map_rows(rows, mapping, source_name)
+
+        report: Dict[str, Any] = {
+            "mode": mode, "source": source_name, "mapping_id": mid,
+            "total_rows": len(rows),
+            "valid_rows": len(facts),
+            "error_rows": len(validation_errors),
+            "inserted": 0, "superseded": 0, "duplicates": 0,
+            "quarantined": 0, "blocked": 0,
+            "rows": [], "errors": validation_errors,
+            "wrote": False,
+        }
+
+        # Fail loud: ANY validation error aborts an apply batch before
+        # any write (no partial silent skip). The report — per-row errors
+        # included — travels on the exception so the caller does not have
+        # to re-run preview to see what failed.
+        if mode == "apply" and validation_errors:
+            raise IngestValidationError(
+                f"ingest validation failed for {len(validation_errors)} "
+                f"row(s) — nothing written. Per-row errors are attached "
+                f"as exc.report.",
+                report=report,
+            )
+        if not facts:
+            return report
+
+        namespace = f"ingest:{source_name}"
+
+        # 2. Resolve the existing current record per row.
+        #    key_field rows: deterministic doc-identity lookup;
+        #    keyless rows: content-based three-layer scan.
+        def _find_existing(fact: Dict[str, Any]) -> tuple[str | None, str]:
+            if fact.get("key_value"):
+                # Scope-aware doc-identity lookup (#289 fix): the keyed
+                # path must honor the same client_scope/doc_class
+                # narrowing as the keyless _find_current_similar path —
+                # otherwise a keyed re-ingest under one client_scope
+                # dedupes against (or supersedes) another scope's
+                # records. IS NOT DISTINCT FROM keeps NULL matching NULL.
+                scope_sql, scope_params = self._doc_identity_scope_clause(
+                    namespace, client_scope, doc_class, fact["source_doc_id"],
+                )
+                with self._state.lock:
+                    assert self.connection is not None
+                    row = self.connection.execute(
+                        f"""SELECT memory_id, content FROM memory_records
+                           WHERE category = ?
+                             AND valid_to IS NULL
+                             AND (user_scope IS NULL OR user_scope = ?)
+                             {scope_sql}
+                           LIMIT 1""",
+                        [fact["category"], self.user_id, *scope_params],
+                    ).fetchone()
+                if row:
+                    return row[0], "row_key"
+                return None, ""
+            existing_id, reason = self._find_current_similar(
+                fact["content"], fact["category"], namespace=namespace,
+                client_scope=client_scope, doc_class=doc_class,
+            )
+            return existing_id, (reason or "")
+
+        resolved = []
+        seen_batch_keys: Dict[tuple, int] = {}
+        for fact in facts:
+            existing_id, match_reason = _find_existing(fact)
+            if fact.get("key_value"):
+                # Keyed mode: dedupe in-batch by document identity
+                # (namespace + category + source_doc_id), NOT content —
+                # two rows with identical rendered content but different
+                # key values are DISTINCT documents and must both be
+                # stored (#289 fix; content-keyed dedupe silently dropped
+                # the second row).
+                batch_key: tuple = (
+                    "key", fact["category"], fact["source_doc_id"],
+                )
+            else:
+                # Keyless mode: content-based in-batch dedupe (all rows
+                # share one source_doc_id, so content is the identity).
+                batch_key = (
+                    "content", fact["content"].strip().lower(),
+                )
+            in_batch_dup = seen_batch_keys.get(batch_key)
+            resolved.append((fact, existing_id, match_reason, in_batch_dup))
+            seen_batch_keys[batch_key] = fact["row_number"]
+
+        # 3. Per-row outcomes.
+        for fact, existing_id, match_reason, in_batch_dup in resolved:
+            row_entry: Dict[str, Any] = {
+                "row_number": fact["row_number"],
+                "content": fact["content"],
+            }
+            if in_batch_dup is not None:
+                row_entry["outcome"] = "duplicate"
+                row_entry["existing_memory_id"] = None
+                row_entry["reason"] = "duplicate row within the batch"
+                report["duplicates"] += 1
+                report["rows"].append(row_entry)
+                continue
+            if existing_id is not None:
+                # Existing current record for this row identity/content.
+                with self._state.lock:
+                    assert self.connection is not None
+                    old = self.connection.execute(
+                        "SELECT content FROM memory_records "
+                        "WHERE memory_id = ?",
+                        [existing_id],
+                    ).fetchone()
+                old_content = old[0] if old else ""
+                if old_content == fact["content"]:
+                    row_entry["outcome"] = "duplicate"
+                    row_entry["existing_memory_id"] = existing_id
+                    row_entry["reason"] = f"identical ({match_reason})"
+                    report["duplicates"] += 1
+                    report["rows"].append(row_entry)
+                    continue
+                row_entry["outcome"] = (
+                    "would_supersede" if mode == "preview" else "superseded"
+                )
+                row_entry["existing_memory_id"] = existing_id
+            else:
+                row_entry["outcome"] = (
+                    "would_insert" if mode == "preview" else "inserted"
+                )
+            if mode == "preview":
+                report["rows"].append(row_entry)
+                continue
+
+            # 4. APPLY: candidate → confirm-approve (the evidence path).
+            evidence_text = (
+                f"structured_ingest: {source_name} "
+                f"row {fact['row_number']} (mapping {mid})"
+            )
+            payload = {
+                "ingest": {
+                    "source_file": source_name,
+                    "row_number": fact["row_number"],
+                    "mapping_id": mid,
+                    "mapping": mapping,
+                    "key_value": fact.get("key_value"),
+                },
+                # Carried into memory_evidence by review_candidate:
+                "source_session_id": source_name,
+                "extraction_method": "structured_ingest",
+                "user_scope": self.user_id,
+                "external_source": True,
+            }
+            candidate = self.save_candidate(
+                category=fact["category"],
+                content=fact["content"],
+                tags=fact["tags"],
+                payload=payload,
+                source="structured_ingest",
+                confidence=0.9,
+                durability="durable",
+                scope="profile",
+                project_id=project_id,
+                namespace=namespace,
+                client_scope=client_scope,
+                doc_class=doc_class,
+                source_doc_id=fact["source_doc_id"],
+                session_id=source_name,
+                evidence_text=evidence_text,
+                evidence_role="structured_ingest",
+                source_timestamp=self._now(),
+                dedup=False,
+                external=True,
+                provenance_origin="external",
+                grounding="extracted",
+            )
+            if candidate is None:
+                # sanitize_content reduced the row to nothing.
+                row_entry["outcome"] = "blocked"
+                row_entry["reason"] = "candidate rejected at save (empty/injected)"
+                report["blocked"] += 1
+                report["rows"].append(row_entry)
+                continue
+            row_entry["candidate_id"] = candidate.get("candidate_id")
+            if candidate.get("status") == "quarantined":
+                # Inbound security scan blocked this row at the boundary
+                # — quarantined (not silently dropped), human-reviewable.
+                row_entry["outcome"] = "quarantined"
+                row_entry["reason"] = candidate.get("quarantine_reason") or ""
+                report["quarantined"] += 1
+                report["rows"].append(row_entry)
+                continue
+            review = self.review_candidate(
+                candidate_id=candidate["candidate_id"],
+                decision="approved",
+                reason=(
+                    f"structured_ingest confirmed: {source_name} "
+                    f"row {fact['row_number']} (mapping {mid})"
+                ),
+                review_source="tool",
+                supersedes_memory_id=existing_id,
+            )
+            memory = review.get("memory") if review else None
+            if memory is None:
+                # Approval refused (tombstone/rejection gate/dedup) —
+                # the candidate records the decision; report it.
+                final = (review or {}).get("candidate", {}).get(
+                    "status", "unknown"
+                )
+                row_entry["outcome"] = "blocked"
+                row_entry["reason"] = f"approval gate: {final}"
+                report["blocked"] += 1
+                report["rows"].append(row_entry)
+                continue
+            row_entry["memory_id"] = memory.get("memory_id")
+            report["rows"].append(row_entry)
+            if row_entry["outcome"] == "superseded":
+                report["superseded"] += 1
+            else:
+                report["inserted"] += 1
+
+        # "wrote" reflects ACTUAL applied rows — an apply batch where
+        # every row ended duplicate/blocked/quarantined wrote nothing.
+        report["wrote"] = mode == "apply" and bool(
+            report["inserted"] or report["superseded"]
+        )
+        return report
+
     # -- value-supersession (stale-number detection) -------------------------
 
     def _find_conflicting_active_value(

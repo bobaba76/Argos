@@ -622,6 +622,32 @@ class MemoryService:
         if method == "save_candidate":
             # MS1: strip server-set fields from client args.
             return store.save_candidate(**_sanitize_args(args))
+        if method == "ingest_structured":
+            # #289: structured ingestion (JSON/CSV → memory with
+            # provenance). Provenance is server-set inside
+            # ingest_structured (source="structured_ingest",
+            # provenance_origin="external") — the client cannot claim it
+            # because the method's signature has no provenance params.
+            # user_scope comes from the service-resolved identity (the
+            # dispatch already ran store.set_user_scope(user_id)), not
+            # from client args. client_scope/doc_class are narrowed by
+            # the facade when present; over raw RPC they are accepted
+            # as-is (trusted-local boundary, same as save_candidate).
+            args = _sanitize_args(args)
+            # Strict bool (#289 fix): bool("false") is True — only the
+            # literal boolean True passes the human-in-loop gate.
+            confirm = args.get("confirm", False) is True
+            return store.ingest_structured(
+                data=str(args.get("data", "")),
+                fmt=str(args.get("fmt", "")),
+                mapping=args.get("mapping") or {},
+                source_name=str(args.get("source_name", "ingest")),
+                mode=str(args.get("mode", "preview")),
+                confirm=confirm,
+                client_scope=args.get("client_scope"),
+                doc_class=args.get("doc_class"),
+                project_id=args.get("project_id"),
+            )
         if method == "find_semantic_duplicate":
             return _record_to_dict(
                 store.find_semantic_duplicate(

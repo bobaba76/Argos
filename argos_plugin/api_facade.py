@@ -71,6 +71,13 @@ READ_OPERATIONS: Set[str] = {
 # Never creates active memory directly.
 PROPOSAL_OPERATIONS: Set[str] = {
     "memory_propose",
+    # #289: structured ingestion (JSON/CSV → memory with provenance).
+    # Preview mode writes nothing; apply mode requires an explicit
+    # confirm and flows through the candidate/approval machinery
+    # (save_candidate external → review_candidate tool-approved), so
+    # every write is an approved, evidenced candidate — never a raw
+    # unprovenanced insert.
+    "ingest",
 }
 
 # Feedback tier: separately scoped.
@@ -316,6 +323,8 @@ MIN_LIMIT = 1
 # AF7: limits for tags and payload in memory_propose.
 MAX_TAGS = 50
 MAX_PAYLOAD_BYTES = 4096
+# #289: structured ingest batch size bound (raw JSON/CSV text).
+MAX_INGEST_BYTES = 256 * 1024
 
 # Client-controlled internal flags that are NEVER accepted from external
 # callers (D6). These are internal-only and must not be set by API clients.
@@ -415,6 +424,89 @@ def _validate_propose_params(params: Dict[str, Any]) -> Dict[str, Any]:
                 f"Parameter {flag} is not available on the public API.",
             )
     # Caller may NOT claim provenance fields (D4).
+    for provenance_key in ("source", "provenance_origin", "grounding", "user_scope"):
+        if params.get(provenance_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {provenance_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
+def _validate_ingest_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate ingest (#289) parameters.
+
+    Proposal-tier batch write: requires the raw data (JSON/CSV text),
+    the format, and a field-mapping spec. Server-set provenance (D4):
+    the caller may NOT claim source/provenance_origin/grounding/
+    user_scope — the facade derives them. Apply mode requires an
+    explicit ``confirm=True`` (human-in-loop gate); preview (dry-run)
+    is the default and writes nothing.
+    """
+    cleaned: Dict[str, Any] = {}
+    data = params.get("data")
+    if not isinstance(data, str) or not data.strip():
+        raise APIError("invalid_input", "data is required (JSON or CSV text)")
+    # Byte-count limit (#289 fix): len(str) counts characters, but the
+    # limit is a wire-size bound — UTF-8 multibyte content can exceed it
+    # while passing a character count. Count encoded bytes.
+    if len(data.encode("utf-8")) > MAX_INGEST_BYTES:
+        raise APIError(
+            "request_too_large",
+            f"data exceeds max ingest size {MAX_INGEST_BYTES} bytes",
+        )
+    cleaned["data"] = data
+    fmt = str(params.get("fmt", "")).strip().lower()
+    if fmt not in {"json", "csv"}:
+        raise APIError("invalid_input", "fmt must be 'json' or 'csv'")
+    cleaned["fmt"] = fmt
+    source_name = str(params.get("source_name", "")).strip()
+    if not source_name:
+        raise APIError("invalid_input", "source_name is required")
+    if len(source_name) > 200:
+        raise APIError("invalid_input", "source_name exceeds 200 characters")
+    cleaned["source_name"] = source_name
+    mapping = params.get("mapping")
+    if not isinstance(mapping, dict):
+        raise APIError("invalid_input", "mapping spec must be a dict")
+    if not str(mapping.get("category", "")).strip():
+        raise APIError("invalid_input", "mapping.category is required")
+    if not str(mapping.get("content_template", "")).strip():
+        raise APIError("invalid_input", "mapping.content_template is required")
+    if len(json.dumps(mapping)) > MAX_PAYLOAD_BYTES:
+        raise APIError(
+            "request_too_large",
+            f"mapping exceeds max size {MAX_PAYLOAD_BYTES} bytes",
+        )
+    cleaned["mapping"] = mapping
+    mode = str(params.get("mode", "preview")).strip().lower()
+    if mode not in {"preview", "apply"}:
+        raise APIError("invalid_input", "mode must be 'preview' or 'apply'")
+    cleaned["mode"] = mode
+    # Human-in-loop gate: apply requires an explicit confirm flag.
+    # Strict bool check (#289 fix): bool("false") is True in Python, so a
+    # client sending the STRING "false" must not pass the human-in-loop
+    # gate — only the literal boolean True confirms.
+    confirm = params.get("confirm", False) is True
+    if mode == "apply" and not confirm:
+        raise APIError(
+            "invalid_input",
+            "apply mode requires confirm=true (preview first, then confirm)",
+        )
+    cleaned["confirm"] = confirm
+    # Optional ACL metadata (narrowing only — enforced against the
+    # credential in _op_ingest; never widened).
+    for opt_key in ("client_scope", "doc_class", "project_id"):
+        val = params.get(opt_key)
+        if val is not None:
+            if not isinstance(val, str) or not val.strip():
+                raise APIError(
+                    "invalid_input", f"{opt_key} must be a non-empty string"
+                )
+            cleaned[opt_key] = val.strip()
+    # Caller may NOT claim provenance fields (D4) — same rule as
+    # memory_propose. Provenance is server-set for every ingested row.
     for provenance_key in ("source", "provenance_origin", "grounding", "user_scope"):
         if params.get(provenance_key) is not None:
             raise APIError(
@@ -659,6 +751,8 @@ class ArgosAPIFacade:
                 validated = {}
             elif operation == "memory_propose":
                 validated = _validate_propose_params(params)
+            elif operation == "ingest":
+                validated = _validate_ingest_params(params)
             elif operation == "record_feedback":
                 validated = _validate_feedback_params(params)
             else:
@@ -701,6 +795,8 @@ class ArgosAPIFacade:
                 result = self._op_capabilities(ctx)
             elif operation == "memory_propose":
                 result = self._op_memory_propose(ctx, validated, idempotency_key)
+            elif operation == "ingest":
+                result = self._op_ingest(ctx, validated)
             elif operation == "record_feedback":
                 result = self._op_record_feedback(ctx, validated, idempotency_key)
             else:
@@ -1101,6 +1197,54 @@ class ArgosAPIFacade:
             "candidate_id": candidate.get("candidate_id") if candidate else None,
             "status": candidate.get("status", "pending") if candidate else "error",
         }
+
+    def _op_ingest(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Proposal tier (class A): #289 structured ingestion.
+
+        JSON/CSV rows → memory with first-class provenance. Preview mode
+        (default) writes NOTHING and reports what WOULD be stored;
+        apply mode requires the validated confirm flag and flows every
+        row through the candidate/approval machinery (save_candidate
+        external → review_candidate tool-approved) — never a raw
+        unprovenanced insert.
+
+        Server-set provenance (D4): the store stamps
+        source="structured_ingest", provenance_origin="external",
+        grounding="extracted" on every row; the caller cannot claim
+        them (rejected in _validate_ingest_params). Scoping: rows are
+        written under ctx.user_id (multi-tenant safe); client_scope
+        narrows to the caller's credential clearance (never widens).
+        """
+        # AF3: scope the store to the caller's user for the duration of
+        # the operation (same save/restore pattern as _op_search).
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            # D3: client_scope may only narrow the credential clearance.
+            client_scope = params.get("client_scope")
+            if ctx.max_client_scope is not None:
+                if client_scope is not None and client_scope != ctx.max_client_scope:
+                    raise APIError(
+                        "forbidden",
+                        "client_scope may not differ from the credential's "
+                        "clearance.",
+                    )
+                client_scope = ctx.max_client_scope
+            return self._store.ingest_structured(
+                data=params["data"],
+                fmt=params["fmt"],
+                mapping=params["mapping"],
+                source_name=params["source_name"],
+                mode=params["mode"],
+                confirm=params.get("confirm", False),
+                client_scope=client_scope,
+                doc_class=params.get("doc_class"),
+                project_id=params.get("project_id"),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
 
     def _op_record_feedback(
         self, ctx: AuthContext, params: Dict[str, Any], idempotency_key: str | None,

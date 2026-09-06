@@ -575,6 +575,14 @@ class SharedMemoryStore:
     def save_candidate(self, **kwargs: Any) -> dict | None:
         return self._rpc.call("store", "save_candidate", **kwargs)
 
+    def ingest_structured(self, **kwargs: Any) -> dict:
+        """#289: structured ingestion (JSON/CSV → memory with provenance)."""
+        result = self._rpc.call("store", "ingest_structured", **kwargs)
+        return result or {
+            "mode": kwargs.get("mode", "preview"), "wrote": False,
+            "rows": [], "errors": [],
+        }
+
     def find_semantic_duplicate(
         self, content: str, min_similarity: float = 0.88,
     ) -> MemoryRecord | None:

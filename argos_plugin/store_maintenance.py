@@ -1091,6 +1091,8 @@ class StoreMaintenanceMixin:
         "rollup_cursor",
         "last_session_end",
         "last_cleanup_junk",
+        "compaction_last_run",
+        "compaction_last_count",
     })
 
     def get_state(self, key: str) -> str | None:

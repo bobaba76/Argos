@@ -821,6 +821,25 @@ class MemoryService:
                 tenant=args.get("tenant"),
             )
             return None
+        # #281: run_compaction — execute the schedule-aware compaction
+        # pass SERVER-SIDE so it has direct access to the DuckDB store
+        # (consolidate, set_state, _fetch_records, connection). The
+        # client-side SharedMemoryStore proxy cannot reach these because
+        # they are in _FORBIDDEN_STORE_METHODS (MS2/MS7 security model).
+        # This narrow RPC method is NOT in the forbidden set — it runs
+        # the compaction module's run_compaction() helper inside the
+        # service process, returning the report dict.
+        if method == "run_compaction":
+            try:
+                from compaction import run_compaction as _run_compaction
+            except ImportError:
+                from argos_plugin.compaction import run_compaction as _run_compaction
+            return _run_compaction(
+                store,
+                interval_days=int(args.get("interval_days", 7)),
+                aggressiveness=float(args.get("aggressiveness", 1.0)),
+                dry_run=bool(args.get("dry_run", False)),
+            )
         raise ValueError(f"Unsupported store method: {method}")
 
     def _call_graph(self, method: str, args: dict, user_id: str, graph) -> Any:

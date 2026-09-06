@@ -39,6 +39,7 @@ from api_facade import (
     IdempotencyRegistry,
     MAX_PAYLOAD_BYTES,
     MAX_TAGS,
+    PROPOSAL_OPERATIONS,
     PUBLIC_OPERATIONS,
     READ_OPERATIONS,
 )
@@ -442,11 +443,20 @@ class TestNoSelfApproval:
     """An MCP/model principal cannot approve its own candidate."""
 
     def test_approve_not_in_public_operations(self):
-        """Approval (review_candidate with decision=approved) is not a
-        public facade operation — it's not in PUBLIC_OPERATIONS."""
+        """Approval is not a raw public operation name — 'approve' and
+        'reject' are not in PUBLIC_OPERATIONS. The public surface is
+        'review_candidate' (#295 admin console), which is in the
+        PROPOSAL tier (requires authorization) and the facade always
+        sets review_source='tool' (human-driven, never auto_review).
+        The storage layer enforces the invariant: auto_review may only
+        set 'reviewed_approved', never 'approved'."""
         assert "approve" not in PUBLIC_OPERATIONS
-        assert "review_candidate" not in PUBLIC_OPERATIONS
         assert "reject" not in PUBLIC_OPERATIONS
+        # #295: review_candidate IS now public (admin console surfaces
+        # the approval-ledger flow through the facade), but it's in the
+        # PROPOSAL tier — only authorized principals can call it.
+        assert "review_candidate" in PUBLIC_OPERATIONS
+        assert "review_candidate" in PROPOSAL_OPERATIONS
 
     def test_attempting_approval_returns_method_not_allowed(self):
         """Calling 'approve' through the facade is rejected."""

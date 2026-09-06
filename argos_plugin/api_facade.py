@@ -65,6 +65,16 @@ READ_OPERATIONS: Set[str] = {
     "capabilities",
     "explain",
     "explain_retrieval",
+    # #295: admin console browse — list memories by namespace/scope/
+    # category without a semantic query. Read-only, ACL-scoped.
+    "browse",
+    # #295: list pending candidates for the review queue. Read-only,
+    # scoped to the caller's user_id.
+    "list_candidates",
+    # #295: portable export (#294) — read-only, scoped to the caller's
+    # user_id. The export carries records, evidence, candidates, and
+    # governance tables (tombstones/receipts/rejections/aliases).
+    "export",
 }
 
 # Proposal tier: external caller → candidate → security scan → review queue.
@@ -93,6 +103,13 @@ PROPOSAL_OPERATIONS: Set[str] = {
     # preview-first, per-record report, append-only receipts, and
     # server-derived identity (D4).
     "erase_request",
+    # #295: candidate review — approve/reject/quarantine a pending
+    # proposal through the existing approval-ledger flow. This is the
+    # ONLY path by which a candidate becomes active memory (no bypass).
+    # The storage layer enforces the approval invariant: "approved" is
+    # reserved for review_source="tool"/"manual"; auto_review may only
+    # set "reviewed_approved" (user confirmation still required).
+    "review_candidate",
 }
 
 # Feedback tier: separately scoped.
@@ -663,6 +680,136 @@ def _validate_feedback_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def _validate_browse_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate browse parameters (#295 admin console).
+
+    Browse is a read-only listing by namespace/scope/category — no
+    semantic query. The caller may narrow with optional filters but
+    may never widen beyond their ACL scope (enforced by _enforce_identity).
+    """
+    cleaned: Dict[str, Any] = {}
+    limit = params.get("limit", 50)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise APIError("invalid_input", "limit must be an integer")
+    if limit < MIN_LIMIT or limit > MAX_LIMIT:
+        raise APIError(
+            "invalid_input", f"limit must be between {MIN_LIMIT} and {MAX_LIMIT}",
+        )
+    cleaned["limit"] = limit
+    # Optional filters — validated as strings, no internal flags.
+    for opt_key in ("category", "namespace", "project_id", "client_scope"):
+        val = params.get(opt_key)
+        if val is not None:
+            cleaned[opt_key] = str(val)
+    for flag in FORBIDDEN_CLIENT_FLAGS:
+        if params.get(flag):
+            raise APIError(
+                "forbidden",
+                f"Parameter {flag} is not available on the public API.",
+            )
+    return cleaned
+
+
+def _validate_list_candidates_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate list_candidates parameters (#295 admin console).
+
+    Read-only listing of pending candidates for the review queue.
+    Scoped to the caller's user_id by the store.
+    """
+    cleaned: Dict[str, Any] = {}
+    status = str(params.get("status", "pending")).strip().lower()
+    # Allowed statuses mirror the candidate lifecycle in store_write.py.
+    if status not in ("pending", "quarantined", "reviewed_approved",
+                      "pending_user_confirmation", "rejected", "approved"):
+        raise APIError("invalid_input", f"invalid candidate status: {status}")
+    cleaned["status"] = status
+    limit = params.get("limit", 50)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise APIError("invalid_input", "limit must be an integer")
+    # list_candidates allows up to 500 (matching the store's own cap)
+    # since the review queue may have more items than a search page.
+    if limit < MIN_LIMIT or limit > 500:
+        raise APIError(
+            "invalid_input", f"limit must be between {MIN_LIMIT} and 500",
+        )
+    cleaned["limit"] = limit
+    candidate_id = params.get("candidate_id")
+    if candidate_id is not None:
+        cleaned["candidate_id"] = str(candidate_id)
+    return cleaned
+
+
+def _validate_review_candidate_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate review_candidate parameters (#295 admin console).
+
+    This is the ONLY public path to approve/reject a candidate. The
+    storage layer enforces the approval invariant (review_source="tool"
+    for "approved"; auto_review may only set "reviewed_approved").
+    The facade always sets review_source="tool" — the UI is a
+    human-driven confirmation surface, not an automated reviewer.
+    """
+    cleaned: Dict[str, Any] = {}
+    candidate_id = str(params.get("candidate_id", "")).strip()
+    if not candidate_id:
+        raise APIError("invalid_input", "candidate_id is required")
+    cleaned["candidate_id"] = candidate_id
+    decision = str(params.get("decision", "")).strip().lower()
+    if decision not in ("approved", "rejected", "quarantined"):
+        raise APIError(
+            "invalid_input",
+            "decision must be 'approved', 'rejected', or 'quarantined'",
+        )
+    cleaned["decision"] = decision
+    reason = str(params.get("reason", "")).strip()
+    if len(reason) > MAX_CONTENT_LENGTH:
+        raise APIError(
+            "request_too_large",
+            f"reason exceeds max length {MAX_CONTENT_LENGTH}",
+        )
+    cleaned["reason"] = reason
+    # Optional review metadata.
+    for opt_key in ("supersedes_memory_id", "durability", "scope"):
+        val = params.get(opt_key)
+        if val is not None:
+            cleaned[opt_key] = str(val)
+    for flag in FORBIDDEN_CLIENT_FLAGS:
+        if params.get(flag):
+            raise APIError(
+                "forbidden",
+                f"Parameter {flag} is not available on the public API.",
+            )
+    return cleaned
+
+
+def _validate_export_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate export parameters (#295 admin console, #294 portable export).
+
+    Read-only portable export scoped to the caller's user_id. Optional
+    narrowing by categories/namespace/client_scope/doc_class.
+    """
+    cleaned: Dict[str, Any] = {}
+    categories = params.get("categories")
+    if categories is not None:
+        if not isinstance(categories, list):
+            raise APIError("invalid_input", "categories must be a list")
+        cleaned["categories"] = [str(c) for c in categories]
+    for opt_key in ("namespace", "client_scope", "doc_class"):
+        val = params.get(opt_key)
+        if val is not None:
+            cleaned[opt_key] = str(val)
+    for flag in FORBIDDEN_CLIENT_FLAGS:
+        if params.get(flag):
+            raise APIError(
+                "forbidden",
+                f"Parameter {flag} is not available on the public API.",
+            )
+    return cleaned
+
+
 # -- Audit (D10) -------------------------------------------------------------
 
 def _hash_query(query: str) -> str:
@@ -833,6 +980,14 @@ class ArgosAPIFacade:
                 validated = _validate_erase_params(params)
             elif operation == "record_feedback":
                 validated = _validate_feedback_params(params)
+            elif operation == "browse":
+                validated = _validate_browse_params(params)
+            elif operation == "list_candidates":
+                validated = _validate_list_candidates_params(params)
+            elif operation == "review_candidate":
+                validated = _validate_review_candidate_params(params)
+            elif operation == "export":
+                validated = _validate_export_params(params)
             else:
                 raise APIError(
                     "method_not_allowed",
@@ -879,6 +1034,14 @@ class ArgosAPIFacade:
                 result = self._op_erase_request(ctx, validated)
             elif operation == "record_feedback":
                 result = self._op_record_feedback(ctx, validated, idempotency_key)
+            elif operation == "browse":
+                result = self._op_browse(ctx, validated)
+            elif operation == "list_candidates":
+                result = self._op_list_candidates(ctx, validated)
+            elif operation == "review_candidate":
+                result = self._op_review_candidate(ctx, validated)
+            elif operation == "export":
+                result = self._op_export(ctx, validated)
             else:
                 raise APIError(
                     "internal_error",
@@ -1388,6 +1551,193 @@ class ArgosAPIFacade:
             raise APIError("not_found", "Memory not found.")
         self._store.record_feedback(params["memory_id"], params["feedback"])
         return {"memory_id": params["memory_id"], "feedback": params["feedback"]}
+
+    # -- #295: admin console operations --------------------------------------
+
+    def _op_browse(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Read tier (#295): browse memories by namespace/scope/category.
+
+        Lists active memories without a semantic query — the admin
+        console's "browse" view. ACL-scoped via set_user_scope (same
+        pattern as _op_search). Optional category/namespace/project_id/
+        client_scope filters narrow the listing.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            # Use list_memories if available (store_maintenance mixin);
+            # fall back to list_recent for SharedMemoryStore.
+            category = params.get("category")
+            limit = params["limit"]
+            if hasattr(self._store, "list_memories"):
+                results = self._store.list_memories(
+                    category=category, limit=limit,
+                )
+            elif hasattr(self._store, "list_recent"):
+                results = self._store.list_recent(limit=limit)
+            else:
+                results = []
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        items = []
+        for r in results:
+            item = r.to_dict() if hasattr(r, "to_dict") else dict(r)
+            # Optional namespace filter (post-filter since list_memories
+            # doesn't accept namespace — the store's user_scope already
+            # scopes to the caller).
+            if params.get("namespace"):
+                rec_ns = item.get("namespace")
+                if rec_ns is not None and rec_ns != params["namespace"]:
+                    continue
+            items.append({
+                "memory_id": item.get("memory_id"),
+                "category": item.get("category"),
+                "content": item.get("content"),
+                "tags": item.get("tags", []),
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+                "status": item.get("status"),
+                "scope": item.get("scope"),
+                "namespace": item.get("namespace"),
+            })
+        return {"results": items, "count": len(items)}
+
+    def _op_list_candidates(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier (#295): list pending candidates for the review queue.
+
+        Scoped to the caller's user_id via set_user_scope. The candidate
+        lifecycle statuses (pending, quarantined, reviewed_approved,
+        pending_user_confirmation, rejected, approved) are validated in
+        _validate_list_candidates_params.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "list_candidates"):
+                return {"candidates": [], "count": 0}
+            candidates = self._store.list_candidates(
+                status=params["status"],
+                candidate_id=params.get("candidate_id"),
+                limit=params["limit"],
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        # Redact: strip payload (may contain internal metadata), keep
+        # the fields the review queue needs.
+        items = []
+        for c in candidates:
+            items.append({
+                "candidate_id": c.get("candidate_id"),
+                "category": c.get("category"),
+                "content": c.get("content"),
+                "tags": c.get("tags", []),
+                "source": c.get("source"),
+                "confidence": c.get("confidence"),
+                "status": c.get("status"),
+                "created_at": c.get("created_at"),
+                "reviewed_at": c.get("reviewed_at"),
+                "review_reason": c.get("review_reason"),
+                "quarantine_reason": c.get("quarantine_reason"),
+                "provenance_origin": c.get("provenance_origin"),
+                "grounding": c.get("grounding"),
+                "evidence_text": c.get("evidence_text", "")[:500],
+            })
+        return {"candidates": items, "count": len(items)}
+
+    def _op_review_candidate(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Proposal tier (#295): approve/reject/quarantine a candidate.
+
+        This is the ONLY public path to activate a candidate. The
+        storage layer enforces the approval invariant: the facade always
+        sets review_source="tool" (the UI is a human-driven confirmation
+        surface, not an automated reviewer). The store's review_candidate
+        method handles the approval ledger, grounding ceiling, external-
+        source invariant, and injection guard.
+
+        Server-derived identity (D4): the reviewer is ctx.principal,
+        not a client-supplied name.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "review_candidate"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Candidate review is not available on this store.",
+                )
+            result = self._store.review_candidate(
+                candidate_id=params["candidate_id"],
+                decision=params["decision"],
+                reason=params.get("reason", ""),
+                review_source="tool",  # human-driven, never auto_review
+                supersedes_memory_id=params.get("supersedes_memory_id"),
+                durability=params.get("durability"),
+                scope=params.get("scope"),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        if result is None:
+            raise APIError("not_found", "Candidate not found or already reviewed.")
+        # Redact: return the candidate + memory summary (no payload).
+        cand = result.get("candidate", {})
+        mem = result.get("memory")
+        return {
+            "candidate_id": cand.get("candidate_id"),
+            "decision": cand.get("status"),
+            "review_reason": cand.get("review_reason"),
+            "reviewed_at": cand.get("reviewed_at"),
+            "memory_id": getattr(mem, "memory_id", None) if mem else None,
+            "reviewer": ctx.principal,  # server-derived identity
+        }
+
+    def _op_export(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Read tier (#295/#294): portable export of the caller's memories.
+
+        Scoped to the caller's user_id via set_user_scope. The export
+        carries records, evidence, candidates, and governance tables
+        (tombstones/receipts/rejections/aliases). Optional narrowing by
+        categories/namespace/client_scope/doc_class.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "export_portable"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Portable export is not available on this store.",
+                )
+            result = self._store.export_portable(
+                categories=params.get("categories"),
+                namespace=params.get("namespace"),
+                client_scope=params.get("client_scope"),
+                doc_class=params.get("doc_class"),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        # Return the export metadata + counts; the jsonl/markdown are
+        # available for download but not included in the summary to
+        # keep the response bounded.
+        header = result.get("header", {})
+        return {
+            "header": header,
+            "row_count": len(result.get("rows", [])),
+            "jsonl_available": "jsonl" in result,
+            "markdown_available": "markdown" in result,
+            "jsonl": result.get("jsonl", ""),
+            "markdown": result.get("markdown", ""),
+        }
 
     # -- Audit (D10) ---------------------------------------------------------
 

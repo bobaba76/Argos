@@ -1,0 +1,144 @@
+name: retrieval-weekly-gate (Tier 2)
+
+# #292 Tier 2: the full recall/bench gate on a weekly cadence (or on
+# demand). This is the REAL eval — the existing self-corpus gate
+# (eval/run_gate.py) over the frozen snapshot + gold_v1 — which is far
+# too slow/LLM-adjacent for per-PR use. Regression = DELTA vs the
+# recorded baseline (eval/verdict.py thresholds), never absolute; the
+# drift report tracks recall/MRR across runs.
+#
+# ARTIFACT PROVISIONING (#292 review): the gate's inputs are
+# deliberately gitignored (personal memory content — .gitignore
+# argos_plugin/eval/snapshots/ + eval/gold/*) and exist only on the
+# maintainer machine. `actions/checkout` runs `git clean -ffdx`, which
+# would DELETE ignored files before the preflight can see them — so the
+# "Provision gate artifacts" step below copies them from a fixed
+# host-side directory (ARGOS_GATE_ARTIFACTS_DIR on the self-hosted
+# runner) into the workspace BEFORE preflight, and fails loudly if
+# they are absent. The preflight then verifies integrity (sha256 vs
+# manifest) — a monitored failure, never a silent skip.
+
+on:
+  schedule:
+    # Mondays 04:00 UTC.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preflight only (validate artifacts, skip the gate run)"
+        type: boolean
+        default: true
+      snapshot_id:
+        description: "Snapshot dir name under argos_plugin/eval/snapshots/"
+        required: false
+        default: "20260826_170626_224920_4d612e0f"
+
+permissions:
+  contents: read
+  # actions/upload-artifact needs the actions: write scope — without it
+  # the upload step (if: always()) fails 403 every run.
+  actions: write
+
+concurrency:
+  group: retrieval-weekly
+  cancel-in-progress: false
+
+jobs:
+  weekly-gate:
+    # self-hosted: the snapshot DB (459MB, gitignored), the Hermes
+    # venv-cuda, and the HF model cache live on the maintainer's machine.
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 180
+    env:
+      SNAPSHOT_ID: ${{ github.event.inputs.snapshot_id || '20260826_170626_224920_4d612e0f' }}
+      SNAPSHOT_DIR: argos_plugin/eval/snapshots/${{ github.event.inputs.snapshot_id || '20260826_170626_224920_4d612e0f' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run == true || github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'false' }}
+      # Host-side directory holding the gitignored gate artifacts
+      # (snapshot dir + gold_v1.jsonl). Provisioned into the workspace
+      # by the step below — checkout's git clean -ffdx would otherwise
+      # wipe them before preflight.
+      ARGOS_GATE_ARTIFACTS_DIR: ${{ vars.ARGOS_GATE_ARTIFACTS_DIR || 'D:/argos-gate-artifacts' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provision gate artifacts (gitignored by design)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${ARGOS_GATE_ARTIFACTS_DIR:?host artifact dir not configured}"
+          echo "Provisioning gate artifacts from $SRC ..."
+          mkdir -p "$SNAPSHOT_DIR" argos_plugin/eval/gold
+          # Host-side layout mirrors the repo-relative paths:
+          #   $SRC/snapshots/<id>/hybrid_memory.duckdb
+          #   $SRC/snapshots/<id>/hybrid_memory.duckdb.wal
+          #   $SRC/snapshots/<id>/manifest.json
+          #   $SRC/snapshots/<id>/gate_baseline.json
+          #   $SRC/gold/gold_v1.jsonl
+          for f in \
+            "snapshots/$SNAPSHOT_ID/hybrid_memory.duckdb" \
+            "snapshots/$SNAPSHOT_ID/hybrid_memory.duckdb.wal" \
+            "snapshots/$SNAPSHOT_ID/manifest.json" \
+            "snapshots/$SNAPSHOT_ID/gate_baseline.json"; do
+            if [ -f "$SRC/$f" ]; then
+              cp "$SRC/$f" "$SNAPSHOT_DIR/$(basename "$f")"
+            else
+              echo "MISSING gate artifact: $SRC/$f" >&2
+              exit 2
+            fi
+          done
+          if [ -f "$SRC/gold/gold_v1.jsonl" ]; then
+            cp "$SRC/gold/gold_v1.jsonl" argos_plugin/eval/gold/gold_v1.jsonl
+          else
+            echo "MISSING gate artifact: gold_v1.jsonl" >&2
+            exit 2
+          fi
+          echo "Gate artifacts provisioned."
+
+      - name: Preflight (dry-report — artifacts present + coherent)
+        shell: bash
+        run: |
+          python argos_plugin/eval/ci_tier2_check.py --check \
+            --snapshot "$SNAPSHOT_DIR" \
+            --gold argos_plugin/eval/gold/gold_v1.jsonl \
+            --baseline "$SNAPSHOT_DIR/gate_baseline.json"
+
+      - name: Run the full gate (delta vs recorded baseline)
+        # Skipped on an explicit dry_run dispatch; runs on schedule.
+        if: ${{ github.event_name == 'schedule' || inputs.dry_run == false }}
+        shell: bash
+        run: |
+          # --out lands INSIDE the drift-scan dir AND is timestamped per
+          # run: a fixed filename would be OVERWRITTEN every Monday, so
+          # drift_history would always see {"runs": 1} and cross-run
+          # deltas would never accumulate (PR #337 re-review). The date
+          # component makes each run a distinct file; the weekly cadence
+          # means one file per run, sorted chronologically by name.
+          GATE_OUT="argos_plugin/eval/snapshots/gate_scores_weekly_$(date -u +%Y%m%d).json"
+          echo "gate output: $GATE_OUT"
+          python argos_plugin/eval/run_gate.py \
+            --snapshot "$SNAPSHOT_DIR" \
+            --gold argos_plugin/eval/gold/gold_v1.jsonl \
+            --out "$GATE_OUT" \
+            --compare "$SNAPSHOT_DIR/gate_baseline.json"
+        env:
+          HF_HUB_OFFLINE: "1"
+          PYTHONPATH: "."
+
+      - name: Drift report (recall/MRR across runs)
+        if: always()
+        shell: bash
+        run: |
+          # Scans the SAME directory the gate writes into (see --out
+          # above) — every weekly run's timestamped file accumulates, so
+          # the drift history shows cross-run deltas.
+          python argos_plugin/eval/ci_tier2_check.py --drift-history \
+            argos_plugin/eval/snapshots
+
+      - name: Upload gate scores
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-gate-scores
+          # Glob: every timestamped per-run scores file uploads.
+          path: argos_plugin/eval/snapshots/gate_scores_weekly_*.json
+          if-no-files-found: ignore

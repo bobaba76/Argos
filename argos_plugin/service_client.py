@@ -603,6 +603,19 @@ class SharedMemoryStore:
             "store", "verify_erase_receipt", receipt_id=receipt_id,
         ) or {"valid": False, "reason": "receipt not found"}
 
+    def export_portable(self, **kwargs: Any) -> dict:
+        """#294: portable export (anti-lock-in, data sovereignty)."""
+        result = self._rpc.call("store", "export_portable", **kwargs)
+        return result or {"header": {}, "rows": [], "jsonl": "", "markdown": ""}
+
+    def import_portable(self, **kwargs: Any) -> dict:
+        """#294: portable re-import (idempotent, tombstone-aware)."""
+        result = self._rpc.call("store", "import_portable", **kwargs)
+        return result or {
+            "mode": kwargs.get("mode", "preview"), "wrote": False,
+            "rows": [], "errors": [],
+        }
+
     def find_semantic_duplicate(
         self, content: str, min_similarity: float = 0.88,
     ) -> MemoryRecord | None:

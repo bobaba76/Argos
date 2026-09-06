@@ -700,6 +700,29 @@ class MemoryService:
             return store.verify_erase_receipt(
                 receipt_id=str(args.get("receipt_id", "")),
             )
+        if method == "export_portable":
+            # #294: portable export (anti-lock-in). Read-only, scoped to
+            # the service-resolved user (dispatch already ran
+            # store.set_user_scope(user_id)) — a tenant can only export
+            # its own data.
+            args = _sanitize_args(args)
+            return store.export_portable(
+                categories=args.get("categories"),
+                namespace=args.get("namespace"),
+                client_scope=args.get("client_scope"),
+                doc_class=args.get("doc_class"),
+            )
+        if method == "import_portable":
+            # #294: portable re-import. STRICT confirm (bool("false") is
+            # True — only literal True passes); rows are stamped with the
+            # service-resolved user_scope inside the store method.
+            args = _sanitize_args(args)
+            confirm = args.get("confirm", False) is True
+            return store.import_portable(
+                data=str(args.get("data", "")),
+                mode=str(args.get("mode", "preview")),
+                confirm=confirm,
+            )
         if method == "find_semantic_duplicate":
             return _record_to_dict(
                 store.find_semantic_duplicate(

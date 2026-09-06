@@ -1595,6 +1595,449 @@ class StoreMaintenanceMixin:
             "tombstoned": tomb is not None,
         }
 
+    # -- portable export/import (#294) ----------------------------------------
+    # Anti-lock-in / data sovereignty: a COMPLETE, versioned, deterministic
+    # JSONL export of everything a tenant owns (records + provenance +
+    # evidence + version chains + tombstones + deletion receipts +
+    # candidates + rejection ledger + aliases) plus a human-readable
+    # Markdown digest; and an idempotent re-import path that restores
+    # provenance and respects tombstones (deleted stays deleted).
+
+    # Tables included in a portable export, with their deterministic
+    # ORDER BY and row type. The graph is deliberately NOT exported —
+    # it is a derived index rebuilt by backfill_graph.py / rebuild_graph.py
+    # (documented in export_portable's docstring).
+    _PORTABLE_TABLES: Dict[str, tuple] = {
+        "record": ("memory_records", "memory_id"),
+        "evidence": ("memory_evidence", "memory_id"),
+        "tombstone": ("deletion_tombstones", "content_hash, category"),
+        "receipt": ("deletion_receipts", "created_at, receipt_id"),
+        "candidate": ("memory_candidates", "candidate_id"),
+        "rejection": ("rejection_ledger", "subject, predicate"),
+        "alias": ("entity_aliases", "alias, canonical_entity"),
+    }
+
+    def _rows_as_dicts(self, sql: str, params: List[Any]) -> List[Dict[str, Any]]:
+        """Run a query and return rows as plain dicts (column-name keyed)."""
+        assert self.connection is not None
+        cur = self.connection.execute(sql, params)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def export_portable(
+        self,
+        *,
+        categories: List[str] | None = None,
+        namespace: str | None = None,
+        client_scope: str | None = None,
+        doc_class: str | None = None,
+    ) -> Dict[str, Any]:
+        """Full portable export — complete, versioned, deterministic (#294).
+
+        Anti-lock-in: the export carries EVERYTHING a user needs to take
+        their memory elsewhere — all record fields (provenance origin/
+        grounding, version chains valid_from/valid_to/superseded_by,
+        embedding metadata, ACL metadata), evidence rows, pending
+        candidates, the rejection ledger, entity aliases, deletion
+        tombstones, and the append-only deletion receipts (#293).
+        Nothing user-owned is left behind.
+
+        NOT exported (deliberately, documented):
+        - the Kuzu graph: a derived index rebuilt from the records via
+          backfill_graph.py / rebuild_graph.py (its #287 valid windows
+          are re-derived on re-index, so no temporal state is lost);
+        - access_audit / system_state / file_catalog: operational
+          telemetry, not user memory.
+
+        Scope: rows are filtered to the store's current ``user_id``
+        (multi-tenant safe — one tenant's export never includes
+        another's) plus optional categories/namespace/client_scope/
+        doc_class narrowing. Records are the only filtered table; the
+        governance tables (tombstones/receipts/rejections/aliases/
+        evidence/candidates) are user-scoped as stored.
+
+        Deterministic: rows are ordered by primary key and serialized
+        with sorted keys — the same store state produces byte-identical
+        JSONL (the export timestamp lives only in the Markdown digest).
+
+        Returns:
+        {
+          "header": {export_format, export_version, schema_version,
+                     scope, counts},
+          "rows": [ {type, data} ... ],   # deterministic order
+          "jsonl": str,                   # the portable document
+          "markdown": str,                # human-readable digest
+        }
+        """
+        try:
+            try:
+                from .portable_export import (
+                    make_header, order_rows, render_markdown, serialize_export,
+                )
+            except ImportError:
+                from portable_export import (
+                    make_header, order_rows, render_markdown, serialize_export,
+                )
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("portable_export module unavailable") from exc
+
+        scope: Dict[str, Any] = {"user_scope": self.user_id}
+        if categories:
+            scope["categories"] = [str(c) for c in categories]
+        if namespace:
+            scope["namespace"] = namespace
+        if client_scope:
+            scope["client_scope"] = client_scope
+        if doc_class:
+            scope["doc_class"] = doc_class
+
+        # Record filter — always user-scoped; optional narrowing.
+        rec_clauses = ["(user_scope IS NULL OR user_scope = ?)"]
+        rec_params: List[Any] = [self.user_id]
+        if categories:
+            placeholders = ", ".join(["?" for _ in categories])
+            rec_clauses.append(f"LOWER(category) IN ({placeholders})")
+            rec_params.extend(str(c).lower() for c in categories)
+        if namespace:
+            rec_clauses.append("namespace = ?")
+            rec_params.append(namespace)
+        if client_scope:
+            rec_clauses.append("client_scope = ?")
+            rec_params.append(client_scope)
+        if doc_class:
+            rec_clauses.append("doc_class = ?")
+            rec_params.append(doc_class)
+        rec_where = " AND ".join(rec_clauses)
+
+        rows: List[Dict[str, Any]] = []
+
+        # Records: user-scoped + filtered, ordered by memory_id.
+        with self._state.lock:
+            assert self.connection is not None
+            cur = self.connection.execute(
+                f"SELECT * FROM memory_records WHERE {rec_where} "
+                "ORDER BY memory_id",
+                rec_params,
+            )
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                rows.append({"type": "record", "data": dict(zip(cols, row))})
+
+        # Governance/provenance tables: user-scoped as stored, no extra
+        # narrowing (their rows belong to the exporting user by
+        # construction; tombstones/receipts/rejections key on user_scope).
+        for rtype, (table, order_by) in self._PORTABLE_TABLES.items():
+            if rtype == "record":
+                continue
+            with self._state.lock:
+                assert self.connection is not None
+                cur = self.connection.execute(
+                    f"SELECT * FROM {table} "
+                    "WHERE (user_scope IS NULL OR user_scope = ?) "
+                    f"ORDER BY {order_by}",
+                    [self.user_id],
+                )
+                cols = [d[0] for d in cur.description]
+                for row in cur.fetchall():
+                    rows.append({"type": rtype, "data": dict(zip(cols, row))})
+
+        rows = order_rows(rows)
+        counts: Dict[str, int] = {}
+        for r in rows:
+            counts[r["type"]] = counts.get(r["type"], 0) + 1
+
+        try:
+            try:
+                from .schema_migrations import get_schema_version
+            except ImportError:
+                from schema_migrations import get_schema_version
+            with self._state.lock:
+                schema_version = get_schema_version(self.connection)
+        except Exception:
+            schema_version = 0
+
+        header = make_header(
+            schema_version=schema_version, scope=scope, counts=counts,
+        )
+        return {
+            "header": header,
+            "rows": rows,
+            "jsonl": serialize_export(header, rows),
+            "markdown": render_markdown(header, rows, source=self.user_id),
+        }
+
+    def import_portable(
+        self,
+        data: str,
+        *,
+        mode: str = "preview",
+        confirm: bool = False,
+    ) -> Dict[str, Any]:
+        """Re-import a portable export — idempotent, tombstone-aware (#294).
+
+        Accepts the JSONL produced by :meth:`export_portable`, validates
+        it (versioned format — unknown/newer versions are refused), and
+        restores records WITH their provenance, evidence, version chains
+        and governance state.
+
+        #289 pattern: preview (dry-run) reports what WOULD be written —
+        per-row outcomes and validation errors — and writes NOTHING;
+        apply requires a STRICT confirm (only the literal boolean True;
+        the string "false" must NOT pass). Validation errors abort the
+        whole batch before any write (no partial silent write).
+
+        Idempotent: rows are written by primary key (INSERT OR REPLACE),
+        so replaying the same export is a no-op — no duplicates.
+
+        Tombstone-aware (POPIA): a record whose content hash is
+        tombstoned in the TARGET store is NOT imported (deleted stays
+        deleted); the export's tombstone/receipt rows are restored so
+        the provenance of deletions survives the round-trip.
+
+        Scope: every imported row is stamped with the TARGET store's
+        current ``user_id`` — an import never writes into another
+        tenant's scope, and imported data is owned by the importing
+        cell.
+
+        Returns a report dict:
+        {
+          "mode", "export_version", "schema_version",
+          "total_rows", "valid_rows", "error_rows",
+          "restored", "unchanged", "tombstone_blocked",
+          "rows": [ {line, type, identity, outcome} ... ],
+          "errors": [ {line, errors: [...]} ... ],
+          "wrote": bool,
+        }
+        """
+        try:
+            try:
+                from .portable_export import parse_import
+            except ImportError:
+                from portable_export import parse_import
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("portable_export module unavailable") from exc
+
+        if mode not in {"preview", "apply"}:
+            raise ValueError("mode must be 'preview' or 'apply'")
+        if mode == "apply" and confirm is not True:
+            raise ValueError(
+                "import apply requires confirm=True (preview first, "
+                "then confirm)"
+            )
+
+        header, rows, parse_errors = parse_import(data)
+        report: Dict[str, Any] = {
+            "mode": mode,
+            "export_version": header.get("export_version"),
+            "schema_version": header.get("schema_version"),
+            "total_rows": len(rows) + len(parse_errors),
+            "valid_rows": len(rows),
+            "error_rows": len(parse_errors),
+            "restored": 0,
+            "unchanged": 0,
+            "tombstone_blocked": 0,
+            "rows": [],
+            "errors": parse_errors,
+            "wrote": False,
+        }
+        if not rows:
+            return report
+
+        # Fail loud: ANY validation error aborts an apply batch before
+        # any write (no partial silent skip).
+        if mode == "apply" and parse_errors:
+            raise ValueError(
+                f"import validation failed for {len(parse_errors)} "
+                f"row(s) — nothing written."
+            )
+
+        # Tombstone fingerprints for the target scope (deleted stays
+        # deleted — a record erased after the export must not be
+        # resurrected by replaying an older export).
+        with self._state.lock:
+            assert self.connection is not None
+            tomb_rows = self.connection.execute(
+                "SELECT content_hash, category FROM deletion_tombstones "
+                "WHERE (user_scope IS NULL OR user_scope = ?)",
+                [self.user_id],
+            ).fetchall()
+        tombstoned = {(h, c) for h, c in tomb_rows}
+
+        def _identity(rtype: str, data: Dict[str, Any]) -> str:
+            if rtype == "record":
+                return str(data.get("memory_id", ""))
+            if rtype == "evidence":
+                return str(data.get("memory_id", ""))
+            if rtype == "tombstone":
+                return f"{data.get('content_hash', '')}:{data.get('category', '')}"
+            if rtype == "receipt":
+                return str(data.get("receipt_id", ""))
+            if rtype == "candidate":
+                return str(data.get("candidate_id", ""))
+            if rtype == "rejection":
+                return f"{data.get('subject', '')}:{data.get('predicate', '')}"
+            if rtype == "alias":
+                return f"{data.get('alias', '')}:{data.get('canonical_entity', '')}"
+            return ""
+
+        # Per-row outcomes FIRST (read-only presence checks) so an apply
+        # run reports "restored" for genuinely new rows and "unchanged"
+        # for idempotent replays — then write.
+        for row in rows:
+            rtype, data = row["type"], row["data"]
+            identity = _identity(rtype, data)
+            entry = {
+                "line": row.get("line"),
+                "type": rtype,
+                "identity": identity,
+            }
+            if rtype == "record":
+                content = str(data.get("content") or "")
+                category = str(data.get("category") or "")
+                h = self._tombstone_hash(content)
+                if (h, category) in tombstoned:
+                    entry["outcome"] = "tombstone_blocked"
+                    report["tombstone_blocked"] += 1
+                    report["rows"].append(entry)
+                    continue
+                exists = self._import_row_exists(rtype, data)
+                same = False
+                if exists:
+                    with self._state.lock:
+                        assert self.connection is not None
+                        existing = self.connection.execute(
+                            "SELECT content FROM memory_records "
+                            "WHERE memory_id = ?",
+                            [identity],
+                        ).fetchone()
+                    same = bool(existing and existing[0] == content)
+                if exists and same:
+                    entry["outcome"] = "unchanged"
+                else:
+                    entry["outcome"] = (
+                        "would_restore" if mode == "preview" else "restored"
+                    )
+                report["rows"].append(entry)
+                continue
+            # Non-record types: presence check by identity.
+            exists = self._import_row_exists(rtype, data)
+            entry["outcome"] = (
+                "unchanged" if exists else
+                ("would_restore" if mode == "preview" else "restored")
+            )
+            report["rows"].append(entry)
+
+        # Apply: one transaction for the whole batch (all-or-nothing).
+        # Tombstone-blocked records are skipped (deleted stays deleted).
+        if mode == "apply":
+            with self._state.lock:
+                assert self.connection is not None
+                self.connection.execute("BEGIN TRANSACTION")
+                try:
+                    for row in rows:
+                        if row["type"] == "record":
+                            data = row["data"]
+                            h = self._tombstone_hash(
+                                str(data.get("content") or ""))
+                            if (h, str(data.get("category") or "")) in tombstoned:
+                                continue
+                        self._import_row(row["type"], row["data"])
+                    self.connection.execute("COMMIT")
+                except Exception:
+                    self.connection.execute("ROLLBACK")
+                    raise
+
+        # Final counts from the per-row outcomes.
+        for entry in report["rows"]:
+            if entry["outcome"] == "restored":
+                report["restored"] += 1
+            elif entry["outcome"] == "unchanged":
+                report["unchanged"] += 1
+
+        report["wrote"] = mode == "apply"
+        return report
+
+    def _import_row(self, rtype: str, data: Dict[str, Any]) -> None:
+        """Write one import row by primary key (INSERT OR REPLACE).
+
+        The row's user_scope is FORCED to the target store's current
+        user — an import never writes into another tenant's scope.
+        Columns unknown to the live schema are dropped (forward
+        compatibility); missing columns take the schema defaults.
+        """
+        table = self._PORTABLE_TABLES[rtype][0]
+        with self._state.lock:
+            assert self.connection is not None
+            cols_cur = self.connection.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ?",
+                [table],
+            ).fetchall()
+        live_cols = {r[0] for r in cols_cur}
+        row = {k: v for k, v in data.items() if k in live_cols}
+        row["user_scope"] = self.user_id
+        if not row:
+            return
+        col_list = ", ".join(row.keys())
+        ph = ", ".join(["?" for _ in row])
+        self.connection.execute(
+            f"INSERT OR REPLACE INTO {table} ({col_list}) "
+            f"VALUES ({ph})",
+            list(row.values()),
+        )
+
+    def _import_row_exists(self, rtype: str, data: Dict[str, Any]) -> bool:
+        """Read-only presence check for preview/unchanged reporting."""
+        table = self._PORTABLE_TABLES[rtype][0]
+        if rtype in {"record", "evidence"}:
+            key_col, key_val = "memory_id", data.get("memory_id")
+        elif rtype == "receipt":
+            key_col, key_val = "receipt_id", data.get("receipt_id")
+        elif rtype == "candidate":
+            key_col, key_val = "candidate_id", data.get("candidate_id")
+        elif rtype == "tombstone":
+            with self._state.lock:
+                assert self.connection is not None
+                row = self.connection.execute(
+                    "SELECT 1 FROM deletion_tombstones "
+                    "WHERE content_hash = ? AND category = ?"
+                    " AND (user_scope IS NULL OR user_scope = ?)",
+                    [data.get("content_hash"), data.get("category"),
+                     self.user_id],
+                ).fetchone()
+            return row is not None
+        elif rtype == "rejection":
+            with self._state.lock:
+                assert self.connection is not None
+                row = self.connection.execute(
+                    "SELECT 1 FROM rejection_ledger "
+                    "WHERE subject = ? AND predicate = ?"
+                    " AND (user_scope IS NULL OR user_scope = ?)",
+                    [data.get("subject"), data.get("predicate"),
+                     self.user_id],
+                ).fetchone()
+            return row is not None
+        elif rtype == "alias":
+            with self._state.lock:
+                assert self.connection is not None
+                row = self.connection.execute(
+                    "SELECT 1 FROM entity_aliases "
+                    "WHERE alias = ? AND canonical_entity = ?"
+                    " AND (user_scope IS NULL OR user_scope = ?)",
+                    [data.get("alias"), data.get("canonical_entity"),
+                     self.user_id],
+                ).fetchone()
+            return row is not None
+        else:
+            return False
+        with self._state.lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                f"SELECT 1 FROM {table} WHERE {key_col} = ?",
+                [key_val],
+            ).fetchone()
+        return row is not None
+
     # -- system state KV (P4.2 distillation, future maintenance) -------------
 
     # SM2/SM9: key allowlist for system_state. Only these keys may be

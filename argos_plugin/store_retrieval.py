@@ -388,16 +388,18 @@ class StoreRetrievalMixin:
         query_dim = len(emb)
         try:
             assert self.connection is not None
-            dim_row = self.connection.execute(
+            # No LIMIT — with >=3 distinct dims, LIMIT 2 can miss the real
+            # mismatch or false-positive. Fetch ALL distinct dims and
+            # compare against a set.
+            dim_rows = self.connection.execute(
                 "SELECT DISTINCT embedding_dim FROM memory_records "
-                "WHERE embedding IS NOT NULL AND embedding_dim IS NOT NULL "
-                "LIMIT 2"
+                "WHERE embedding IS NOT NULL AND embedding_dim IS NOT NULL"
             ).fetchall()
-            stored_dims = [r[0] for r in dim_row]
+            stored_dims = {r[0] for r in dim_rows}
             if stored_dims and query_dim not in stored_dims:
                 raise ValueError(
                     f"Dimension mismatch: query vector has dim {query_dim} "
-                    f"but stored vectors have dim(s) {stored_dims}. "
+                    f"but stored vectors have dim(s) {sorted(stored_dims)}. "
                     f"Run reembed_memories.py to re-embed with the current model. "
                     f"Text search fallback remains available."
                 )

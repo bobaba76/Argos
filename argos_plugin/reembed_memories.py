@@ -183,6 +183,10 @@ def reembed_store(
     embedding_dim = len(probe)
 
     # Re-embed in batches.
+    # #286: only re-embed current (valid_to IS NULL) records — skip
+    # superseded/archived historical versions, matching the guard in
+    # backfill_null_embeddings(). Historical versions retain their
+    # original embeddings for audit/reproducibility.
     re_embedded = 0
     skipped = 0
     offset = 0
@@ -191,6 +195,7 @@ def reembed_store(
     while offset < total:
         rows = conn.execute(
             "SELECT memory_id, content FROM memory_records "
+            "WHERE valid_to IS NULL "
             "ORDER BY memory_id LIMIT ? OFFSET ?",
             [batch_size, offset],
         ).fetchall()
@@ -217,7 +222,8 @@ def reembed_store(
                                embedding_dim = ?,
                                embedder_id = ?,
                                embedded_at = ?
-                           WHERE memory_id = ?""",
+                           WHERE memory_id = ?
+                             AND valid_to IS NULL""",
                         [emb, len(emb), embedder_id, now_ts, mid],
                     )
                     re_embedded += 1
@@ -351,52 +357,26 @@ def main() -> int:
     print("Backup complete.")
     print()
 
-    # Re-embed in batches.
-    batch_size = max(1, args.batch_size)
-    re_embedded = 0
-    skipped = 0
-    offset = 0
-
-    while offset < total:
-        rows = conn.execute(
-            "SELECT memory_id, content FROM memory_records "
-            "ORDER BY memory_id LIMIT ? OFFSET ?",
-            [batch_size, offset],
-        ).fetchall()
-        if not rows:
-            break
-
-        # Collect non-empty contents.
-        ids_to_update = []
-        texts_to_embed = []
-        for memory_id, content in rows:
-            if content and content.strip():
-                ids_to_update.append(memory_id)
-                texts_to_embed.append(content)
-            else:
-                skipped += 1
-
-        if texts_to_embed:
-            # Embed content (is_query=False — these are stored documents).
-            embeddings = embedder.embed_batch(texts_to_embed, is_query=False)
-            for mid, emb in zip(ids_to_update, embeddings):
-                if emb:
-                    conn.execute(
-                        "UPDATE memory_records SET embedding = ? WHERE memory_id = ?",
-                        [emb, mid],
-                    )
-                    re_embedded += 1
-                else:
-                    skipped += 1
-
-        offset += len(rows)
-        print(f"  Progress: {min(offset, total)}/{total} rows processed "
-              f"({re_embedded} re-embedded, {skipped} skipped)")
+    # #286: route through reembed_store() so the provenance-stamping path
+    # (embedding_dim, embedder_id, embedded_at) is the one operators
+    # actually run. The old inline loop only updated `embedding`, leaving
+    # stale embedding_dim and NULL embedder_id/embedded_at — which made
+    # _vector_search_raw's pre-check force text-only fallback on every
+    # query after a model switch.
+    report = reembed_store(
+        conn, embedder,
+        batch_size=max(1, args.batch_size),
+        dry_run=False,
+    )
 
     print()
     print(f"=== RE-EMBED COMPLETE ===")
-    print(f"Re-embedded: {re_embedded}")
-    print(f"Skipped:     {skipped}")
+    print(f"Re-embedded: {report['re_embedded']}")
+    print(f"Skipped:     {report['skipped']}")
+    print(f"Embedder:    {report['source_embedder']}")
+    print(f"Dim:         {report['embedding_dim']}")
+    print(f"Before dims: {report['before_dims']}")
+    print(f"After dims:  {report['after_dims']}")
     print(f"Backup at:   {backup_path}")
     print()
     print("You can now start Hermes. Search will use the new embedding space.")

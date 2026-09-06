@@ -1292,6 +1292,17 @@ class StoreMaintenanceMixin:
         if not rows:
             return 0
         updated = 0
+        # #286: stamp embedding provenance on backfilled rows, same as
+        # reembed_store() and remember(). Without this, backfilled rows
+        # have embeddings but NULL embedding_dim — invisible to the
+        # _vector_search_raw pre-check (WHERE embedding_dim IS NOT NULL),
+        # causing a stale-metadata trap on embedder-change during an
+        # outage.
+        embedder_id = getattr(embedder, "_model_name", None) or getattr(
+            embedder, "model_name", None
+        )
+        from datetime import datetime, timezone
+        backfill_ts = datetime.now(timezone.utc).isoformat()
         for i in range(0, len(rows), batch_size):
             chunk = rows[i:i + batch_size]
             texts = [r[1] for r in chunk]
@@ -1305,14 +1316,16 @@ class StoreMaintenanceMixin:
                     if not vec:
                         continue
                     self.connection.execute(
-                        "UPDATE memory_records SET embedding = ? "
+                        "UPDATE memory_records SET embedding = ?, "
+                        "embedding_dim = ?, embedder_id = ?, embedded_at = ? "
                         "WHERE memory_id = ?"
                         " AND (user_scope IS NULL OR user_scope = ?)"
                         # SM5: add valid_to IS NULL guard so a record
                         # superseded between SELECT and UPDATE (TOCTOU)
                         # doesn't get its embedding written.
                         " AND valid_to IS NULL",
-                        [vec, memory_id, self.user_id],
+                        [vec, len(vec), embedder_id, backfill_ts,
+                         memory_id, self.user_id],
                     )
                     updated += 1
             logger.info(

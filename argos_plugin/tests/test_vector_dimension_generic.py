@@ -514,3 +514,255 @@ class TestStoreWriteStampsProvenance:
             assert rec.embedded_at is None
         finally:
             store.close()
+
+
+class TestCLIReembedStampsProvenance:
+    """8. CLI main() routes through reembed_store() — end-to-end test.
+
+    The operational re-embed path (CLI main(), shipped by deploy.py) must
+    stamp embedding_dim, embedder_id, and embedded_at on every re-embedded
+    record. This test exercises main() end-to-end (not just
+    reembed_store()) to verify the CLI doesn't bypass the provenance-
+    stamping path.
+    """
+
+    def test_main_routes_through_reembed_store(self, tmp_path, monkeypatch):
+        """main() calls reembed_store() and stamps provenance on rows."""
+        import duckdb
+        import reembed_memories
+
+        # Create a store with 384-dim records.
+        store = DuckDBMemoryStore(
+            tmp_path / "cli.duckdb", user_id="alice",
+            embedder=_MockEmbedder384(),
+        )
+        store.remember(category="personal_fact", content="CLI test fact about hiking")
+        store.remember(category="personal_fact", content="CLI test fact about cooking")
+        store.close()
+
+        db_path = tmp_path / "cli.duckdb"
+
+        # Monkeypatch _get_hermes_home and _resolve_db_path so main()
+        # finds our test DB without HERMES_HOME.
+        monkeypatch.setattr(reembed_memories, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            reembed_memories, "_resolve_db_path",
+            lambda home, override=None: db_path,
+        )
+        # Monkeypatch _load_model_name to return our mock model.
+        monkeypatch.setattr(
+            reembed_memories, "_load_model_name", lambda home: "mock-768",
+        )
+        # Monkeypatch LocalEmbedder to return our mock 768-dim embedder.
+        monkeypatch.setattr(
+            reembed_memories, "LocalEmbedder",
+            lambda model_name: _MockEmbedder768(),
+            raising=False,
+        )
+        # Inject LocalEmbedder into the module's namespace (main() does
+        # `from embeddings import LocalEmbedder`).
+        import types
+        mock_embeddings = types.ModuleType("embeddings")
+        mock_embeddings.LocalEmbedder = lambda model_name: _MockEmbedder768()
+        monkeypatch.setitem(sys.modules, "embeddings", mock_embeddings)
+
+        # Run main() with no args (not --dry-run).
+        monkeypatch.setattr(sys, "argv", ["reembed_memories.py"])
+        rc = reembed_memories.main()
+
+        assert rc == 0
+
+        # Verify provenance is stamped on every row.
+        conn = duckdb.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT memory_id, embedder_id, embedded_at, embedding_dim "
+                "FROM memory_records ORDER BY memory_id"
+            ).fetchall()
+            assert len(rows) == 2
+            for mid, eid, eat, edim in rows:
+                assert eid == "mock-768", (
+                    f"embedder_id not stamped by CLI for {mid}: got {eid}"
+                )
+                assert eat is not None, (
+                    f"embedded_at not stamped by CLI for {mid}"
+                )
+                assert edim == 768, (
+                    f"embedding_dim not stamped by CLI for {mid}: got {edim}"
+                )
+        finally:
+            conn.close()
+
+    def test_main_dry_run_does_not_write(self, tmp_path, monkeypatch):
+        """main() --dry-run does not modify any rows."""
+        import duckdb
+        import reembed_memories
+
+        store = DuckDBMemoryStore(
+            tmp_path / "clidry.duckdb", user_id="alice",
+            embedder=_MockEmbedder384(),
+        )
+        store.remember(category="personal_fact", content="Dry run CLI fact")
+        store.close()
+
+        db_path = tmp_path / "clidry.duckdb"
+
+        monkeypatch.setattr(reembed_memories, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(
+            reembed_memories, "_resolve_db_path",
+            lambda home, override=None: db_path,
+        )
+        monkeypatch.setattr(
+            reembed_memories, "_load_model_name", lambda home: "mock-768",
+        )
+        import types
+        mock_embeddings = types.ModuleType("embeddings")
+        mock_embeddings.LocalEmbedder = lambda model_name: _MockEmbedder768()
+        monkeypatch.setitem(sys.modules, "embeddings", mock_embeddings)
+
+        # Capture before state.
+        conn = duckdb.connect(str(db_path))
+        before = conn.execute(
+            "SELECT embedding_dim, embedder_id FROM memory_records"
+        ).fetchall()
+        conn.close()
+
+        monkeypatch.setattr(sys, "argv", ["reembed_memories.py", "--dry-run"])
+        rc = reembed_memories.main()
+        assert rc == 0
+
+        # Verify nothing changed.
+        conn = duckdb.connect(str(db_path))
+        try:
+            after = conn.execute(
+                "SELECT embedding_dim, embedder_id FROM memory_records"
+            ).fetchall()
+            assert before == after
+        finally:
+            conn.close()
+
+
+class TestReembedSkipsSuperseded:
+    """9. reembed_store() skips superseded (valid_to IS NOT NULL) rows."""
+
+    def test_reembed_skips_superseded_rows(self, tmp_path):
+        """reembed_store() does not re-embed rows with valid_to IS NOT NULL."""
+        import duckdb
+        from reembed_memories import reembed_store
+
+        store = DuckDBMemoryStore(
+            tmp_path / "sup.duckdb", user_id="alice",
+            embedder=_MockEmbedder384(),
+        )
+        # Create a current record.
+        rec = store.remember(
+            category="personal_fact",
+            content="Current fact about hiking trails",
+        )
+        # Manually supersede it by setting valid_to.
+        with store._state.lock:
+            store.connection.execute(
+                "UPDATE memory_records SET valid_to = ? WHERE memory_id = ?",
+                ["2025-01-01T00:00:00Z", rec.memory_id],
+            )
+        store.close()
+
+        # Re-embed — the superseded row should NOT be touched.
+        conn = duckdb.connect(str(tmp_path / "sup.duckdb"))
+        try:
+            report = reembed_store(conn, _MockEmbedder768())
+            # No current rows to re-embed.
+            assert report["re_embedded"] == 0
+        finally:
+            conn.close()
+
+    def test_reembed_only_touches_current_rows(self, tmp_path):
+        """reembed_store() re-embeds current rows but skips superseded ones."""
+        import duckdb
+        from reembed_memories import reembed_store
+
+        store = DuckDBMemoryStore(
+            tmp_path / "mixed.duckdb", user_id="alice",
+            embedder=_MockEmbedder384(),
+        )
+        # Create two current records.
+        rec1 = store.remember(
+            category="personal_fact",
+            content="Current fact about hiking in the mountains",
+        )
+        rec2 = store.remember(
+            category="personal_fact",
+            content="Current fact about cooking Italian pasta",
+        )
+        # Supersede rec1.
+        with store._state.lock:
+            store.connection.execute(
+                "UPDATE memory_records SET valid_to = ? WHERE memory_id = ?",
+                ["2025-01-01T00:00:00Z", rec1.memory_id],
+            )
+        store.close()
+
+        # Re-embed — only rec2 (current) should be touched.
+        conn = duckdb.connect(str(tmp_path / "mixed.duckdb"))
+        try:
+            report = reembed_store(conn, _MockEmbedder768())
+            assert report["re_embedded"] == 1
+
+            # Check that the superseded row kept its old dim.
+            dims = conn.execute(
+                "SELECT memory_id, embedding_dim FROM memory_records ORDER BY memory_id"
+            ).fetchall()
+            for mid, edim in dims:
+                if mid == rec1.memory_id:
+                    # Superseded — should still be 384 (not re-embedded).
+                    assert edim == 384, (
+                        f"Superseded row {mid} was re-embedded: dim={edim}"
+                    )
+                elif mid == rec2.memory_id:
+                    # Current — should be 768.
+                    assert edim == 768, (
+                        f"Current row {mid} was not re-embedded: dim={edim}"
+                    )
+        finally:
+            conn.close()
+
+
+class TestBackfillStampsProvenance:
+    """10. backfill_null_embeddings() stamps embedding_dim + provenance."""
+
+    def test_backfill_stamps_embedding_dim(self, tmp_path):
+        """backfill_null_embeddings() stamps embedding_dim on backfilled rows."""
+        # Create a store with no embedder (records get NULL embeddings).
+        store = DuckDBMemoryStore(
+            tmp_path / "backfill.duckdb", user_id="alice",
+            embedder=None,
+        )
+        rec = store.remember(
+            category="personal_fact",
+            content="Fact that will be backfilled after embedder recovery",
+        )
+        assert rec.embedding is None
+        assert rec.embedding_dim is None
+
+        # Now give the store an embedder and trigger backfill.
+        store.embedder = _MockEmbedder768()
+        backfilled = store.backfill_null_embeddings()
+        assert backfilled >= 1
+
+        # Verify the row has embedding_dim stamped.
+        import duckdb
+        conn = duckdb.connect(str(tmp_path / "backfill.duckdb"))
+        try:
+            row = conn.execute(
+                "SELECT embedding_dim, embedder_id, embedded_at "
+                "FROM memory_records WHERE memory_id = ?",
+                [rec.memory_id],
+            ).fetchone()
+            assert row is not None
+            edim, eid, eat = row
+            assert edim == 768, f"embedding_dim not stamped: {edim}"
+            assert eid == "mock-768", f"embedder_id not stamped: {eid}"
+            assert eat is not None, "embedded_at not stamped"
+        finally:
+            conn.close()
+        store.close()

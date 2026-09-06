@@ -48,10 +48,10 @@ class MemoryConfig(BaseModel):
     max_injected_items: int = Field(20, ge=1, le=512)
     inject_content_char_cap: int = Field(800, ge=100, le=5000)
     freshness_markers: bool = True
-    skip_retrieval_on_trivial: bool = False
-    injection_min_score: float = Field(0.0, ge=0.0, le=1.0)
-    chronological_injection: bool = False
-    date_anchor_rerank: bool = False
+    skip_retrieval_on_trivial: bool = True
+    injection_min_score: float = Field(0.30, ge=0.0, le=1.0)
+    chronological_injection: bool = True
+    date_anchor_rerank: bool = True
     history_at_current_time: bool = True
 
     # -- extraction / review ---------------------------------------------------
@@ -197,9 +197,9 @@ class MemoryConfig(BaseModel):
     # that exist in code but are deliberately NOT rendered in the Hermes
     # settings UI (config_schema.py). They are either: advanced tuning
     # thresholds (phrase_lift_*, graph_ppr_*, router_*_threshold,
-    # injection_min_score, chain_unfold_arc_min_similarity), operational
+    # chain_unfold_arc_min_similarity), operational
     # instrumentation (scale_warn_*), internal config objects (acl,
-    # backup dict), or experimental wired-but-off features (watcher_*).
+    # backup dict), or experimental/dev features (watcher_*).
     #
     # Source of truth: MemoryConfig.internal_keys() ==
     # model_fields - schema_keys. A new model field that is NOT in the UI
@@ -211,11 +211,9 @@ class MemoryConfig(BaseModel):
         "consolidation_auto_apply",
         "evidence_retention",
         "graph_ppr_enabled", "graph_ppr_damping", "graph_ppr_boost",
-        "injection_min_score",
         "phrase_lift_alpha", "phrase_lift_pool",
         "router_temporal_threshold", "router_multihop_threshold",
         "scale_warn_latency_ms", "scale_warn_records",
-        "skip_retrieval_on_trivial",
         "watcher_enabled", "watcher_interval_min", "watcher_scan_roots",
     })
 

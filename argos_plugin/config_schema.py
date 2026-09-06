@@ -345,6 +345,34 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Trigger expansion when top hit similarity is below this (0.0-1.0).",
             group="Retrieval",
         ),
+        # -- Recommendations (free quality) -----------------------------------
+        # These two knobs improve focus and cost with zero external calls and
+        # zero mutation. They are surfaced here so a fresh install gets the
+        # shipped posture AND the user can see/change it — the "nobody
+        # remembers to enable them" failure class. The remaining quality
+        # features (reranker, router, distillation, rollup) cost LLM/GPU and
+        # stay off by default; destructive/experimental features stay off by
+        # design. See CONFIG_REFERENCE.md for the full posture.
+        ProviderField(
+            key="skip_retrieval_on_trivial",
+            label="Skip retrieval on trivial turns",
+            kind=KIND_BOOL,
+            default="true",
+            description="Skip the memory search entirely on trivial/filler turns (hello, ok, thanks…).",
+            info="Ships ON. Zero cost, zero risk — it only skips work that would return nothing useful, and keeps trivial turns off the retrieval floor entirely (saves embedding+search wall-time).",
+            inline=True,
+            group="Recommendations",
+        ),
+        ProviderField(
+            key="injection_min_score",
+            label="Injection relevance floor",
+            kind=KIND_TEXT,
+            default="0.30",
+            description="Cosine floor for auto-injected memories — hits below this are dropped (0.0–1.0).",
+            info="0.0 = inject everything (noise floor). 0.30 keeps weak matches out of the injected block; raise if injections feel scattered, lower if you miss fringe recalls. Ships at the maintainer's validated 0.30.",
+            inline=True,
+            group="Recommendations",
+        ),
         ProviderField(
             key="llm_model",
             label="LLM model",
@@ -600,9 +628,9 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             key="chronological_injection",
             label="Chronological injection (temporal)",
             kind=KIND_BOOL,
-            default="false",
+            default="true",
             description="On temporal/multi-hop turns, re-sort the injected memories by timestamp (oldest first) so the model reads a timeline in order instead of relevance-scrambled order.",
-            info="Ships OFF. Fixes 'temporal whiplash' — when a 'when did / how long ago / what happened first' question retrieves memories in relevance order, the model sees events out of sequence. This only re-orders the injection for temporal queries; ordinary turns keep relevance order. No token cost; reuse of the P2A temporal classifier.",
+            info="Ships ON. Fixes 'temporal whiplash' — when a 'when did / how long ago / what happened first' question retrieves memories in relevance order, the model sees events out of sequence. This only re-orders the injection for temporal queries; ordinary turns keep relevance order. No token cost; reuse of the P2A temporal classifier.",
             inline=True,
             group="Temporal",
         ),
@@ -610,9 +638,9 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             key="date_anchor_rerank",
             label="Date-anchored re-rank (temporal)",
             kind=KIND_BOOL,
-            default="false",
+            default="true",
             description="On temporal turns with an explicit date expression ('10 days ago', 'last Tuesday', 'on March 2nd'), re-sort injected memories by proximity to the resolved target date.",
-            info="Ships OFF pending drip confirmation. Zero-LLM (regex resolve vs today + stable sort). Measured +10pp on extractable questions (n=20, Flash) with control arm exactly flat. Reorders only when the intent router says temporal AND a date expression is found; otherwise keeps relevance order.",
+            info="Ships ON. Zero-LLM (regex + stable sort). Measured +10pp on extractable questions (n=20, Flash) with control arm exactly flat. Reorders only when the intent router says temporal AND a date expression is found; otherwise keeps relevance order.",
             inline=True,
             group="Temporal",
         ),

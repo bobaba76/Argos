@@ -33,10 +33,10 @@ class TestConfigParity:
         assert c.max_injected_items == 20
         assert c.inject_content_char_cap == 800
         assert c.freshness_markers is True
-        assert c.skip_retrieval_on_trivial is False
-        assert c.injection_min_score == 0.0
-        assert c.chronological_injection is False
-        assert c.date_anchor_rerank is False
+        assert c.skip_retrieval_on_trivial is True
+        assert c.injection_min_score == 0.30
+        assert c.chronological_injection is True
+        assert c.date_anchor_rerank is True
         assert c.history_at_current_time is True
 
     def test_extraction_review_defaults(self):

@@ -292,7 +292,7 @@ class StoreRetrievalMixin:
         )
         sql = (
             f"SELECT * FROM memory_records WHERE {where_sql} "
-            f"AND ({conditions}) LIMIT 500"
+            f"AND ({conditions}) LIMIT 2000"
         )
         results = self._fetch_records(sql, [*where_params, *patterns])
         out: List[MemoryRecord] = []

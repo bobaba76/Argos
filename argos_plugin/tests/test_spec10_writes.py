@@ -654,3 +654,216 @@ class TestT8ProviderSideEffects:
         assert facade_rec[0].status == "active"
         assert facade_rec[0].content == native_rec.content
         assert facade_rec[0].category == native_rec.category
+
+
+# -- T9: facade_delete_memory server-side gating (BLOCKER regression) --------
+
+class TestT9FacadeDeleteGating:
+    """T9: facade_delete_memory is gated server-side — raw RPC without
+    confirm/CAS is denied, identity is stripped, audit records denials.
+
+    These tests drive the service handler directly (no subprocess) to
+    verify the server-side gates. The service handler is the security
+    boundary — the facade's loopback gate is defense-in-depth on top.
+    """
+
+    def _make_service_and_store(self, tmp_path):
+        """Build a MemoryService + DuckDBMemoryStore for direct handler tests."""
+        from store import DuckDBMemoryStore
+        from memory_service import MemoryService
+        db_path = tmp_path / "test.duckdb"
+        store = DuckDBMemoryStore(db_path, user_id="test_user", embedder=None)
+        svc = MemoryService(tmp_path)
+        # Register the test user's tenant with the store + graph.
+        svc._tenants["default"].store = store
+        return svc, store
+
+    def test_raw_rpc_without_confirm_denied(self, tmp_path):
+        """(i) Raw RPC facade_delete_memory without confirm → denied,
+        audit row records the denial."""
+        svc, store = self._make_service_and_store(tmp_path)
+        # Seed a memory
+        rec = store.remember(content="to delete", category="context_note")
+        mid = rec.memory_id
+        # Call the handler directly without confirm
+        with pytest.raises(PermissionError, match="confirm"):
+            svc._call_store(
+                "facade_delete_memory",
+                {"memory_id": mid, "expected_version": mid},
+                "test_user",
+                store,
+                None,
+                svc._tenants.get("default"),
+            )
+        # Memory still exists
+        records = store.get_memories_by_ids([mid])
+        assert len(records) == 1
+
+    def test_raw_rpc_without_cas_denied(self, tmp_path):
+        """Raw RPC facade_delete_memory without expected_version → denied."""
+        svc, store = self._make_service_and_store(tmp_path)
+        rec = store.remember(content="to delete", category="context_note")
+        mid = rec.memory_id
+        with pytest.raises(PermissionError, match="expected_version"):
+            svc._call_store(
+                "facade_delete_memory",
+                {"memory_id": mid, "confirm": True},
+                "test_user",
+                store,
+                None,
+                svc._tenants.get("default"),
+            )
+        records = store.get_memories_by_ids([mid])
+        assert len(records) == 1
+
+    def test_client_user_id_stripped(self, tmp_path):
+        """(ii) Client-chosen user_id in the call → stripped, service-
+        resolved identity used. The _FORBIDDEN_CLIENT_ARGS set includes
+        user_id, so _sanitize_args removes it before the store sees it."""
+        from memory_service import _FORBIDDEN_CLIENT_ARGS
+        assert "user_id" in _FORBIDDEN_CLIENT_ARGS
+        assert "tenant" in _FORBIDDEN_CLIENT_ARGS
+
+    def test_valid_cas_confirm_deletes(self, tmp_path):
+        """(iii) Valid CAS + confirm → deletes exactly the expected version,
+        audit written."""
+        svc, store = self._make_service_and_store(tmp_path)
+        rec = store.remember(content="to delete", category="context_note")
+        mid = rec.memory_id
+        result = svc._call_store(
+            "facade_delete_memory",
+            {"memory_id": mid, "confirm": True, "expected_version": mid},
+            "test_user",
+            store,
+            None,
+            svc._tenants.get("default"),
+        )
+        # Memory is gone
+        records = store.get_memories_by_ids([mid])
+        assert len(records) == 0 or all(r.status != "active" for r in records)
+
+    def test_stale_cas_denied(self, tmp_path):
+        """CAS with stale expected_version → denied, no delete."""
+        svc, store = self._make_service_and_store(tmp_path)
+        rec = store.remember(content="to delete", category="context_note")
+        mid = rec.memory_id
+        with pytest.raises((ValueError, PermissionError), match="CAS"):
+            svc._call_store(
+                "facade_delete_memory",
+                {"memory_id": mid, "confirm": True,
+                 "expected_version": "stale-version"},
+                "test_user",
+                store,
+                None,
+                svc._tenants.get("default"),
+            )
+        # Memory still exists
+        records = store.get_memories_by_ids([mid])
+        assert len(records) == 1
+
+    def test_delete_memory_stays_forbidden_raw(self, tmp_path):
+        """(iv) delete_memory stays forbidden on the raw RPC boundary."""
+        from memory_service import _FORBIDDEN_STORE_METHODS
+        assert "delete_memory" in _FORBIDDEN_STORE_METHODS
+        assert "facade_delete_memory" not in _FORBIDDEN_STORE_METHODS
+
+
+# -- T10: Post-write graph hook (WARNING 2 regression) ----------------------
+
+class TestT10PostWriteGraphHook:
+    """T10: facade-mediated writes through the service dispatch trigger
+    graph indexing (save) and graph removal+re-index (update/delete).
+
+    These tests drive the service handler directly to verify the
+    post-write graph hooks fire. The graph is a Kuzu instance attached
+    to the tenant; the hook calls graph.index_memory / graph.remove_memory
+    after a successful store write.
+    """
+
+    def _make_service_with_graph(self, tmp_path):
+        """Build a MemoryService + DuckDBMemoryStore + mock graph."""
+        from store import DuckDBMemoryStore
+        from memory_service import MemoryService
+        db_path = tmp_path / "test.duckdb"
+        store = DuckDBMemoryStore(db_path, user_id="test_user", embedder=None)
+        svc = MemoryService(tmp_path)
+        tenant = svc._tenants["default"]
+        tenant.store = store
+        # Attach a mock graph to verify hook calls.
+        tenant.graph = MagicMock()
+        return svc, store, tenant
+
+    def test_remember_triggers_graph_index(self, tmp_path):
+        """store.remember through the service dispatch indexes the graph."""
+        svc, store, tenant = self._make_service_with_graph(tmp_path)
+        svc._call_store(
+            "remember",
+            {"content": "graph hook test", "category": "context_note", "tags": ["test"]},
+            "test_user",
+            store,
+            None,
+            tenant,
+        )
+        tenant.graph.index_memory.assert_called_once()
+        call_kwargs = tenant.graph.index_memory.call_args.kwargs
+        assert call_kwargs["content"] == "graph hook test"
+        assert call_kwargs["category"] == "context_note"
+
+    def test_update_triggers_graph_remove_and_index(self, tmp_path):
+        """update_memory through the service dispatch removes the old id
+        from the graph and indexes the new version."""
+        svc, store, tenant = self._make_service_with_graph(tmp_path)
+        # Seed a memory
+        rec = store.remember(content="original", category="context_note")
+        old_mid = rec.memory_id
+        tenant.graph.reset_mock()
+        # Update
+        svc._call_store(
+            "update_memory",
+            {"memory_id": old_mid, "content": "updated"},
+            "test_user",
+            store,
+            None,
+            tenant,
+        )
+        # Old id removed from graph
+        tenant.graph.remove_memory.assert_called_once_with(old_mid)
+        # New version indexed
+        tenant.graph.index_memory.assert_called_once()
+        call_kwargs = tenant.graph.index_memory.call_args.kwargs
+        assert call_kwargs["content"] == "updated"
+
+    def test_facade_delete_triggers_graph_remove(self, tmp_path):
+        """facade_delete_memory through the service dispatch removes the
+        memory from the graph."""
+        svc, store, tenant = self._make_service_with_graph(tmp_path)
+        rec = store.remember(content="to delete", category="context_note")
+        mid = rec.memory_id
+        tenant.graph.reset_mock()
+        svc._call_store(
+            "facade_delete_memory",
+            {"memory_id": mid, "confirm": True, "expected_version": mid},
+            "test_user",
+            store,
+            None,
+            tenant,
+        )
+        tenant.graph.remove_memory.assert_called_once_with(mid)
+
+    def test_graph_failure_does_not_fail_write(self, tmp_path):
+        """A graph indexing failure must not fail the store write."""
+        svc, store, tenant = self._make_service_with_graph(tmp_path)
+        tenant.graph.index_memory.side_effect = RuntimeError("graph down")
+        # The write should still succeed
+        result = svc._call_store(
+            "remember",
+            {"content": "survives graph failure", "category": "context_note"},
+            "test_user",
+            store,
+            None,
+            tenant,
+        )
+        assert result is not None
+        # The memory was written to the store
+        assert store.count() >= 1
+

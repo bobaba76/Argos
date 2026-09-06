@@ -1955,17 +1955,17 @@ class ArgosAPIFacade:
         """Class C (trusted-local privileged): direct active-memory write.
 
         Loopback + server-derived identity only (gated in execute()).
-        Same provider-level semantics as the native memory_save tool:
+        Same store-level semantics as the native memory_save tool:
           store.remember(**save_kwargs) → active memory
-        The facade does NOT do graph indexing here — that's the
-        provider_session's responsibility on the native path. Over the
-        facade, the store.remember() path handles the DuckDB write;
-        graph indexing happens via the shared service's post-write hook
-        when the service is live. For direct-store mode (tests), the
-        test verifies the store-level write + version chain.
+        Graph indexing happens via the shared service's post-write hook
+        (memory_service.py) when the service is live. For direct-store
+        mode (tests), the test verifies the store-level write + version
+        chain; graph indexing is reconciled by backfill_graph.py.
 
-        Server-set provenance (D4): source="api", transport=ctx.transport.
-        The caller cannot claim these (rejected in validation).
+        The caller cannot claim provenance fields (source,
+        provenance_origin, grounding, user_scope) — rejected in
+        validation. The store's remember() defaults apply (source=
+        "explicit", provenance_origin derived from payload).
         """
         _scope_before = getattr(self._store, "user_id", None)
         try:
@@ -1999,8 +1999,18 @@ class ArgosAPIFacade:
 
         Updates an existing memory by memory_id, creating a new version
         (the old version is superseded). CAS via expected_version: if
-        provided, the store checks the current version before applying.
+        provided, the facade checks the current version before applying.
         Stale version → 409 conflict, no write.
+
+        #200 Spec-10: expected_version is the last-seen memory_id (each
+        update mints a new memory_id for the new version). Clients should
+        send the memory_id they last saw, not the original — this is how
+        the version chain tracks staleness.
+
+        TOCTOU note: the CAS check is check-then-act (two store calls).
+        This is safe in today's single-owner loopback context (class C
+        is loopback-only, one writer). A future multi-writer deployment
+        should make the CAS compare+write a single atomic store call.
         """
         _scope_before = getattr(self._store, "user_id", None)
         try:
@@ -2008,6 +2018,8 @@ class ArgosAPIFacade:
                 self._store.set_user_scope(ctx.user_id)
             memory_id = params["memory_id"]
             # #200 Spec-10: CAS check — verify expected_version if provided.
+            # expected_version = last-seen memory_id (each update mints a
+            # new id). TOCTOU: check-then-act, safe in single-owner loopback.
             expected_version = params.get("expected_version")
             if expected_version is not None:
                 current = self._cas_check_version(memory_id, expected_version)
@@ -2045,31 +2057,48 @@ class ArgosAPIFacade:
         Deletes an existing memory by memory_id. CAS via expected_version:
         if provided, the store checks the current version before applying.
         Stale version → 409 conflict, no write.
+
+        #200 Spec-10: over SharedMemoryStore (RPC), the service handler
+        enforces strict confirm + CAS + audit server-side (same pattern
+        as erase_subject #293). The facade passes confirm=True and
+        expected_version through; the service gates them. For direct
+        DuckDBMemoryStore (tests), the facade does the CAS check itself.
         """
         _scope_before = getattr(self._store, "user_id", None)
         try:
             if hasattr(self._store, "set_user_scope"):
                 self._store.set_user_scope(ctx.user_id)
             memory_id = params["memory_id"]
-            # #200 Spec-10: CAS check.
             expected_version = params.get("expected_version")
-            if expected_version is not None:
-                current = self._cas_check_version(memory_id, expected_version)
-                if not current:
-                    raise APIError(
-                        "conflict",
-                        "expected_version does not match the current "
-                        "memory version (CAS conflict).",
-                        details={"memory_id": memory_id,
-                                 "expected_version": expected_version},
-                    )
             # #200: over SharedMemoryStore (RPC), delete_memory is in
             # _FORBIDDEN_STORE_METHODS. Use the sanctioned facade path
-            # when available; fall back to delete_memory for direct
-            # DuckDBMemoryStore (tests).
+            # when available; the service handler enforces confirm+CAS+
+            # audit server-side. For direct DuckDBMemoryStore (tests),
+            # the facade does the CAS check itself.
             if hasattr(self._store, "facade_delete_memory"):
-                result = self._store.facade_delete_memory(memory_id=memory_id)
+                # Service-side gating: pass confirm + expected_version.
+                # The service strips client identity, resolves user_id
+                # from its own context, enforces CAS atomically under
+                # the tenant lock, and writes the audit row.
+                delete_kwargs: Dict[str, Any] = {
+                    "memory_id": memory_id,
+                    "confirm": True,
+                }
+                if expected_version is not None:
+                    delete_kwargs["expected_version"] = expected_version
+                result = self._store.facade_delete_memory(**delete_kwargs)
             else:
+                # Direct-store mode (tests): facade-side CAS check.
+                if expected_version is not None:
+                    current = self._cas_check_version(memory_id, expected_version)
+                    if not current:
+                        raise APIError(
+                            "conflict",
+                            "expected_version does not match the current "
+                            "memory version (CAS conflict).",
+                            details={"memory_id": memory_id,
+                                     "expected_version": expected_version},
+                        )
                 result = self._store.delete_memory(memory_id=memory_id)
         finally:
             if _scope_before is not None and hasattr(self._store, "set_user_scope"):
@@ -2101,6 +2130,11 @@ class ArgosAPIFacade:
         The expected_version must match the memory_id of the active
         record. If expected_version != memory_id, the caller's view is
         stale (the memory was updated to a new version).
+
+        PR-3 docs note: clients should send the last-seen memory_id as
+        expected_version, not the original memory_id from the first
+        version. Each update mints a new id; sending the old one is a
+        CAS conflict by design.
         """
         try:
             records = self._store.get_memories_by_ids([memory_id])

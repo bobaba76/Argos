@@ -724,7 +724,12 @@ class SharedMemoryStore:
         delete_memory is in _FORBIDDEN_STORE_METHODS on the RPC boundary
         (no raw RPC passthrough). The facade gates this with ctx.is_loopback
         + server-derived identity before calling this method. The service
-        dispatches it to store.delete_memory() with the same semantics.
+        handler enforces the SAME controls server-side: strict confirm
+        (literal True only), strict CAS (expected_version required,
+        compare+delete atomically under the tenant lock), identity stripped
+        + service-resolved, and an audit row for every call (denied
+        included). A raw RPC caller with the endpoint token cannot skip
+        these gates.
         """
         value = self._rpc.call("store", "facade_delete_memory", **kwargs)
         if value is False or value is None:

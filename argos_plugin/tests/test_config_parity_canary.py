@@ -299,10 +299,14 @@ class TestT2LoaderModelParity:
             config_path.write_text(json.dumps(REALISTIC_CONFIG), encoding="utf-8")
             cfg = _load_config(str(tmp))
 
-            # Spot-check tuned values (NOT defaults).
+            # Spot-check tuned values (NOT defaults, to keep wipe-detection).
+            # Note: injection_min_score (0.30) and skip_retrieval_on_trivial
+            # (True) are now ON by default too, so a reversion to defaults is
+            # no longer distinguishable for those two — accepted trade-off of
+            # flipping the shipped posture; the remaining keys still detect.
             assert cfg.max_injected_items == 96  # default is 20
-            assert cfg.injection_min_score == 0.3  # default is 0.0
-            assert cfg.skip_retrieval_on_trivial is True  # default is False
+            assert cfg.injection_min_score == 0.3  # default is 0.30
+            assert cfg.skip_retrieval_on_trivial is True  # default is True
             assert cfg.phrase_lift_alpha == 0.15  # default is 0.0
             assert cfg.conflict_surfacing is True  # default is True (but test it)
             assert cfg.router_enabled is True  # default is False

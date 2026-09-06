@@ -34,8 +34,8 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 |---------|---------|-------------|
 | `max_injected_items` | `20` | Max memories auto-injected as context before each turn. |
 | `inject_content_char_cap` | `800` | Per-item char cap in injected context. |
-| `injection_min_score` *(JSON only)* | `0.0` | Relevance floor for injected items — items below this are dropped. |
-| `skip_retrieval_on_trivial` *(JSON only)* | `false` | Skip retrieval for trivial/filler turns. Cost lever. |
+| `skip_retrieval_on_trivial` | `true` | Skip retrieval for trivial/filler turns. Cost + focus lever. **Ships ON.** |
+| `injection_min_score` | `0.30` | Relevance floor for injected items — items below this are dropped. **Ships at the validated 0.30.** |
 | `context_aware_retrieval` | `true` | Prepend recent conversation context to queries with pronouns/references. Zero latency, no LLM calls. |
 | `context_window_size` | `3` | Recent user messages used as context (1–10). |
 | `context_max_chars` | `500` | Max total chars of context to prepend (100–2000). |
@@ -43,8 +43,8 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 | `query_expansion_similarity_floor` | `0.3` | Trigger expansion when top hit similarity is below this (0.0–1.0). |
 | `phrase_lift_alpha` *(JSON only)* | `0.0` | Exact-phrase lift strength in ranking. No-op at default. |
 | `phrase_lift_pool` *(JSON only)* | `200` | Candidate pool scanned for phrase lift. |
-| `chronological_injection` | `false` | Chronological re-sort of injected items. |
-| `date_anchor_rerank` | `false` | Date-expression re-ranking for temporal queries. |
+| `chronological_injection` | `true` | Chronological re-sort of injected items on temporal turns. **Ships ON.** |
+| `date_anchor_rerank` | `true` | Date-expression re-ranking for temporal queries. **Ships ON.** |
 | `history_at_current_time` | `true` | Widen retrieval to superseded versions on historical queries; injected with a "(previously)" label. **When to change:** set to `false` if you only want current-version results. |
 | `conflict_surfacing` | `true` | When the injected set contains two active records that conflict on the same subject (differing values, or one asserting a rule vs a later discontinuation/scoping), inject an explicit conflict note so the answerer surfaces the disagreement instead of smoothing it. **When to change:** set to `false` if conflict notes add noise; keep `true` for trust-critical use cases. |
 

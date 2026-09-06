@@ -35,6 +35,9 @@ on:
 
 permissions:
   contents: read
+  # actions/upload-artifact needs the actions: write scope — without it
+  # the upload step (if: always()) fails 403 every run.
+  actions: write
 
 concurrency:
   group: retrieval-weekly
@@ -104,13 +107,18 @@ jobs:
         if: ${{ github.event_name == 'schedule' || inputs.dry_run == false }}
         shell: bash
         run: |
-          # --out lands INSIDE the drift-scan dir so the drift report
-          # actually sees this run's scores (PR #337 review: the output
-          # path and the scan dir must be the same directory).
+          # --out lands INSIDE the drift-scan dir AND is timestamped per
+          # run: a fixed filename would be OVERWRITTEN every Monday, so
+          # drift_history would always see {"runs": 1} and cross-run
+          # deltas would never accumulate (PR #337 re-review). The date
+          # component makes each run a distinct file; the weekly cadence
+          # means one file per run, sorted chronologically by name.
+          GATE_OUT="argos_plugin/eval/snapshots/gate_scores_weekly_$(date -u +%Y%m%d).json"
+          echo "gate output: $GATE_OUT"
           python argos_plugin/eval/run_gate.py \
             --snapshot "$SNAPSHOT_DIR" \
             --gold argos_plugin/eval/gold/gold_v1.jsonl \
-            --out argos_plugin/eval/snapshots/gate_scores_weekly.json \
+            --out "$GATE_OUT" \
             --compare "$SNAPSHOT_DIR/gate_baseline.json"
         env:
           HF_HUB_OFFLINE: "1"
@@ -121,7 +129,8 @@ jobs:
         shell: bash
         run: |
           # Scans the SAME directory the gate writes into (see --out
-          # above) — every weekly run is visible to the drift history.
+          # above) — every weekly run's timestamped file accumulates, so
+          # the drift history shows cross-run deltas.
           python argos_plugin/eval/ci_tier2_check.py --drift-history \
             argos_plugin/eval/snapshots
 
@@ -130,5 +139,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: retrieval-gate-scores
-          path: argos_plugin/eval/snapshots/gate_scores_weekly.json
+          # Glob: every timestamped per-run scores file uploads.
+          path: argos_plugin/eval/snapshots/gate_scores_weekly_*.json
           if-no-files-found: ignore

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -125,22 +126,23 @@ class TestTier2Workflow:
 
     # -- PR #337 review blockers ---------------------------------------------
 
+    def _weekly_gate_steps(self) -> list:
+        wf = yaml.safe_load(
+            (_REPO_ROOT / ".github" / "workflows" / "retrieval-weekly.yml")
+            .read_text(encoding="utf-8")
+        )
+        return wf["jobs"]["weekly-gate"]["steps"]
+
     def test_drift_scan_sees_the_gate_output(self):
         """Blocker 1 regression: the drift report must scan the SAME
         directory the gate writes its scores into — otherwise every
         weekly run's drift report is {"runs": 0} and 'reports drift'
         never happens."""
-        wf = yaml.safe_load(
-            (_REPO_ROOT / ".github" / "workflows" / "retrieval-weekly.yml")
-            .read_text(encoding="utf-8")
-        )
-        job = wf["jobs"]["weekly-gate"]
+        steps = self._weekly_gate_steps()
         gate_step = next(
-            s for s in job["steps"]
-            if "run_gate.py" in (s.get("run") or ""))
+            s for s in steps if "run_gate.py" in (s.get("run") or ""))
         drift_step = next(
-            s for s in job["steps"]
-            if "--drift-history" in (s.get("run") or ""))
+            s for s in steps if "--drift-history" in (s.get("run") or ""))
         gate_run = gate_step["run"]
         drift_run = drift_step["run"]
         # The gate's --out path...
@@ -153,18 +155,76 @@ class TestTier2Workflow:
                      if "--drift-history" in ln]
         assert drift_dir, "drift step has no --drift-history"
         drift_dir = drift_dir[0].split("--drift-history", 1)[1].strip()
-        out_norm = out_path.replace("\\", "/").rstrip("/")
+        out_norm = out_path.replace("\\", "/").strip('"').rstrip("/")
         drift_norm = drift_dir.replace("\\", "/").rstrip("/")
         assert out_norm.startswith(drift_norm), (
             f"gate --out ({out_norm}) is outside the drift scan dir "
             f"({drift_norm}) — the drift report would never see a run"
         )
-        # And the uploaded artifact path matches the written output.
+
+    def test_gate_output_is_timestamped_per_run(self):
+        """Re-review BLOCKER regression: a FIXED --out filename is
+        overwritten every Monday, so drift_history always sees
+        {"runs": 1} and cross-run deltas never accumulate. The output
+        filename must contain a varying (per-run) component."""
+        steps = self._weekly_gate_steps()
+        gate_run = next(
+            s["run"] for s in steps if "run_gate.py" in (s.get("run") or ""))
+        # The gate step computes a timestamped output filename.
+        assert re.search(r"gate_scores_weekly_.*\$\(", gate_run) or \
+            re.search(r"GATE_OUT=.*\$\(", gate_run), (
+            "gate output filename is fixed — every weekly run overwrites "
+            "the same file and drift history can never accumulate"
+        )
+        # And --out references the computed variable (not a literal).
+        out_lines = [ln.strip() for ln in gate_run.splitlines()
+                     if "--out" in ln and not ln.strip().startswith("#")]
+        assert out_lines, "gate step has no --out"
+        assert "$GATE_OUT" in out_lines[0] or "$(date" in out_lines[0], (
+            "--out must reference the per-run timestamped filename"
+        )
+
+    def test_upload_artifact_path_is_a_glob(self):
+        """The upload must cover the per-run timestamped files (a fixed
+        path would miss every run but one)."""
+        steps = self._weekly_gate_steps()
         upload = next(
-            s for s in job["steps"]
+            s for s in steps
             if str(s.get("uses", "")).startswith("actions/upload-artifact"))
-        with_clause = upload.get("with", {}) or {}
-        assert "gate_scores_weekly.json" in str(with_clause.get("path", ""))
+        path = str((upload.get("with") or {}).get("path", ""))
+        assert "gate_scores_weekly_*" in path or "*" in path, (
+            f"upload path is not a glob: {path}"
+        )
+
+    def test_weekly_permissions_allow_artifact_upload(self):
+        """upload-artifact needs the actions: write scope — with only
+        contents: read the upload step (if: always()) fails 403."""
+        wf = yaml.safe_load(
+            (_REPO_ROOT / ".github" / "workflows" / "retrieval-weekly.yml")
+            .read_text(encoding="utf-8")
+        )
+        perms = wf.get("permissions") or {}
+        assert perms.get("actions") == "write", (
+            "weekly workflow must grant actions: write for upload-artifact"
+        )
+
+    def test_tier1_uses_minimal_install(self):
+        """The tier1 slice is text-only (embedder=None) — installing the
+        full requirements.txt (torch + sentence-transformers) makes the
+        job slow enough that concurrency-cancel kills it on iterative
+        PRs. Minimal install: duckdb + pytest."""
+        wf = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml")
+                            .read_text(encoding="utf-8"))
+        job = wf["jobs"]["tier1-slice"]
+        install_steps = [s.get("run", "") for s in job["steps"]
+                         if "pip install" in (s.get("run") or "")]
+        assert install_steps, "tier1 job has no install step"
+        joined = " ".join(install_steps)
+        assert "requirements.txt" not in joined, (
+            "tier1 must NOT install the full requirements.txt (torch/"
+            "sentence-transformers) — the slice is text-only"
+        )
+        assert "duckdb" in joined and "pytest" in joined
 
     def test_drift_scan_finds_a_written_scores_file(self, tmp_path):
         """Functional: a gate_scores file written into the scanned dir
@@ -185,6 +245,29 @@ class TestTier2Workflow:
             "drift scan did not find the run's written output"
         )
         assert rep["history"][0]["mrr"] == 0.88
+
+    def test_drift_history_accumulates_across_runs(self, tmp_path):
+        """The deliverable: two timestamped per-run files in the scan
+        dir produce a cross-run delta (the fixed-filename failure mode
+        made this impossible)."""
+        from eval.ci_tier2_check import drift_history
+        scanned_dir = tmp_path / "snapshots"
+        scanned_dir.mkdir()
+        for date, recall, mrr in (
+            ("20260901", 1.0, 0.88),
+            ("20260908", 0.995, 0.87),
+        ):
+            (scanned_dir / f"gate_scores_weekly_{date}.json").write_text(
+                json.dumps({
+                    "timestamp": f"20{date[:4]}-{date[4:6]}-{date[6:]}T00:00:00+00:00",
+                    "probe_count": 1000, "ladder": [5, 20, 96],
+                    "overall": {"recall@96": recall, "mrr": mrr},
+                }), encoding="utf-8")
+        rep = drift_history(scanned_dir)
+        assert rep["runs"] == 2, (
+            "timestamped per-run files must accumulate in the drift history"
+        )
+        assert rep["history"][1]["drift_vs_previous"] == pytest.approx(-0.005)
 
     def test_weekly_provisions_gitignored_artifacts_before_preflight(self):
         """Blocker 2 regression: the gate's inputs are gitignored and

@@ -18,9 +18,11 @@ from pathlib import Path
 
 import pytest
 
-_plugin_dir = Path(__file__).resolve().parent.parent
-if str(_plugin_dir) not in sys.path:
-    sys.path.insert(0, str(_plugin_dir.parent))
+# The `eval` package resolves from the REPO ROOT (tests/conftest.py puts
+# argos_plugin on sys.path, not the root) — guard on the root we insert.
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
 from eval.ci_tier1_slice import (  # noqa: E402
     BASELINE_FILE, GOLD_SLICE, PATHS_FILE, load_gold, paths_match,

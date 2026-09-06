@@ -91,8 +91,14 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install deps (minimal — text-only slice)
+        # MINIMAL install (PR #337 re-review): the slice store is
+        # embedder=None (text-leg only), so duckdb + pytest suffice.
+        # The full requirements.txt (torch + sentence-transformers)
+        # would make this job slow enough that the workflow-level
+        # concurrency cancel (cancel-in-progress on iterative PRs)
+        # would routinely kill it mid-run.
+        run: pip install duckdb==1.5.5 pytest==9.1.1 pytest-timeout==2.3.1
 
       - name: Detect retrieval-touching paths
         id: trigger

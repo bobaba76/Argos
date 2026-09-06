@@ -10,6 +10,7 @@ Endpoints:
                                 embedding ready, graph available-or-degraded)
     GET  /v1/capabilities    — operations available to the principal
     POST /v1/memory/search   — search memories
+    POST /v1/memory/explain-retrieval — why a memory did NOT surface
     GET  /v1/memories/{mid}  — fetch a single memory
     GET  /v1/memories/{mid}/history — version history
 
@@ -76,6 +77,14 @@ class SearchRequest(BaseModel):
     category_filter: Optional[constr(max_length=100)] = None
     # No project_id, client_scope, namespace, user_id, tenant — those
     # are server-derived from the credential. The facade enforces this.
+
+
+class ExplainRetrievalRequest(BaseModel):
+    """Strict request body for POST /v1/memory/explain-retrieval."""
+    model_config = {"extra": "forbid"}
+    query: constr(min_length=1, max_length=MAX_QUERY_LENGTH)
+    memory_id: constr(min_length=1, max_length=MAX_MEMORY_ID_LENGTH)
+    top_k: conint(ge=1, le=50) = 20
 
 
 # -- Error envelope (D7) -----------------------------------------------------
@@ -435,6 +444,30 @@ def create_app(
             )
         try:
             result = facade.execute(ctx, "explain", {"memory_id": memory_id})
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- Explain-retrieval: POST /v1/memory/explain-retrieval ---------------
+
+    @app.post("/v1/memory/explain-retrieval")
+    async def explain_retrieval(
+        body: ExplainRetrievalRequest,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """Diagnose why a memory did NOT surface in retrieval.
+
+        Deterministic, read-only, zero-LLM: rank, per-stage diagnostics,
+        and human-readable reasons. ACL-enforced (cross-user returns
+        not_found; existence not leaked).
+        """
+        try:
+            result = facade.execute(ctx, "explain_retrieval", {
+                "query": body.query,
+                "memory_id": body.memory_id,
+                "top_k": body.top_k,
+            })
             return result
         except APIError as exc:
             status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)

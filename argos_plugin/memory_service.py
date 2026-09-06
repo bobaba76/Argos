@@ -709,6 +709,16 @@ class MemoryService:
             return store.get_chain_membership(args.get("memory_ids", []) or [])
         if method == "provenance":
             return store.provenance(args.get("memory_id", ""))
+        if method == "explain_retrieval":
+            # Read-only diagnostic (Spec 2): why-not for a memory.
+            # No writes, no retrieval side-effects — safe on the RPC
+            # boundary. user_scope is enforced server-side by the store.
+            return store.explain_retrieval(
+                query=str(args.get("query", "")),
+                expected_memory_id=str(args.get("expected_memory_id", "")),
+                top_k=int(args.get("top_k", 20)),
+                project_id=args.get("project_id"),
+            )
         if method == "backfill_evidence":
             return store.backfill_evidence(
                 retention=args.get("retention", "full")

@@ -275,3 +275,37 @@ def test_get_status_returns_config_fingerprint(tmp_path):
             store._rpc.stop_service()
         finally:
             time.sleep(0.5)
+
+
+def test_shared_service_explain_retrieval_rpc(tmp_path):
+    """The why-not diagnostic must travel the FULL RPC path:
+    proxy -> dispatch -> store (the layer that silently broke before)."""
+    from service_client import SharedMemoryStore
+
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        encoding="utf-8",
+    )
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        rec = store.remember(
+            category="preference",
+            content="User prefers the explanatory memory diagnostic",
+        )
+        assert rec is not None
+        expl = store.explain_retrieval(
+            "explanatory memory diagnostic", rec.memory_id, top_k=5,
+        )
+        assert expl.get("expected_memory_id") == rec.memory_id
+        assert expl.get("expected") is not None
+        assert isinstance(expl.get("found_in_results", False), bool)
+        assert isinstance(expl.get("reasons", []), list) and expl["reasons"]
+        assert "top_results" in expl and "diagnostics" in expl
+        # Unknown memory -> structured memory_not_found, NOT an exception.
+        expl_missing = store.explain_retrieval("anything", "mem-nonexistent", top_k=5)
+        assert any("memory_not_found" in r for r in expl_missing.get("reasons", []))
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)

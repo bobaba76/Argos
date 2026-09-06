@@ -66,6 +66,14 @@ class StubStore:
     def get_memory_history(self, memory_id: str, **kwargs) -> List[MemoryRecord]:
         return [self._memories[memory_id]] if memory_id in self._memories else []
 
+    def explain_retrieval(self, query, expected_memory_id, **kwargs) -> Dict[str, Any]:
+        if expected_memory_id not in self._memories:
+            return {"expected_memory_id": expected_memory_id, "found_in_results": False,
+                    "reasons": ["memory_not_found"], "top_results": [], "diagnostics": {}}
+        rec = self._memories[expected_memory_id]
+        return {"expected_memory_id": expected_memory_id, "found_in_results": True,
+                "reasons": ["found"], "top_results": [], "diagnostics": {}}
+
     def save_candidate(self, **kwargs) -> Dict[str, Any]:
         cid = f"cand-{self._next}"
         self._next += 1
@@ -676,3 +684,16 @@ class TestMCPServerAuditM:
             TOOL_DEFINITIONS[0] = {}  # type: ignore
         with pytest.raises(AttributeError):
             TOOL_DEFINITIONS.append({})  # type: ignore
+
+    # -- Explain-retrieval (why-not) tool registration ---------------------
+
+    def test_memory_why_not_tool_registered_and_mapped(self):
+        """memory_why_not is advertised and maps to explain_retrieval."""
+        names = [t["name"] for t in TOOL_DEFINITIONS]
+        assert "memory_why_not" in names
+        assert TOOL_TO_OPERATION["memory_why_not"] == "explain_retrieval"
+        tool = next(t for t in TOOL_DEFINITIONS if t["name"] == "memory_why_not")
+        schema = tool["inputSchema"]
+        assert schema["required"] == ["query", "memory_id"]
+        assert schema["additionalProperties"] is False
+        assert schema["properties"]["top_k"]["maximum"] == 50

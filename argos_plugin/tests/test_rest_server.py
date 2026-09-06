@@ -84,6 +84,32 @@ class StubStore:
         self._memories[mid] = rec
         return rec
 
+    def explain_retrieval(self, query, expected_memory_id, **kwargs) -> Dict[str, Any]:
+        if self._should_fail:
+            raise RuntimeError("SQL: SELECT * FROM memory_records WHERE id='abc'")
+        if expected_memory_id not in self._memories:
+            return {
+                "expected_memory_id": expected_memory_id,
+                "expected": None,
+                "found_in_results": False,
+                "rank": None,
+                "top_results": [],
+                "reasons": ["memory_not_found: no record with this memory_id"],
+                "diagnostics": {},
+            }
+        rec = self._memories[expected_memory_id]
+        return {
+            "expected_memory_id": expected_memory_id,
+            "expected": {"memory_id": rec.memory_id, "content": rec.content[:200]},
+            "found_in_results": True,
+            "rank": 3,
+            "top_results": [
+                {"memory_id": rec.memory_id, "content": rec.content[:120],
+                 "category": rec.category, "similarity": 0.9, "raw_similarity": 0.7},
+            ],
+            "reasons": ["found: memory is in the results (no issue detected)"],
+            "diagnostics": {"vector_similarity": 0.9, "status": "active"},
+        }
 
 def _make_client(
     store=None,
@@ -453,6 +479,51 @@ class TestSearchAndFetch:
 # ---------------------------------------------------------------------------
 # Concurrency limit test
 # ---------------------------------------------------------------------------
+
+
+class TestExplainRetrieval:
+    """POST /v1/memory/explain-retrieval — why-not diagnostic."""
+
+    def test_explain_retrieval_ok(self):
+        store = StubStore()
+        store.remember(category="preference", content="User likes sunrise runs")
+        client = _make_client(store)
+        resp = client.post(
+            "/v1/memory/explain-retrieval",
+            headers={"Authorization": "Bearer test-rest-token"},
+            json={"query": "sunrise runs", "memory_id": "mem-1", "top_k": 10},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["expected_memory_id"] == "mem-1"
+        assert body["found_in_results"] is True
+
+    def test_explain_retrieval_requires_auth(self):
+        client = _make_client(StubStore())
+        resp = client.post(
+            "/v1/memory/explain-retrieval",
+            json={"query": "sunrise runs", "memory_id": "mem-1"},
+        )
+        assert resp.status_code == 401
+
+    def test_explain_retrieval_missing_memory_404(self):
+        client = _make_client(StubStore())
+        resp = client.post(
+            "/v1/memory/explain-retrieval",
+            headers={"Authorization": "Bearer test-rest-token"},
+            json={"query": "anything", "memory_id": "mem-missing"},
+        )
+        assert resp.status_code == 404
+
+    def test_explain_retrieval_invalid_body_422(self):
+        client = _make_client(StubStore())
+        resp = client.post(
+            "/v1/memory/explain-retrieval",
+            headers={"Authorization": "Bearer test-rest-token"},
+            json={"query": "ok", "memory_id": "mem-1", "top_k": 0},
+        )
+        assert resp.status_code == 422
+
 
 class TestConcurrencyLimit:
     """Bounded concurrency: semaphore → 429 when saturated."""

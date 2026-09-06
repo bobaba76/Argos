@@ -121,6 +121,36 @@ class StubStore:
         self._memories[mid] = rec
         return rec
 
+    def explain_retrieval(self, query, expected_memory_id, **kwargs) -> dict:
+        self.calls.append({"method": "explain_retrieval",
+                           "args": {"query": query,
+                                    "expected_memory_id": expected_memory_id,
+                                    **kwargs}})
+        if self._should_fail:
+            raise RuntimeError("SQL: SELECT * FROM memory_records WHERE id='abc'")
+        rec = self._memories.get(expected_memory_id)
+        if rec is None:
+            return {
+                "expected_memory_id": expected_memory_id,
+                "expected": None,
+                "found_in_results": False,
+                "rank": None,
+                "top_results": [],
+                "reasons": ["memory_not_found: no record with this memory_id"],
+                "diagnostics": {},
+            }
+        return {
+            "expected_memory_id": expected_memory_id,
+            "expected": {"memory_id": rec.memory_id, "content": rec.content[:200]},
+            "found_in_results": True,
+            "rank": 3,
+            "top_results": [
+                {"memory_id": rec.memory_id, "content": rec.content[:120],
+                 "category": rec.category, "similarity": 0.9, "raw_similarity": 0.7},
+            ],
+            "reasons": ["found: memory is in the results (no issue detected)"],
+            "diagnostics": {"vector_similarity": 0.9, "status": "active"},
+        }
 
 def _make_ctx(
     principal: str = "client-a",
@@ -586,6 +616,74 @@ class TestInputValidation:
 # ---------------------------------------------------------------------------
 # #222 API facade audit AF1-AF11
 # ---------------------------------------------------------------------------
+
+
+
+class TestExplainRetrieval:
+    """explain_retrieval (why-not) — read tier, ACL-scoped, validated."""
+
+    def test_explain_retrieval_allowed(self):
+        store = StubStore()
+        store.remember(category="preference", content="User likes sunrise runs")
+        facade = _make_facade(store)
+        result = facade.execute(
+            _make_ctx(),
+            "explain_retrieval",
+            {"query": "sunrise runs", "memory_id": "mem-1", "top_k": 10},
+        )
+        assert result["expected_memory_id"] == "mem-1"
+        assert result["found_in_results"] is True
+        assert result["reasons"]
+        stored = [c for c in store.calls if c["method"] == "explain_retrieval"]
+        assert stored and stored[0]["args"]["top_k"] == 10
+
+    def test_explain_retrieval_missing_memory_not_found(self):
+        store = StubStore()
+        facade = _make_facade(store)
+        with pytest.raises(APIError) as ei:
+            facade.execute(
+                _make_ctx(), "explain_retrieval",
+                {"query": "anything", "memory_id": "mem-missing"},
+            )
+        assert ei.value.code == "not_found"
+
+    def test_explain_retrieval_not_authorized(self):
+        store = StubStore()
+        store.remember(category="preference", content="User likes sunrise runs")
+        facade = _make_facade(store)
+        ctx = _make_ctx(allowed_ops=set())
+        with pytest.raises(APIError) as ei:
+            facade.execute(
+                ctx, "explain_retrieval",
+                {"query": "sunrise runs", "memory_id": "mem-1"},
+            )
+        assert ei.value.code == "forbidden"
+
+    def test_explain_retrieval_invalid_input(self):
+        facade = _make_facade()
+        for bad in (
+            {"memory_id": "mem-1"},
+            {"query": "anything"},
+            {"query": "anything", "memory_id": "mem-1", "top_k": 0},
+            {"query": "anything", "memory_id": "mem-1", "top_k": 51},
+            {"query": "anything", "memory_id": "x" * 300},
+        ):
+            with pytest.raises(APIError) as ei:
+                facade.execute(_make_ctx(), "explain_retrieval", bad)
+            assert ei.value.code in ("invalid_input", "request_too_large")
+
+    def test_explain_retrieval_error_envelope_no_leak(self):
+        store = StubStore()
+        store.remember(category="preference", content="User likes sunrise runs")
+        store._should_fail = True
+        facade = _make_facade(store)
+        with pytest.raises(APIError) as ei:
+            facade.execute(
+                _make_ctx(), "explain_retrieval",
+                {"query": "sunrise runs", "memory_id": "mem-1"},
+            )
+        assert ei.value.code == "internal_error"
+        assert "SELECT" not in ei.value.message and "/var" not in ei.value.message
 
 
 class TestAPIFacadeAudit222:

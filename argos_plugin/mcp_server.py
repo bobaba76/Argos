@@ -1,8 +1,8 @@
 """Spec-09 (#124): MCP stdio server — read tier.
 
 Transport adapter only. Exposes the READ tier of the public allowlist
-(search, fetch, fetch_history, capabilities) over MCP stdio, behind the
-facade from #123.
+(search, fetch, fetch_history, explain, explain_retrieval, capabilities)
+over MCP stdio, behind the facade from #123.
 
 Protocol: MCP JSON-RPC 2.0 over stdio (newline-delimited).
   - stdout carries ONLY valid MCP JSON-RPC messages
@@ -118,6 +118,34 @@ def _explain_input_schema() -> Dict[str, Any]:
             "memory_id": {
                 "type": "string",
                 "description": "The memory ID to explain (provenance view).",
+            },
+        },
+    }
+
+
+def _explain_retrieval_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_why_not (retrieval diagnostic)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["query", "memory_id"],
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query that should have surfaced the memory.",
+                "maxLength": 2000,
+            },
+            "memory_id": {
+                "type": "string",
+                "description": "The memory ID that did not surface.",
+                "maxLength": 256,
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Diagnostic window size (1-50).",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 20,
             },
         },
     }
@@ -314,6 +342,44 @@ TOOL_DEFINITIONS: tuple = (
             },
         },
     },
+    {
+        "name": "memory_why_not",
+        "description": (
+            "Diagnose why a memory did NOT surface in retrieval — rank, "
+            "per-stage diagnostics (vector/text/status/scope), and "
+            "human-readable reasons. Deterministic, read-only, zero-LLM. "
+            "ACL-enforced."
+        ),
+        "inputSchema": _explain_retrieval_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "expected_memory_id": {"type": "string"},
+                "expected": {"type": "object"},
+                "found_in_results": {"type": "boolean"},
+                "rank": {
+                    "anyOf": [{"type": "integer"}, {"type": "null"}],
+                },
+                "top_results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "category": {"type": "string"},
+                            "similarity": {"type": "number"},
+                            "raw_similarity": {"type": "number"},
+                        },
+                    },
+                },
+                "reasons": {"type": "array", "items": {"type": "string"}},
+                "diagnostics": {"type": "object"},
+            },
+        },
+    },
+
 )
 
 # Map MCP tool names to facade operations.
@@ -322,6 +388,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_fetch": "fetch",
     "memory_fetch_history": "fetch_history",
     "memory_explain": "explain",
+    "memory_why_not": "explain_retrieval",
     "memory_capabilities": "capabilities",
     "memory_propose": "memory_propose",
 }

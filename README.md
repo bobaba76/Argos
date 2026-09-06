@@ -24,8 +24,8 @@ Nothing becomes a memory silently. Every turn is mined for facts (regex first, L
 
 The API is a **read tier today** (spec-09: transports are trust boundaries, not thin wrappers). Both servers bind to loopback only and enforce a bearer token; the operation set is an explicit allowlist behind `ArgosAPIFacade` (auth-context → ACL → validation → audit). No raw RPC passthrough — internal operations (shutdown, backup, set_state, purge, and friends) are never exposed.
 
-- **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio; `search`, `fetch`, `fetch_history`, `capabilities`. Register with any MCP client.
-- **REST (HTTP):** `argos_plugin/rest_server.py` — `GET /v1/health`, `GET /v1/ready`, `GET /v1/capabilities`, `POST /v1/memory/search`, `GET /v1/memories/{memory_id}`, `GET /v1/memories/{memory_id}/history`. Bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
+- **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio; `search`, `fetch`, `fetch_history`, `explain`, `explain_retrieval`, `capabilities`. Register with any MCP client.
+- **REST (HTTP):** `argos_plugin/rest_server.py` — `GET /v1/health`, `GET /v1/ready`, `GET /v1/capabilities`, `POST /v1/memory/search`, `POST /v1/memory/explain-retrieval`, `GET /v1/memories/{memory_id}`, `GET /v1/memories/{memory_id}/history`, `GET /v1/memories/{memory_id}/explain`. Bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
 
 ```bash
 # REST

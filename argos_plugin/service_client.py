@@ -522,6 +522,28 @@ class SharedMemoryStore:
         """#280: Assemble the full provenance view for a memory (RPC proxy)."""
         return self._rpc.call("store", "provenance", memory_id=memory_id) or {}
 
+    def explain_retrieval(
+        self,
+        query: str,
+        expected_memory_id: str,
+        *,
+        top_k: int = 20,
+        project_id: str | None = None,
+    ) -> dict:
+        """#280: diagnose why a memory did NOT surface in retrieval (RPC proxy).
+
+        Read-only, deterministic, zero-LLM. The diagnostic pass runs in
+        the memory service process (no writes, retrieval suppressed,
+        no reranker side-effects).
+        """
+        return self._rpc.call(
+            "store", "explain_retrieval",
+            query=query,
+            expected_memory_id=expected_memory_id,
+            top_k=top_k,
+            project_id=project_id,
+        ) or {}
+
     def backfill_evidence(self, retention: str = "full") -> int:
         """Backfill memory_evidence from approved candidates (pre-Wave-2 memories)."""
         return int(

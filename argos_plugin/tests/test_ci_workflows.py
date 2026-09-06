@@ -123,6 +123,99 @@ class TestTier2Workflow:
         assert "ci_tier2_check.py --check" in run_steps
         assert "ci_tier2_check.py --drift-history" in run_steps
 
+    # -- PR #337 review blockers ---------------------------------------------
+
+    def test_drift_scan_sees_the_gate_output(self):
+        """Blocker 1 regression: the drift report must scan the SAME
+        directory the gate writes its scores into — otherwise every
+        weekly run's drift report is {"runs": 0} and 'reports drift'
+        never happens."""
+        wf = yaml.safe_load(
+            (_REPO_ROOT / ".github" / "workflows" / "retrieval-weekly.yml")
+            .read_text(encoding="utf-8")
+        )
+        job = wf["jobs"]["weekly-gate"]
+        gate_step = next(
+            s for s in job["steps"]
+            if "run_gate.py" in (s.get("run") or ""))
+        drift_step = next(
+            s for s in job["steps"]
+            if "--drift-history" in (s.get("run") or ""))
+        gate_run = gate_step["run"]
+        drift_run = drift_step["run"]
+        # The gate's --out path...
+        out_match = [ln.strip() for ln in gate_run.splitlines()
+                     if "--out" in ln]
+        assert out_match, "gate step has no --out"
+        out_path = out_match[0].split("--out", 1)[1].strip().rstrip("\\")
+        # ...must live INSIDE the drift scan dir.
+        drift_dir = [ln.strip() for ln in drift_run.splitlines()
+                     if "--drift-history" in ln]
+        assert drift_dir, "drift step has no --drift-history"
+        drift_dir = drift_dir[0].split("--drift-history", 1)[1].strip()
+        out_norm = out_path.replace("\\", "/").rstrip("/")
+        drift_norm = drift_dir.replace("\\", "/").rstrip("/")
+        assert out_norm.startswith(drift_norm), (
+            f"gate --out ({out_norm}) is outside the drift scan dir "
+            f"({drift_norm}) — the drift report would never see a run"
+        )
+        # And the uploaded artifact path matches the written output.
+        upload = next(
+            s for s in job["steps"]
+            if str(s.get("uses", "")).startswith("actions/upload-artifact"))
+        with_clause = upload.get("with", {}) or {}
+        assert "gate_scores_weekly.json" in str(with_clause.get("path", ""))
+
+    def test_drift_scan_finds_a_written_scores_file(self, tmp_path):
+        """Functional: a gate_scores file written into the scanned dir
+        IS found by drift_history (the actual failure mode of blocker 1)."""
+        from eval.ci_tier2_check import drift_history
+        scores = {
+            "timestamp": "2026-09-07T00:00:00+00:00",
+            "probe_count": 1000, "ladder": [5, 20, 96],
+            "overall": {"recall@96": 1.0, "mrr": 0.88},
+        }
+        # Simulate the weekly run: scores written into the scanned dir.
+        scanned_dir = tmp_path / "snapshots"
+        scanned_dir.mkdir()
+        (scanned_dir / "gate_scores_weekly.json").write_text(
+            json.dumps(scores), encoding="utf-8")
+        rep = drift_history(scanned_dir)
+        assert rep["runs"] == 1, (
+            "drift scan did not find the run's written output"
+        )
+        assert rep["history"][0]["mrr"] == 0.88
+
+    def test_weekly_provisions_gitignored_artifacts_before_preflight(self):
+        """Blocker 2 regression: the gate's inputs are gitignored and
+        checkout's git clean -ffdx deletes ignored files — a provisioning
+        step must run BEFORE preflight, or the weekly gate never
+        executes."""
+        wf = yaml.safe_load(
+            (_REPO_ROOT / ".github" / "workflows" / "retrieval-weekly.yml")
+            .read_text(encoding="utf-8")
+        )
+        steps = wf["jobs"]["weekly-gate"]["steps"]
+        names = [s.get("name", "") for s in steps]
+        prov_idx = next(
+            (i for i, n in enumerate(names) if "Provision" in n), None)
+        pre_idx = next(
+            (i for i, n in enumerate(names) if "Preflight" in n), None)
+        assert prov_idx is not None, (
+            "no provisioning step — checkout's git clean -ffdx wipes the "
+            "gitignored snapshot/baseline/gold before preflight"
+        )
+        assert pre_idx is not None
+        assert prov_idx < pre_idx, "provisioning must precede preflight"
+        # The provisioning step references all three artifact classes.
+        prov_run = " ".join(
+            s.get("run", "") for s in steps if "Provision" in s.get("name", ""))
+        assert "hybrid_memory.duckdb" in prov_run
+        assert "gate_baseline.json" in prov_run
+        assert "gold_v1.jsonl" in prov_run
+        # It fails loudly (exit 2) when an artifact is absent.
+        assert "exit 2" in prov_run
+
 
 class TestTier2CheckScript:
     """The tier2 preflight/drift tool behaves correctly."""

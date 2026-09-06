@@ -96,7 +96,12 @@ jobs:
 
       - name: Detect retrieval-touching paths
         id: trigger
+        # set -eo pipefail: if the trigger probe errors, FAIL the step
+        # loudly instead of silently emitting an empty RUN (which would
+        # skip the slice via the env.RUN == 'True' guard).
+        shell: bash
         run: |
+          set -eo pipefail
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
           if [ -z "$BASE" ]; then
             BASE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
@@ -109,8 +114,12 @@ jobs:
           CHANGED=$(git diff --name-only "$BASE" HEAD || true)
           # The trigger list is the checked-in ci_retrieval_paths.txt —
           # one source of truth shared with the test suite.
-          RUN=$(python argos_plugin/eval/ci_tier1_slice.py --paths $CHANGED \
-            | grep -oE 'True|False' | tail -1)
+          PROBE_OUT=$(python argos_plugin/eval/ci_tier1_slice.py --paths $CHANGED)
+          RUN=$(echo "$PROBE_OUT" | grep -oE 'True|False' | tail -1)
+          if [ -z "$RUN" ]; then
+            echo "trigger probe produced no decision: $PROBE_OUT" >&2
+            exit 2
+          fi
           echo "tier1 trigger: $RUN"
           echo "RUN=$RUN" >> "$GITHUB_ENV"
 

@@ -1,6 +1,10 @@
 # Retrieval/embedding-touching paths — a PR touching any of these runs
 # the Tier 1 curated slice (ci_tier1_slice.py) as a non-blocking CI job.
 # One path prefix per line; matched as a prefix against changed files.
+# NOTE: the Tier 1 slice store is embedder=None (text-leg only) —
+# embeddings.py/rerank.py changes trigger the job but the slice cannot
+# score them; ONLY the Tier 2 weekly gate (full snapshot + embedder)
+# covers embedder/reranker regressions.
 argos_plugin/store_retrieval.py
 argos_plugin/store_core.py
 argos_plugin/store_write.py

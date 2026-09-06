@@ -63,6 +63,12 @@ _FORBIDDEN_CLIENT_ARGS = frozenset({
     "requested_by",  # #293: erase-receipt attribution is server-derived —
                      # a client-supplied requested_by would forge the
                      # audit trail of a provable deletion.
+    # #200 Spec-10: facade_delete_memory identity args — the service
+    # resolves user_id from its own context (same as erase_subject #293).
+    # A client-chosen user_id would let any local process with the
+    # endpoint token delete another user's memories.
+    "user_id",
+    "tenant",
 })
 
 # MS2: destructive/admin methods forbidden on the RPC boundary (same as
@@ -609,10 +615,61 @@ class MemoryService:
             return [_record_to_dict(record) for record in records]
         if method == "remember":
             # MS1: strip server-set fields from client args.
-            return _record_to_dict(store.remember(**_sanitize_args(args)))
+            rec = store.remember(**_sanitize_args(args))
+            # #200 Spec-10: post-write graph hook — index the new memory
+            # in the graph (mirror what provider_session does on the
+            # native path). Graph failures must not fail the write.
+            if rec is not None and tenant is not None and tenant.graph is not None:
+                try:
+                    tenant.graph.index_memory(
+                        memory_id=rec.memory_id,
+                        category=rec.category,
+                        content=rec.content,
+                        tags=rec.tags or [],
+                        created_at=rec.created_at,
+                        use_llm=False,
+                        valid_from=getattr(rec, "valid_from", None) or rec.created_at,
+                        valid_to=getattr(rec, "valid_to", None),
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Post-write graph index failed for %s: %s",
+                        rec.memory_id, exc,
+                    )
+            return _record_to_dict(rec)
         if method == "update_memory":
             # MS1: strip server-set fields from client args.
-            return _record_to_dict(store.update_memory(**_sanitize_args(args)))
+            old_memory_id = args.get("memory_id", "")
+            rec = store.update_memory(**_sanitize_args(args))
+            # #200 Spec-10: post-write graph hook — update_memory creates
+            # a new version (new memory_id); remove the old id from the
+            # graph and index the new version (mirror provider_session).
+            if rec is not None and tenant is not None and tenant.graph is not None:
+                try:
+                    if old_memory_id and old_memory_id != rec.memory_id:
+                        tenant.graph.remove_memory(old_memory_id)
+                except Exception as exc:
+                    logger.debug(
+                        "Graph remove_memory failed for updated %s: %s",
+                        old_memory_id, exc,
+                    )
+                try:
+                    tenant.graph.index_memory(
+                        memory_id=rec.memory_id,
+                        category=rec.category,
+                        content=rec.content,
+                        tags=rec.tags or [],
+                        created_at=rec.created_at,
+                        use_llm=False,
+                        valid_from=getattr(rec, "valid_from", None) or rec.created_at,
+                        valid_to=getattr(rec, "valid_to", None),
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Post-write graph index failed for updated %s: %s",
+                        rec.memory_id, exc,
+                    )
+            return _record_to_dict(rec)
         if method == "get_memories_by_ids":
             records = store.get_memories_by_ids(
                 args.get("memory_ids", []),
@@ -775,6 +832,119 @@ class MemoryService:
             )
         if method == "delete_memory":
             return store.delete_memory(**args)
+        # #200 Spec-10: sanctioned facade-only delete path. The facade
+        # gates this with ctx.is_loopback + server-derived identity before
+        # calling. delete_memory is in _FORBIDDEN_STORE_METHODS for raw
+        # RPC; facade_delete_memory is NOT — but it enforces the SAME
+        # controls server-side (same pattern as erase_subject #293 and
+        # run_compaction #281): strict confirm (literal True only),
+        # strict CAS (expected_version required, compare+delete in one
+        # store call), identity stripped + service-resolved, and an audit
+        # row for every call (denied included). A raw RPC caller with the
+        # endpoint token cannot skip these gates.
+        if method == "facade_delete_memory":
+            args = _sanitize_args(args)
+            memory_id = str(args.get("memory_id", ""))
+            expected_version = args.get("expected_version")
+            confirm = args.get("confirm", False) is True
+            tenant_name = tenant.name if tenant else "default"
+            # Gate 1: strict confirm (bool("false") is True — only
+            # literal True passes, same as erase_subject).
+            if not confirm:
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"facade_delete:{memory_id}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes="confirm_required",
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise PermissionError(
+                    "facade_delete_memory requires confirm=True "
+                    "(strict boolean). Preview is not supported for "
+                    "deletion — use the facade's memory_delete operation."
+                )
+            # Gate 2: strict CAS — expected_version is REQUIRED. The
+            # caller must send the last-seen memory_id (each update mints
+            # a new id). Compare+delete in one store call: fetch the
+            # record, verify it's active and its memory_id matches
+            # expected_version, then delete. This is a single logical
+            # transaction under the tenant store lock (already held).
+            if not expected_version:
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"facade_delete:{memory_id}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes="cas_required",
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise PermissionError(
+                    "facade_delete_memory requires expected_version "
+                    "(CAS). Send the last-seen memory_id as "
+                    "expected_version."
+                )
+            # CAS compare: verify the record exists, is active, and its
+            # memory_id matches expected_version. TOCTOU note: this is
+            # check-then-act under the tenant store lock, so it's safe
+            # in today's single-owner loopback context. A future
+            # multi-writer deployment should make this a single atomic
+            # store-level call (compare_and_delete).
+            records = store.get_memories_by_ids([memory_id])
+            if not records:
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"facade_delete:{memory_id}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes="not_found",
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise ValueError(f"Memory not found: {memory_id}")
+            rec = records[0]
+            rec_status = getattr(rec, "status", None)
+            rec_mid = getattr(rec, "memory_id", None)
+            if rec_status != "active" or rec_mid != str(expected_version):
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"facade_delete:{memory_id}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes="cas_conflict",
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise ValueError(
+                    f"CAS conflict: expected_version={expected_version} "
+                    f"does not match the active record (memory_id={rec_mid}, "
+                    f"status={rec_status})."
+                )
+            # All gates passed — delete.
+            result = store.delete_memory(memory_id=memory_id)
+            # Audit the successful deletion.
+            store.write_access_audit(
+                user_id=user_id,
+                query_text=f"facade_delete:{memory_id}",
+                granted_count=1,
+                denied_count=0,
+                denied_scopes="",
+                tenant=tenant_name,
+                excluded=False,
+            )
+            # Post-write graph hook: remove the deleted memory from the
+            # graph (mirror what provider_session does on the native path).
+            if tenant is not None and tenant.graph is not None:
+                try:
+                    tenant.graph.remove_memory(memory_id)
+                except Exception as exc:
+                    logger.debug(
+                        "Graph remove_memory failed for deleted %s: %s",
+                        memory_id, exc,
+                    )
+            return result
         # -- deletion tombstones (read-only visibility + escape hatch) ---------
         if method == "list_tombstones":
             return store.list_tombstones(

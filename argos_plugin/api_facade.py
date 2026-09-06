@@ -129,10 +129,29 @@ WRITE_OPERATIONS: Set[str] = {
     "memory_delete",
 }
 
+# #200 Spec-10 PR 2/3: Collections — exhaustive, structural, no ranking.
+# Read tier: list collections, list items (EXHAUSTIVE — no top-N cutoff).
+# Filter by status/scope only; no ranking, no similarity.
+COLLECTION_READ_OPERATIONS: Set[str] = {
+    "collection_list",
+    "collection_items",
+}
+
+# Write tier: create collection, add/update/remove items. Class C loopback
+# + server-derived identity ONLY in v1. Non-loopback → denied fail-closed.
+# No candidate pipeline for collections in v1 (explicitly deferred).
+COLLECTION_WRITE_OPERATIONS: Set[str] = {
+    "collection_create",
+    "collection_add_item",
+    "collection_update_item",
+    "collection_remove_item",
+}
+
 # All operations available through the facade.
 PUBLIC_OPERATIONS: Set[str] = (
     READ_OPERATIONS | PROPOSAL_OPERATIONS | FEEDBACK_OPERATIONS
     | WRITE_OPERATIONS
+    | COLLECTION_READ_OPERATIONS | COLLECTION_WRITE_OPERATIONS
 )
 
 # Operations that are NEVER exposed on the public boundary (D2).
@@ -974,6 +993,163 @@ def _validate_memory_delete_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+# -- #200 Spec-10 PR 2/3: Collection validation -------------------------------
+
+def _validate_collection_list_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate collection_list parameters (read tier)."""
+    cleaned: Dict[str, Any] = {}
+    status = params.get("status")
+    if status is not None:
+        cleaned["status"] = str(status)
+    limit = params.get("limit")
+    if limit is not None:
+        cleaned["limit"] = int(limit)
+    # Caller may NOT claim scope fields (server-derived).
+    for scope_key in ("user_scope", "tenant"):
+        if params.get(scope_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {scope_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
+def _validate_collection_items_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate collection_items parameters (read tier — exhaustive)."""
+    cleaned: Dict[str, Any] = {}
+    collection_id = str(params.get("collection_id", "")).strip()
+    if not collection_id:
+        raise APIError("invalid_input", "collection_id is required")
+    cleaned["collection_id"] = collection_id
+    status = params.get("status")
+    if status is not None:
+        cleaned["status"] = str(status)
+    include_archived = params.get("include_archived")
+    if include_archived is not None:
+        cleaned["include_archived"] = bool(include_archived)
+    limit = params.get("limit")
+    if limit is not None:
+        cleaned["limit"] = int(limit)
+    for scope_key in ("user_scope", "tenant"):
+        if params.get(scope_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {scope_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
+def _validate_collection_create_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate collection_create parameters (class C write)."""
+    cleaned: Dict[str, Any] = {}
+    name = str(params.get("name", "")).strip()
+    if not name:
+        raise APIError("invalid_input", "name is required")
+    if len(name) > 200:
+        raise APIError("invalid_input", "name exceeds max length 200")
+    cleaned["name"] = name
+    template = params.get("template")
+    if template is not None:
+        cleaned["template"] = str(template)
+    schema = params.get("schema")
+    if schema is not None:
+        if not isinstance(schema, list):
+            raise APIError("invalid_input", "schema must be a list of field defs")
+        if len(json.dumps(schema)) > MAX_PAYLOAD_BYTES:
+            raise APIError("request_too_large", "schema exceeds max payload size")
+        cleaned["schema"] = schema
+    for scope_key in ("user_scope", "tenant", "collection_id"):
+        if params.get(scope_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {scope_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
+def _validate_collection_add_item_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate collection_add_item parameters (class C write)."""
+    cleaned: Dict[str, Any] = {}
+    collection_id = str(params.get("collection_id", "")).strip()
+    if not collection_id:
+        raise APIError("invalid_input", "collection_id is required")
+    cleaned["collection_id"] = collection_id
+    fields = params.get("fields")
+    if fields is None:
+        raise APIError("invalid_input", "fields is required")
+    if not isinstance(fields, dict):
+        raise APIError("invalid_input", "fields must be a dict")
+    if len(json.dumps(fields)) > MAX_PAYLOAD_BYTES:
+        raise APIError("request_too_large", "fields exceeds max payload size")
+    cleaned["fields"] = fields
+    status = params.get("status")
+    if status is not None:
+        cleaned["status"] = str(status)
+    for scope_key in ("user_scope", "tenant", "item_id"):
+        if params.get(scope_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {scope_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
+def _validate_collection_update_item_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate collection_update_item parameters (class C write with CAS)."""
+    cleaned: Dict[str, Any] = {}
+    item_id = str(params.get("item_id", "")).strip()
+    if not item_id:
+        raise APIError("invalid_input", "item_id is required")
+    cleaned["item_id"] = item_id
+    fields = params.get("fields")
+    if fields is not None:
+        if not isinstance(fields, dict):
+            raise APIError("invalid_input", "fields must be a dict")
+        if len(json.dumps(fields)) > MAX_PAYLOAD_BYTES:
+            raise APIError("request_too_large", "fields exceeds max payload size")
+        cleaned["fields"] = fields
+    status = params.get("status")
+    if status is not None:
+        cleaned["status"] = str(status)
+    expected_version = params.get("expected_version")
+    if expected_version is not None:
+        cleaned["expected_version"] = str(expected_version)
+    if fields is None and status is None:
+        raise APIError("invalid_input", "at least one of fields/status must be provided")
+    for scope_key in ("user_scope", "tenant"):
+        if params.get(scope_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {scope_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
+def _validate_collection_remove_item_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate collection_remove_item parameters (class C write with CAS)."""
+    cleaned: Dict[str, Any] = {}
+    item_id = str(params.get("item_id", "")).strip()
+    if not item_id:
+        raise APIError("invalid_input", "item_id is required")
+    cleaned["item_id"] = item_id
+    expected_version = params.get("expected_version")
+    if expected_version is not None:
+        cleaned["expected_version"] = str(expected_version)
+    for scope_key in ("user_scope", "tenant"):
+        if params.get(scope_key) is not None:
+            raise APIError(
+                "forbidden",
+                f"Parameter {scope_key} is server-set and may not be "
+                f"provided by the caller.",
+            )
+    return cleaned
+
+
 # -- Audit (D10) -------------------------------------------------------------
 
 def _hash_query(query: str) -> str:
@@ -1113,7 +1289,10 @@ class ArgosAPIFacade:
         # #200 Spec-10: Class C write ops require loopback + server-derived
         # identity. Non-loopback callers (external MCP/REST) can only use
         # class A (propose) and class B (review) — never direct writes.
-        if operation in WRITE_OPERATIONS and not ctx.is_loopback:
+        # Collection write ops are also class C only in v1 (no candidate
+        # pipeline for collections — explicitly deferred per spec D1).
+        if (operation in WRITE_OPERATIONS
+                or operation in COLLECTION_WRITE_OPERATIONS) and not ctx.is_loopback:
             self._audit(ctx, operation, request_id, "denied",
                         denied_reason="write_requires_loopback")
             raise APIError(
@@ -1184,6 +1363,18 @@ class ArgosAPIFacade:
                 validated = _validate_memory_update_params(params)
             elif operation == "memory_delete":
                 validated = _validate_memory_delete_params(params)
+            elif operation == "collection_list":
+                validated = _validate_collection_list_params(params)
+            elif operation == "collection_items":
+                validated = _validate_collection_items_params(params)
+            elif operation == "collection_create":
+                validated = _validate_collection_create_params(params)
+            elif operation == "collection_add_item":
+                validated = _validate_collection_add_item_params(params)
+            elif operation == "collection_update_item":
+                validated = _validate_collection_update_item_params(params)
+            elif operation == "collection_remove_item":
+                validated = _validate_collection_remove_item_params(params)
             elif operation == "export":
                 validated = _validate_export_params(params)
             else:
@@ -1199,9 +1390,10 @@ class ArgosAPIFacade:
 
         # 5. Idempotency check (mutations only).
         # #200 Spec-10: full idempotency coverage — all write ops, not
-        # just proposal/feedback. Class C writes (save/update/delete) are
-        # included.
-        if operation in (PROPOSAL_OPERATIONS | FEEDBACK_OPERATIONS | WRITE_OPERATIONS):
+        # just proposal/feedback. Class C writes (save/update/delete) and
+        # collection writes (create/add/update/remove) are included.
+        if operation in (PROPOSAL_OPERATIONS | FEEDBACK_OPERATIONS
+                         | WRITE_OPERATIONS | COLLECTION_WRITE_OPERATIONS):
             request_hash = hashlib.sha256(
                 json.dumps(validated, sort_keys=True).encode("utf-8")
             ).hexdigest()
@@ -1247,6 +1439,18 @@ class ArgosAPIFacade:
                 result = self._op_memory_update(ctx, validated)
             elif operation == "memory_delete":
                 result = self._op_memory_delete(ctx, validated)
+            elif operation == "collection_list":
+                result = self._op_collection_list(ctx, validated)
+            elif operation == "collection_items":
+                result = self._op_collection_items(ctx, validated)
+            elif operation == "collection_create":
+                result = self._op_collection_create(ctx, validated)
+            elif operation == "collection_add_item":
+                result = self._op_collection_add_item(ctx, validated)
+            elif operation == "collection_update_item":
+                result = self._op_collection_update_item(ctx, validated)
+            elif operation == "collection_remove_item":
+                result = self._op_collection_remove_item(ctx, validated)
             elif operation == "export":
                 result = self._op_export(ctx, validated)
             else:
@@ -1271,8 +1475,9 @@ class ArgosAPIFacade:
             ) from exc
 
         # 7. Record idempotency for mutations.
-        # #200 Spec-10: full coverage — all write ops.
-        if operation in (PROPOSAL_OPERATIONS | FEEDBACK_OPERATIONS | WRITE_OPERATIONS) and idempotency_key:
+        # #200 Spec-10: full coverage — all write ops + collection writes.
+        if operation in (PROPOSAL_OPERATIONS | FEEDBACK_OPERATIONS
+                         | WRITE_OPERATIONS | COLLECTION_WRITE_OPERATIONS) and idempotency_key:
             request_hash = hashlib.sha256(
                 json.dumps(validated, sort_keys=True).encode("utf-8")
             ).hexdigest()
@@ -2076,13 +2281,15 @@ class ArgosAPIFacade:
             # audit server-side. For direct DuckDBMemoryStore (tests),
             # the facade does the CAS check itself.
             if hasattr(self._store, "facade_delete_memory"):
-                # Service-side gating: pass confirm + expected_version.
+                # Service-side gating: the proxy (SharedMemoryStore) uses
+                # call_gated() which sets _confirmed in the RPC envelope.
                 # The service strips client identity, resolves user_id
                 # from its own context, enforces CAS atomically under
                 # the tenant lock, and writes the audit row.
+                # #200 PR-2 fix: confirm is no longer passed — the gate
+                # authority is the _confirmed envelope flag.
                 delete_kwargs: Dict[str, Any] = {
                     "memory_id": memory_id,
-                    "confirm": True,
                 }
                 if expected_version is not None:
                     delete_kwargs["expected_version"] = expected_version
@@ -2109,6 +2316,158 @@ class ArgosAPIFacade:
             "status": "deleted",
             "memory_id": memory_id,
         }
+
+    # -- #200 Spec-10 PR 2/3: Collection operations --------------------------
+
+    def _op_collection_list(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier: list collections for the caller's scope. EXHAUSTIVE."""
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            collections = self._store.list_collections(
+                status=params.get("status"),
+                limit=params.get("limit", 200),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        return {"collections": collections, "count": len(collections)}
+
+    def _op_collection_items(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier: list items in a collection. EXHAUSTIVE — no cutoff."""
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            items = self._store.list_collection_items(
+                collection_id=params["collection_id"],
+                status=params.get("status"),
+                include_archived=params.get("include_archived", False),
+                limit=params.get("limit", 0),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        return {"items": items, "count": len(items)}
+
+    def _op_collection_create(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Class C write: create a collection. Server-mints ID.
+
+        #200 PR-2 fix: passes confirm=True as the RPC-seam capability
+        marker. The service dispatch (memory_service.py) denies raw RPC
+        calls without confirm=True and writes an audit row. In
+        direct-store mode (tests), confirm is accepted and ignored.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            collection = self._store.create_collection(
+                name=params["name"],
+                template=params.get("template"),
+                schema=params.get("schema"),
+                tenant=ctx.tenant,
+                confirm=True,
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        return {"status": "created", "collection": collection,
+                "collection_id": collection["collection_id"]}
+
+    def _op_collection_add_item(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Class C write: add an item to a collection. Server-mints ID.
+
+        #200 PR-2 fix: passes confirm=True (RPC-seam capability marker).
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            item = self._store.add_collection_item(
+                collection_id=params["collection_id"],
+                fields=params["fields"],
+                status=params.get("status", "open"),
+                tenant=ctx.tenant,
+                confirm=True,
+            )
+        except ValueError as exc:
+            raise APIError("invalid_input", str(exc))
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        return {"status": "added", "item": item,
+                "item_id": item["item_id"]}
+
+    def _op_collection_update_item(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Class C write: update a collection item. CAS via expected_version.
+
+        #200 PR-2 fix: passes confirm=True (RPC-seam capability marker).
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            item = self._store.update_collection_item(
+                item_id=params["item_id"],
+                fields=params.get("fields"),
+                status=params.get("status"),
+                expected_version=params.get("expected_version"),
+                confirm=True,
+            )
+        except ValueError as exc:
+            if "CAS conflict" in str(exc):
+                raise APIError("conflict", str(exc),
+                               details={"item_id": params["item_id"]})
+            if "not found" in str(exc).lower():
+                raise APIError("not_found", str(exc))
+            raise APIError("invalid_input", str(exc))
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        return {"status": "updated", "item": item,
+                "item_id": item["item_id"]}
+
+    def _op_collection_remove_item(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Class C write: remove (archive) a collection item. CAS via
+        expected_version. Sets archived_at; does not delete the row.
+
+        #200 PR-2 fix: passes confirm=True (RPC-seam capability marker).
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            item = self._store.remove_collection_item(
+                item_id=params["item_id"],
+                expected_version=params.get("expected_version"),
+                confirm=True,
+            )
+        except ValueError as exc:
+            if "CAS conflict" in str(exc):
+                raise APIError("conflict", str(exc),
+                               details={"item_id": params["item_id"]})
+            if "not found" in str(exc).lower():
+                raise APIError("not_found", str(exc))
+            raise APIError("invalid_input", str(exc))
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        return {"status": "removed", "item": item,
+                "item_id": item["item_id"]}
 
     def _cas_check_version(
         self, memory_id: str, expected_version: str,

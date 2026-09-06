@@ -159,10 +159,71 @@ def _migration_2_to_3(conn) -> None:
     """)
 
 
+def _migration_3_to_4(conn) -> None:
+    """#200 Spec-10 PR 2/3: Collections — exhaustive, structural, no ranking.
+
+    Creates two new tables for collection-based storage:
+
+    - ``collections``: named lists (backlog, todo, reading-list, etc.)
+      with optional template and optional field schema (JSON). Server-
+      minted collection_id PK. Scope columns (user_scope, tenant) for
+      Cells isolation (#131). status defaults to 'active'.
+
+    - ``collection_items``: items within a collection. Free-form fields
+      JSON (validated only when the parent collection has a schema set;
+      v1 minimal name/type/required check). Server-minted item_id PK.
+      status defaults to 'open' (open|done|parked). archived_at marks
+      removed items. Scope columns for Cells isolation.
+
+    Both tables use the same VARCHAR-timestamp, user_scope/tenant
+    isolation pattern as memory_records. No embeddings, no ranking,
+    no graph edges — plain filtered SQL only.
+
+    Idempotent (CREATE TABLE IF NOT EXISTS) and transactional via the
+    runner.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS collections (
+            collection_id   VARCHAR PRIMARY KEY,
+            name            VARCHAR NOT NULL,
+            template        VARCHAR,
+            schema          JSON,
+            status          VARCHAR DEFAULT 'active',
+            user_scope      VARCHAR,
+            tenant          VARCHAR,
+            created_at      VARCHAR,
+            updated_at      VARCHAR
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS collection_items (
+            item_id         VARCHAR PRIMARY KEY,
+            collection_id   VARCHAR REFERENCES collections,
+            fields          JSON,
+            status          VARCHAR DEFAULT 'open',
+            user_scope      VARCHAR,
+            tenant          VARCHAR,
+            created_at      VARCHAR,
+            updated_at      VARCHAR,
+            archived_at     VARCHAR
+        )
+    """)
+    # Index for exhaustive filtered reads by scope + status.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_collection_items_scope_status
+        ON collection_items (user_scope, status, collection_id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_collections_scope_status
+        ON collections (user_scope, status)
+    """)
+
+
 MIGRATIONS: List[Migration] = [
     (0, 1, _migration_0_to_1),
     (1, 2, _migration_1_to_2),
     (2, 3, _migration_2_to_3),
+    (3, 4, _migration_3_to_4),
 ]
 
 # The latest schema version = the last migration's version_to.

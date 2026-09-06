@@ -133,6 +133,21 @@ def _read_endpoint(home: Path) -> dict | None:
     return None
 
 
+def _compute_gate_hmac(gate_secret: str, request: dict) -> str:
+    """#200 PR-2 fix: compute HMAC-SHA256 over the request (minus
+    _gate_hmac and token) using the boot-time gate_secret. The service
+    verifies this before honoring _confirmed — a raw RPC caller without
+    the gate_secret cannot forge it."""
+    import hmac as _hmac
+    import hashlib as _hashlib
+    body = {k: v for k, v in request.items() if k not in ("_gate_hmac", "token")}
+    return _hmac.new(
+        gate_secret.encode("utf-8"),
+        json.dumps(body, sort_keys=True).encode("utf-8"),
+        _hashlib.sha256,
+    ).hexdigest()
+
+
 def _record_from_dict(value: dict | None) -> MemoryRecord | None:
     if not value:
         return None
@@ -241,6 +256,15 @@ class _SharedRPC:
         request["v"] = _PROTOCOL_VERSION
         request["token"] = endpoint["token"]
         request.setdefault("user_id", self.user_id)
+        # #200 PR-2 fix: if this is a gated call, compute the HMAC over
+        # the final request (all envelope fields added) using the
+        # boot-time gate_secret. The service verifies this before
+        # honoring _confirmed. The _needs_gate_hmac flag is stripped
+        # from the request before sending (it's a client-side marker).
+        if request.pop("_needs_gate_hmac", False):
+            gate_secret = endpoint.get("gate_secret", "")
+            if gate_secret:
+                request["_gate_hmac"] = _compute_gate_hmac(gate_secret, request)
         try:
             with socket.create_connection(
                 (str(endpoint["host"]), int(endpoint["port"])), timeout=timeout
@@ -380,6 +404,24 @@ class _SharedRPC:
 
     def call(self, component: str, method: str, **args: Any) -> Any:
         return self._request({"component": component, "method": method, "args": args})
+
+    def call_gated(self, component: str, method: str, **args: Any) -> Any:
+        """Like call(), but marks the request as facade-confirmed with
+        an HMAC proof the server verifies.
+
+        #200 PR-2 fix: the _confirmed flag goes in the request ENVELOPE,
+        NOT in args. But _confirmed alone is still client-asserted — so
+        call_gated also sets _needs_gate_hmac=True, which _request_once
+        uses to compute an HMAC-SHA256 over the final request (after all
+        envelope fields like v, token, user_id are added) using the
+        boot-time gate_secret. The service verifies the HMAC before
+        honoring _confirmed. A raw RPC caller with the endpoint token
+        but without the gate_secret cannot forge the HMAC.
+        """
+        request = {"component": component, "method": method, "args": args}
+        request["_confirmed"] = True
+        request["_needs_gate_hmac"] = True
+        return self._request(request)
 
     def stop_service(self) -> Any:
         return self._request({"method": "shutdown"})
@@ -724,17 +766,56 @@ class SharedMemoryStore:
         delete_memory is in _FORBIDDEN_STORE_METHODS on the RPC boundary
         (no raw RPC passthrough). The facade gates this with ctx.is_loopback
         + server-derived identity before calling this method. The service
-        handler enforces the SAME controls server-side: strict confirm
-        (literal True only), strict CAS (expected_version required,
-        compare+delete atomically under the tenant lock), identity stripped
-        + service-resolved, and an audit row for every call (denied
-        included). A raw RPC caller with the endpoint token cannot skip
-        these gates.
+        handler enforces the SAME controls server-side: strict
+        _confirmed (envelope flag, not client-supplied confirm), strict
+        CAS (expected_version required, compare+delete atomically under
+        the tenant lock), identity stripped + service-resolved, and an
+        audit row for every call (denied included). A raw RPC caller
+        with the endpoint token cannot skip these gates.
+
+        #200 PR-2 fix: uses call_gated() to set _confirmed in the RPC
+        envelope — same mechanism as collection writes. A client-supplied
+        confirm in args is stripped by _sanitize_args and NOT trusted.
         """
-        value = self._rpc.call("store", "facade_delete_memory", **kwargs)
+        kwargs.pop("confirm", None)  # strip — gate authority is in the envelope
+        value = self._rpc.call_gated("store", "facade_delete_memory", **kwargs)
         if value is False or value is None:
             return False
         return value
+
+    # -- #200 Spec-10 PR 2/3: Collections proxies ---------------------------
+    # Read proxies use call() (un-gated). Write proxies use call_gated()
+    # which sets _confirmed in the RPC envelope — the service checks
+    # this envelope flag (NOT a client-supplied confirm in args) as the
+    # gate authority for collection writes.
+
+    def list_collections(self, **kwargs: Any) -> List[Dict[str, Any]]:
+        return list(self._rpc.call("store", "list_collections", **kwargs) or [])
+
+    def list_collection_items(self, **kwargs: Any) -> List[Dict[str, Any]]:
+        return list(self._rpc.call("store", "list_collection_items", **kwargs) or [])
+
+    def count_collection_items(self, **kwargs: Any) -> int:
+        return int(self._rpc.call("store", "count_collection_items", **kwargs) or 0)
+
+    def get_collection(self, **kwargs: Any) -> Dict[str, Any] | None:
+        return self._rpc.call("store", "get_collection", **kwargs)
+
+    def create_collection(self, **kwargs: Any) -> Dict[str, Any]:
+        kwargs.pop("confirm", None)  # strip — gate authority is in the envelope
+        return self._rpc.call_gated("store", "create_collection", **kwargs)
+
+    def add_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
+        kwargs.pop("confirm", None)
+        return self._rpc.call_gated("store", "add_collection_item", **kwargs)
+
+    def update_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
+        kwargs.pop("confirm", None)
+        return self._rpc.call_gated("store", "update_collection_item", **kwargs)
+
+    def remove_collection_item(self, **kwargs: Any) -> Dict[str, Any]:
+        kwargs.pop("confirm", None)
+        return self._rpc.call_gated("store", "remove_collection_item", **kwargs)
 
     def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Read-only census of deletion tombstones (hash+metadata, newest first)."""

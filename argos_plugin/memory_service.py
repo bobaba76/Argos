@@ -69,6 +69,13 @@ _FORBIDDEN_CLIENT_ARGS = frozenset({
     # endpoint token delete another user's memories.
     "user_id",
     "tenant",
+    # #200 PR-2 fix: confirm is NOT a client-supplied gate authority.
+    # A raw RPC caller can pass confirm=True and bypass the gate. The
+    # real gate authority is the _confirmed flag in the RPC request
+    # ENVELOPE (set by _SharedRPC._call_gated, NOT from client args).
+    # Stripping confirm here ensures a client-supplied confirm never
+    # reaches the gate logic.
+    "confirm",
 })
 
 # MS2: destructive/admin methods forbidden on the RPC boundary (same as
@@ -98,6 +105,22 @@ _FORBIDDEN_STORE_METHODS = frozenset({
 
 _FORBIDDEN_GRAPH_METHODS = frozenset({
     "clear_scope",
+})
+
+# #200 Spec-10 PR 2/3 fix: Collection WRITE methods that are gated at the
+# raw-RPC seam. These are NOT in _FORBIDDEN_STORE_METHODS (the facade
+# legitimately calls them), but a raw RPC caller with the endpoint token
+# must NOT be able to bypass the facade's loopback gate + audit. The
+# dispatch handler requires confirm=True (literal bool — same precedent
+# as facade_delete_memory and erase_subject #293) and writes an audit
+# row on every call (success + denial). Reads (list_collections,
+# list_collection_items, count_collection_items, get_collection) are
+# NOT gated — they're read-only and scope-filtered.
+_GATED_COLLECTION_WRITE_METHODS = frozenset({
+    "create_collection",
+    "add_collection_item",
+    "update_collection_item",
+    "remove_collection_item",
 })
 
 
@@ -578,7 +601,7 @@ class MemoryService:
             return self._tenants[user_id]
         return self._tenants[self._default_tenant]
 
-    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None, tenant: "_Tenant | None" = None) -> Any:
+    def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None, tenant: "_Tenant | None" = None, confirmed: bool = False) -> Any:
         store.set_user_scope(user_id)
         if method == "search":
             records = store.search(
@@ -846,24 +869,28 @@ class MemoryService:
             args = _sanitize_args(args)
             memory_id = str(args.get("memory_id", ""))
             expected_version = args.get("expected_version")
-            confirm = args.get("confirm", False) is True
             tenant_name = tenant.name if tenant else "default"
-            # Gate 1: strict confirm (bool("false") is True — only
-            # literal True passes, same as erase_subject).
-            if not confirm:
+            # Gate 1: _confirmed envelope flag (NOT client-supplied confirm).
+            # #200 PR-2 fix: confirm is now in _FORBIDDEN_CLIENT_ARGS and
+            # stripped by _sanitize_args. The gate authority is the
+            # _confirmed flag in the RPC envelope (set by call_gated),
+            # which a raw RPC caller cannot forge. Same fix as collection
+            # writes — closes the client-spoofable confirm=True gap.
+            if not confirmed:
                 store.write_access_audit(
                     user_id=user_id,
                     query_text=f"facade_delete:{memory_id}",
                     granted_count=0,
                     denied_count=1,
-                    denied_scopes="confirm_required",
+                    denied_scopes="not_confirmed",
                     tenant=tenant_name,
                     excluded=True,
                 )
                 raise PermissionError(
-                    "facade_delete_memory requires confirm=True "
-                    "(strict boolean). Preview is not supported for "
-                    "deletion — use the facade's memory_delete operation."
+                    "facade_delete_memory requires a facade-confirmed "
+                    "request (_confirmed in the RPC envelope). Raw RPC "
+                    "deletes are not permitted — use the facade's "
+                    "memory_delete operation."
                 )
             # Gate 2: strict CAS — expected_version is REQUIRED. The
             # caller must send the last-seen memory_id (each update mints
@@ -944,6 +971,119 @@ class MemoryService:
                         "Graph remove_memory failed for deleted %s: %s",
                         memory_id, exc,
                     )
+            return result
+        # -- #200 Spec-10 PR 2/3: Collections dispatch -----------------------
+        # All collection methods delegate to the store's StoreCollectionsMixin.
+        # Identity is server-resolved (dispatch already ran
+        # store.set_user_scope(user_id)); client-supplied user_scope/tenant
+        # are stripped by _sanitize_args (in _FORBIDDEN_CLIENT_ARGS).
+        if method == "list_collections":
+            return store.list_collections(
+                status=args.get("status"),
+                limit=int(args.get("limit", 200)),
+            )
+        if method == "list_collection_items":
+            return store.list_collection_items(
+                collection_id=args.get("collection_id", ""),
+                status=args.get("status"),
+                include_archived=bool(args.get("include_archived", False)),
+                limit=int(args.get("limit", 0)),
+            )
+        if method == "count_collection_items":
+            return store.count_collection_items(
+                collection_id=args.get("collection_id", ""),
+                status=args.get("status"),
+            )
+        if method == "get_collection":
+            return store.get_collection(args.get("collection_id", ""))
+        # -- #200 Spec-10 PR 2/3 fix: gated collection writes -------------
+        # These 4 write methods require _confirmed=True from the RPC
+        # request ENVELOPE (set by _SharedRPC.call_gated), NOT a client-
+        # supplied confirm in args. A raw RPC caller using call() cannot
+        # set _confirmed — it's in the envelope, not in args. And
+        # _sanitize_args strips 'confirm' from args (it's in
+        # _FORBIDDEN_CLIENT_ARGS), so even a forged confirm=True in args
+        # never reaches this gate. Every call (success + denial) writes
+        # an audit row with the service-resolved user_id. Same precedent
+        # as facade_delete_memory and erase_subject #293.
+        if method in _GATED_COLLECTION_WRITE_METHODS:
+            args = _sanitize_args(args)
+            tenant_name = tenant.name if tenant else "default"
+            if not confirmed:
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"collection_write:{method}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes="not_confirmed",
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise PermissionError(
+                    f"{method} requires a facade-confirmed request "
+                    f"(_confirmed in the RPC envelope). Raw RPC "
+                    f"collection writes are not permitted — use the "
+                    f"facade (class C loopback)."
+                )
+            # Gate passed — dispatch to the store method.
+            try:
+                if method == "create_collection":
+                    result = store.create_collection(
+                        name=args.get("name", ""),
+                        template=args.get("template"),
+                        schema=args.get("schema"),
+                        tenant=tenant_name,
+                    )
+                elif method == "add_collection_item":
+                    result = store.add_collection_item(
+                        collection_id=args.get("collection_id", ""),
+                        fields=args.get("fields", {}),
+                        status=args.get("status", "open"),
+                        tenant=tenant_name,
+                    )
+                elif method == "update_collection_item":
+                    result = store.update_collection_item(
+                        item_id=args.get("item_id", ""),
+                        fields=args.get("fields"),
+                        status=args.get("status"),
+                        expected_version=args.get("expected_version"),
+                    )
+                elif method == "remove_collection_item":
+                    result = store.remove_collection_item(
+                        item_id=args.get("item_id", ""),
+                        expected_version=args.get("expected_version"),
+                    )
+                else:
+                    raise ValueError(f"Unhandled gated collection write: {method}")
+            except ValueError as exc:
+                # CAS conflict / not found / invalid — audit the denial.
+                msg = str(exc).lower()
+                if "cas conflict" in msg:
+                    denied_reason = "cas_conflict"
+                elif "not found" in msg:
+                    denied_reason = "not_found"
+                else:
+                    denied_reason = "invalid_input"
+                store.write_access_audit(
+                    user_id=user_id,
+                    query_text=f"collection_write:{method}",
+                    granted_count=0,
+                    denied_count=1,
+                    denied_scopes=denied_reason,
+                    tenant=tenant_name,
+                    excluded=True,
+                )
+                raise
+            # Success — audit the granted write.
+            store.write_access_audit(
+                user_id=user_id,
+                query_text=f"collection_write:{method}",
+                granted_count=1,
+                denied_count=0,
+                denied_scopes="",
+                tenant=tenant_name,
+                excluded=False,
+            )
             return result
         # -- deletion tombstones (read-only visibility + escape hatch) ---------
         if method == "list_tombstones":
@@ -1437,7 +1577,12 @@ class MemoryService:
             self._lock_wait_total_s += time.monotonic() - t0
             self._lock_wait_count += 1
             if component == "store":
-                return self._call_store(method, args, user_id, tenant.store, tenant.policy, tenant)
+                # #200 PR-2 fix: pass the _confirmed envelope flag to
+                # _call_store. This is the gate authority for collection
+                # writes — it comes from the RPC envelope (set by
+                # _SharedRPC.call_gated), NOT from client-supplied args.
+                confirmed = request.get("_confirmed", False) is True
+                return self._call_store(method, args, user_id, tenant.store, tenant.policy, tenant, confirmed)
             return self._call_graph(method, args, user_id, tenant.graph, tenant.store)
 
     def _backup(self, args: dict) -> Any:
@@ -1552,6 +1697,34 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 token = str(request.pop("token", ""))
                 if not hmac.compare_digest(token, server.auth_token):
                     raise PermissionError("invalid service token")
+                # #200 PR-2 fix: verify the gate HMAC before honoring
+                # _confirmed. The facade's call_gated() computes an
+                # HMAC-SHA256 over the request (minus _gate_hmac and
+                # token) using the boot-time gate_secret. A raw RPC
+                # caller with the endpoint token but without the
+                # gate_secret cannot forge this HMAC. Without this
+                # verification, _confirmed is just another client-
+                # asserted boolean — the same spoof one layer up.
+                gate_hmac = request.pop("_gate_hmac", "")
+                client_confirmed = request.get("_confirmed", False) is True
+                if client_confirmed:
+                    # _confirmed is only honored if backed by a valid
+                    # HMAC. Compute the expected HMAC over the request
+                    # dict (token and _gate_hmac already removed).
+                    expected_hmac = hmac.new(
+                        server.gate_secret.encode("utf-8"),
+                        json.dumps(request, sort_keys=True).encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    if not isinstance(gate_hmac, str) or not hmac.compare_digest(
+                        gate_hmac, expected_hmac
+                    ):
+                        # The HMAC doesn't match — _confirmed is forged.
+                        # Strip it so the gate denies.
+                        request["_confirmed"] = False
+                else:
+                    # No _confirmed claimed — ensure it's False.
+                    request["_confirmed"] = False
                 result = server.memory_service.dispatch(request)
                 self._write({"ok": True, "result": result})
             except Exception as exc:
@@ -1590,11 +1763,12 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         self.wfile.flush()
 
 
-def _write_endpoint(path: Path, port: int, token: str) -> None:
+def _write_endpoint(path: Path, port: int, token: str, gate_secret: str) -> None:
     payload = {
         "host": "127.0.0.1",
         "port": port,
         "token": token,
+        "gate_secret": gate_secret,
         "pid": os.getpid(),
         "version": 1,
     }
@@ -1666,12 +1840,20 @@ def serve(home: Path, port: int = 0) -> None:
 
     service = MemoryService(home)
     token = secrets.token_urlsafe(32)
+    # #200 PR-2 fix: gate_secret is a separate boot-time secret used by
+    # the facade to HMAC-sign gated requests (collection writes,
+    # facade_delete_memory). The service verifies the HMAC before
+    # honoring _confirmed — a raw RPC caller with the endpoint token
+    # but without the gate_secret cannot forge the HMAC. This closes
+    # the client-spoofable _confirmed gap.
+    gate_secret = secrets.token_urlsafe(32)
     server = _ThreadingTCPServer(("127.0.0.1", port), _RequestHandler)
     server.auth_token = token
+    server.gate_secret = gate_secret
     server.memory_service = service
     service.server = server
 
-    _write_endpoint(endpoint, int(server.server_address[1]), token)
+    _write_endpoint(endpoint, int(server.server_address[1]), token, gate_secret)
 
     # Opportunistic one-time graph hygiene at startup: quarantine junk/leak
     # entity nodes so noise fades from graph-aware recall. Runs off the hot

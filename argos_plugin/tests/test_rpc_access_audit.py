@@ -231,3 +231,393 @@ class TestAuditSurvivesRestart:
                 store2._rpc.stop_service()
             finally:
                 time.sleep(0.5)
+
+
+# -- #200 PR 2/3 fix: collection write gating at the raw-RPC seam -------------
+
+class TestCollectionWriteRpcGating:
+    """#200 PR 2/3 fix (second fix): raw RPC collection writes are denied
+    at the service dispatch. The gate authority is the _confirmed flag in
+    the RPC request ENVELOPE (set by _SharedRPC.call_gated), NOT a client-
+    supplied confirm in args. A raw RPC caller cannot forge the envelope
+    flag by passing confirm=True in args — _sanitize_args strips confirm
+    (it's in _FORBIDDEN_CLIENT_ARGS), and the service only trusts
+    _confirmed from the envelope.
+
+    Tests:
+      - raw RPC via call() without _confirmed → denied + audit
+      - raw RPC via call() WITH forged confirm=True in args → DENIED
+      - **forged _confirmed=true in envelope without HMAC → DENIED** (the real spoof-closing test)
+      - forged _confirmed=true WITH forged _gate_hmac → DENIED (HMAC verification)
+      - forged client user_id/tenant → stripped, service-resolved identity in audit
+      - facade-mediated write → succeeds + audit granted row
+      - CAS conflict → audit denial row, no write
+      - reads stay un-gated
+      - _GATED_COLLECTION_WRITE_METHODS is exactly the 4 writes
+    """
+
+    def test_raw_rpc_create_denied(self, tmp_path):
+        """Raw RPC create_collection via call() (no _confirmed envelope)
+        → PermissionError + audit denial row."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc.call("store", "create_collection", name="Raw RPC")
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1, "raw RPC denial not audited"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirmed_in_envelope_denied(self, tmp_path):
+        """THE REAL SPOOF-CLOSING TEST: a raw RPC caller forges
+        _confirmed=true in the envelope WITHOUT a valid HMAC → DENIED.
+
+        This proves the gate authority is the server-verified HMAC, not
+        the client-asserted _confirmed boolean. A raw caller with the
+        endpoint token can set _confirmed=true in the JSON, but without
+        the boot-time gate_secret they cannot compute the correct HMAC.
+        The service strips _confirmed when the HMAC doesn't match.
+        """
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            # Forge _confirmed=true in the envelope with NO HMAC.
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc._request_once(
+                    {
+                        "component": "store",
+                        "method": "create_collection",
+                        "args": {"name": "Forged Envelope"},
+                        "_confirmed": True,
+                    },
+                    timeout=10.0,
+                )
+            # Audit denial row written.
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1, "forged _confirmed denial not audited"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirmed_with_forged_hmac_denied(self, tmp_path):
+        """Forged _confirmed=true WITH a forged _gate_hmac (wrong secret)
+        → DENIED. The HMAC verification catches a caller who tries to
+        guess the gate_secret."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            import hashlib as _hashlib
+            import hmac as _hmac
+            # Compute an HMAC with the WRONG secret.
+            fake_secret = "wrong-secret-not-the-real-one"
+            body = {
+                "component": "store",
+                "method": "create_collection",
+                "args": {"name": "Forged HMAC"},
+                "_confirmed": True,
+                "v": 1,
+                "user_id": "test_user",
+            }
+            fake_hmac = _hmac.new(
+                fake_secret.encode("utf-8"),
+                json.dumps(body, sort_keys=True).encode("utf-8"),
+                _hashlib.sha256,
+            ).hexdigest()
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc._request_once(
+                    {
+                        "component": "store",
+                        "method": "create_collection",
+                        "args": {"name": "Forged HMAC"},
+                        "_confirmed": True,
+                        "_gate_hmac": fake_hmac,
+                    },
+                    timeout=10.0,
+                )
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1, "forged HMAC denial not audited"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirm_in_args_still_denied(self, tmp_path):
+        """THE SPOOF-CLOSING TEST: raw RPC with forged confirm=True in args
+        → DENIED. The gate authority is _confirmed in the ENVELOPE, not
+        confirm in args. _sanitize_args strips confirm (in
+        _FORBIDDEN_CLIENT_ARGS), so it never reaches the gate logic."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            # Forge confirm=True in args — must be DENIED.
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc.call(
+                    "store", "create_collection",
+                    name="Forged Confirm", confirm=True,
+                )
+            # Audit denial row written with not_confirmed reason.
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1, "forged confirm denial not audited"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirm_on_add_item_denied(self, tmp_path):
+        """Forged confirm=True on add_collection_item → DENIED."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            # Create a collection via the gated path first.
+            store.create_collection(name="Valid")
+            col = store.list_collections()[0]
+            # Forged confirm=True in args → denied.
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc.call(
+                    "store", "add_collection_item",
+                    collection_id=col["collection_id"],
+                    fields={"title": "forged"},
+                    confirm=True,
+                )
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirm_on_update_denied(self, tmp_path):
+        """Forged confirm=True on update_collection_item → DENIED."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            store.create_collection(name="Valid")
+            col = store.list_collections()[0]
+            store.add_collection_item(
+                collection_id=col["collection_id"], fields={"title": "item"},
+            )
+            items = store.list_collection_items(collection_id=col["collection_id"])
+            item_id = items[0]["item_id"]
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc.call(
+                    "store", "update_collection_item",
+                    item_id=item_id, status="done", confirm=True,
+                )
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_confirm_on_remove_denied(self, tmp_path):
+        """Forged confirm=True on remove_collection_item → DENIED."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            store.create_collection(name="Valid")
+            col = store.list_collections()[0]
+            store.add_collection_item(
+                collection_id=col["collection_id"], fields={"title": "item"},
+            )
+            items = store.list_collection_items(collection_id=col["collection_id"])
+            item_id = items[0]["item_id"]
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc.call(
+                    "store", "remove_collection_item",
+                    item_id=item_id, confirm=True,
+                )
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_forged_client_identity_stripped(self, tmp_path):
+        """Raw RPC with forged user_id/tenant in args → stripped by
+        _sanitize_args; service-resolved identity used in audit."""
+        store = _make_store(tmp_path, user_id="real_user")
+        try:
+            from service_client import SharedMemoryServiceError
+            # Forge user_id and tenant in the args — _sanitize_args strips them.
+            with pytest.raises((SharedMemoryServiceError, PermissionError)):
+                store._rpc.call(
+                    "store", "create_collection",
+                    name="Forged", user_id="attacker", tenant="evil",
+                    confirm=True,
+                )
+            # The denial audit row must use the service-resolved user_id
+            # (real_user), not the forged "attacker".
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            denial_rows = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "not_confirmed" in (r.get("denied_scopes") or "")
+            ]
+            assert len(denial_rows) >= 1
+            assert denial_rows[0]["user_id"] == "real_user"
+            assert denial_rows[0]["user_id"] != "attacker"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_facade_collection_write_succeeds_with_audit(self, tmp_path):
+        """Facade-mediated collection write → succeeds + audit granted row.
+        The facade uses call_gated() which sets _confirmed in the envelope."""
+        from api_facade import (
+            ArgosAPIFacade, AuthContext,
+            COLLECTION_READ_OPERATIONS, COLLECTION_WRITE_OPERATIONS,
+            READ_OPERATIONS, WRITE_OPERATIONS,
+        )
+        store = _make_store(tmp_path)
+        try:
+            facade = ArgosAPIFacade(store)
+            ctx = AuthContext(
+                principal="test-principal",
+                tenant="default",
+                user_id="test_user",
+                transport="loopback",
+                allowed_operations=(
+                    READ_OPERATIONS | WRITE_OPERATIONS
+                    | COLLECTION_READ_OPERATIONS | COLLECTION_WRITE_OPERATIONS
+                ),
+                is_loopback=True,
+            )
+            # Facade-mediated create → succeeds (call_gated sets _confirmed).
+            r = facade.execute(ctx, "collection_create", {"name": "Via Facade"})
+            assert r["status"] == "created"
+            # Audit granted row written.
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            granted = [r for r in rows if r.get("granted_count", 0) > 0 and not r.get("excluded")]
+            assert len(granted) >= 1, "facade collection write not audited as granted"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_cas_conflict_audited_as_denial(self, tmp_path):
+        """CAS conflict on update_collection_item → audit denial row, no write."""
+        store = _make_store(tmp_path)
+        try:
+            from service_client import SharedMemoryServiceError
+            # Create collection + item via the gated proxy path.
+            store.create_collection(name="CAS Test")
+            col = store.list_collections()[0]
+            store.add_collection_item(
+                collection_id=col["collection_id"], fields={"title": "item"},
+            )
+            items = store.list_collection_items(collection_id=col["collection_id"])
+            item_id = items[0]["item_id"]
+            # CAS conflict: wrong expected_version (via gated proxy).
+            with pytest.raises((SharedMemoryServiceError, Exception)):
+                store.update_collection_item(
+                    item_id=item_id,
+                    status="done",
+                    expected_version="stale-version",
+                )
+            # Audit denial row for the CAS conflict.
+            exported = store.export_access_audit()
+            rows = [json.loads(line) for line in exported.strip().splitlines() if line]
+            cas_denials = [
+                r for r in rows
+                if r.get("excluded") is True
+                and "cas_conflict" in (r.get("denied_scopes") or "")
+            ]
+            assert len(cas_denials) >= 1, "CAS conflict denial not audited"
+            # The item status must NOT have changed.
+            items_after = store.list_collection_items(collection_id=col["collection_id"])
+            assert items_after[0]["status"] == "open"
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_reads_not_gated(self, tmp_path):
+        """Read operations (list/count/get) are NOT gated — they work
+        without _confirmed. The gated set is exactly the 4 WRITE methods."""
+        store = _make_store(tmp_path)
+        try:
+            # Create a collection via the gated proxy path first.
+            store.create_collection(name="Read Test")
+            col = store.list_collections()[0]
+            store.add_collection_item(
+                collection_id=col["collection_id"], fields={"title": "item"},
+            )
+            # Reads via call() (no _confirmed) → all succeed (no gating).
+            cols = store.list_collections()
+            assert len(cols) >= 1
+            items = store.list_collection_items(collection_id=col["collection_id"])
+            assert len(items) >= 1
+            count = store.count_collection_items(collection_id=col["collection_id"])
+            assert count >= 1
+            got = store.get_collection(collection_id=col["collection_id"])
+            assert got is not None
+        finally:
+            try:
+                store._rpc.stop_service()
+            finally:
+                time.sleep(0.5)
+
+    def test_gated_set_is_exactly_4_writes(self):
+        """The _GATED_COLLECTION_WRITE_METHODS set contains exactly the 4
+        collection write methods — no reads, no extras."""
+        import sys
+        _plugin_dir = Path(__file__).resolve().parent.parent
+        if str(_plugin_dir) not in sys.path:
+            sys.path.insert(0, str(_plugin_dir))
+        from memory_service import _GATED_COLLECTION_WRITE_METHODS
+        assert _GATED_COLLECTION_WRITE_METHODS == frozenset({
+            "create_collection",
+            "add_collection_item",
+            "update_collection_item",
+            "remove_collection_item",
+        })
+
+    def test_confirm_in_forbidden_client_args(self):
+        """confirm is in _FORBIDDEN_CLIENT_ARGS — _sanitize_args strips it."""
+        import sys
+        _plugin_dir = Path(__file__).resolve().parent.parent
+        if str(_plugin_dir) not in sys.path:
+            sys.path.insert(0, str(_plugin_dir))
+        from memory_service import _FORBIDDEN_CLIENT_ARGS, _sanitize_args
+        assert "confirm" in _FORBIDDEN_CLIENT_ARGS
+        # _sanitize_args strips it.
+        sanitized = _sanitize_args({"name": "test", "confirm": True})
+        assert "confirm" not in sanitized
+        assert sanitized == {"name": "test"}

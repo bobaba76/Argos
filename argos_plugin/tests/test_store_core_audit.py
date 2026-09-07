@@ -189,9 +189,11 @@ class TestSC6TransactionalMigrations:
         """SC6: _init_db wraps backfills in a transaction."""
         from store_core import StoreCoreMixin as DuckDBMemoryStore
         src = inspect.getsource(DuckDBMemoryStore._init_db)
-        assert "BEGIN TRANSACTION" in src
-        assert "COMMIT" in src
-        assert "ROLLBACK" in src
+        # #347: transaction management is now via _tx_begin/_tx_commit/
+        # _tx_rollback helpers (depth-tracking for nested calls).
+        assert "_tx_begin" in src
+        assert "_tx_commit" in src
+        assert "_tx_rollback" in src
 
 
 # ---------------------------------------------------------------------------

@@ -90,3 +90,15 @@ class StoreMixinState:
     """Active ``DuckDBRetriever`` instance (lazy-initialised).
     Set in ``store_retrieval._get_retriever`` / ``set_retriever``;
     read in ``store_retrieval``."""
+
+    # -- #347: explicit transaction depth tracking ---------------------------
+    tx_depth: int = 0
+    """Tracks whether we're inside an explicit BEGIN/COMMIT transaction.
+    Incremented by ``_tx_begin`` in ``store_write``; decremented by
+    ``_tx_commit`` / ``_tx_rollback``. Used by ``_begin_transaction_if_needed``
+    to decide whether to start a new transaction for autocommit paths
+    (``remember``, ``save_candidate``, ``restore_memory``, ``purge_tombstone``,
+    ``purge_rejection``) — if ``tx_depth > 0`` the caller's transaction
+    provides atomicity and no new BEGIN is issued (DuckDB raises
+    ``TransactionException`` if BEGIN is called within an active
+    transaction, and the exception aborts the outer transaction)."""

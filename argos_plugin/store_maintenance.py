@@ -1430,7 +1430,7 @@ class StoreMaintenanceMixin:
             })
             with self._state.lock:
                 assert self.connection is not None
-                self.connection.execute("BEGIN TRANSACTION")
+                self._tx_begin()
                 try:
                     # Receipt FIRST (append-only log) — inside the same
                     # transaction as the deletion so the proof and the
@@ -1477,9 +1477,9 @@ class StoreMaintenanceMixin:
                             "requested_by": requested_by or self.user_id,
                         },
                     )
-                    self.connection.execute("COMMIT")
+                    self._tx_commit()
                 except Exception:
-                    self.connection.execute("ROLLBACK")
+                    self._tx_rollback()
                     raise
             entry["outcome"] = "erased"
             entry["receipt_id"] = receipt_id
@@ -1977,7 +1977,7 @@ class StoreMaintenanceMixin:
         if mode == "apply":
             with self._state.lock:
                 assert self.connection is not None
-                self.connection.execute("BEGIN TRANSACTION")
+                self._tx_begin()
                 try:
                     for row in rows:
                         if row["type"] == "record" and _record_blocked(row["data"]):
@@ -2006,9 +2006,9 @@ class StoreMaintenanceMixin:
                             reason=f"import_portable:{_rtype}",
                             refs={"type": _rtype, "imported": True},
                         )
-                    self.connection.execute("COMMIT")
+                    self._tx_commit()
                 except Exception:
-                    self.connection.execute("ROLLBACK")
+                    self._tx_rollback()
                     raise
 
         # Final counts from the per-row outcomes.

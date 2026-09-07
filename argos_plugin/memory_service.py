@@ -603,6 +603,19 @@ class MemoryService:
 
     def _call_store(self, method: str, args: dict, user_id: str, store, policy: "TenantPolicy | None" = None, tenant: "_Tenant | None" = None, confirmed: bool = False) -> Any:
         store.set_user_scope(user_id)
+        # #347: stamp the actor server-side per-request. set_user_scope
+        # resets the actor to user_id/"human"; re-stamp with the
+        # server-derived identity here so mutation_events records the
+        # real actor. In credential mode (#129), the identity came from
+        # a credential — force "model" since the service resolved it,
+        # not a human-driven envelope (#341/#344). In trusted-local
+        # mode, the caller is the local user — "human" is the right
+        # default (the facade overrides with ctx.principal_type when
+        # available, but the RPC path doesn't carry that — this stamp
+        # is the authoritative service-side actor).
+        _actor_type = "model" if getattr(self, "_credential_mode", False) else "human"
+        if hasattr(store, "set_actor_context"):
+            store.set_actor_context(user_id, _actor_type)
         if method == "search":
             records = store.search(
                 args.get("query", ""),
@@ -1223,13 +1236,14 @@ class MemoryService:
                 offset=int(args.get("offset", 0)),
                 event_type=args.get("event_type"),
             )
-        # #347: set_actor_context — server-derived actor identity for
-        # mutation_events. The actor_type is overridden to "model" in
-        # credential mode (server-derived, not client-trusted #341/#344).
+        # #347: set_actor_context — retained for facade/local-store
+        # compatibility. The per-request stamp at the top of _call_store
+        # is the authoritative service-side actor; this dispatch arm is
+        # a no-op for the RPC path (the stamp above already ran) but
+        # keeps the proxy method working for local stores that call it
+        # directly.
         if method == "set_actor_context":
             _actor_type = args.get("actor_type", "human")
-            # In credential mode, force model — the service resolved the
-            # identity from a credential, not a trusted-local envelope.
             if getattr(self, "_credential_mode", False):
                 _actor_type = "model"
             store.set_actor_context(user_id, _actor_type)

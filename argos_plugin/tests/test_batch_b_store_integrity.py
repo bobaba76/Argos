@@ -166,18 +166,18 @@ class TestDeleteMemoryPromoteTransaction:
 
     def test_promote_path_wrapped_in_transaction(self):
         """Structural check: the delete_memory promote path must be wrapped
-        in BEGIN TRANSACTION / COMMIT / ROLLBACK (#77)."""
+        in _tx_begin / _tx_commit / _tx_rollback (#77, #347)."""
         import inspect
         from store_write import StoreWriteMixin
         source = inspect.getsource(StoreWriteMixin.delete_memory)
-        assert "BEGIN TRANSACTION" in source
-        assert "COMMIT" in source
-        assert "ROLLBACK" in source
+        assert "_tx_begin" in source
+        assert "_tx_commit" in source
+        assert "_tx_rollback" in source
         # The transaction must wrap the multi-statement promote path
         # (UPDATE + tombstone + DELETE), not the single-statement paths.
         pred_branch = source[source.index("if pred:"):source.index("return", source.index("if pred:"))]
-        assert "BEGIN TRANSACTION" in pred_branch
-        assert "ROLLBACK" in pred_branch
+        assert "_tx_begin" in pred_branch
+        assert "_tx_rollback" in pred_branch
 
     def test_non_head_paths_not_transactional(self):
         """Structural check: the quarantine and hard-delete paths are
@@ -187,7 +187,7 @@ class TestDeleteMemoryPromoteTransaction:
         source = inspect.getsource(StoreWriteMixin.delete_memory)
         non_head_idx = source.index("if not is_head:")
         non_head_block = source[non_head_idx:non_head_idx + 300]
-        assert "BEGIN TRANSACTION" not in non_head_block
+        assert "_tx_begin" not in non_head_block
 
 
 # ---------------------------------------------------------------------------

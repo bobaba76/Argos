@@ -74,7 +74,7 @@ committed, re-runnable artifact:
 | Claim | Status | What's missing |
 |---|---|---|
 | Self-corpus gate + personal bench | internal | maintained for the weekly recon |
-| MemConflict 16-question slice — turn-level ingest (28/8 vs 30/8) | internal | Same 16 questions (persona 0, sessions 0–9), same answerer (deepseek-v4-flash via OpenRouter), same levers/prompt. AA 0.406 → 0.344 (one question, n=16), UOCS 0.188 → 0.438, CRS 0.188 → 0.125. **Mechanism caveat (chain-verify 30/8):** store-level chains are absent — 0 of 595 (and 0 of 884 in the 30/8 DB) records have `valid_to`/`superseded_by` set; ingest is `remember(dedup=False)`, so supersession/versioning never fires and chain-unfold has nothing to walk. The UOCS delta is the answerer's timestamp reasoning over the chronologically rendered list (prompt rule "latest wins"), not store update-arithmetic — the #8 store-level intent remains unproven (filed as #74). Not comparable to the 13/8 180-question baseline (different harness, ingest, scorer handling). Artifacts live in the benchmark clone (`hermes-memconflict-fork`, `argosvault/Results/`), untracked — not banked, so not a public claim yet. |
+| MemConflict 16-question slice — turn-level ingest (28/8 vs 30/8) | internal | Same 16 questions (persona 0, sessions 0–9), same answerer (deepseek-v4-flash via OpenRouter), same levers/prompt. AA 0.406 → 0.344 (one question, n=16), UOCS 0.188 → 0.438, CRS 0.188 → 0.125. **Mechanism caveat (chain-verify 30/8):** store-level chains are absent — 0 of 595 (and 0 of 884 in the 30/8 DB) records have `valid_to`/`superseded_by` set; ingest is `remember(dedup=False)`, so supersession/versioning never fires and chain-unfold has nothing to walk. The UOCS delta is the answerer's timestamp reasoning over the chronologically rendered list (prompt rule "latest wins"), not store update-arithmetic — the #8 store-level intent remains unproven at the benchmark level (filed as #74; #74 is now **closed** — `store.ingest_versioned()` landed 2026-09-01 and is unit-tested, but no chained LongMemEval run has been banked, so the caveat stands — see the 2026-09-07 resolution entry). Not comparable to the 13/8 180-question baseline (different harness, ingest, scorer handling). Artifacts live in the benchmark clone (`hermes-memconflict-fork`, `argosvault/Results/`), untracked — not banked, so not a public claim yet. |
 
 ---
 
@@ -126,7 +126,8 @@ committed, re-runnable artifact:
   `valid_to`/`superseded_by`; ingest is `remember(dedup=False)`, so supersession never
   fires and chain-unfold has nothing to walk). The UOCS gain is the answerer's timestamp
   reasoning over the chronologically rendered list, not store update-arithmetic — the #8
-  store-level intent remains unproven. Filed as #74.
+  store-level intent remains unproven. Filed as #74 (resolution recorded in the 2026-09-07
+  entry below).
 - **2026-08-30 (sync)** — §2 test-suite row refreshed: was "26 test modules" (27/8); now
   48 modules / 877 tests, re-verified green on the refactor working tree (12:17, 0 failures).
   The README Verification section cites the same counts.
@@ -157,6 +158,23 @@ committed, re-runnable artifact:
     12.3%, both exceeding the 5% tolerance) — test additions since the last recorded full-suite green
   run (30/8) merged without a suite run. Canary re-checked **green** after this refresh. This
   entry records the refresh and the catch, so the audit's living index stays honest.
+
+- **2026-09-07 (#354 — #74 resolution entry)** — issue #74 ("benchmark ingest must fire
+  store-level versioning") is **CLOSED**: the store-side fix landed 2026-09-01 (`6f06460`,
+  follow-up `b982dd1`) as `store.ingest_versioned()` (`store_write.py:366`), which detects
+  restatements (exact/substring/semantic) and routes them through `update_memory` so
+  `valid_to`/`superseded_by` chains form; `tests/test_ingest_versioning.py` covers
+  insert/duplicate/supersede/chain-walk/tombstone-block mechanics. **Proof-at-scale is NOT
+  yet banked**: no LongMemEval/MemConflict adapter in this tree calls `ingest_versioned`
+  (the benchmark adapters live in the sibling checkout), and no chained-run artifact
+  (judged files + `verify_repro` entry showing >0 rows with `valid_to`/`superseded_by`) has
+  been committed. So the §3 caveat above narrows from "machinery absent" to "machinery
+  present, run not banked" and **stands until a chained run is committed**. This entry
+  records the *resolution* (the 2026-08-30 chain-verify entry records the *filing*),
+  mirroring the #23/#24 pattern, so the audit no longer implies #74 is an open gap.
+  Hygiene note: when refreshing this audit, `gh issue view` every "filed as #N" reference
+  (#10, #14, #74, #139, #325) before quoting it, and add a resolution line in the same pass
+  when an issue has closed with a fix. No code behavior changed.
 
 - **2026-09-07 (parity guard extended + wired into CI)** —the canary now
   guards **both** docs rows (CLAIMS-AUDIT §2 and the README Verification "Test suite"

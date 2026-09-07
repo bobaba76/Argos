@@ -98,8 +98,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 Path(args.live_db), snap_dir, endpoint=Path(args.endpoint),
             )
         except Exception as exc:
-            _report(f"ERROR: snapshot failed: {exc}")
-            _report("verdict: ERROR")
+            text = str(exc)
+            if "locked" in text or "used by another process" in text:
+                # Endpoint says DOWN but the DB file is exclusive-locked:
+                # the service is actually UP yet not answering health
+                # (e.g. #246-style protocol drift of the probe, or a
+                # wedged dispatch). Never snapshot in that state; report
+                # the true situation so the alert is actionable.
+                _report("ERROR: service endpoint is not answering, but the live DB "
+                        "is locked — the memory service is likely UP but unhealthy "
+                        "(probe/protocol mismatch or wedge). Snapshot skipped; "
+                        "live data untouched.")
+                _report("verdict: ERROR (service unhealthy — manual check)")
+            else:
+                _report(f"ERROR: snapshot failed: {exc}")
+                _report("verdict: ERROR")
             return 2
         newest = snap_dir / manifest["snapshot_id"]
         out_path = newest / "recon_scores.json"

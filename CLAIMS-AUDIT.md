@@ -189,3 +189,17 @@ committed, re-runnable artifact:
   (ValueError) when `parse_error` is set — fail closed; absent config keeps the v1
   open-store + startup warning behavior (pinned by existing test). Docstrings updated
   to describe the actual contract. 4 new tests.
+- **2026-09-05 — spec-10 PR-3/3: transports (MCP+REST) read+write, collections, docs**:
+  The external API is now read+write (spec-09 read tier + spec-10 write tier).
+  MCP stdio (`mcp_server.py`) exposes 16 tools: 6 read, 1 propose, 1 review, 2 write
+  (class C loopback), 6 collection (2 read + 4 write). REST (`rest_server.py`) exposes
+  the full read surface + `POST /v1/memories` (class C on loopback, class A propose
+  otherwise), `POST /v1/candidates/{id}/decision` (class B human-only), `POST /v1/memories/{id}/feedback`,
+  and collection CRUD (`POST/GET/PATCH/DELETE /v1/collections[/{id}/items[/{item_id}]]`).
+  `Idempotency-Key` required on all mutations; CAS via `If-Match` → 409 on conflict.
+  `principal_type` ("human"|"model") and `is_loopback` are wired by both transports —
+  a model principal is denied class B (no self-approval); class C writes require loopback.
+  The HMAC gate from PR-2 extends through transports: collection writes go through
+  `facade → store proxy → call_gated() → _gate_hmac` (verified by the service with the
+  boot-time `gate_secret`). Acceptance tests T1-T12: 39 tests in `test_spec10_transports.py`,
+  all deterministic, no LLM calls. README updated from "read tier today" to "read+write tier."

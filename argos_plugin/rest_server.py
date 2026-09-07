@@ -40,7 +40,7 @@ import sys
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
@@ -53,6 +53,9 @@ from api_facade import (
     READ_OPERATIONS,
     PROPOSAL_OPERATIONS,
     FEEDBACK_OPERATIONS,
+    WRITE_OPERATIONS,
+    COLLECTION_READ_OPERATIONS,
+    COLLECTION_WRITE_OPERATIONS,
 )
 from access_scoping import ACLConfig
 
@@ -85,6 +88,65 @@ class ExplainRetrievalRequest(BaseModel):
     query: constr(min_length=1, max_length=MAX_QUERY_LENGTH)
     memory_id: constr(min_length=1, max_length=MAX_MEMORY_ID_LENGTH)
     top_k: conint(ge=1, le=50) = 20
+
+
+# -- #200 Spec-10 PR-3: Write tier request models -----------------------------
+
+class CreateMemoryRequest(BaseModel):
+    """Strict request body for POST /v1/memories.
+
+    On loopback: class C direct write (memory_save). On non-loopback:
+    class A proposal (memory_propose). The transport decides based on
+    is_loopback — the caller does NOT choose the write class.
+    """
+    model_config = {"extra": "forbid"}
+    content: constr(min_length=1, max_length=10000)
+    category: constr(min_length=1, max_length=100) = "context_note"
+    tags: Optional[List[str]] = None
+
+
+class CandidateDecisionRequest(BaseModel):
+    """Strict request body for POST /v1/candidates/{id}/decision.
+
+    Class B — human principal only. Model principals are denied by the
+    facade (no self-approval).
+    """
+    model_config = {"extra": "forbid"}
+    decision: constr(pattern=r"^(approved|rejected|quarantined)$")
+    reason: Optional[constr(max_length=2000)] = None
+
+
+class FeedbackRequest(BaseModel):
+    """Strict request body for POST /v1/memories/{id}/feedback."""
+    model_config = {"extra": "forbid"}
+    feedback: constr(min_length=1, max_length=2000)
+
+
+class CreateCollectionRequest(BaseModel):
+    """Strict request body for POST /v1/collections. Class C, loopback only.
+
+    Note: the 'schema' field is accepted via a raw dict body (not a
+    Pydantic field) to avoid shadowing BaseModel.schema. The endpoint
+    extracts it manually.
+    """
+    model_config = {"extra": "forbid"}
+    name: constr(min_length=1, max_length=500)
+    template: Optional[constr(max_length=100)] = None
+
+
+class AddCollectionItemRequest(BaseModel):
+    """Strict request body for POST /v1/collections/{id}/items. Class C."""
+    model_config = {"extra": "forbid"}
+    fields: Dict[str, Any]
+    status: constr(pattern=r"^(open|done|parked)$") = "open"
+
+
+class UpdateCollectionItemRequest(BaseModel):
+    """Strict request body for PATCH /v1/collections/{id}/items/{item_id}."""
+    model_config = {"extra": "forbid"}
+    fields: Optional[Dict[str, Any]] = None
+    status: Optional[constr(pattern=r"^(open|done|parked)$")] = None
+    expected_version: Optional[constr(max_length=256)] = None
 
 
 # -- Error envelope (D7) -----------------------------------------------------
@@ -138,6 +200,12 @@ class RESTAuth:
     The credential is separate from the internal service token. It's
     loaded from a file (api_credential.json) or env var (ARGOS_REST_TOKEN).
     Verification uses hmac.compare_digest to prevent timing attacks.
+
+    #200 Spec-10 PR-3: wires principal_type and is_loopback.
+    - principal_type: "human" (default) or "model" (ARGOS_API_PRINCIPAL_TYPE).
+      A model principal is denied class B (candidate approval).
+    - is_loopback: REST is bound to 127.0.0.1 only, so it IS a loopback
+      transport. Set ARGOS_API_NO_LOOPBACK=1 to disable (for testing).
     """
 
     def __init__(self, expected_token: str) -> None:
@@ -188,17 +256,34 @@ class RESTAuth:
                     "request_id": request_id,
                 }},
             )
+        # #200 PR-3: wire principal_type — "human" (default) or "model".
+        principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "human")
+        if principal_type not in ("human", "model"):
+            principal_type = "human"
+        # #200 PR-3: REST is bound to 127.0.0.1 → loopback transport.
+        is_loopback = os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
         # Build the auth context. In v1 (trusted-local mode), the
         # principal/tenant/user_id come from env vars and max_* scope
-        # fields are always None (open scope). Credential-derived
-        # max_project_id / max_client_scope / max_namespace is the
-        # follow-up that activates facade scope narrowing.
+        # fields are always None (open scope).
+        allowed = set(READ_OPERATIONS) | COLLECTION_READ_OPERATIONS
+        if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
+            allowed |= PROPOSAL_OPERATIONS
+        if os.environ.get("ARGOS_API_CAN_FEEDBACK", "").lower() in ("true", "1", "yes"):
+            allowed |= FEEDBACK_OPERATIONS
+        # #200 PR-3: class C writes (loopback only).
+        if is_loopback and os.environ.get("ARGOS_API_CAN_WRITE", "").lower() in ("true", "1", "yes"):
+            allowed |= WRITE_OPERATIONS
+            allowed |= COLLECTION_WRITE_OPERATIONS
         return AuthContext(
             principal=os.environ.get("ARGOS_API_PRINCIPAL", "local"),
             tenant=os.environ.get("ARGOS_API_TENANT", "default"),
             user_id=os.environ.get("ARGOS_API_USER_ID", "default_user"),
             transport="rest",
-            allowed_operations=set(READ_OPERATIONS),
+            allowed_operations=allowed,
+            can_propose="memory_propose" in allowed,
+            can_feedback="record_feedback" in allowed,
+            principal_type=principal_type,
+            is_loopback=is_loopback,
         )
 
 
@@ -475,6 +560,292 @@ def create_app(
 
     # -- No list/export endpoint (by design) ---------------------------------
 
+    # -- #200 Spec-10 PR-3: Write tier endpoints ----------------------------
+
+    def _require_idempotency_key(idempotency_key: str = Header(default="")) -> str:
+        """Require an Idempotency-Key header on all POST mutations.
+
+        Returns the key or raises 400 if missing. The facade's idempotency
+        registry (#123) deduplicates on this key.
+        """
+        if not idempotency_key:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {
+                    "code": "malformed_request",
+                    "message": "Idempotency-Key header is required for mutations.",
+                    "request_id": str(uuid.uuid4()),
+                }},
+            )
+        return idempotency_key
+
+    # -- POST /v1/memories — create memory (class C loopback or class A propose)
+
+    @app.post("/v1/memories")
+    async def create_memory(
+        body: CreateMemoryRequest,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ):
+        """Create a memory. On loopback: class C direct write (memory_save).
+        On non-loopback: class A proposal (memory_propose). The transport
+        decides based on is_loopback — the caller does NOT choose the class.
+        """
+        try:
+            params: Dict[str, Any] = {
+                "content": body.content,
+                "category": body.category,
+            }
+            if body.tags:
+                params["tags"] = body.tags
+            # Loopback → memory_save (class C). Non-loopback → memory_propose (class A).
+            operation = "memory_save" if ctx.is_loopback else "memory_propose"
+            result = facade.execute(ctx, operation, params, idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- GET /v1/candidates — list pending candidates (read)
+
+    @app.get("/v1/candidates")
+    async def list_candidates(
+        ctx: AuthContext = Depends(auth),
+    ):
+        """List pending candidates for the review queue. Read-only,
+        scoped to the caller's user_id."""
+        try:
+            result = facade.execute(ctx, "list_candidates", {})
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- POST /v1/candidates/{candidate_id}/decision — review (class B, human only)
+
+    @app.post("/v1/candidates/{candidate_id}/decision")
+    async def review_candidate(
+        candidate_id: str,
+        body: CandidateDecisionRequest,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ):
+        """Approve/reject/quarantine a pending candidate. Class B — human
+        principal only. Model principals are denied (no self-approval)."""
+        if len(candidate_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "candidate_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            result = facade.execute(ctx, "review_candidate", {
+                "candidate_id": candidate_id,
+                "decision": body.decision,
+                "reason": body.reason or "",
+            }, idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- POST /v1/memories/{memory_id}/feedback — record feedback
+
+    @app.post("/v1/memories/{memory_id}/feedback")
+    async def record_feedback(
+        memory_id: str,
+        body: FeedbackRequest,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """Record feedback on a memory (e.g. 'helpful', 'not_relevant')."""
+        if len(memory_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "memory_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            result = facade.execute(ctx, "record_feedback", {
+                "memory_id": memory_id,
+                "feedback": body.feedback,
+            })
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- GET /v1/collections — list collections (read, exhaustive)
+
+    @app.get("/v1/collections")
+    async def list_collections(
+        ctx: AuthContext = Depends(auth),
+    ):
+        """List collections for the caller's scope. Read-only, exhaustive."""
+        try:
+            result = facade.execute(ctx, "collection_list", {})
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- POST /v1/collections — create collection (class C, loopback only)
+
+    @app.post("/v1/collections")
+    async def create_collection(
+        request: Request,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ):
+        """Create a new collection. Class C write — loopback only.
+
+        Accepts a raw JSON body to allow a 'schema' field (which would
+        shadow BaseModel.schema if used in a Pydantic model).
+        """
+        try:
+            raw = await request.json()
+        except Exception:
+            return _error_response(
+                "malformed_request", "Invalid JSON body.",
+                str(uuid.uuid4()), 400,
+            )
+        if not isinstance(raw, dict):
+            return _error_response(
+                "malformed_request", "Request body must be a JSON object.",
+                str(uuid.uuid4()), 400,
+            )
+        name = raw.get("name")
+        if not name or not isinstance(name, str) or len(name) < 1 or len(name) > 500:
+            return _error_response(
+                "invalid_input", "Field 'name' is required (1-500 chars).",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            params: Dict[str, Any] = {"name": name}
+            template = raw.get("template")
+            if template and isinstance(template, str) and len(template) <= 100:
+                params["template"] = template
+            schema = raw.get("schema")
+            if schema is not None:
+                params["schema"] = schema
+            result = facade.execute(ctx, "collection_create", params,
+                                    idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- GET /v1/collections/{collection_id}/items — list items (exhaustive)
+
+    @app.get("/v1/collections/{collection_id}/items")
+    async def list_collection_items(
+        collection_id: str,
+        status: Optional[str] = None,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """List ALL items in a collection (exhaustive — no top-N cutoff).
+        Scope-filtered to the caller's user_id."""
+        if len(collection_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "collection_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            params: Dict[str, Any] = {"collection_id": collection_id}
+            if status:
+                params["status"] = status
+            result = facade.execute(ctx, "collection_items", params)
+            return result
+        except APIError as exc:
+            status_code = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status_code)
+
+    # -- POST /v1/collections/{collection_id}/items — add item (class C)
+
+    @app.post("/v1/collections/{collection_id}/items")
+    async def add_collection_item(
+        collection_id: str,
+        body: AddCollectionItemRequest,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ):
+        """Add an item to a collection. Class C write — loopback only."""
+        if len(collection_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "collection_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            result = facade.execute(ctx, "collection_add_item", {
+                "collection_id": collection_id,
+                "fields": body.fields,
+                "status": body.status,
+            }, idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- PATCH /v1/collections/{collection_id}/items/{item_id} — update item
+
+    @app.patch("/v1/collections/{collection_id}/items/{item_id}")
+    async def update_collection_item(
+        collection_id: str,
+        item_id: str,
+        body: UpdateCollectionItemRequest,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+        if_match: str = Header(default=""),
+    ):
+        """Update an item in a collection. Class C write — loopback only.
+        CAS via If-Match header or expected_version in body → 409 on conflict."""
+        if len(collection_id) > MAX_MEMORY_ID_LENGTH or len(item_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "ID is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        # If-Match header takes precedence over body expected_version.
+        expected_version = if_match or body.expected_version
+        try:
+            params: Dict[str, Any] = {"item_id": item_id}
+            if body.fields is not None:
+                params["fields"] = body.fields
+            if body.status is not None:
+                params["status"] = body.status
+            if expected_version:
+                params["expected_version"] = expected_version
+            result = facade.execute(ctx, "collection_update_item", params,
+                                    idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- DELETE /v1/collections/{collection_id}/items/{item_id} — remove item
+
+    @app.delete("/v1/collections/{collection_id}/items/{item_id}")
+    async def remove_collection_item(
+        collection_id: str,
+        item_id: str,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+        if_match: str = Header(default=""),
+    ):
+        """Remove (archive) an item from a collection. Class C write —
+        loopback only. CAS via If-Match header → 409 on conflict."""
+        if len(collection_id) > MAX_MEMORY_ID_LENGTH or len(item_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "ID is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            params: Dict[str, Any] = {"item_id": item_id}
+            if if_match:
+                params["expected_version"] = if_match
+            result = facade.execute(ctx, "collection_remove_item", params,
+                                    idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
     return app
 
 
@@ -516,7 +887,7 @@ def main() -> None:
     import uvicorn
     from service_client import SharedMemoryStore
 
-    parser = argparse.ArgumentParser(description="Argos REST API server (read tier)")
+    parser = argparse.ArgumentParser(description="Argos REST API server (read + write tier)")
     parser.add_argument("--home", required=True, type=Path,
                         help="Path to the Hermes home directory.")
     parser.add_argument("--port", type=int, default=8732,

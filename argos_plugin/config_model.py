@@ -295,7 +295,7 @@ class MemoryConfig(BaseModel):
 
     # Clamped float fields: {name: (lo, hi, default)}.
     _CLAMPED_FLOAT_FIELDS: ClassVar[dict] = {
-        "injection_min_score": (0.0, 1.0, 0.0),
+        "injection_min_score": (0.0, 1.0, 0.30),
         "extraction_dup_threshold": (0.0, 1.0, 0.88),
         "graph_retrieval_boost": (0.0, 0.5, 0.0),
         "graph_boost_min_similarity": (0.0, 1.0, 0.15),

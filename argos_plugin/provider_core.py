@@ -61,14 +61,16 @@ _DEFAULT_MAX_INJECTED = 20
 # `inject_content_char_cap` (default 800).
 _DEFAULT_INJECT_CONTENT_CHAR_CAP = 800
 
-# Default-off injection gates (2026-08-23): the trivial-query gate skips heavy
-# retrieval on low-information turns; the score floor drops weak-evidence
-# items.  Both are opt-in config keys — benchmark/default behavior unchanged.
+# Injection gates (2026-08-23; shipped ON by default in #322): the trivial-query
+# gate skips heavy retrieval on low-information turns; the score floor drops
+# weak-evidence items. Runtime defaults live in config_model.py (both ON — the
+# floor at 0.30); this constant only feeds the plugin schema's advertised
+# default, so it must track the config-model value.
 _TRIVIAL_QUERY_PATTERNS = (
     r"^\s*(test(ing)?|just a test|this is just a test|hello+|hi+|hey+|yo|ping|pong|ok(ay)?|k|thanks|thank you|thx|ty|good (morning|evening|afternoon)|gm|gn)\s*[!.?…]*\s*$",
     r"^\s*(?:ha\s*){2,}[!.]*\s*$",
 )
-_DEFAULT_INJECTION_MIN_SCORE = 0.0
+_DEFAULT_INJECTION_MIN_SCORE = 0.30
 
 # Freshness markers (2026-08-27, anti-staleness): recalled memories whose
 # CONTENT carries an explicit date anchor ("26/8", "PR #96224",
@@ -455,7 +457,7 @@ class ProviderCoreMixin:
             {
                 "key": "skip_retrieval_on_trivial",
                 "description": "Skip memory retrieval on trivial turns (greetings, 'test', 'ok') to save tokens; real questions always retrieve",
-                "default": "false",
+                "default": "true",
                 "choices": ["true", "false"],
                 "required": False,
             },

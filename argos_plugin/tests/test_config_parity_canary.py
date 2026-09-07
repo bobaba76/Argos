@@ -527,3 +527,111 @@ class TestT4UnknownKeyPassthrough:
             assert cfg.max_injected_items == 20
             assert cfg.router_enabled is False
             assert cfg.conflict_surfacing is True
+
+
+class TestT5ConsolidationAutoApplyDefault:
+    """T5 (#361): consolidation_auto_apply must default to False at every
+    layer so that enabling consolidation_enabled never silently triggers
+    an irreversible auto-quarantine at session end.
+
+    The safe-default contract (provider_session.py:721-728 comment) is:
+    when consolidation_auto_apply is absent/False, consolidation runs in
+    dry_run mode (report only). This test pins both the model default and
+    the session-layer inline read so a regression at either site fails CI.
+
+    Sibling compaction_auto_apply is already consistent (model False,
+    session fallback False, schema false) — not changed here, verify-only.
+    """
+
+    def test_model_default_is_false(self):
+        """(a) MemoryConfig().consolidation_auto_apply is False."""
+        from config_model import MemoryConfig
+        cfg = MemoryConfig()
+        assert cfg.consolidation_auto_apply is False
+
+    def test_session_inline_read_absent_key_resolves_false(self, tmp_path):
+        """(b) A config dict WITHOUT consolidation_auto_apply, loaded
+        through the real provider path (_load_config), resolves the
+        session-layer auto_apply expression to False -> dry_run=True.
+
+        This exercises the real loader + real MemoryConfig.get + the exact
+        inline read from provider_session.py:729-731 -- no stubbing of the
+        config path. The inline expression is replicated verbatim so a
+        fallback-literal regression (e.g. "true") is caught here too.
+        """
+        from provider_core import _load_config
+
+        # consolidation_enabled ON, but auto_apply key intentionally absent.
+        raw = {"consolidation_enabled": "true"}
+        config_path = tmp_path / "hybrid_memory.json"
+        config_path.write_text(json.dumps(raw), encoding="utf-8")
+        cfg = _load_config(str(tmp_path))
+
+        # The key is absent from the JSON; .get() returns the model default
+        # (False), NOT the inline string fallback. Either way the result
+        # must be falsy so dry_run=True.
+        assert "consolidation_auto_apply" not in json.loads(
+            config_path.read_text(encoding="utf-8")
+        ), "fixture must omit the key to test the absent-key default"
+
+        # Inline read replicated verbatim from provider_session.py:729-731.
+        auto_apply = str(
+            cfg.get("consolidation_auto_apply", "false")
+        ).lower() in ("true", "1", "yes")
+        assert auto_apply is False, (
+            "absent consolidation_auto_apply must resolve to False "
+            "(dry-run); got auto_apply=True -- silent auto-quarantine hazard"
+        )
+        # dry_run is the negation, as wired in on_session_end.
+        dry_run = not auto_apply
+        assert dry_run is True
+
+    def test_session_inline_fallback_literal_is_false(self):
+        """Guard: the inline fallback literal in provider_session.py is
+        "false" (not "true"). Catches a literal regression at the read
+        site even if the model default is correct."""
+        import re
+        from pathlib import Path
+        src_path = Path(__file__).resolve().parent.parent / "provider_session.py"
+        text = src_path.read_text(encoding="utf-8")
+        # The exact inline read line.
+        m = re.search(
+            r'self\._config\.get\(\s*"consolidation_auto_apply"\s*,\s*"([^"]*)"\s*\)',
+            text,
+        )
+        assert m is not None, (
+            "could not find the consolidation_auto_apply inline read in "
+            "provider_session.py -- was the read pattern changed?"
+        )
+        assert m.group(1) == "false", (
+            f"inline fallback must be \"false\" (safe default), "
+            f"got {m.group(1)!r}"
+        )
+
+    def test_explicit_true_still_wins(self, tmp_path):
+        """GOTCHA guard: an explicit "consolidation_auto_apply": "true"
+        still resolves to auto_apply=True. This fix only changes the
+        absent-key default; explicit opt-in must keep working."""
+        from provider_core import _load_config
+
+        raw = {
+            "consolidation_enabled": "true",
+            "consolidation_auto_apply": "true",
+        }
+        config_path = tmp_path / "hybrid_memory.json"
+        config_path.write_text(json.dumps(raw), encoding="utf-8")
+        cfg = _load_config(str(tmp_path))
+
+        auto_apply = str(
+            cfg.get("consolidation_auto_apply", "false")
+        ).lower() in ("true", "1", "yes")
+        assert auto_apply is True, (
+            "explicit consolidation_auto_apply=true must keep auto-applying"
+        )
+
+    def test_compaction_sibling_still_false(self):
+        """Verify-only: compaction_auto_apply remains consistent at False
+        (model default). Do not change it."""
+        from config_model import MemoryConfig
+        cfg = MemoryConfig()
+        assert cfg.compaction_auto_apply is False

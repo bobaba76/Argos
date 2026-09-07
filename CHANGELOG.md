@@ -22,6 +22,7 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 
 ### Fixed
 
+- **consolidation_auto_apply default mismatch** (#361): the safe-default contract (dry-run/report-only unless explicit opt-in) was contradicted by every real default — `MemoryConfig` default `True`, session inline fallback `"true"`, doc row `true`. Enabling `consolidation_enabled` would silently trigger an irreversible auto-quarantine at session end. All three sites now default to `false`; explicit `"consolidation_auto_apply": "true"` still wins.
 - **BM25-lite** (#26): substring token counting replaced with exact word-boundary token counting; text search and phrase-lift share one tokenizer regex.
 
 ## [2026-09-04]

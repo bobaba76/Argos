@@ -86,7 +86,7 @@ class TestConfigParity:
         assert c.consolidation_enabled is False
         assert c.consolidation_min_age_days == 30
         assert c.consolidation_max_actions == 25
-        assert c.consolidation_auto_apply is True
+        assert c.consolidation_auto_apply is False
         assert c.duplicate_min_similarity == 0.88
         assert c.duplicate_semantic_max_pairs == 20000
 

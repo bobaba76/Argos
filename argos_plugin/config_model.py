@@ -93,7 +93,7 @@ class MemoryConfig(BaseModel):
     consolidation_enabled: bool = False
     consolidation_min_age_days: int = Field(30, ge=1, le=3650)
     consolidation_max_actions: int = Field(25, ge=1, le=500)
-    consolidation_auto_apply: bool = True
+    consolidation_auto_apply: bool = False
     duplicate_min_similarity: float = Field(0.88, ge=0.0, le=1.0)
     duplicate_semantic_max_pairs: int = Field(20000, ge=100, le=1000000)
 

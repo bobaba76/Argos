@@ -128,7 +128,7 @@ A few knobs are not surfaced in the UI yet — edit the JSON directly. Those are
 | `consolidation_enabled` | `false` | Reversible maintenance of expired/duplicate memories at session end. Preview with `memory_maintenance` `dry_run=true` first. **When to change:** enable when the store accumulates stale duplicates. |
 | `consolidation_min_age_days` | `30` | Age threshold for stale temporary memories. **When to change:** lower to clean sooner; raise to keep records longer. |
 | `consolidation_max_actions` | `25` | Max records to quarantine per run. **When to change:** raise for faster cleanup; lower to reduce per-run impact. |
-| `consolidation_auto_apply` *(JSON only)* | `true` | Auto-apply consolidation actions without manual confirmation. When `false`, consolidation produces proposals only. **When to change:** set to `false` for manual review of all consolidation actions. |
+| `consolidation_auto_apply` *(JSON only)* | `false` | Auto-apply consolidation actions without manual confirmation. When `false`, consolidation produces proposals only. **When to change:** set to `false` for manual review of all consolidation actions. |
 
 ## Lifecycle (archival, forgetting, rollups)
 

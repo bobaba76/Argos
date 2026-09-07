@@ -727,7 +727,7 @@ class ProviderSessionMixin:
                     # consolidate(dry_run=False) to apply. This prevents
                     # automatic quarantine without explicit opt-in.
                     auto_apply = str(
-                        self._config.get("consolidation_auto_apply", "true")
+                        self._config.get("consolidation_auto_apply", "false")
                     ).lower() in ("true", "1", "yes")
                     report = self._store.consolidate(
                         dry_run=not auto_apply,

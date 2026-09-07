@@ -1,5 +1,7 @@
 # Argos
 
+![CI](https://github.com/bobaba76/Argos/actions/workflows/ci.yml/badge.svg)
+
 Persistent memory for AI agents, on your own machine. A Hermes plugin with a standalone server: hybrid vector + graph store, local embeddings, and an external API (MCP + REST).
 
 ## Capabilities
@@ -15,6 +17,12 @@ Persistent memory for AI agents, on your own machine. A Hermes plugin with a sta
 - **Multitenant cells.** Per-tenant stores behind the shared service: provisioning, isolation, and concurrency gates (end-to-end tested).
 - **Temporal as-of queries.** Records carry `valid_from` / `valid_to` / `superseded_by`; retrieval defaults to the current view and supports `as_of` and `include_closed`. Chronological injection (oldest-first on temporal turns) is implemented, off by default.
 - **Reversible cleanup.** Maintenance and consolidation quarantine stale or duplicate memories, not delete them. Explicit deletion (`memory_delete`) is chain-aware: multi-version records promote the predecessor or quarantine the middle version; single-version records are hard-deleted and tombstoned against re-creation.
+
+## Architecture
+
+![Argos architecture](docs/assets/argos-architecture.png)
+
+Agents reach Argos over loopback-only MCP/REST behind a canonical auth → ACL → validation → audit gate. Writes flow through an extraction → review pipeline (sensitive facts wait for explicit user confirmation); reads run the hybrid retrieval pipeline (text + vector search fused with RRF, then expansion, graph boost, and recency/date-anchor passes) and return ranked, provenance-carrying records. Everything persists locally in DuckDB (records, embeddings, version chains) plus a Kuzu knowledge graph; embeddings run on your machine, while optional LLM-assisted steps (extraction, review, query expansion) call your configured cloud model.
 
 ## Trust model
 
@@ -105,6 +113,7 @@ Protocols, dataset SHA-256, per-category denominators, model versions, prompts, 
 
 Every number and capability statement above is backed by a committed, re-runnable artifact — nothing is quoted without evidence.
 
+- **Independent review** — Argos is profiled in [agent-memory-atlas](https://neoneye.github.io/agent-memory-atlas/systems/argos/), a code-grounded catalog of agent-memory systems (reports pinned to a reviewed commit, capability marks backed by source evidence).
 - **Claims audit** — [CLAIMS-AUDIT.md](CLAIMS-AUDIT.md) maps every claim to its evidence and separates three tiers: *measured* (committed judged artifacts), *structural* (checked against source), and *aspirational* (not claims yet). It is updated whenever a claim changes.
 - **Reproducibility gate** — `./eval/repro/verify_repro.sh` re-derives every headline number and fails on any drift. Reproducing a number fully needs the committed judged artifacts **plus** the documented external run data: the sibling LongMemEval dataset checkout and the phase-A retrieval caches (see §1 → §8 of the reproducibility doc). Last gate run: **2026-09-03, all checks PASS**.
 - **Test suite** — 2,842 test functions across 150 test modules (as of 2026-09-07), covering the store, retrieval, security gates, API facade, multitenancy, and eval harness; runs hermetically on a fresh clone without a live Hermes runtime. The gate forces hermetic mode (`ARGOS_HERMETIC_TESTS=1` in the runner) so unmocked LLM-path tests can never make real calls, even in venvs that resolve the Hermes runtime. Run it in a visible, live-updating window (GPU venv + bounded parallel workers with the shared-service grouping, per #98): `powershell -File scripts/run_tests_visible.ps1`. Manual equivalent from `argos_plugin/`: `"%LOCALAPPDATA%/hermes/hermes-agent/venv-cuda/Scripts/python.exe" -m pytest tests/ -q -n 4 --dist loadgroup`.
@@ -117,7 +126,7 @@ Honest boundaries that travel with the claims:
 
 ## What it can't do
 
-The external API is read-tier only — no remote writes yet. Memory data, embeddings, and graph live locally as flat files — no hosted vendor. LLM calls for extraction, review, and distillation go through your configured cloud model; no native local-LLM support yet. Embeddings run offline (CPU or CUDA); the optional reranker needs a GPU (or falls back to similarity-only).
+The external API binds to loopback only — reads and writes work locally (MCP + REST), but there is no remote network access from other machines. Memory data, embeddings, and graph live locally as flat files — no hosted vendor. LLM calls for extraction, review, and distillation go through your configured cloud model; no native local-LLM support yet. Embeddings run offline (CPU or CUDA); the optional reranker needs a GPU (or falls back to similarity-only).
 
 ## Quick start
 

@@ -22,19 +22,36 @@ Nothing becomes a memory silently. Every turn is mined for facts (regex first, L
 
 ## External API
 
-The API is a **read tier today** (spec-09: transports are trust boundaries, not thin wrappers). Both servers bind to loopback only and enforce a bearer token; the operation set is an explicit allowlist behind `ArgosAPIFacade` (auth-context → ACL → validation → audit). No raw RPC passthrough — internal operations (shutdown, backup, set_state, purge, and friends) are never exposed.
+The API is a **read + write tier** (spec-09/10: transports are trust boundaries, not thin wrappers). Both servers bind to loopback only and enforce a bearer token; the operation set is an explicit allowlist behind `ArgosAPIFacade` (auth-context → ACL → validation → audit). No raw RPC passthrough — internal operations (shutdown, backup, set_state, purge, and friends) are never exposed.
 
-- **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio; `search`, `fetch`, `fetch_history`, `explain`, `explain_retrieval`, `capabilities`. Register with any MCP client.
-- **REST (HTTP):** `argos_plugin/rest_server.py` — `GET /v1/health`, `GET /v1/ready`, `GET /v1/capabilities`, `POST /v1/memory/search`, `POST /v1/memory/explain-retrieval`, `GET /v1/memories/{memory_id}`, `GET /v1/memories/{memory_id}/history`, `GET /v1/memories/{memory_id}/explain`. Bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
+**Write classes** (spec-10):
+- **Class A (propose):** external callers submit a candidate for human review. Nothing becomes active memory until a human approves it.
+- **Class B (review):** human principals approve/reject candidates. Model principals are denied — no self-approval, ever.
+- **Class C (direct write):** loopback-only trusted-local writes (`memory_save`, `memory_update`, collection writes). Same provider-level semantics as the native path (graph indexing, version chaining).
+
+- **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio. Read: `memory_search`, `memory_fetch`, `memory_fetch_history`, `memory_explain`, `memory_why_not`, `memory_capabilities`, `collection_list`, `collection_items`. Write (loopback): `memory_save`, `memory_update`, `collection_create`, `collection_add_item`, `collection_update_item`, `collection_remove_item`. Review: `memory_candidate_review` (human only). Propose: `memory_propose`. Register with any MCP client.
+- **REST (HTTP):** `argos_plugin/rest_server.py` — bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
+  - Read: `GET /v1/health`, `GET /v1/ready`, `GET /v1/capabilities`, `POST /v1/memory/search`, `POST /v1/memory/explain-retrieval`, `GET /v1/memories/{memory_id}`, `GET /v1/memories/{memory_id}/history`, `GET /v1/memories/{memory_id}/explain`, `GET /v1/candidates`, `GET /v1/collections`, `GET /v1/collections/{collection_id}/items`.
+  - Write (loopback): `POST /v1/memories` (class C direct write on loopback; class A propose on non-loopback), `POST /v1/collections`, `POST /v1/collections/{collection_id}/items`, `PATCH /v1/collections/{collection_id}/items/{item_id}`, `DELETE /v1/collections/{collection_id}/items/{item_id}`.
+  - Review: `POST /v1/candidates/{candidate_id}/decision` (human only).
+  - Feedback: `POST /v1/memories/{memory_id}/feedback`.
+  - `Idempotency-Key` header required on all POSTs/PATCHes/DELETEs. CAS via `If-Match` header on PATCH/DELETE → 409 on conflict.
 
 ```bash
-# REST
-ARGOS_REST_TOKEN=<token> python -m argos_plugin.rest_server --home <hermes-home> --port 8732
-# MCP
-python -m argos_plugin.mcp_server --home <hermes-home>
+# REST (read + write on loopback)
+ARGOS_REST_TOKEN=<token> ARGOS_API_CAN_WRITE=1 \
+  python -m argos_plugin.rest_server --home <hermes-home> --port 8732
+# MCP (read + write on loopback)
+ARGOS_API_CAN_WRITE=1 python -m argos_plugin.mcp_server --home <hermes-home>
 ```
 
-Writes over the API (propose → human-approve classes) are on the roadmap behind the same facade.
+**Collections** (spec-10 PR-2/3): exhaustive, structural stores (backlogs, reading lists). No ranking, no similarity — all items returned. Scope-isolated per tenant/user. Collection writes are class C (loopback only) and gated by a server-verified HMAC capability (boot-time `gate_secret`); a raw RPC caller without the secret cannot forge the proof.
+
+**Security model** (spec-10):
+- `principal_type` ("human" | "model") is wired by the transport — a model principal is denied class B (no self-approval). The default is "model" (fail-closed): a transport that forgets to set `ARGOS_API_PRINCIPAL_TYPE` is treated as a model agent and cannot approve candidates. A human-driven UI must explicitly set `ARGOS_API_PRINCIPAL_TYPE=human` to unlock class B.
+- `is_loopback` is set by the transport — class C writes require loopback + server-derived identity.
+- Client-supplied `user_id`/`tenant`/`scope` are rejected or narrowed, never widened.
+- Collection writes and `facade_delete_memory` require a server-verified HMAC (`call_gated` → `_gate_hmac`); the service verifies before honoring `_confirmed`.
 
 ## Admin Console (#295)
 

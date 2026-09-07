@@ -166,11 +166,20 @@ class TestAllowlist:
             assert r.status_code == 404
 
     def test_no_list_export_endpoint(self):
-        """No list/export endpoint (by design)."""
+        """No list/export endpoint (by design).
+
+        #200 PR-3: POST /v1/memories now exists (write tier). GET /v1/memories
+        (list) still doesn't exist — it returns 405 (method not allowed for
+        the path) rather than 404. The list/export prohibition is about
+        unbounded reads, not writes.
+        """
         client = _make_client()
-        for path in ["/v1/memories", "/v1/memories/list", "/v1/export"]:
+        for path in ["/v1/memories/list", "/v1/export"]:
             r = client.get(path, headers=_auth_headers())
             assert r.status_code == 404
+        # GET /v1/memories → 405 (POST exists, GET does not — no list endpoint).
+        r = client.get("/v1/memories", headers=_auth_headers())
+        assert r.status_code == 405
 
     def test_no_raw_rpc_passthrough(self):
         """No raw RPC/component/method passthrough."""

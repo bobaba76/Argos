@@ -202,10 +202,403 @@ def _propose_input_schema() -> Dict[str, Any]:
     }
 
 
+def _save_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_save (class C write, loopback only).
+
+    #200 Spec-10 PR-3: direct active-memory write. Only available on
+    loopback transport (is_loopback=True). Non-loopback → denied.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["content", "category", "idempotency_key"],
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The fact to save directly to active memory.",
+                "maxLength": 10000,
+            },
+            "category": {
+                "type": "string",
+                "description": "Memory category (e.g. context_note, personal_fact).",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _update_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_update (class C write, loopback only)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["memory_id", "content", "idempotency_key"],
+        "properties": {
+            "memory_id": {
+                "type": "string",
+                "description": "The memory ID to update (creates a new version).",
+                "maxLength": 256,
+            },
+            "content": {
+                "type": "string",
+                "description": "The new content for the memory.",
+                "maxLength": 10000,
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional new tags.",
+            },
+            "expected_version": {
+                "type": "string",
+                "description": "CAS: the last-seen memory_id. Stale → 409 conflict.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _candidate_review_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_candidate_review (class B, human only).
+
+    #200 Spec-10 PR-3: approve/reject a pending candidate. Human principal
+    only — model principals are denied (no self-approval).
+    #200 PR-3 fix: idempotency_key is required — aligns with REST which
+    requires Idempotency-Key on POST /v1/candidates/{id}/decision. All
+    mutations require an idempotency key (docs say so).
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["candidate_id", "decision", "idempotency_key"],
+        "properties": {
+            "candidate_id": {
+                "type": "string",
+                "description": "The candidate to review.",
+                "maxLength": 256,
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["approved", "rejected", "quarantined"],
+                "description": "The review decision.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason for the decision.",
+                "maxLength": 2000,
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _collection_create_input_schema() -> Dict[str, Any]:
+    """Strict input schema for collection_create (class C, loopback only)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "idempotency_key"],
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Collection name.",
+                "maxLength": 500,
+            },
+            "template": {
+                "type": "string",
+                "description": "Optional template type (e.g. backlog, reading_list).",
+            },
+            "schema": {
+                "type": "object",
+                "description": "Optional field schema (name/type/required per field).",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _collection_add_item_input_schema() -> Dict[str, Any]:
+    """Strict input schema for collection_add_item (class C, loopback only)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["collection_id", "fields", "idempotency_key"],
+        "properties": {
+            "collection_id": {
+                "type": "string",
+                "description": "The collection to add to.",
+                "maxLength": 256,
+            },
+            "fields": {
+                "type": "object",
+                "description": "Item fields (validated against collection schema if set).",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["open", "done", "parked"],
+                "description": "Initial item status (default: open).",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _collection_items_input_schema() -> Dict[str, Any]:
+    """Strict input schema for collection_items (read, exhaustive)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["collection_id"],
+        "properties": {
+            "collection_id": {
+                "type": "string",
+                "description": "The collection to list items for.",
+                "maxLength": 256,
+            },
+            "status": {
+                "type": "string",
+                "enum": ["open", "done", "parked"],
+                "description": "Optional status filter.",
+            },
+            "include_archived": {
+                "type": "boolean",
+                "description": "Include archived items (default: false).",
+                "default": False,
+            },
+        },
+    }
+
+
+def _collection_update_item_input_schema() -> Dict[str, Any]:
+    """Strict input schema for collection_update_item (class C, loopback only)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["item_id", "idempotency_key"],
+        "properties": {
+            "item_id": {
+                "type": "string",
+                "description": "The item to update.",
+                "maxLength": 256,
+            },
+            "fields": {
+                "type": "object",
+                "description": "Updated fields (merged with existing).",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["open", "done", "parked"],
+                "description": "New item status.",
+            },
+            "expected_version": {
+                "type": "string",
+                "description": "CAS: the item's current item_id. Stale → 409.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _collection_remove_item_input_schema() -> Dict[str, Any]:
+    """Strict input schema for collection_remove_item (class C, loopback only)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["item_id", "idempotency_key"],
+        "properties": {
+            "item_id": {
+                "type": "string",
+                "description": "The item to remove (archive).",
+                "maxLength": 256,
+            },
+            "expected_version": {
+                "type": "string",
+                "description": "CAS: the item's current item_id. Stale → 409.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
+def _collection_list_input_schema() -> Dict[str, Any]:
+    """Strict input schema for collection_list (read)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": {
+                "type": "string",
+                "description": "Optional status filter (e.g. active).",
+            },
+        },
+    }
+
+
 # Tool name → (facade operation, input schema, description, output schema).
 # Deterministic ordering (D6): sorted by tool name.
 # M9: tuple (immutable) to prevent accidental mutation across instances.
+# #200 Spec-10 PR-3: write tier + collection tools added.
 TOOL_DEFINITIONS: tuple = (
+    {
+        "name": "collection_add_item",
+        "description": (
+            "Add an item to a collection. Class C write — loopback only. "
+            "Requires idempotency key."
+        ),
+        "inputSchema": _collection_add_item_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string"},
+                "item_id": {"type": "string"},
+                "item": {"type": "object"},
+            },
+        },
+    },
+    {
+        "name": "collection_create",
+        "description": (
+            "Create a new collection (backlog, reading list, etc.). "
+            "Class C write — loopback only. Requires idempotency key."
+        ),
+        "inputSchema": _collection_create_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string"},
+                "collection_id": {"type": "string"},
+                "collection": {"type": "object"},
+            },
+        },
+    },
+    {
+        "name": "collection_items",
+        "description": (
+            "List ALL items in a collection (exhaustive — no top-N cutoff). "
+            "Read-only. Scope-filtered to the caller's user_id."
+        ),
+        "inputSchema": _collection_items_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "items": {"type": "array", "items": {"type": "object"}},
+                "count": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "collection_list",
+        "description": (
+            "List collections for the caller's scope. Read-only, exhaustive."
+        ),
+        "inputSchema": _collection_list_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "collections": {"type": "array", "items": {"type": "object"}},
+                "count": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "collection_remove_item",
+        "description": (
+            "Remove (archive) an item from a collection. Class C write — "
+            "loopback only. CAS via expected_version. Requires idempotency key."
+        ),
+        "inputSchema": _collection_remove_item_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string"},
+                "item_id": {"type": "string"},
+                "item": {"type": "object"},
+            },
+        },
+    },
+    {
+        "name": "collection_update_item",
+        "description": (
+            "Update an item in a collection. Class C write — loopback only. "
+            "CAS via expected_version. Requires idempotency key."
+        ),
+        "inputSchema": _collection_update_item_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string"},
+                "item_id": {"type": "string"},
+                "item": {"type": "object"},
+            },
+        },
+    },
+    {
+        "name": "memory_candidate_review",
+        "description": (
+            "Review a pending candidate (approve/reject/quarantine). "
+            "Class B — HUMAN principal only. A model principal cannot "
+            "approve its own candidate (no self-approval, ever)."
+        ),
+        "inputSchema": _candidate_review_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "candidate_id": {"type": "string"},
+                "decision": {"type": "string"},
+                "review_reason": {"type": "string"},
+                "reviewed_at": {"type": "string"},
+                "memory_id": {"type": "string"},
+                "reviewer": {"type": "string"},
+            },
+        },
+    },
     {
         "name": "memory_capabilities",
         "description": "List the operations available to the authenticated principal.",
@@ -314,6 +707,23 @@ TOOL_DEFINITIONS: tuple = (
         },
     },
     {
+        "name": "memory_save",
+        "description": (
+            "Save a fact directly to active memory (class C write — "
+            "loopback only). Same provider-level semantics as the native "
+            "memory_save tool. Requires idempotency key."
+        ),
+        "inputSchema": _save_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string"},
+                "memory_id": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "memory_search",
         "description": "Search memories by natural-language query.",
         "inputSchema": _search_input_schema(),
@@ -339,6 +749,24 @@ TOOL_DEFINITIONS: tuple = (
                     },
                 },
                 "count": {"type": "integer"},
+            },
+        },
+    },
+    {
+        "name": "memory_update",
+        "description": (
+            "Update an existing memory, creating a new version (class C "
+            "write — loopback only). CAS via expected_version. Requires "
+            "idempotency key."
+        ),
+        "inputSchema": _update_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {"type": "string"},
+                "memory_id": {"type": "string"},
+                "old_memory_id": {"type": "string"},
             },
         },
     },
@@ -391,7 +819,30 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_why_not": "explain_retrieval",
     "memory_capabilities": "capabilities",
     "memory_propose": "memory_propose",
+    # #200 Spec-10 PR-3: write tier + collection tools.
+    "memory_save": "memory_save",
+    "memory_update": "memory_update",
+    "memory_candidate_review": "review_candidate",
+    "collection_list": "collection_list",
+    "collection_items": "collection_items",
+    "collection_create": "collection_create",
+    "collection_add_item": "collection_add_item",
+    "collection_update_item": "collection_update_item",
+    "collection_remove_item": "collection_remove_item",
 }
+
+# Tools that require an idempotency_key (popped from arguments and passed
+# as a separate keyword to facade.execute).
+TOOLS_WITH_IDEMPOTENCY_KEY: frozenset = frozenset({
+    "memory_propose",
+    "memory_save",
+    "memory_update",
+    "memory_candidate_review",
+    "collection_create",
+    "collection_add_item",
+    "collection_update_item",
+    "collection_remove_item",
+})
 
 
 # -- JSON-RPC message helpers ------------------------------------------------
@@ -610,8 +1061,15 @@ class MCPServer:
                 "Argos memory service. Use memory_search to find memories, "
                 "memory_fetch to get one by ID, memory_fetch_history for "
                 "version history, memory_propose to submit a fact for human "
-                "review (requires an idempotency key), and "
-                "memory_capabilities to list available operations."
+                "review (requires an idempotency key), memory_save to write "
+                "directly to active memory (loopback only), memory_update to "
+                "update a memory with version chaining, "
+                "memory_candidate_review to approve/reject candidates "
+                "(human only), collection_list/collection_items to list "
+                "collections and their items, and collection_create/"
+                "collection_add_item/collection_update_item/"
+                "collection_remove_item to manage collections (loopback "
+                "only). Use memory_capabilities to list available operations."
             ),
         }
         self._send(_make_response(msg_id, result=result))
@@ -668,12 +1126,13 @@ class MCPServer:
                     # facade validation (fail-open, not fail-closed, since
                     # the facade does its own validation).
                     pass
-        # M1: only pop idempotency_key for memory_propose — other tools
-        # should not have it, and the schema validation above would have
-        # already rejected it (additionalProperties: false). For propose,
-        # the key is passed as a keyword arg, not in the params dict.
+        # M1: pop idempotency_key for tools that require it. The key is
+        # passed as a keyword arg to facade.execute, not in the params
+        # dict. Schema validation (additionalProperties: false) ensures
+        # only tools with idempotency_key in their schema accept it.
+        # #200 PR-3: extended to write tier + collection tools.
         idempotency_key = None
-        if tool_name == "memory_propose":
+        if tool_name in TOOLS_WITH_IDEMPOTENCY_KEY:
             idempotency_key = arguments.pop("idempotency_key", None)
         # Call the facade. The facade handles validation, auth, ACL,
         # idempotency, audit, and error redaction.
@@ -751,6 +1210,19 @@ def _load_auth_context(home: Path) -> "AuthContext":
     ARGOS_API_TENANT (default: "default"), and the user_id from
     ARGOS_API_USER_ID (default: "default_user").
 
+    #200 Spec-10 PR-3: principal_type and is_loopback are wired here.
+    - principal_type: "model" (default) or "human" (ARGOS_API_PRINCIPAL_TYPE).
+      A model principal is denied class B (candidate approval) — no
+      self-approval, ever. The default is "model" (fail-closed): a
+      transport that forgets to set principal_type is treated as a model
+      agent and CANNOT approve candidates. A human-driven UI must
+      explicitly set ARGOS_API_PRINCIPAL_TYPE=human to unlock class B.
+    - is_loopback: True for MCP stdio (the process is spawned locally by
+      the user's shell — it's a trusted-local transport). This enables
+      class C writes (memory_save, memory_update, collection writes).
+      Set ARGOS_API_NO_LOOPBACK=1 to disable (for testing non-loopback
+      denial).
+
     M3 — Threat model (trusted-local mode):
     Identity is derived from environment variables with NO credential
     verification. Any process that can set env vars can impersonate any
@@ -760,23 +1232,43 @@ def _load_auth_context(home: Path) -> "AuthContext":
     the spawner, not the user — a malicious spawner can impersonate
     anyone. For non-trusted-local deployments, a credential file or
     signed token MUST be used instead (future work, #129).
-
-    In production (multi-user/hosted mode, #129), this would verify
-    a credential file and derive identity from it. For now, the env-var
-    approach is the trusted-local mode documented in the spec.
     """
-    from api_facade import AuthContext, READ_OPERATIONS, PROPOSAL_OPERATIONS, FEEDBACK_OPERATIONS
+    from api_facade import (
+        AuthContext, READ_OPERATIONS, PROPOSAL_OPERATIONS,
+        FEEDBACK_OPERATIONS, WRITE_OPERATIONS,
+        COLLECTION_READ_OPERATIONS, COLLECTION_WRITE_OPERATIONS,
+    )
 
     principal = os.environ.get("ARGOS_API_PRINCIPAL", "local")
     tenant = os.environ.get("ARGOS_API_TENANT", "default")
     user_id = os.environ.get("ARGOS_API_USER_ID", "default_user")
+    # #200 PR-3 fix: wire principal_type — "model" (default) or "human".
+    # A model principal is denied class B (candidate approval). The
+    # default is "model" (fail-closed): a transport that forgets to set
+    # ARGOS_API_PRINCIPAL_TYPE is treated as a model agent and CANNOT
+    # approve candidates. A human-driven UI MUST explicitly set
+    # ARGOS_API_PRINCIPAL_TYPE=human to unlock class B. This closes the
+    # self-approval spoof: a model agent wired with defaults
+    # (ARGOS_API_CAN_PROPOSE=1, principal_type unset) is denied class B.
+    principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "model")
+    if principal_type not in ("human", "model"):
+        principal_type = "model"  # fail-closed: unknown → model (denied class B)
+    # #200 PR-3: MCP stdio is a loopback transport (local process).
+    # Class C writes require loopback. Set ARGOS_API_NO_LOOPBACK=1 to
+    # test non-loopback denial.
+    is_loopback = os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
 
-    # Default: read-only. Proposal and feedback are opt-in via env vars.
-    allowed = set(READ_OPERATIONS)
+    # Default: read-only + collection reads. Proposal, feedback, writes,
+    # and collection writes are opt-in via env vars.
+    allowed = set(READ_OPERATIONS) | COLLECTION_READ_OPERATIONS
     if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
         allowed |= PROPOSAL_OPERATIONS
     if os.environ.get("ARGOS_API_CAN_FEEDBACK", "").lower() in ("true", "1", "yes"):
         allowed |= FEEDBACK_OPERATIONS
+    # #200 PR-3: class C writes (loopback only).
+    if is_loopback and os.environ.get("ARGOS_API_CAN_WRITE", "").lower() in ("true", "1", "yes"):
+        allowed |= WRITE_OPERATIONS
+        allowed |= COLLECTION_WRITE_OPERATIONS
 
     return AuthContext(
         principal=principal,
@@ -786,6 +1278,8 @@ def _load_auth_context(home: Path) -> "AuthContext":
         allowed_operations=allowed,
         can_propose="memory_propose" in allowed,
         can_feedback="record_feedback" in allowed,
+        principal_type=principal_type,
+        is_loopback=is_loopback,
     )
 
 
@@ -798,7 +1292,7 @@ def main() -> None:
     from api_facade import ArgosAPIFacade, ACLConfig
     from service_client import SharedMemoryStore
 
-    parser = argparse.ArgumentParser(description="Argos MCP stdio server (read tier)")
+    parser = argparse.ArgumentParser(description="Argos MCP stdio server (read + write tier)")
     parser.add_argument("--home", required=True, type=Path,
                         help="Path to the Hermes home directory.")
     args = parser.parse_args()

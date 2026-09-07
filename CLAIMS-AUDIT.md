@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 137 test modules in `argos_plugin/tests/` (2,493 `def test_` definitions; counts generated via AST 2026-09-06 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
+| Test suite | ✓ | 150 test modules in `argos_plugin/tests/` (2,842 `def test_` definitions; counts generated via AST 2026-09-07 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -149,6 +149,15 @@ committed, re-runnable artifact:
       history entry above is left as-is (it records the *filing*); this entry records the
       *resolution* so the audit no longer implies either gap is open.
   No code behavior changed — this is a documentation-only refresh of the living index.
+- **2026-09-07 (canary catch)** — §2 test-suite row refreshed: was 137 modules / 2,493 (6/9); now
+  150 modules /  ​2,842 `def test_` definitions, counted via AST (`ast.walk`, UTF-8 BOM
+  tolerated) by `scripts/count_test_fns.py`. The README Verification section quotes the same
+  refresh (was 2,350 /  ​131 as of 2026-09-05). The parity canary had gone **red**
+  (`test_claims_audit_parity.py` failed both params: module drift 8.7%, test drift
+    12.3%, both exceeding the 5% tolerance) — test additions since the last recorded full-suite green
+  run (30/8) merged without a suite run. Canary re-checked **green** after this refresh. This
+  entry records the refresh and the catch, so the audit's living index stays honest.
+
 - **2026-09-06 (#325)** — §2 test-suite row refreshed: was 59 modules / 1169 tests (01/9);
   now 137 modules / 2,493 `def test_` definitions, counted via AST (`ast.walk`, UTF-8 BOM
   tolerated) by the new `scripts/count_test_fns.py`. The README Verification section quotes

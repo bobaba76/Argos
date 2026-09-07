@@ -202,8 +202,10 @@ class RESTAuth:
     Verification uses hmac.compare_digest to prevent timing attacks.
 
     #200 Spec-10 PR-3: wires principal_type and is_loopback.
-    - principal_type: "human" (default) or "model" (ARGOS_API_PRINCIPAL_TYPE).
-      A model principal is denied class B (candidate approval).
+    - principal_type: "model" (default) or "human" (ARGOS_API_PRINCIPAL_TYPE).
+      A model principal is denied class B (candidate approval). The default
+      is "model" (fail-closed): a transport that forgets to set it is
+      treated as a model agent and cannot approve candidates.
     - is_loopback: REST is bound to 127.0.0.1 only, so it IS a loopback
       transport. Set ARGOS_API_NO_LOOPBACK=1 to disable (for testing).
     """
@@ -256,10 +258,15 @@ class RESTAuth:
                     "request_id": request_id,
                 }},
             )
-        # #200 PR-3: wire principal_type — "human" (default) or "model".
-        principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "human")
+        # #200 PR-3 fix: wire principal_type — "model" (default) or "human".
+        # The default is "model" (fail-closed): a transport that forgets
+        # to set ARGOS_API_PRINCIPAL_TYPE is treated as a model agent and
+        # CANNOT approve candidates (class B denied). A human-driven UI
+        # MUST explicitly set ARGOS_API_PRINCIPAL_TYPE=human to unlock
+        # class B. This closes the self-approval spoof.
+        principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "model")
         if principal_type not in ("human", "model"):
-            principal_type = "human"
+            principal_type = "model"  # fail-closed: unknown → model
         # #200 PR-3: REST is bound to 127.0.0.1 → loopback transport.
         is_loopback = os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
         # Build the auth context. In v1 (trusted-local mode), the
@@ -655,8 +662,12 @@ def create_app(
         memory_id: str,
         body: FeedbackRequest,
         ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
     ):
-        """Record feedback on a memory (e.g. 'helpful', 'not_relevant')."""
+        """Record feedback on a memory (e.g. 'helpful', 'not_relevant').
+
+        Idempotency-Key required — all mutations require it (docs say so).
+        """
         if len(memory_id) > MAX_MEMORY_ID_LENGTH:
             return _error_response(
                 "invalid_input", "memory_id is too long.",
@@ -666,7 +677,7 @@ def create_app(
             result = facade.execute(ctx, "record_feedback", {
                 "memory_id": memory_id,
                 "feedback": body.feedback,
-            })
+            }, idempotency_key=idempotency_key)
             return result
         except APIError as exc:
             status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
@@ -720,10 +731,22 @@ def create_app(
         try:
             params: Dict[str, Any] = {"name": name}
             template = raw.get("template")
-            if template and isinstance(template, str) and len(template) <= 100:
+            if template is not None:
+                if not isinstance(template, str) or len(template) > 100:
+                    return _error_response(
+                        "invalid_input",
+                        "Field 'template' must be a string (max 100 chars).",
+                        str(uuid.uuid4()), 422,
+                    )
                 params["template"] = template
             schema = raw.get("schema")
             if schema is not None:
+                if not isinstance(schema, dict):
+                    return _error_response(
+                        "invalid_input",
+                        "Field 'schema' must be a JSON object.",
+                        str(uuid.uuid4()), 422,
+                    )
                 params["schema"] = schema
             result = facade.execute(ctx, "collection_create", params,
                                     idempotency_key=idempotency_key)

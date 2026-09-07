@@ -48,7 +48,7 @@ ARGOS_API_CAN_WRITE=1 python -m argos_plugin.mcp_server --home <hermes-home>
 **Collections** (spec-10 PR-2/3): exhaustive, structural stores (backlogs, reading lists). No ranking, no similarity — all items returned. Scope-isolated per tenant/user. Collection writes are class C (loopback only) and gated by a server-verified HMAC capability (boot-time `gate_secret`); a raw RPC caller without the secret cannot forge the proof.
 
 **Security model** (spec-10):
-- `principal_type` ("human" | "model") is wired by the transport — a model principal is denied class B (no self-approval). A transport that forgets to set it defaults to "human" (fail-closed for model self-approval).
+- `principal_type` ("human" | "model") is wired by the transport — a model principal is denied class B (no self-approval). The default is "model" (fail-closed): a transport that forgets to set `ARGOS_API_PRINCIPAL_TYPE` is treated as a model agent and cannot approve candidates. A human-driven UI must explicitly set `ARGOS_API_PRINCIPAL_TYPE=human` to unlock class B.
 - `is_loopback` is set by the transport — class C writes require loopback + server-derived identity.
 - Client-supplied `user_id`/`tenant`/`scope` are rejected or narrowed, never widened.
 - Collection writes and `facade_delete_memory` require a server-verified HMAC (`call_gated` → `_gate_hmac`); the service verifies before honoring `_confirmed`.

@@ -278,11 +278,14 @@ def _candidate_review_input_schema() -> Dict[str, Any]:
 
     #200 Spec-10 PR-3: approve/reject a pending candidate. Human principal
     only — model principals are denied (no self-approval).
+    #200 PR-3 fix: idempotency_key is required — aligns with REST which
+    requires Idempotency-Key on POST /v1/candidates/{id}/decision. All
+    mutations require an idempotency key (docs say so).
     """
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["candidate_id", "decision"],
+        "required": ["candidate_id", "decision", "idempotency_key"],
         "properties": {
             "candidate_id": {
                 "type": "string",
@@ -298,6 +301,12 @@ def _candidate_review_input_schema() -> Dict[str, Any]:
                 "type": "string",
                 "description": "Optional reason for the decision.",
                 "maxLength": 2000,
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
             },
         },
     }
@@ -828,6 +837,7 @@ TOOLS_WITH_IDEMPOTENCY_KEY: frozenset = frozenset({
     "memory_propose",
     "memory_save",
     "memory_update",
+    "memory_candidate_review",
     "collection_create",
     "collection_add_item",
     "collection_update_item",
@@ -1201,11 +1211,12 @@ def _load_auth_context(home: Path) -> "AuthContext":
     ARGOS_API_USER_ID (default: "default_user").
 
     #200 Spec-10 PR-3: principal_type and is_loopback are wired here.
-    - principal_type: "human" (default) or "model" (ARGOS_API_PRINCIPAL_TYPE).
+    - principal_type: "model" (default) or "human" (ARGOS_API_PRINCIPAL_TYPE).
       A model principal is denied class B (candidate approval) — no
-      self-approval, ever. This is the #200 warning: a transport that
-      forgets to set principal_type defaults to "human" (fail-closed
-      for model self-approval — a model must explicitly declare itself).
+      self-approval, ever. The default is "model" (fail-closed): a
+      transport that forgets to set principal_type is treated as a model
+      agent and CANNOT approve candidates. A human-driven UI must
+      explicitly set ARGOS_API_PRINCIPAL_TYPE=human to unlock class B.
     - is_loopback: True for MCP stdio (the process is spawned locally by
       the user's shell — it's a trusted-local transport). This enables
       class C writes (memory_save, memory_update, collection writes).
@@ -1231,11 +1242,17 @@ def _load_auth_context(home: Path) -> "AuthContext":
     principal = os.environ.get("ARGOS_API_PRINCIPAL", "local")
     tenant = os.environ.get("ARGOS_API_TENANT", "default")
     user_id = os.environ.get("ARGOS_API_USER_ID", "default_user")
-    # #200 PR-3: wire principal_type — "human" (default) or "model".
-    # A model principal is denied class B (candidate approval).
-    principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "human")
+    # #200 PR-3 fix: wire principal_type — "model" (default) or "human".
+    # A model principal is denied class B (candidate approval). The
+    # default is "model" (fail-closed): a transport that forgets to set
+    # ARGOS_API_PRINCIPAL_TYPE is treated as a model agent and CANNOT
+    # approve candidates. A human-driven UI MUST explicitly set
+    # ARGOS_API_PRINCIPAL_TYPE=human to unlock class B. This closes the
+    # self-approval spoof: a model agent wired with defaults
+    # (ARGOS_API_CAN_PROPOSE=1, principal_type unset) is denied class B.
+    principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "model")
     if principal_type not in ("human", "model"):
-        principal_type = "human"  # fail-closed: unknown → human (safer default)
+        principal_type = "model"  # fail-closed: unknown → model (denied class B)
     # #200 PR-3: MCP stdio is a loopback transport (local process).
     # Class C writes require loopback. Set ARGOS_API_NO_LOOPBACK=1 to
     # test non-loopback denial.

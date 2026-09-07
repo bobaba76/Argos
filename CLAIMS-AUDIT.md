@@ -199,6 +199,9 @@ committed, re-runnable artifact:
   `Idempotency-Key` required on all mutations; CAS via `If-Match` → 409 on conflict.
   `principal_type` ("human"|"model") and `is_loopback` are wired by both transports —
   a model principal is denied class B (no self-approval); class C writes require loopback.
+  The default `principal_type` is "model" (fail-closed): a transport that forgets to set
+  `ARGOS_API_PRINCIPAL_TYPE` is treated as a model agent and cannot approve candidates.
+  A human-driven UI must explicitly set `ARGOS_API_PRINCIPAL_TYPE=human` to unlock class B.
   The HMAC gate from PR-2 extends through transports: collection writes go through
   `facade → store proxy → call_gated() → _gate_hmac` (verified by the service with the
   boot-time `gate_secret`). Acceptance tests T1-T12: 39 tests in `test_spec10_transports.py`,

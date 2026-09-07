@@ -192,13 +192,22 @@ class StubStore:
         self._next_id += 1
         item = {"item_id": iid, "collection_id": kwargs.get("collection_id", ""),
                 "fields": kwargs.get("fields", {}), "status": kwargs.get("status", "open"),
-                "tenant": kwargs.get("tenant", "default")}
+                "tenant": kwargs.get("tenant", "default"),
+                "_created_by": getattr(self, "user_id", "default_user")}
         self._items[iid] = item
         return item
 
     def list_collection_items(self, **kwargs) -> List[Dict[str, Any]]:
         col_id = kwargs.get("collection_id", "")
         items = [i for i in self._items.values() if i["collection_id"] == col_id]
+        # T10: filter by the current user scope (set by the facade via
+        # set_user_scope). Items created by user "a-user" have
+        # _created_by="a-user"; tenant B's user_id is "b-user" → no match.
+        # When _scope_filter is disabled (default), no filtering — this
+        # keeps the stub simple for tests that don't test isolation.
+        if getattr(self, "_scope_filter", False):
+            scope_user = getattr(self, "user_id", "default_user")
+            items = [i for i in items if i.get("_created_by") == scope_user]
         status = kwargs.get("status")
         if status:
             items = [i for i in items if i.get("status") == status]
@@ -511,6 +520,7 @@ class TestT5NoModelSelfApproval:
             allowed_ops=READ_OPERATIONS | PROPOSAL_OPERATIONS | {"review_candidate"})
         server._handle_line(json.dumps(_mcp_call("memory_candidate_review", {
             "candidate_id": "cand-1", "decision": "approved",
+            "idempotency_key": "mcp-rev-1",
         })))
         msgs = _parse_stdout(stdout)
         assert msgs
@@ -528,6 +538,72 @@ class TestT5NoModelSelfApproval:
                         headers={**_auth_headers(), "Idempotency-Key": "rev-2"},
                         json={"decision": "approved"})
         assert r.status_code == 200
+
+    def test_rest_default_principal_type_denied_review(self):
+        """REGRESSION (PR-3 fix): transport WITHOUT ARGOS_API_PRINCIPAL_TYPE
+        → defaults to "model" → class B DENIED.
+
+        This is the #200 spoof-closer: a model agent wired with defaults
+        (ARGOS_API_CAN_PROPOSE=1, principal_type unset) is treated as a
+        model and cannot approve its own candidate.
+        """
+        store = StubStore()
+        store.save_candidate(content="test", category="context_note")
+        # Explicitly unset ARGOS_API_PRINCIPAL_TYPE to test the default.
+        _set_env(
+            ARGOS_API_PRINCIPAL_TYPE=None,  # unset → default "model"
+            ARGOS_API_CAN_PROPOSE="1",
+            ARGOS_API_CAN_FEEDBACK="1",
+            ARGOS_API_NO_LOOPBACK="1",
+        )
+        facade = _make_facade(store)
+        app = create_app(facade, auth_token="test-rest-token")
+        client = TestClient(app)
+        r = client.post("/v1/candidates/cand-1/decision",
+                        headers={**_auth_headers(), "Idempotency-Key": "rev-default"},
+                        json={"decision": "approved"})
+        assert r.status_code == 403
+
+    def test_rest_explicit_human_can_review(self):
+        """REGRESSION (PR-3 fix): transport WITH explicit
+        ARGOS_API_PRINCIPAL_TYPE=human + review in allowed_ops → allowed.
+        """
+        store = StubStore()
+        store.save_candidate(content="test", category="context_note")
+        _set_env(
+            ARGOS_API_PRINCIPAL_TYPE="human",
+            ARGOS_API_CAN_PROPOSE="1",
+            ARGOS_API_CAN_FEEDBACK="1",
+            ARGOS_API_NO_LOOPBACK="1",
+        )
+        facade = _make_facade(store)
+        app = create_app(facade, auth_token="test-rest-token")
+        client = TestClient(app)
+        r = client.post("/v1/candidates/cand-1/decision",
+                        headers={**_auth_headers(), "Idempotency-Key": "rev-human"},
+                        json={"decision": "approved"})
+        assert r.status_code == 200
+
+    def test_mcp_default_principal_type_denied_review(self):
+        """REGRESSION (PR-3 fix): MCP WITHOUT ARGOS_API_PRINCIPAL_TYPE
+        → defaults to "model" → class B DENIED.
+        """
+        store = StubStore()
+        store.save_candidate(content="test", category="context_note")
+        # Build auth context WITHOUT setting principal_type (simulate
+        # the default path in _load_auth_context).
+        from mcp_server import _load_auth_context
+        # Temporarily unset the env var to test the default.
+        _set_env(ARGOS_API_PRINCIPAL_TYPE=None)
+        ctx = _load_auth_context(Path("/tmp/fake"))
+        assert ctx.principal_type == "model"
+        # Now verify the facade denies class B for this context.
+        facade = _make_facade(store)
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "review_candidate", {
+                "candidate_id": "cand-1", "decision": "approved",
+            }, idempotency_key="mcp-rev-default")
+        assert exc_info.value.code == "forbidden"
 
 
 # ===========================================================================
@@ -616,18 +692,49 @@ class TestT8ProviderSideEffects:
         assert r.status_code == 200
         assert "memory_id" in r.json()
 
-    def test_rest_memory_update_chains_version(self):
-        """POST /v1/memories then update → new version, old superseded."""
+    def test_mcp_memory_update_chains_version(self):
+        """MCP memory_save then memory_update → new version, old superseded.
+
+        Exercises the update path through the MCP transport and asserts:
+        - a new memory_id is minted (version chain)
+        - the old memory_id is marked "superseded"
+        - the new content is active
+        """
         store = StubStore()
-        client = _make_rest_client(store=store, is_loopback=True)
-        # Save
-        r1 = client.post("/v1/memories", headers={**_auth_headers(), "Idempotency-Key": "t8-2"},
-                         json={"content": "v1", "category": "context_note"})
-        mid = r1.json()["memory_id"]
-        # Update via facade (no REST update endpoint in v1 — update is class C only)
-        # Verify the store has the memory
+        # Save via MCP (class C, loopback).
+        server, stdout, _ = _make_mcp_server(store=store, is_loopback=True)
+        server._handle_line(json.dumps(_mcp_call("memory_save", {
+            "content": "v1", "category": "context_note",
+            "idempotency_key": "t8-save",
+        })))
+        msgs = _parse_stdout(stdout)
+        assert msgs
+        result = msgs[0].get("result", {})
+        structured = result.get("structuredContent", {})
+        mid = structured.get("memory_id")
+        assert mid is not None
         assert mid in store._memories
         assert store._memories[mid].status == "active"
+        assert store._memories[mid].content == "v1"
+
+        # Update via MCP (class C, loopback) — creates a new version.
+        server2, stdout2, _ = _make_mcp_server(store=store, is_loopback=True)
+        server2._handle_line(json.dumps(_mcp_call("memory_update", {
+            "memory_id": mid, "content": "v2",
+            "idempotency_key": "t8-update",
+        })))
+        msgs2 = _parse_stdout(stdout2)
+        assert msgs2
+        result2 = msgs2[0].get("result", {})
+        structured2 = result2.get("structuredContent", {})
+        new_mid = structured2.get("memory_id")
+        assert new_mid is not None
+        assert new_mid != mid, "Update must mint a new memory_id (version chain)"
+        # Old version is superseded.
+        assert store._memories[mid].status == "superseded"
+        # New version is active with the new content.
+        assert store._memories[new_mid].status == "active"
+        assert store._memories[new_mid].content == "v2"
 
 
 # ===========================================================================
@@ -690,20 +797,74 @@ class TestT10CollectionIsolation:
     """T10: tenant A's items invisible to tenant B (incl. counts/existence)."""
 
     def test_rest_tenant_isolation(self):
-        """Tenant A's collection items not visible to tenant B."""
+        """Tenant A's collection items not visible to tenant B.
+
+        Tenant A creates a collection + items (as user "a-user"). Tenant B
+        (user "b-user") queries the same collection → 200 + count == 0
+        (scope-filtered by the facade's set_user_scope).
+        """
         store = StubStore()
-        # Tenant A creates collection + items
+        store._scope_filter = True  # enable scope filtering for this test
+        # Tenant A creates collection + items.
+        store.set_user_scope("a-user")
         col = store.create_collection(name="a-col", tenant="tenant-a")
         store.add_collection_item(collection_id=col["collection_id"],
                                  fields={"x": 1}, tenant="tenant-a")
-        # Tenant B queries — the facade sets user_scope to tenant B's user.
-        # With a real store, tenant B would see 0 items. The stub store
-        # doesn't filter by tenant, but the endpoint works and the facade
-        # enforces scope via set_user_scope.
-        client = _make_rest_client(store=store, is_loopback=True)
+        store.add_collection_item(collection_id=col["collection_id"],
+                                 fields={"x": 2}, tenant="tenant-a")
+        # Tenant A sees 2 items.
+        store.set_user_scope("a-user")
+        items_a = store.list_collection_items(collection_id=col["collection_id"])
+        assert len(items_a) == 2
+
+        # Tenant B queries via REST — the facade sets user_scope to
+        # "b-user" (tenant B's user_id). The stub store filters by
+        # _created_by, so tenant B sees 0 items.
+        _set_env(
+            ARGOS_API_PRINCIPAL_TYPE="human",
+            ARGOS_API_CAN_PROPOSE="1",
+            ARGOS_API_CAN_FEEDBACK="1",
+            ARGOS_API_CAN_WRITE="1",
+        )
+        # Override the principal identity to tenant B.
+        os.environ["ARGOS_API_USER_ID"] = "b-user"
+        os.environ["ARGOS_API_TENANT"] = "tenant-b"
+        facade = _make_facade(store)
+        app = create_app(facade, auth_token="test-rest-token")
+        client = TestClient(app)
         r = client.get(f"/v1/collections/{col['collection_id']}/items",
                        headers=_auth_headers())
-        assert r.status_code in (200, 404)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["count"] == 0, \
+            f"Tenant B should see 0 items, saw {body['count']}"
+        assert len(body["items"]) == 0
+
+    def test_rest_same_tenant_sees_items(self):
+        """Sanity: tenant A sees their own items (not a blanket deny)."""
+        store = StubStore()
+        store._scope_filter = True
+        store.set_user_scope("a-user")
+        col = store.create_collection(name="a-col", tenant="tenant-a")
+        store.add_collection_item(collection_id=col["collection_id"],
+                                 fields={"x": 1}, tenant="tenant-a")
+        # Tenant A queries via REST.
+        _set_env(
+            ARGOS_API_PRINCIPAL_TYPE="human",
+            ARGOS_API_CAN_PROPOSE="1",
+            ARGOS_API_CAN_FEEDBACK="1",
+            ARGOS_API_CAN_WRITE="1",
+        )
+        os.environ["ARGOS_API_USER_ID"] = "a-user"
+        os.environ["ARGOS_API_TENANT"] = "tenant-a"
+        facade = _make_facade(store)
+        app = create_app(facade, auth_token="test-rest-token")
+        client = TestClient(app)
+        r = client.get(f"/v1/collections/{col['collection_id']}/items",
+                       headers=_auth_headers())
+        assert r.status_code == 200
+        body = r.json()
+        assert body["count"] == 1
 
 
 # ===========================================================================

@@ -58,6 +58,13 @@ class StoreCoreMixin:
         # Alias cache: avoids a full-table scan on every search query
         # (issue #27). Invalidated on add_alias / remove_alias.
         self._state.alias_cache = None
+        # #347: Actor context for mutation_events. Defaults to the store's
+        # user_id and "human" for local paths. The facade sets this from
+        # ctx.principal + ctx.principal_type before mutations; the RPC
+        # service sets it from the resolved user_id and auth mode. Never
+        # a client-passed string — server-derived identity only.
+        self._actor: str = self.user_id
+        self._actor_type: str = "human"
 
     # -- connection management ------------------------------------------------
 
@@ -503,7 +510,49 @@ class StoreCoreMixin:
             except Exception as exc:
                 logger.warning("access_audit table creation failed: %s", exc)
 
+            # #347: Append-only, actor-attributed mutation event log.
+            # Every store mutation (create, approve, reject, update, delete,
+            # tombstone, rejection, purge, erase, import, denial) writes one
+            # row in the SAME transaction as the mutation itself. Unlike
+            # access_audit (which rotates at 100k and logs reads/denials
+            # only), mutation_events NEVER rotates — no startup purge, no
+            # cap. A capped provenance log cannot backfill; the commercial
+            # "showable history" claim dies at the cap. Growth is bounded by
+            # mutation volume (not query volume) and export-and-archive is
+            # the only offload path.
+            try:
+                self.connection.execute("""
+                    CREATE TABLE IF NOT EXISTS mutation_events (
+                        event_id     VARCHAR PRIMARY KEY,
+                        ts           VARCHAR,
+                        actor        VARCHAR,
+                        actor_type   VARCHAR,
+                        event_type   VARCHAR,
+                        entity_type  VARCHAR,
+                        entity_key   VARCHAR,
+                        content_hash VARCHAR,
+                        reason       VARCHAR,
+                        refs         JSON,
+                        delta        JSON,
+                        user_scope   VARCHAR,
+                        namespace    VARCHAR,
+                        client_scope VARCHAR
+                    )
+                """)
+                self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_mutation_events_scope_ts
+                    ON mutation_events (user_scope, ts)
+                """)
+                self.connection.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_mutation_events_type_ts
+                    ON mutation_events (event_type, ts)
+                """)
+            except Exception as exc:
+                logger.warning("mutation_events table creation failed: %s", exc)
+
             # SC2: purge old access_audit rows on startup (keep latest 100k).
+            # NOTE: mutation_events is deliberately NOT purged — it is the
+            # permanent provenance log. See #347 and the table comment above.
             if not self._state.read_only:
                 try:
                     self._purge_access_audit(max_rows=100000)
@@ -574,6 +623,21 @@ class StoreCoreMixin:
         # already invalidated on add_alias/remove_alias; this closes the
         # scope-switch path (every RPC request calls set_user_scope first).
         self._state.alias_cache = None
+        # #347: reset actor context to the new scope's defaults. The
+        # facade/RPC layer will override with the real principal before
+        # any mutation if one is available.
+        self._actor = self.user_id
+        self._actor_type = "human"
+
+    def set_actor_context(self, actor: str | None, actor_type: str = "human") -> None:
+        """#347: Set the actor identity for mutation_events.
+
+        Called by the facade (from ctx.principal + ctx.principal_type) or
+        the RPC service (from the resolved user_id + auth mode) before a
+        mutation. Never a client-passed string — server-derived only.
+        """
+        self._actor = (actor or self.user_id).strip() or self.user_id
+        self._actor_type = actor_type if actor_type in {"human", "model"} else "human"
 
     def get_schema_version(self) -> int:
         """#288: return the persisted schema version (PRAGMA user_version).

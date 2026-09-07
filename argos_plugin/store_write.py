@@ -67,6 +67,62 @@ logger = logging.getLogger(__name__)
 class StoreWriteMixin:
     """Write-path methods for DuckDBMemoryStore."""
 
+    # -- #347: mutation_events seam -------------------------------------------
+    # _record_event writes one append-only row into mutation_events in the
+    # SAME transaction as the mutation. It MUST be called while holding
+    # self._state.lock and inside an active transaction (BEGIN/COMMIT). A
+    # crash between the mutation and COMMIT rolls back both — the event
+    # never exists without its mutation. Fail-loud (#330): a failed event
+    # write must fail the mutation, not log-warning swallow.
+
+    def _record_event(
+        self,
+        *,
+        event_type: str,
+        entity_type: str = "memory",
+        entity_key: str | None = None,
+        content_hash: str | None = None,
+        reason: str = "",
+        refs: Dict[str, Any] | None = None,
+        delta: Dict[str, Any] | None = None,
+        user_scope: str | None = None,
+        namespace: str | None = None,
+        client_scope: str | None = None,
+    ) -> None:
+        """#347: Write one mutation_events row. MUST be called inside the
+        mutation's transaction (under self._state.lock).
+
+        Fail-loud (#330): if the event INSERT fails, the caller's
+        transaction is rolled back by the exception propagating. Never
+        log-warning swallow — missing provenance is a data-integrity
+        defect, not an operational inconvenience.
+        """
+        assert self.connection is not None
+        event_id = f"evt-{uuid.uuid4().hex}"
+        self.connection.execute(
+            """INSERT INTO mutation_events
+               (event_id, ts, actor, actor_type, event_type, entity_type,
+                entity_key, content_hash, reason, refs, delta,
+                user_scope, namespace, client_scope)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                event_id,
+                self._now(),
+                getattr(self, "_actor", self.user_id),
+                getattr(self, "_actor_type", "human"),
+                event_type,
+                entity_type,
+                entity_key,
+                content_hash,
+                (reason or "")[:2000],
+                json.dumps(refs) if refs else None,
+                json.dumps(delta) if delta else None,
+                user_scope or self.user_id,
+                namespace,
+                client_scope,
+            ],
+        )
+
     def remember(
         self,
         category: str,
@@ -252,6 +308,19 @@ class StoreWriteMixin:
                 "Blocked re-creation of deleted memory (tombstone %s): %s",
                 _ts.get("created_at", ""), content[:60],
             )
+            # #347: log the refusal even though nothing lands — the gate
+            # fired and that is provenance worth keeping.
+            with self._state.lock:
+                assert self.connection is not None
+                self._record_event(
+                    event_type="refeed_refused",
+                    entity_type="memory",
+                    content_hash=self._tombstone_hash(content),
+                    reason=f"tombstone: {_ts.get('reason', 'user_delete')}",
+                    refs={"category": category, "gate": "tombstone_check"},
+                    namespace=namespace or "conversation",
+                    client_scope=client_scope,
+                )
             return None
 
         # Rejection-ledger check (#39): a previously-rejected claim slot may not
@@ -264,6 +333,17 @@ class StoreWriteMixin:
                 "Blocked re-creation of rejected claim (ledger %s): %s",
                 _rj.get("created_at", ""), content[:60],
             )
+            with self._state.lock:
+                assert self.connection is not None
+                self._record_event(
+                    event_type="refeed_refused",
+                    entity_type="memory",
+                    content_hash=self._tombstone_hash(content),
+                    reason=f"rejection_ledger: {_rj.get('reason', 'review_rejected')}",
+                    refs={"category": category, "gate": "rejection_check"},
+                    namespace=namespace or "conversation",
+                    client_scope=client_scope,
+                )
             return None
 
         memory_id = f"mem-{uuid.uuid4().hex}"
@@ -341,6 +421,15 @@ class StoreWriteMixin:
                 prov, ground,
                 embedding_dim, embedder_id, embedded_at,
             ])
+            # #347: record the creation event in the same transaction.
+            self._record_event(
+                event_type="memory_created",
+                entity_key=memory_id,
+                reason=f"source={source}, grounding={ground}",
+                refs={"memory_id": memory_id, "source": source},
+                namespace=namespace or "conversation",
+                client_scope=client_scope,
+            )
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [memory_id]
         )
@@ -1123,6 +1212,16 @@ class StoreWriteMixin:
                     "Blocked re-proposal of deleted fact (tombstone %s): %s",
                     _ts.get("created_at", ""), content[:60],
                 )
+                with self._state.lock:
+                    assert self.connection is not None
+                    self._record_event(
+                        event_type="refeed_refused",
+                        entity_type="candidate",
+                        content_hash=self._tombstone_hash(content),
+                        reason=f"tombstone: {_ts.get('reason', 'user_delete')}",
+                        refs={"category": category, "gate": "tombstone_check",
+                              "path": "save_candidate"},
+                    )
                 return None
             # Rejection-ledger check (#39): a previously-rejected claim slot may
             # not re-enter the proposal queue. The one-way ladder refuses
@@ -1133,6 +1232,16 @@ class StoreWriteMixin:
                     "Blocked re-proposal of rejected claim (ledger %s): %s",
                     _rj.get("created_at", ""), content[:60],
                 )
+                with self._state.lock:
+                    assert self.connection is not None
+                    self._record_event(
+                        event_type="refeed_refused",
+                        entity_type="candidate",
+                        content_hash=self._tombstone_hash(content),
+                        reason=f"rejection_ledger: {_rj.get('reason', 'review_rejected')}",
+                        refs={"category": category, "gate": "rejection_check",
+                              "path": "save_candidate"},
+                    )
                 return None
 
         candidate_id = f"cand-{uuid.uuid4().hex}"
@@ -1349,6 +1458,18 @@ class StoreWriteMixin:
         if decision not in allowed:
             raise ValueError("invalid candidate review decision")
         if decision == "approved" and review_source == "auto_review":
+            # #347: log the refused auto-approval attempt — today this
+            # raises into the void, unlogged. The event records that the
+            # invariant gate fired.
+            with self._state.lock:
+                assert self.connection is not None
+                self._record_event(
+                    event_type="auto_approval_refused",
+                    entity_type="candidate",
+                    entity_key=candidate_id,
+                    reason="approval invariant: auto_review may not set 'approved'",
+                    refs={"candidate_id": candidate_id, "review_source": review_source},
+                )
             raise ValueError(
                 "approval invariant: automatic review may not set 'approved'; "
                 "use 'reviewed_approved' (user confirmation happens via the "
@@ -1425,6 +1546,9 @@ class StoreWriteMixin:
         memory = None
         final_status = decision
         superseded_ok = False
+        # #347: track the original decision (before downgrade) so the
+        # event_type reflects what the caller asked for vs what landed.
+        _original_decision = decision
         if decision in {"approved", "reviewed_approved"}:
             selected_durability = durability or candidate["durability"]
             selected_scope = scope or candidate["scope"]
@@ -1592,6 +1716,32 @@ class StoreWriteMixin:
                             now,
                         ],
                     )
+                # #347: record the review event in the same transaction.
+                _event_type = {
+                    "approved": "candidate_approved",
+                    "reviewed_approved": "candidate_reviewed",
+                    "pending_user_confirmation": "candidate_downgraded",
+                    "rejected": "candidate_rejected",
+                }.get(final_status, "candidate_reviewed")
+                self._record_event(
+                    event_type=_event_type,
+                    entity_type="candidate",
+                    entity_key=candidate_id,
+                    reason=reason or final_status,
+                    refs={
+                        "candidate_id": candidate_id,
+                        "final_status": final_status,
+                        "original_decision": _original_decision,
+                        "review_source": review_source,
+                        "memory_id": memory.memory_id if memory else None,
+                        "superseded": superseded_ok,
+                        "supersedes_memory_id": supersedes_memory_id,
+                    },
+                    content_hash=(
+                        self._tombstone_hash(candidate["content"])
+                        if final_status == "rejected" else None
+                    ),
+                )
                 self.connection.execute("COMMIT")
             except Exception:
                 self.connection.execute("ROLLBACK")
@@ -2349,6 +2499,14 @@ class StoreWriteMixin:
                      AND (user_scope IS NULL OR user_scope = ?)""",
                 [now, memory_id, self.user_id],
             )
+            # #347: record the restore event.
+            self._record_event(
+                event_type="memory_restored",
+                entity_type="memory",
+                entity_key=memory_id,
+                reason="restore from quarantine",
+                refs={"memory_id": memory_id, "non_head": row[0] is not None},
+            )
         return True
 
     def record_feedback(self, memory_id: str, feedback: str) -> bool:
@@ -2765,6 +2923,22 @@ class StoreWriteMixin:
                        FROM memory_evidence WHERE memory_id = ?""",
                     [new_id, memory_id],
                 )
+                # #347: record the update/supersession event.
+                self._record_event(
+                    event_type="memory_updated",
+                    entity_type="memory",
+                    entity_key=new_id,
+                    reason=f"superseded {memory_id}",
+                    refs={
+                        "old_memory_id": memory_id,
+                        "new_memory_id": new_id,
+                    },
+                    delta={
+                        "old_valid_to": now,
+                        "old_superseded_by": new_id,
+                        "new_valid_from": created_ts,
+                    },
+                )
                 self.connection.execute("COMMIT")
             except Exception:
                 self.connection.execute("ROLLBACK")
@@ -3097,6 +3271,18 @@ class StoreWriteMixin:
                             " AND (user_scope IS NULL OR user_scope = ?)",
                             [memory_id, self.user_id],
                         )
+                        # #347: record the delete event.
+                        self._record_event(
+                            event_type="memory_deleted",
+                            entity_type="memory",
+                            entity_key=memory_id,
+                            content_hash=self._tombstone_hash(_del_content),
+                            reason=f"promoted predecessor {pred[0]}",
+                            refs={
+                                "action": "promoted",
+                                "promoted_memory_id": pred[0],
+                            },
+                        )
                         self.connection.execute("COMMIT")
                     except Exception:
                         self.connection.execute("ROLLBACK")
@@ -3115,6 +3301,14 @@ class StoreWriteMixin:
                        WHERE memory_id = ?
                          AND (user_scope IS NULL OR user_scope = ?)""",
                     [now, now, memory_id, self.user_id],
+                )
+                # #347: record the quarantine-as-delete event.
+                self._record_event(
+                    event_type="memory_deleted",
+                    entity_type="memory",
+                    entity_key=memory_id,
+                    reason="quarantined (middle version, chain preserved)",
+                    refs={"action": "quarantined"},
                 )
                 return {"deleted": True, "action": "quarantined"}
             # Head with no predecessor: hard delete. Fingerprint the content
@@ -3137,6 +3331,15 @@ class StoreWriteMixin:
                     "DELETE FROM memory_evidence WHERE memory_id = ?"
                     " AND (user_scope IS NULL OR user_scope = ?)",
                     [memory_id, self.user_id],
+                )
+                # #347: record the hard-delete event.
+                self._record_event(
+                    event_type="memory_deleted",
+                    entity_type="memory",
+                    entity_key=memory_id,
+                    content_hash=self._tombstone_hash(_del_content),
+                    reason="hard delete (single version)",
+                    refs={"action": "deleted"},
                 )
                 self.connection.execute("COMMIT")
             except Exception:
@@ -3218,6 +3421,16 @@ class StoreWriteMixin:
                 [h, category, self.user_id],
             )
             deleted = cursor.fetchone()
+            if deleted:
+                # #347: record the purge event.
+                self._record_event(
+                    event_type="tombstone_purged",
+                    entity_type="tombstone",
+                    entity_key=f"{h}:{category}",
+                    content_hash=h,
+                    reason="explicit purge — re-feed allowed",
+                    refs={"category": category},
+                )
         return deleted is not None
 
     def list_tombstones(self, limit: int = 200) -> List[Dict[str, Any]]:
@@ -3316,6 +3529,15 @@ class StoreWriteMixin:
                    WHERE subject = ? AND predicate = ? AND user_scope = ?""",
                 [key[0], key[1], key[2]],
             ).fetchone()
+            if check and check[0] == 0:
+                # #347: record the purge event.
+                self._record_event(
+                    event_type="rejection_purged",
+                    entity_type="rejection",
+                    entity_key=f"{key[0]}:{key[1]}",
+                    reason="explicit purge — re-proposal allowed",
+                    refs={"subject": key[0], "predicate": key[1]},
+                )
         return bool(check and check[0] == 0)
 
     def list_rejections(self, limit: int = 200) -> List[Dict[str, Any]]:

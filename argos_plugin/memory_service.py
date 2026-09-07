@@ -1196,6 +1196,44 @@ class MemoryService:
                 limit=int(args.get("limit", 10000)),
                 format=args.get("format", "jsonl"),
             )
+        # #347: mutation_events read surface — same wheel/principals gate
+        # as export_access_audit. No rotation; full history is exportable.
+        if method == "export_mutation_events":
+            acl = getattr(store, "_acl_config", None)
+            if acl is not None and not acl.is_open_store:
+                role = acl.role_for(user_id)
+                if role is None:
+                    raise PermissionError(
+                        "Mutation event export is restricted to authorized "
+                        "principals. Unassigned users may not export."
+                    )
+                role_def = acl.roles.get(role, {})
+                if not role_def.get("wheel", False):
+                    raise PermissionError(
+                        "Mutation event export is restricted to principals "
+                        f"(wheel role). Role {role!r} is not authorized."
+                    )
+            return store.export_mutation_events(
+                limit=int(args.get("limit", 10000)),
+                format=args.get("format", "jsonl"),
+            )
+        if method == "list_mutation_events":
+            return store.list_mutation_events(
+                limit=int(args.get("limit", 10000)),
+                offset=int(args.get("offset", 0)),
+                event_type=args.get("event_type"),
+            )
+        # #347: set_actor_context — server-derived actor identity for
+        # mutation_events. The actor_type is overridden to "model" in
+        # credential mode (server-derived, not client-trusted #341/#344).
+        if method == "set_actor_context":
+            _actor_type = args.get("actor_type", "human")
+            # In credential mode, force model — the service resolved the
+            # identity from a credential, not a trusted-local envelope.
+            if getattr(self, "_credential_mode", False):
+                _actor_type = "model"
+            store.set_actor_context(user_id, _actor_type)
+            return True
         # -- system state KV + distillation data access (P4.2) -----------------
         if method == "get_state":
             return store.get_state(args.get("key", ""))

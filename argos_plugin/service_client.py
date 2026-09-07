@@ -941,6 +941,52 @@ class SharedMemoryStore:
             limit=limit, format=format,
         ) or ""
 
+    # -- #347: mutation_events read surface + actor context -------------------
+
+    def export_mutation_events(
+        self,
+        *,
+        limit: int = 10000,
+        format: str = "jsonl",
+    ) -> str:
+        """#347: Proxy for store.export_mutation_events over RPC.
+
+        Returns the mutation event log as JSONL or CSV. Same wheel/
+        principals gate as export_access_audit. No rotation — the full
+        history is exportable.
+        """
+        return self._rpc.call(
+            "store", "export_mutation_events",
+            limit=limit, format=format,
+        ) or ""
+
+    def list_mutation_events(
+        self,
+        *,
+        limit: int = 10000,
+        offset: int = 0,
+        event_type: str | None = None,
+    ) -> list:
+        """#347: Proxy for store.list_mutation_events over RPC.
+
+        Returns a paginated, scope-filtered list of mutation events.
+        """
+        return self._rpc.call(
+            "store", "list_mutation_events",
+            limit=limit, offset=offset, event_type=event_type,
+        ) or []
+
+    def set_actor_context(self, actor: str, actor_type: str = "human") -> None:
+        """#347: Proxy for store.set_actor_context over RPC.
+
+        Sets the server-derived actor identity for mutation_events.
+        The service overrides actor_type to "model" in credential mode.
+        """
+        self._rpc.call(
+            "store", "set_actor_context",
+            actor_type=actor_type,
+        )
+
     # -- entity aliases -------------------------------------------------------
 
     def add_alias(self, alias: str, canonical_entity: str) -> None:

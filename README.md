@@ -7,7 +7,7 @@ Persistent memory for AI agents, on your own machine. A Hermes plugin with a sta
 - **Facts persist across sessions.** Tell it once, ask weeks later.
 - **Changes are versioned, not erased.** Updating a fact chains a new version onto the old one. Ask "what changed?" and get the history.
 - **Semantic search.** Vector + keyword fusion (RRF), optional GPU reranker (BAAI/bge-reranker-base, similarity + cross-encoder blend), date-anchored temporal handling, and a change-intent chain-unfold pass.
-- **Relationship graph.** A Kùzu graph of entities, relations, and aliases powers multi-hop queries ("who works with my sister?").
+- **Relationship graph.** A Kùzu graph of entities, relations, and aliases backs entity-aware retrieval boosts. A measured A/B (2026-09-02, #139: 1,201 records /  ​300 queries) found graph traversal flat on every metric — the graph is a boost signal, not a traversal engine (see CLAIMS-AUDIT §4).
 - **Ambient context.** Time, location, weather, and recent file activity inject every turn via a `pre_llm_call` hook.
 - **Insight capture.** "I just realised…" moments are logged verbatim. Browse with `/ilog`, resurface with `/revisit`, store exclusions with `/neg <claim>`.
 - **Gated distillation.** Once a day, cost-capped, Argos proposes distilled patterns from accumulated records. Nothing lands in memory without your approval.

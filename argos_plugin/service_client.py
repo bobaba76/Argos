@@ -976,11 +976,16 @@ class SharedMemoryStore:
             limit=limit, offset=offset, event_type=event_type,
         ) or []
 
-    def set_actor_context(self, actor: str, actor_type: str = "human") -> None:
+    def set_actor_context(self, actor_type: str = "human") -> None:
         """#347: Proxy for store.set_actor_context over RPC.
 
-        Sets the server-derived actor identity for mutation_events.
-        The service overrides actor_type to "model" in credential mode.
+        The actor identity is server-derived from the resolved user_id
+        (#341/#344) — the client cannot set it. Only actor_type is sent;
+        the service overrides it to "model" in credential mode.
+
+        Note: the per-request stamp in _call_store is authoritative; this
+        method is retained for facade/local-store compatibility but is a
+        no-op on the RPC path (the stamp already ran at _call_store entry).
         """
         self._rpc.call(
             "store", "set_actor_context",

@@ -512,41 +512,26 @@ class StoreCoreMixin:
 
             # #347: Append-only, actor-attributed mutation event log.
             # Every store mutation (create, approve, reject, update, delete,
-            # tombstone, rejection, purge, erase, import, denial) writes one
-            # row in the SAME transaction as the mutation itself. Unlike
-            # access_audit (which rotates at 100k and logs reads/denials
-            # only), mutation_events NEVER rotates — no startup purge, no
-            # cap. A capped provenance log cannot backfill; the commercial
+            # tombstone, rejection, purge, erase, import) writes one row in
+            # the SAME transaction as the mutation itself. Unlike access_audit
+            # (which rotates at 100k and logs reads/denials only),
+            # mutation_events NEVER rotates — no startup purge, no cap. A
+            # capped provenance log cannot backfill; the commercial
             # "showable history" claim dies at the cap. Growth is bounded by
             # mutation volume (not query volume) and export-and-archive is
             # the only offload path.
+            #
+            # DDL is shared with _migration_4_to_5 via
+            # _create_mutation_events_ddl to avoid schema drift (round-2
+            # review: schema DDL was duplicated between _init_db and the
+            # migration).
             try:
-                self.connection.execute("""
-                    CREATE TABLE IF NOT EXISTS mutation_events (
-                        event_id     VARCHAR PRIMARY KEY,
-                        ts           VARCHAR,
-                        actor        VARCHAR,
-                        actor_type   VARCHAR,
-                        event_type   VARCHAR,
-                        entity_type  VARCHAR,
-                        entity_key   VARCHAR,
-                        content_hash VARCHAR,
-                        reason       VARCHAR,
-                        refs         JSON,
-                        delta        JSON,
-                        user_scope   VARCHAR,
-                        namespace    VARCHAR,
-                        client_scope VARCHAR
-                    )
-                """)
-                self.connection.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_mutation_events_scope_ts
-                    ON mutation_events (user_scope, ts)
-                """)
-                self.connection.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_mutation_events_type_ts
-                    ON mutation_events (event_type, ts)
-                """)
+                from .schema_migrations import _create_mutation_events_ddl
+                _create_mutation_events_ddl(self.connection)
+            except ImportError:
+                # store_core.py imported as a top-level module
+                from schema_migrations import _create_mutation_events_ddl
+                _create_mutation_events_ddl(self.connection)
             except Exception as exc:
                 logger.warning("mutation_events table creation failed: %s", exc)
 

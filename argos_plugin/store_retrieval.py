@@ -1488,23 +1488,15 @@ class StoreRetrievalMixin:
                         bool(excluded),
                     ],
                 )
-                # #347: route denials into mutation_events (no-rotation
-                # guarantee) so denial forensics survive the access_audit
-                # 100k cap. access_audit keeps its rotation for operational
-                # read stats; mutation_events is the permanent record.
-                if denied_count > 0 or excluded:
-                    self._record_event(
-                        event_type="denial",
-                        entity_type="query",
-                        entity_key=_qt,
-                        reason=denied_scopes or "denied",
-                        refs={
-                            "granted_count": int(granted_count),
-                            "denied_count": int(denied_count),
-                            "excluded": bool(excluded),
-                            "tenant": tenant or "default",
-                        },
-                    )
+                # #347 round-2: denial events were previously copied into
+                # mutation_events, but denials scale with READ volume (every
+                # denied search), not mutation volume. mutation_events is
+                # append-only and never rotates — writing denials there would
+                # grow the permanent log unboundedly on a perm-fail path.
+                # Denials stay in access_audit (which rotates at 100k) for
+                # operational telemetry. The mutation_events log is reserved
+                # for committed store mutations (writes), not read-path
+                # access decisions.
         except Exception as exc:
             logger.warning("access_audit write failed: %s", exc)
 
@@ -1601,7 +1593,7 @@ class StoreRetrievalMixin:
             "FROM mutation_events"
         )
         sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY ts DESC, event_id DESC LIMIT ? OFFSET ?"
         params.append(max(1, min(int(limit), 100000)))
         params.append(max(0, int(offset)))
         with self._state.lock:

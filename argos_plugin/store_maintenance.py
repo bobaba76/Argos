@@ -1994,8 +1994,14 @@ class StoreMaintenanceMixin:
                             "evidence": "memory_created",
                             "tombstone": "memory_deleted",
                             "receipt": "memory_erased",
-                            "candidate": "candidate_reviewed",
-                            "rejection": "candidate_rejected",
+                            # #347 round-2: imported candidates were never
+                            # reviewed — map to candidate_created, not
+                            # candidate_reviewed. Imported rejections are
+                            # rejection ledger state, not review decisions —
+                            # map to rejection_imported (not candidate_rejected
+                            # which implies a review happened).
+                            "candidate": "candidate_created",
+                            "rejection": "rejection_imported",
                             "alias": "memory_created",
                         }.get(_rtype, "memory_created")
                         _entity_key = _identity(_rtype, _data)

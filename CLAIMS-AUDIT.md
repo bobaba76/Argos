@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 153 test modules in `argos_plugin/tests/` (2,901 `def test_` definitions; counts generated via AST 2026-09-07 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 153 test modules in `argos_plugin/tests/` (2,902 `def test_` definitions; counts generated via AST 2026-09-07 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -247,7 +247,7 @@ committed, re-runnable artifact:
   `memory_created`, `candidate_created`, `candidate_approved`, `candidate_reviewed`,
   `candidate_downgraded`, `candidate_rejected`, `auto_approval_refused`,
   `memory_updated`, `memory_deleted`, `memory_restored`, `memory_erased`,
-  `refeed_refused`, `tombstone_purged`, `rejection_purged`, `denial`,
+  `refeed_refused`, `tombstone_purged`, `rejection_purged`, `rejection_imported`,
   `import_portable`, `ingest_versioned`, `conflict_resolved`. Actor identity is server-derived
   (`AuthContext.principal` + `principal_type` via `set_actor_context`; local paths
   default to `user_id`/"human"; credential mode forces "model" #341/#344). The ledgers

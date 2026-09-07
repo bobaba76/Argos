@@ -462,6 +462,37 @@ class TestSameTransactionAtomicity:
         events = [e for e in _events(store) if e.get("entity_key") == "mem-rollback-test"]
         assert len(events) == 0
 
+    def test_remember_event_failure_rolls_back_mutation(self, store, monkeypatch):
+        """#347 round-2: patch _record_event to raise on the production
+        remember() path — the memory INSERT must roll back (not stay
+        committed with zero events). This tests the actual autocommit
+        wrapping, not manual BEGIN semantics."""
+        import argos.store_write as sw
+
+        original = sw.StoreWriteMixin._record_event
+        call_count = {"n": 0}
+
+        def failing_record_event(self, **kwargs):
+            call_count["n"] += 1
+            # Only fail on the first call (the memory_created event for
+            # our test record). Subsequent calls (e.g. from other paths)
+            # should work normally.
+            if kwargs.get("event_type") == "memory_created" and call_count["n"] == 1:
+                raise RuntimeError("simulated event write failure")
+            return original(self, **kwargs)
+
+        monkeypatch.setattr(sw.StoreWriteMixin, "_record_event", failing_record_event)
+        # The remember() call must raise (fail-loud #330).
+        with pytest.raises(RuntimeError, match="simulated event write failure"):
+            store.remember(category="personal_fact", content="atomicity test")
+        # The memory record must NOT exist — the INSERT rolled back with
+        # the failed event write.
+        records = store.search("atomicity test", limit=100)
+        assert not any("atomicity test" in r.get("content", "") for r in records)
+        # No memory_created event for the rolled-back record.
+        events = [e for e in _events(store) if "atomicity" in str(e.get("reason", ""))]
+        assert len(events) == 0
+
 
 class TestLedgerHistoryPreserved:
     """Two rejects of the same claim slot with different reasons preserve
@@ -610,9 +641,13 @@ class TestExportAndList:
 
 
 class TestDenialRouting:
-    """Denials are routed into mutation_events (no-rotation guarantee)."""
+    """Denials are NOT routed into mutation_events (round-2 fix: denials
+    scale with read volume, not mutation volume; mutation_events is
+    append-only and never rotates, so writing denials there would grow
+    the permanent log unboundedly on a perm-fail path). Denials stay in
+    access_audit (which rotates at 100k) for operational telemetry."""
 
-    def test_denial_event_written(self, store):
+    def test_denial_event_not_in_mutation_events(self, store):
         store.write_access_audit(
             user_id="test_user",
             query_text="some query",
@@ -622,8 +657,7 @@ class TestDenialRouting:
             excluded=True,
         )
         denials = _events(store, event_type="denial")
-        assert len(denials) == 1
-        assert "forbidden_operation" in denials[0]["reason"]
+        assert len(denials) == 0
 
     def test_allowed_query_no_denial_event(self, store):
         store.write_access_audit(

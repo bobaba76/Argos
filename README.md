@@ -32,6 +32,8 @@ Nothing becomes a memory silently. Every turn is mined for facts (regex first, L
 
 The API is a **read + write tier** (spec-09/10: transports are trust boundaries, not thin wrappers). Both servers bind to loopback only and enforce a bearer token; the operation set is an explicit allowlist behind `ArgosAPIFacade` (auth-context → ACL → validation → audit). No raw RPC passthrough — internal operations (shutdown, backup, set_state, purge, and friends) are never exposed.
 
+**ACL enforcement is opt-in.** The default servers run in trusted-local mode (`api_mode=False`, loopback + bearer token + operation allowlist only); the per-record access-scoping layer engages when started with `api_mode=True` and a configured ACL.
+
 **Write classes** (spec-10):
 - **Class A (propose):** external callers submit a candidate for human review. Nothing becomes active memory until a human approves it.
 - **Class B (review):** human principals approve/reject candidates. Model principals are denied — no self-approval, ever.

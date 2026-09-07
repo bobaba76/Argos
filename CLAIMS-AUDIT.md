@@ -158,6 +158,12 @@ committed, re-runnable artifact:
   run (30/8) merged without a suite run. Canary re-checked **green** after this refresh. This
   entry records the refresh and the catch, so the audit's living index stays honest.
 
+- **2026-09-07 (parity guard extended + wired into CI)** —the canary now
+  guards **both** docs rows (CLAIMS-AUDIT §2 and the README Verification "Test suite"
+  bullet) and runs on **every PR** as a tier-0 merge gate (alongside the retrieval
+  smoke gate,.github/workflows/ci.yml)). Was: audit-row-only, and not part of CI —
+  a red canary sat unnoticed from  ​30/8 to 7/9. The README row formerly had no guard.
+
 - **2026-09-06 (#325)** — §2 test-suite row refreshed: was 59 modules / 1169 tests (01/9);
   now 137 modules / 2,493 `def test_` definitions, counted via AST (`ast.walk`, UTF-8 BOM
   tolerated) by the new `scripts/count_test_fns.py`. The README Verification section quotes

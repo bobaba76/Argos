@@ -61,12 +61,12 @@ jobs:
 
       - name: Run relevant tests
         run: |
-          # Tier 0 (#292): the deterministic retrieval smoke runs on EVERY
-          # PR (seconds, no LLM/embedder/network) — always appended.
+          # Tier 0 (#292/#350): deterministic retrieval smoke + claims-audit
+          # parity guard run on EVERY PR (seconds, no LLM/embedder/network) — always appended..
           if [ -n "$TESTS" ]; then
-            python -m pytest $TESTS argos_plugin/tests/test_retrieval_smoke_gate.py -q --timeout 300 -p no:cacheprovider
+            python -m pytest $TESTS argos_plugin/tests/test_retrieval_smoke_gate.py argos_plugin/tests/test_claims_audit_parity.py -q --timeout 300 -p no:cacheprovider
           else
-            python -m pytest argos_plugin/tests/test_retrieval_smoke_gate.py -q --timeout 300 -p no:cacheprovider
+            python -m pytest argos_plugin/tests/test_retrieval_smoke_gate.py argos_plugin/tests/test_claims_audit_parity.py -q --timeout 300 -p no:cacheprovider
           fi
         env:
           HF_HUB_OFFLINE: "1"

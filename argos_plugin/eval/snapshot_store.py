@@ -62,7 +62,14 @@ def service_running(endpoint: Path) -> bool:
     try:
         sock = socket.create_connection((host, port), timeout=2.0)
         try:
-            payload = (json.dumps({"token": token, "method": "health"}) + "\n").encode("utf-8")
+            # #246 wire protocol: the service requires the envelope's "v"
+            # field to match _PROTOCOL_VERSION, else it answers
+            # VersionMismatch (ok:false) and callers misjudge the service
+            # as DOWN. The endpoint file's "version" metadata declares the
+            # protocol the running service speaks; fall back to 1 for
+            # pre-#246 endpoints that never wrote the field.
+            client_v = int(info.get("version") or 1)
+            payload = (json.dumps({"v": client_v, "token": token, "method": "health"}) + "\n").encode("utf-8")
             sock.sendall(payload)
             resp = b""
             while b"\n" not in resp:

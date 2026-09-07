@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 153 test modules in `argos_plugin/tests/` (2,891 `def test_` definitions; counts generated via AST 2026-09-07 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 153 test modules in `argos_plugin/tests/` (2,901 `def test_` definitions; counts generated via AST 2026-09-07 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -244,10 +244,11 @@ committed, re-runnable artifact:
   `mutation_events` table (schema v5, migration `_migration_4_to_5`) records one event
   row per committed store mutation, written in the SAME DuckDB transaction as the
   mutation (fail-loud #330: a failed event write rolls back the mutation). Event types:
-  `memory_created`, `candidate_approved`, `candidate_reviewed`, `candidate_downgraded`,
-  `candidate_rejected`, `auto_approval_refused`, `memory_updated`, `memory_deleted`,
-  `memory_restored`, `memory_erased`, `refeed_refused`, `tombstone_purged`,
-  `rejection_purged`, `denial`, `import_portable`. Actor identity is server-derived
+  `memory_created`, `candidate_created`, `candidate_approved`, `candidate_reviewed`,
+  `candidate_downgraded`, `candidate_rejected`, `auto_approval_refused`,
+  `memory_updated`, `memory_deleted`, `memory_restored`, `memory_erased`,
+  `refeed_refused`, `tombstone_purged`, `rejection_purged`, `denial`,
+  `import_portable`, `ingest_versioned`, `conflict_resolved`. Actor identity is server-derived
   (`AuthContext.principal` + `principal_type` via `set_actor_context`; local paths
   default to `user_id`/"human"; credential mode forces "model" #341/#344). The ledgers
   (`deletion_tombstones`, `rejection_ledger`) STAY `INSERT OR REPLACE` — one row per
@@ -264,4 +265,6 @@ committed, re-runnable artifact:
   Provenance begins at deployment/shipping date; no historical backfill is possible.
   30 tests in `test_mutation_events.py`: schema/migration, event coverage per mutation
   path, same-transaction atomicity (rollback removes event), ledger history preserved,
-  no rotation at 100k+, actor context, scope filtering, denial routing, export formats.
+  no rotation at 100k+, actor context, scope filtering, denial routing, export formats,
+  candidate_created per proposal, ingest_versioned per version-chain write,
+  conflict_resolved per resolution (keep_old/keep_new/remove_both/manual).

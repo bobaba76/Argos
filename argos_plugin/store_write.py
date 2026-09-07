@@ -509,7 +509,18 @@ class StoreWriteMixin:
                 category=category, content=content, tags=tags,
                 payload=payload, dedup=False, **remember_kwargs,
             )
-            return rec, "inserted" if rec is not None else "blocked"
+            _outcome = "inserted" if rec is not None else "blocked"
+            # #347: ingest_versioned event — captures the ingest path
+            # context (remember() already emits memory_created).
+            self._record_event(
+                event_type="ingest_versioned",
+                entity_type="memory",
+                entity_key=rec.memory_id if rec else None,
+                reason=f"outcome={_outcome}, no existing similar",
+                refs={"outcome": _outcome, "category": category,
+                      "existing_id": None},
+            )
+            return rec, _outcome
         # A current record restates this content. If the text is identical
         # it is a true duplicate (no chain needed); otherwise treat it as an
         # update and supersede via update_memory so a version chain forms.
@@ -525,8 +536,25 @@ class StoreWriteMixin:
                 category=category, content=content, tags=tags,
                 payload=payload, dedup=False, **remember_kwargs,
             )
-            return rec, "inserted" if rec is not None else "blocked"
+            _outcome = "inserted" if rec is not None else "blocked"
+            self._record_event(
+                event_type="ingest_versioned",
+                entity_type="memory",
+                entity_key=rec.memory_id if rec else None,
+                reason=f"outcome={_outcome}, raced-away fallback",
+                refs={"outcome": _outcome, "category": category,
+                      "existing_id": existing_id},
+            )
+            return rec, _outcome
         if existing[0].content == content:
+            self._record_event(
+                event_type="ingest_versioned",
+                entity_type="memory",
+                entity_key=existing_id,
+                reason="outcome=duplicate, identical content",
+                refs={"outcome": "duplicate", "category": category,
+                      "existing_id": existing_id},
+            )
             return existing[0], "duplicate"
         update_kwargs = {
             k: v for k, v in remember_kwargs.items()
@@ -536,12 +564,34 @@ class StoreWriteMixin:
         if payload:
             merged_payload.update(payload)
         if self._ghost_blocked(content, existing[0].category, merged_payload):
+            self._record_event(
+                event_type="ingest_versioned",
+                entity_type="memory",
+                entity_key=existing_id,
+                reason="outcome=blocked, ghost gate",
+                refs={"outcome": "blocked", "category": category,
+                      "existing_id": existing_id, "gate": "ghost"},
+            )
             return None, "blocked"
         new_head = self.update_memory(
             memory_id=existing_id, content=content, tags=tags,
             payload_updates=payload, **update_kwargs,
         )
-        return new_head, "superseded" if new_head is not None else "blocked"
+        _outcome = "superseded" if new_head is not None else "blocked"
+        # update_memory() already emits memory_updated; this event captures
+        # the ingest_versioned context (the version-chain write path).
+        self._record_event(
+            event_type="ingest_versioned",
+            entity_type="memory",
+            entity_key=new_head.memory_id if new_head else None,
+            reason=f"outcome={_outcome}, superseded {existing_id}",
+            refs={"outcome": _outcome, "category": category,
+                  "existing_id": existing_id,
+                  "new_head_id": new_head.memory_id if new_head else None},
+            delta={"old_memory_id": existing_id,
+                   "new_memory_id": new_head.memory_id if new_head else None},
+        )
+        return new_head, _outcome
 
     # -- structured ingestion (#289) ------------------------------------------
 
@@ -1318,6 +1368,22 @@ class StoreWriteMixin:
                     quarantine_reason, (now if _inj else None),
                     prov, ground,
                 ],
+            )
+            # #347: record the candidate creation event.
+            self._record_event(
+                event_type="candidate_created",
+                entity_type="candidate",
+                entity_key=candidate_id,
+                reason=f"source={source}, status={candidate_status}",
+                refs={
+                    "candidate_id": candidate_id,
+                    "category": category,
+                    "source": source,
+                    "status": candidate_status,
+                    "injection_quarantined": _inj,
+                },
+                namespace=namespace or "conversation",
+                client_scope=client_scope,
             )
         return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
 
@@ -2157,6 +2223,34 @@ class StoreWriteMixin:
                             reason=f"conflict_resolved:manual ({reason})"[:200],
                         )
 
+                # #347: record the conflict resolution event. This is the
+                # gap the reviewer flagged: resolve_conflict updates
+                # candidate status and memory records directly (not via
+                # review_candidate/update_memory), so without this event
+                # the "who decided and why" is invisible. remember() calls
+                # inside the branches already emit memory_created; the
+                # direct UPDATE memory_records SET valid_to/superseded_by
+                # calls bypass update_memory() so they get no
+                # memory_updated — this event captures the full resolution.
+                self._record_event(
+                    event_type="conflict_resolved",
+                    entity_type="candidate",
+                    entity_key=candidate_id,
+                    reason=f"outcome={outcome} ({reason})".strip(),
+                    refs={
+                        "candidate_id": candidate_id,
+                        "outcome": outcome,
+                        "old_memory_id": old_memory_id,
+                        "new_memory_id": memory.memory_id if memory else None,
+                        "review_source": review_source,
+                    },
+                    delta={
+                        "old_valid_to": now if old_memory_id and outcome in {
+                            "keep_new", "remove_both", "manual",
+                        } else None,
+                        "new_memory_id": memory.memory_id if memory else None,
+                    } if old_memory_id or memory else None,
+                )
                 self.connection.execute("COMMIT")
             except Exception:
                 self.connection.execute("ROLLBACK")

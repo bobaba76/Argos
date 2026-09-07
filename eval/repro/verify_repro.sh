@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # verify_repro.sh — reproducibility gate for BENCHMARK_REPRODUCIBILITY.md.
 #
-# Re-derives every headline number from the committed judged artifacts
-# (this repo's eval/repro/) plus the external run artifacts (default:
-# sibling ../LongMemEval checkout), and fails loudly on any drift.
+# Re-verifies the committed judged artifacts + dataset SHA (re-counting
+# committed result files; it does not re-run the pipelines behind them),
+# and fails loudly on any drift.
 #
 # Usage:
 #   ./verify_repro.sh                 # artifacts in ../LongMemEval

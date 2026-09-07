@@ -117,8 +117,9 @@ small-n but internally consistent (see caveats §11).
 
 ## 6. Per-category scores — headline run (recomputed 2026-08-22)
 
-REPRODUCIBILITY GATE: `./eval/repro/verify_repro.sh` re-derives every
-headline number above from the committed judged files (plus the sibling
+REPRODUCIBILITY GATE: `./eval/repro/verify_repro.sh` re-verifies the
+committed judged artifacts + dataset SHA above (re-counting committed result
+files; it does not re-run the pipelines behind them — that needs the sibling
 `../LongMemEval` checkout for dataset/cache artifacts; override with
 `--artifacts DIR`) and exits non-zero on any drift — run it before
 quoting a number.

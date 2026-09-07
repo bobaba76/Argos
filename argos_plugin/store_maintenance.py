@@ -1794,6 +1794,12 @@ class StoreMaintenanceMixin:
         deleted); the export's tombstone/receipt rows are restored so
         the provenance of deletions survives the round-trip.
 
+        Rejection-aware (#39 ghost-defense): a record whose claim slot
+        (subject, predicate, scope — see ``rejection_check``) is in the
+        TARGET store's rejection ledger is NOT imported either, so
+        replaying an export taken before a rejection decision cannot
+        resurrect the rejected claim (or a paraphrase of it).
+
         Scope: every imported row is stamped with the TARGET store's
         current ``user_id`` — an import never writes into another
         tenant's scope, and imported data is owned by the importing
@@ -1803,7 +1809,7 @@ class StoreMaintenanceMixin:
         {
           "mode", "export_version", "schema_version",
           "total_rows", "valid_rows", "error_rows",
-          "restored", "unchanged", "tombstone_blocked",
+          "restored", "unchanged", "tombstone_blocked", "rejection_blocked",
           "rows": [ {line, type, identity, outcome} ... ],
           "errors": [ {line, errors: [...]} ... ],
           "wrote": bool,
@@ -1836,6 +1842,7 @@ class StoreMaintenanceMixin:
             "restored": 0,
             "unchanged": 0,
             "tombstone_blocked": 0,
+            "rejection_blocked": 0,
             "rows": [],
             "errors": parse_errors,
             "wrote": False,
@@ -1862,6 +1869,29 @@ class StoreMaintenanceMixin:
                 [self.user_id],
             ).fetchall()
         tombstoned = {(h, c) for h, c in tomb_rows}
+
+        def _record_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+            raw = data.get("payload")
+            if isinstance(raw, dict):
+                return raw
+            if isinstance(raw, str) and raw:
+                try:
+                    parsed = json.loads(raw)
+                except (TypeError, ValueError):
+                    return {}
+                return parsed if isinstance(parsed, dict) else {}
+            return {}
+
+        def _record_blocked(data: Dict[str, Any]) -> str | None:
+            """Ghost-defense gate for an inbound record row (mirrors
+            ``remember``): tombstone first, then the rejection ledger."""
+            content = str(data.get("content") or "")
+            category = str(data.get("category") or "")
+            if (self._tombstone_hash(content), category) in tombstoned:
+                return "tombstone_blocked"
+            if self.rejection_check(category, _record_payload(data)):
+                return "rejection_blocked"
+            return None
 
         def _identity(rtype: str, data: Dict[str, Any]) -> str:
             if rtype == "record":
@@ -1893,11 +1923,10 @@ class StoreMaintenanceMixin:
             }
             if rtype == "record":
                 content = str(data.get("content") or "")
-                category = str(data.get("category") or "")
-                h = self._tombstone_hash(content)
-                if (h, category) in tombstoned:
-                    entry["outcome"] = "tombstone_blocked"
-                    report["tombstone_blocked"] += 1
+                blocked = _record_blocked(data)
+                if blocked:
+                    entry["outcome"] = blocked
+                    report[blocked] += 1
                     report["rows"].append(entry)
                     continue
                 exists = self._import_row_exists(rtype, data)
@@ -1928,19 +1957,16 @@ class StoreMaintenanceMixin:
             report["rows"].append(entry)
 
         # Apply: one transaction for the whole batch (all-or-nothing).
-        # Tombstone-blocked records are skipped (deleted stays deleted).
+        # Tombstone-/rejection-blocked records are skipped (deleted stays
+        # deleted, rejected stays rejected).
         if mode == "apply":
             with self._state.lock:
                 assert self.connection is not None
                 self.connection.execute("BEGIN TRANSACTION")
                 try:
                     for row in rows:
-                        if row["type"] == "record":
-                            data = row["data"]
-                            h = self._tombstone_hash(
-                                str(data.get("content") or ""))
-                            if (h, str(data.get("category") or "")) in tombstoned:
-                                continue
+                        if row["type"] == "record" and _record_blocked(row["data"]):
+                            continue
                         self._import_row(row["type"], row["data"])
                     self.connection.execute("COMMIT")
                 except Exception:

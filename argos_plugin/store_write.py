@@ -408,8 +408,9 @@ class StoreWriteMixin:
 
         Returns ``(record, outcome)`` where *outcome* is one of
         ``"inserted"`` / ``"superseded"`` / ``"duplicate"`` (or
-        ``"blocked"`` when the insert was refused by a tombstone/rejection
-        gate, mirroring ``remember`` returning ``None``).
+        ``"blocked"`` when the insert OR the supersede was refused by a
+        tombstone/rejection gate — ``remember`` returns ``None`` and
+        ``update_memory`` raises ``ValueError`` for a ghost-blocked write).
         """
         if not content or not content.strip():
             return None, "blocked"
@@ -442,6 +443,11 @@ class StoreWriteMixin:
             k: v for k, v in remember_kwargs.items()
             if k in {"expires_at", "structural_guard", "created_at"}
         }
+        merged_payload = dict(existing[0].payload)
+        if payload:
+            merged_payload.update(payload)
+        if self._ghost_blocked(content, existing[0].category, merged_payload):
+            return None, "blocked"
         new_head = self.update_memory(
             memory_id=existing_id, content=content, tags=tags,
             payload_updates=payload, **update_kwargs,
@@ -2423,6 +2429,13 @@ class StoreWriteMixin:
         The old record is preserved for history queries (as_of parameter).
         If no content/tags/payload changes are provided, returns the existing
         record unchanged.
+
+        Ghost-defense (#39 / #353): the new version is gated like a fresh
+        ``remember`` — if the updated content is tombstoned, or the claim
+        slot of the merged payload is in the rejection ledger, the write
+        is refused with ``ValueError`` (a rejected/erased fact cannot be
+        re-landed by restating a live record). Re-assertion must go back
+        through the proposal queue or an explicit purge.
         """
         if content is not None:
             content, _inj = sanitize_content(content)
@@ -2573,6 +2586,23 @@ class StoreWriteMixin:
         if (content is None and tags is None and not payload_updates
                 and expires_at is _NOT_PROVIDED):
             return rec
+
+        # Ghost-defense gate (#39 / #353): the new version is a write like
+        # any other — a tombstoned content or a rejected claim slot may not
+        # be re-landed by superseding a live record.
+        _ghost = self._ghost_blocked(
+            new_content if content is not None else None,
+            rec.category, new_payload,
+        )
+        if _ghost:
+            logger.info(
+                "Blocked update of %s: new version re-lands a %s claim: %s",
+                memory_id, _ghost, new_content[:60],
+            )
+            raise ValueError(
+                f"Content blocked: the updated memory would re-land a "
+                f"{_ghost} claim. Refusing to write."
+            )
 
         # Re-embed if content changed
         new_emb: List[float] = []
@@ -3140,6 +3170,18 @@ class StoreWriteMixin:
                VALUES (?, ?, ?, ?, ?)""",
             [h, category, self.user_id, reason, self._now()],
         )
+
+    def _ghost_blocked(
+        self, content: str | None, category: str, payload: Dict[str, Any] | None,
+    ) -> str | None:
+        """Return ``"tombstoned"`` / ``"rejected"`` if writing this claim
+        would resurrect a ghost, else None. ``content`` None skips the
+        tombstone leg (no content change to fingerprint)."""
+        if content is not None and self.tombstone_check(content, category):
+            return "tombstoned"
+        if self.rejection_check(category, payload):
+            return "rejected"
+        return None
 
     def tombstone_check(self, content: str, category: str) -> dict | None:
         """Return the tombstone row (as a dict) if this content was deleted."""

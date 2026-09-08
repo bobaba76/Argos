@@ -231,6 +231,7 @@ def _create_mutation_events_ddl(conn) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS mutation_events (
             event_id     VARCHAR PRIMARY KEY,
+            seq          BIGINT,
             ts           VARCHAR,
             actor        VARCHAR,
             actor_type   VARCHAR,

@@ -1413,8 +1413,8 @@ class ArgosAPIFacade:
         try:
             if hasattr(self._store, "set_actor_context"):
                 self._store.set_actor_context(ctx.principal, ctx.principal_type)
-        except Exception:
-            pass  # fail-soft: local stores always have a default actor
+        except (TypeError, AttributeError):
+            pass  # RPC proxy may not accept actor; _call_store stamps it
         try:
             if operation == "search":
                 result = self._op_search(ctx, validated)

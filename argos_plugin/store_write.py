@@ -156,14 +156,16 @@ class StoreWriteMixin:
         """
         assert self.connection is not None
         event_id = f"evt-{uuid.uuid4().hex}"
+        self._state.event_seq += 1
         self.connection.execute(
             """INSERT INTO mutation_events
-               (event_id, ts, actor, actor_type, event_type, entity_type,
+               (event_id, seq, ts, actor, actor_type, event_type, entity_type,
                 entity_key, content_hash, reason, refs, delta,
                 user_scope, namespace, client_scope)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 event_id,
+                self._state.event_seq,
                 self._now(),
                 getattr(self, "_actor", self.user_id),
                 getattr(self, "_actor_type", "human"),
@@ -572,95 +574,113 @@ class StoreWriteMixin:
         """
         if not content or not content.strip():
             return None, "blocked"
-        existing_id, _reason = self._find_current_similar(content, category)
-        if existing_id is None:
-            rec = self.remember(
-                category=category, content=content, tags=tags,
-                payload=payload, dedup=False, **remember_kwargs,
+        # #347 round-3: hold the lock across the entire method so wrapper
+        # events join the same transaction as the underlying mutation.
+        # Previously the wrapper events were written after the mutation
+        # committed and outside the lock — a failing event write raised
+        # after the mutation landed (inverted fail-loud).
+        with self._state.lock:
+            assert self.connection is not None
+            existing_id, _reason = self._find_current_similar(content, category)
+            if existing_id is None:
+                _started = self._begin_transaction_if_needed()
+                try:
+                    rec = self.remember(
+                        category=category, content=content, tags=tags,
+                        payload=payload, dedup=False, **remember_kwargs,
+                    )
+                    _outcome = "inserted" if rec is not None else "blocked"
+                    if rec is not None:
+                        # #347: ingest_versioned event — captures the ingest
+                        # path context (remember() already emits memory_created).
+                        self._record_event(
+                            event_type="ingest_versioned",
+                            entity_type="memory",
+                            entity_key=rec.memory_id,
+                            reason=f"outcome={_outcome}, no existing similar",
+                            refs={"outcome": _outcome, "category": category,
+                                  "existing_id": None},
+                        )
+                    self._commit_if_started(_started)
+                except Exception:
+                    self._rollback_if_started(_started)
+                    raise
+                return rec, _outcome
+            # A current record restates this content. If the text is identical
+            # it is a true duplicate (no chain needed); otherwise treat it as an
+            # update and supersede via update_memory so a version chain forms.
+            existing = self._fetch_records(
+                """SELECT * FROM memory_records
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)""",
+                [existing_id, self.user_id],
             )
-            _outcome = "inserted" if rec is not None else "blocked"
-            # #347: ingest_versioned event — captures the ingest path
-            # context (remember() already emits memory_created).
-            self._record_event(
-                event_type="ingest_versioned",
-                entity_type="memory",
-                entity_key=rec.memory_id if rec else None,
-                reason=f"outcome={_outcome}, no existing similar",
-                refs={"outcome": _outcome, "category": category,
-                      "existing_id": None},
-            )
-            return rec, _outcome
-        # A current record restates this content. If the text is identical
-        # it is a true duplicate (no chain needed); otherwise treat it as an
-        # update and supersede via update_memory so a version chain forms.
-        existing = self._fetch_records(
-            """SELECT * FROM memory_records
-               WHERE memory_id = ?
-                 AND (user_scope IS NULL OR user_scope = ?)""",
-            [existing_id, self.user_id],
-        )
-        if not existing:
-            # Raced away between the scan and the fetch — fall back to insert.
-            rec = self.remember(
-                category=category, content=content, tags=tags,
-                payload=payload, dedup=False, **remember_kwargs,
-            )
-            _outcome = "inserted" if rec is not None else "blocked"
-            self._record_event(
-                event_type="ingest_versioned",
-                entity_type="memory",
-                entity_key=rec.memory_id if rec else None,
-                reason=f"outcome={_outcome}, raced-away fallback",
-                refs={"outcome": _outcome, "category": category,
-                      "existing_id": existing_id},
-            )
-            return rec, _outcome
-        if existing[0].content == content:
-            self._record_event(
-                event_type="ingest_versioned",
-                entity_type="memory",
-                entity_key=existing_id,
-                reason="outcome=duplicate, identical content",
-                refs={"outcome": "duplicate", "category": category,
-                      "existing_id": existing_id},
-            )
-            return existing[0], "duplicate"
-        update_kwargs = {
-            k: v for k, v in remember_kwargs.items()
-            if k in {"expires_at", "structural_guard", "created_at"}
-        }
-        merged_payload = dict(existing[0].payload)
-        if payload:
-            merged_payload.update(payload)
-        if self._ghost_blocked(content, existing[0].category, merged_payload):
-            self._record_event(
-                event_type="ingest_versioned",
-                entity_type="memory",
-                entity_key=existing_id,
-                reason="outcome=blocked, ghost gate",
-                refs={"outcome": "blocked", "category": category,
-                      "existing_id": existing_id, "gate": "ghost"},
-            )
-            return None, "blocked"
-        new_head = self.update_memory(
-            memory_id=existing_id, content=content, tags=tags,
-            payload_updates=payload, **update_kwargs,
-        )
-        _outcome = "superseded" if new_head is not None else "blocked"
-        # update_memory() already emits memory_updated; this event captures
-        # the ingest_versioned context (the version-chain write path).
-        self._record_event(
-            event_type="ingest_versioned",
-            entity_type="memory",
-            entity_key=new_head.memory_id if new_head else None,
-            reason=f"outcome={_outcome}, superseded {existing_id}",
-            refs={"outcome": _outcome, "category": category,
-                  "existing_id": existing_id,
-                  "new_head_id": new_head.memory_id if new_head else None},
-            delta={"old_memory_id": existing_id,
-                   "new_memory_id": new_head.memory_id if new_head else None},
-        )
-        return new_head, _outcome
+            if not existing:
+                # Raced away between the scan and the fetch — fall back to insert.
+                _started = self._begin_transaction_if_needed()
+                try:
+                    rec = self.remember(
+                        category=category, content=content, tags=tags,
+                        payload=payload, dedup=False, **remember_kwargs,
+                    )
+                    _outcome = "inserted" if rec is not None else "blocked"
+                    if rec is not None:
+                        self._record_event(
+                            event_type="ingest_versioned",
+                            entity_type="memory",
+                            entity_key=rec.memory_id,
+                            reason=f"outcome={_outcome}, raced-away fallback",
+                            refs={"outcome": _outcome, "category": category,
+                                  "existing_id": existing_id},
+                        )
+                    self._commit_if_started(_started)
+                except Exception:
+                    self._rollback_if_started(_started)
+                    raise
+                return rec, _outcome
+            if existing[0].content == content:
+                # #347 round-3 m2: duplicate is a no-op (no mutation) — skip
+                # the wrapper event. The never-rotating mutation_events log
+                # should only record actual mutations, not read-path no-ops.
+                return existing[0], "duplicate"
+            update_kwargs = {
+                k: v for k, v in remember_kwargs.items()
+                if k in {"expires_at", "structural_guard", "created_at"}
+            }
+            merged_payload = dict(existing[0].payload)
+            if payload:
+                merged_payload.update(payload)
+            if self._ghost_blocked(content, existing[0].category, merged_payload):
+                # #347 round-3 m2: blocked is a no-op (no mutation) — skip
+                # the wrapper event.
+                return None, "blocked"
+            _started = self._begin_transaction_if_needed()
+            try:
+                new_head = self.update_memory(
+                    memory_id=existing_id, content=content, tags=tags,
+                    payload_updates=payload, **update_kwargs,
+                )
+                _outcome = "superseded" if new_head is not None else "blocked"
+                if new_head is not None:
+                    # update_memory() already emits memory_updated; this event
+                    # captures the ingest_versioned context (the version-chain
+                    # write path).
+                    self._record_event(
+                        event_type="ingest_versioned",
+                        entity_type="memory",
+                        entity_key=new_head.memory_id,
+                        reason=f"outcome={_outcome}, superseded {existing_id}",
+                        refs={"outcome": _outcome, "category": category,
+                              "existing_id": existing_id,
+                              "new_head_id": new_head.memory_id},
+                        delta={"old_memory_id": existing_id,
+                               "new_memory_id": new_head.memory_id},
+                    )
+                self._commit_if_started(_started)
+            except Exception:
+                self._rollback_if_started(_started)
+                raise
+            return new_head, _outcome
 
     # -- structured ingestion (#289) ------------------------------------------
 
@@ -1740,7 +1760,7 @@ class StoreWriteMixin:
         # the chain forked or the candidate status inconsistent (issue #9).
         with self._state.lock:
             assert self.connection is not None
-            self._tx_begin()
+            _started = self._begin_transaction_if_needed()
             try:
                 if decision in {"approved", "reviewed_approved"}:
                     memory = self.remember(**remember_kwargs)
@@ -1886,9 +1906,9 @@ class StoreWriteMixin:
                         if final_status == "rejected" else None
                     ),
                 )
-                self._tx_commit()
+                self._commit_if_started(_started)
             except Exception:
-                self._tx_rollback()
+                self._rollback_if_started(_started)
                 raise
         result = {
             "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
@@ -1971,7 +1991,7 @@ class StoreWriteMixin:
         memory = None
         with self._state.lock:
             assert self.connection is not None
-            self._tx_begin()
+            _started = self._begin_transaction_if_needed()
             try:
                 if outcome == "keep_old":
                     # Reject the new candidate; old memory stays as-is.
@@ -2329,9 +2349,9 @@ class StoreWriteMixin:
                         "new_memory_id": memory.memory_id if memory else None,
                     } if old_memory_id or memory else None,
                 )
-                self._tx_commit()
+                self._commit_if_started(_started)
             except Exception:
-                self._tx_rollback()
+                self._rollback_if_started(_started)
                 raise
         result = {
             "candidate": self.list_candidates(candidate_id=candidate_id, limit=1)[0],
@@ -2648,13 +2668,16 @@ class StoreWriteMixin:
             # B9: fetch valid_to alongside the existence check so we can
             # warn about non-head restores.
             row = self.connection.execute(
-                """SELECT valid_to FROM memory_records
+                """SELECT valid_to, status FROM memory_records
                    WHERE memory_id = ?
                      AND (user_scope IS NULL OR user_scope = ?)""",
                 [memory_id, self.user_id],
             ).fetchone()
             if not row:
                 return False
+            # #347 round-3 m2: skip the event if the record is already active
+            # (no-op restore — don't pollute the never-rotating log).
+            _was_quarantined = row[1] != "active"
             if row[0] is not None:
                 logger.warning(
                     "restore_memory: %s is a non-head version (valid_to is "
@@ -2675,14 +2698,17 @@ class StoreWriteMixin:
                          AND (user_scope IS NULL OR user_scope = ?)""",
                     [now, memory_id, self.user_id],
                 )
-                # #347: record the restore event.
-                self._record_event(
-                    event_type="memory_restored",
-                    entity_type="memory",
-                    entity_key=memory_id,
-                    reason="restore from quarantine",
-                    refs={"memory_id": memory_id, "non_head": row[0] is not None},
-                )
+                # #347: record the restore event only if the record was
+                # actually quarantined (round-3 m2: skip no-op events on
+                # the never-rotating log).
+                if _was_quarantined:
+                    self._record_event(
+                        event_type="memory_restored",
+                        entity_type="memory",
+                        entity_key=memory_id,
+                        reason="restore from quarantine",
+                        refs={"memory_id": memory_id, "non_head": row[0] is not None},
+                    )
                 self._commit_if_started(_started)
             except Exception:
                 self._rollback_if_started(_started)
@@ -2992,7 +3018,7 @@ class StoreWriteMixin:
             # Wrap the version-chain write in an explicit transaction so a
             # crash between steps cannot leave two current versions or
             # orphan the evidence trail (issue #9).
-            self._tx_begin()
+            _started = self._begin_transaction_if_needed()
             try:
                 # 1. Create the new version, carrying feedback counters forward
                 #    from the superseded record so importance evidence survives
@@ -3119,9 +3145,9 @@ class StoreWriteMixin:
                         "new_valid_from": created_ts,
                     },
                 )
-                self._tx_commit()
+                self._commit_if_started(_started)
             except Exception:
-                self._tx_rollback()
+                self._rollback_if_started(_started)
                 raise
         fetched = self._fetch_records(
             "SELECT * FROM memory_records WHERE memory_id = ?", [new_id]
@@ -3428,7 +3454,7 @@ class StoreWriteMixin:
                     # head DELETE would leave two active versions of the same
                     # fact (valid_to IS NULL on both). Single-statement paths
                     # (quarantine, hard-delete) are already atomic.
-                    self._tx_begin()
+                    _started = self._begin_transaction_if_needed()
                     try:
                         self.connection.execute(
                             """UPDATE memory_records
@@ -3463,33 +3489,42 @@ class StoreWriteMixin:
                                 "promoted_memory_id": pred[0],
                             },
                         )
-                        self._tx_commit()
+                        self._commit_if_started(_started)
                     except Exception:
-                        self._tx_rollback()
+                        self._rollback_if_started(_started)
                         raise
                     return {
                         "deleted": True, "action": "promoted",
                         "promoted_memory_id": pred[0],
                     }
             # Non-head: quarantine instead of severing the causal arc.
+            # #347 round-3: wrap UPDATE + event in an explicit transaction
+            # (same as promote/hard-delete branches). Without this, a failing
+            # event write leaves the record quarantined with zero events.
             if not is_head:
-                self.connection.execute(
-                    """UPDATE memory_records
-                       SET status = 'quarantined',
-                           quarantine_reason = 'deleted from chain (reversible)',
-                           quarantined_at = ?, updated_at = ?
-                       WHERE memory_id = ?
-                         AND (user_scope IS NULL OR user_scope = ?)""",
-                    [now, now, memory_id, self.user_id],
-                )
-                # #347: record the quarantine-as-delete event.
-                self._record_event(
-                    event_type="memory_deleted",
-                    entity_type="memory",
-                    entity_key=memory_id,
-                    reason="quarantined (middle version, chain preserved)",
-                    refs={"action": "quarantined"},
-                )
+                _started = self._begin_transaction_if_needed()
+                try:
+                    self.connection.execute(
+                        """UPDATE memory_records
+                           SET status = 'quarantined',
+                               quarantine_reason = 'deleted from chain (reversible)',
+                               quarantined_at = ?, updated_at = ?
+                           WHERE memory_id = ?
+                             AND (user_scope IS NULL OR user_scope = ?)""",
+                        [now, now, memory_id, self.user_id],
+                    )
+                    # #347: record the quarantine-as-delete event.
+                    self._record_event(
+                        event_type="memory_deleted",
+                        entity_type="memory",
+                        entity_key=memory_id,
+                        reason="quarantined (middle version, chain preserved)",
+                        refs={"action": "quarantined"},
+                    )
+                    self._commit_if_started(_started)
+                except Exception:
+                    self._rollback_if_started(_started)
+                    raise
                 return {"deleted": True, "action": "quarantined"}
             # Head with no predecessor: hard delete. Fingerprint the content
             # first so a later re-feed (source re-ingest, extractor replay)
@@ -3499,7 +3534,7 @@ class StoreWriteMixin:
             # leave a tombstone for a record that still exists, blocking
             # re-creation via remember()'s tombstone check even though the
             # original is still active.
-            self._tx_begin()
+            _started = self._begin_transaction_if_needed()
             try:
                 self._record_tombstone(_del_content, _del_category)
                 self.connection.execute(
@@ -3521,9 +3556,9 @@ class StoreWriteMixin:
                     reason="hard delete (single version)",
                     refs={"action": "deleted"},
                 )
-                self._tx_commit()
+                self._commit_if_started(_started)
             except Exception:
-                self._tx_rollback()
+                self._rollback_if_started(_started)
                 raise
             return {"deleted": True, "action": "deleted"}
 

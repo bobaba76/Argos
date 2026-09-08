@@ -368,7 +368,7 @@ class StoreCoreMixin:
             # rolls back the partial state instead of leaving it inconsistent.
             # SC6: skip entirely in read-only mode (UPDATEs would fail).
             if not self._state.read_only:
-                self._tx_begin()
+                _started = self._begin_transaction_if_needed()
                 try:
                     self.connection.execute("""
                         UPDATE memory_evidence e
@@ -462,10 +462,10 @@ class StoreCoreMixin:
                             ELSE 'extracted'
                         END
                     """)
-                    self._tx_commit()
+                    self._commit_if_started(_started)
                 except Exception as exc:
                     try:
-                        self._tx_rollback()
+                        self._rollback_if_started(_started)
                     except Exception:
                         pass
                     logger.warning("Backfill transaction failed (rolled back): %s", exc)

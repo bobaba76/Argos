@@ -267,7 +267,9 @@ class TestIngestVersionedEvents:
         assert len(events) == 1
         assert events[0]["entity_key"] == rec.memory_id
 
-    def test_ingest_duplicate_event(self, store):
+    def test_ingest_duplicate_no_event(self, store):
+        """#347 round-3 m2: duplicate is a no-op (no mutation) — no
+        ingest_versioned event should be written."""
         store.ingest_versioned(
             category="personal_fact", content="exact same fact",
         )
@@ -276,10 +278,9 @@ class TestIngestVersionedEvents:
         )
         assert outcome == "duplicate"
         events = _events(store, event_type="ingest_versioned")
-        # Two ingest_versioned calls = two events (inserted + duplicate).
-        assert len(events) == 2
-        dup = [e for e in events if "duplicate" in e["reason"]]
-        assert len(dup) == 1
+        # Only the first insert produced an event; the duplicate is a no-op.
+        assert len(events) == 1
+        assert "inserted" in events[0]["reason"]
 
     def test_ingest_superseded_event(self, store):
         # The supersede path requires _find_current_similar to match the
@@ -293,7 +294,7 @@ class TestIngestVersionedEvents:
         )
         # Without an embedder, different content won't trigger supersede
         # via ingest_versioned. Verify the inserted path produced an
-        # event, and that the duplicate path also produces one.
+        # event.
         events = _events(store, event_type="ingest_versioned")
         assert len(events) == 1
         assert "inserted" in events[0]["reason"]
@@ -492,6 +493,38 @@ class TestSameTransactionAtomicity:
         # No memory_created event for the rolled-back record.
         events = [e for e in _events(store) if "atomicity" in str(e.get("reason", ""))]
         assert len(events) == 0
+
+    def test_quarantine_event_failure_rolls_back(self, store, monkeypatch):
+        """#347 round-3: patch _record_event to raise on the quarantine
+        branch of delete_memory — the UPDATE must roll back (not leave
+        the record quarantined with zero events)."""
+        import argos.store_write as sw
+
+        original = sw.StoreWriteMixin._record_event
+        call_count = {"n": 0}
+
+        def failing_record_event(self, **kwargs):
+            call_count["n"] += 1
+            if kwargs.get("event_type") == "memory_deleted" and call_count["n"] == 1:
+                raise RuntimeError("simulated quarantine event failure")
+            return original(self, **kwargs)
+
+        # Create a chain: head + one older version, so deleting the
+        # non-head version hits the quarantine branch.
+        rec1 = store.remember(category="personal_fact", content="quarantine atomicity v1")
+        store.update_memory(rec1.memory_id, content="quarantine atomicity v2")
+        # rec1 is now a non-head version (superseded by v2).
+        monkeypatch.setattr(sw.StoreWriteMixin, "_record_event", failing_record_event)
+        with pytest.raises(RuntimeError, match="simulated quarantine event failure"):
+            store.delete_memory(rec1.memory_id)
+        # The record must NOT be quarantined — the UPDATE rolled back.
+        from argos.store import DuckDBMemoryStore
+        row = store.connection.execute(
+            "SELECT status FROM memory_records WHERE memory_id = ?",
+            [rec1.memory_id],
+        ).fetchone()
+        assert row is not None
+        assert row[0] != "quarantined", "record was quarantined despite event failure"
 
 
 class TestLedgerHistoryPreserved:

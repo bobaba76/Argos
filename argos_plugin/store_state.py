@@ -102,3 +102,11 @@ class StoreMixinState:
     provides atomicity and no new BEGIN is issued (DuckDB raises
     ``TransactionException`` if BEGIN is called within an active
     transaction, and the exception aborts the outer transaction)."""
+
+    # -- #347: mutation_events sequence counter ------------------------------
+    event_seq: int = 0
+    """Monotonically increasing counter for the ``seq`` column in
+    ``mutation_events``. Provides deterministic insertion-order tiebreaking
+    for same-timestamp events (round-3 review: ``event_id`` is uuid4
+    (random), so ``ORDER BY ts DESC, event_id DESC`` is stable but not
+    chronological; ``seq`` makes tie order match insertion)."""

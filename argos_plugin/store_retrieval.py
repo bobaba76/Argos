@@ -1587,13 +1587,13 @@ class StoreRetrievalMixin:
             conditions.append("event_type = ?")
             params.append(event_type)
         sql = (
-            "SELECT event_id, ts, actor, actor_type, event_type, "
+            "SELECT event_id, seq, ts, actor, actor_type, event_type, "
             "entity_type, entity_key, content_hash, reason, refs, delta, "
             "user_scope, namespace, client_scope "
             "FROM mutation_events"
         )
         sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY ts DESC, event_id DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY ts DESC, seq DESC LIMIT ? OFFSET ?"
         params.append(max(1, min(int(limit), 100000)))
         params.append(max(0, int(offset)))
         with self._state.lock:
@@ -1603,31 +1603,32 @@ class StoreRetrievalMixin:
         for r in rows:
             entry: Dict[str, Any] = {
                 "event_id": r[0],
-                "ts": r[1],
-                "actor": r[2],
-                "actor_type": r[3],
-                "event_type": r[4],
-                "entity_type": r[5],
-                "entity_key": r[6],
-                "content_hash": r[7],
-                "reason": r[8],
-                "user_scope": r[11],
-                "namespace": r[12],
-                "client_scope": r[13],
+                "seq": r[1],
+                "ts": r[2],
+                "actor": r[3],
+                "actor_type": r[4],
+                "event_type": r[5],
+                "entity_type": r[6],
+                "entity_key": r[7],
+                "content_hash": r[8],
+                "reason": r[9],
+                "user_scope": r[12],
+                "namespace": r[13],
+                "client_scope": r[14],
             }
             # Parse JSON columns for convenience.
-            if r[9]:
-                try:
-                    entry["refs"] = json.loads(r[9])
-                except (json.JSONDecodeError, TypeError):
-                    entry["refs"] = r[9]
-            else:
-                entry["refs"] = None
             if r[10]:
                 try:
-                    entry["delta"] = json.loads(r[10])
+                    entry["refs"] = json.loads(r[10])
                 except (json.JSONDecodeError, TypeError):
-                    entry["delta"] = r[10]
+                    entry["refs"] = r[10]
+            else:
+                entry["refs"] = None
+            if r[11]:
+                try:
+                    entry["delta"] = json.loads(r[11])
+                except (json.JSONDecodeError, TypeError):
+                    entry["delta"] = r[11]
             else:
                 entry["delta"] = None
             result.append(entry)
@@ -1637,15 +1638,22 @@ class StoreRetrievalMixin:
         self,
         *,
         limit: int = 10000,
+        offset: int = 0,
+        event_type: str | None = None,
         format: str = "jsonl",
     ) -> str:
         """#347: Export the mutation event log as JSONL or CSV.
 
         Principals-only read (enforced at the RPC dispatch layer, mirroring
         export_access_audit). Scope-filtered to the caller's user_scope.
-        No rotation — the full history is exportable.
+        No rotation — the full history is exportable via offset paging
+        (call with increasing ``offset`` until fewer than ``limit`` rows
+        are returned). Optional ``event_type`` filter mirrors
+        ``list_mutation_events``.
         """
-        events = self.list_mutation_events(limit=limit)
+        events = self.list_mutation_events(
+            limit=limit, offset=offset, event_type=event_type,
+        )
         if format == "csv":
             import csv
             import io

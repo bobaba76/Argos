@@ -1228,6 +1228,8 @@ class MemoryService:
                     )
             return store.export_mutation_events(
                 limit=int(args.get("limit", 10000)),
+                offset=int(args.get("offset", 0)),
+                event_type=args.get("event_type"),
                 format=args.get("format", "jsonl"),
             )
         if method == "list_mutation_events":

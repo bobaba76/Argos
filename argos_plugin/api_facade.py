@@ -1406,6 +1406,15 @@ class ArgosAPIFacade:
                 return cached
 
         # 6. Execute the operation through the store.
+        # #347: set the server-derived actor context on the store before
+        # any operation so mutation_events records the real principal.
+        # The store defaults to user_id/"human" for local paths; this
+        # override brings the facade's ACL-resolved identity.
+        try:
+            if hasattr(self._store, "set_actor_context"):
+                self._store.set_actor_context(ctx.principal, ctx.principal_type)
+        except (TypeError, AttributeError):
+            pass  # RPC proxy may not accept actor; _call_store stamps it
         try:
             if operation == "search":
                 result = self._op_search(ctx, validated)

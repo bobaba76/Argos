@@ -1488,6 +1488,15 @@ class StoreRetrievalMixin:
                         bool(excluded),
                     ],
                 )
+                # #347 round-2: denial events were previously copied into
+                # mutation_events, but denials scale with READ volume (every
+                # denied search), not mutation volume. mutation_events is
+                # append-only and never rotates — writing denials there would
+                # grow the permanent log unboundedly on a perm-fail path.
+                # Denials stay in access_audit (which rotates at 100k) for
+                # operational telemetry. The mutation_events log is reserved
+                # for committed store mutations (writes), not read-path
+                # access decisions.
         except Exception as exc:
             logger.warning("access_audit write failed: %s", exc)
 
@@ -1555,6 +1564,114 @@ class StoreRetrievalMixin:
         for row in rows:
             row_dict = dict(zip(columns, row))
             buf.write(json.dumps(row_dict) + "\n")
+        return buf.getvalue()
+
+    # -- #347: mutation_events read surface -----------------------------------
+
+    def list_mutation_events(
+        self,
+        *,
+        limit: int = 10000,
+        offset: int = 0,
+        event_type: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """#347: Paginated, scope-filtered read of mutation_events.
+
+        Returns rows newest-first, filtered to the caller's user_scope
+        (no cross-tenant leak). Optional event_type filter. No write
+        surface exists — events are written only at the mutation seam.
+        """
+        conditions = ["(user_scope IS NULL OR user_scope = ?)"]
+        params: list[Any] = [self.user_id]
+        if event_type:
+            conditions.append("event_type = ?")
+            params.append(event_type)
+        sql = (
+            "SELECT event_id, seq, ts, actor, actor_type, event_type, "
+            "entity_type, entity_key, content_hash, reason, refs, delta, "
+            "user_scope, namespace, client_scope "
+            "FROM mutation_events"
+        )
+        sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY ts DESC, seq DESC LIMIT ? OFFSET ?"
+        params.append(max(1, min(int(limit), 100000)))
+        params.append(max(0, int(offset)))
+        with self._state.lock:
+            assert self.connection is not None
+            rows = self.connection.execute(sql, params).fetchall()
+        result: List[Dict[str, Any]] = []
+        for r in rows:
+            entry: Dict[str, Any] = {
+                "event_id": r[0],
+                "seq": r[1],
+                "ts": r[2],
+                "actor": r[3],
+                "actor_type": r[4],
+                "event_type": r[5],
+                "entity_type": r[6],
+                "entity_key": r[7],
+                "content_hash": r[8],
+                "reason": r[9],
+                "user_scope": r[12],
+                "namespace": r[13],
+                "client_scope": r[14],
+            }
+            # Parse JSON columns for convenience.
+            if r[10]:
+                try:
+                    entry["refs"] = json.loads(r[10])
+                except (json.JSONDecodeError, TypeError):
+                    entry["refs"] = r[10]
+            else:
+                entry["refs"] = None
+            if r[11]:
+                try:
+                    entry["delta"] = json.loads(r[11])
+                except (json.JSONDecodeError, TypeError):
+                    entry["delta"] = r[11]
+            else:
+                entry["delta"] = None
+            result.append(entry)
+        return result
+
+    def export_mutation_events(
+        self,
+        *,
+        limit: int = 10000,
+        offset: int = 0,
+        event_type: str | None = None,
+        format: str = "jsonl",
+    ) -> str:
+        """#347: Export the mutation event log as JSONL or CSV.
+
+        Principals-only read (enforced at the RPC dispatch layer, mirroring
+        export_access_audit). Scope-filtered to the caller's user_scope.
+        No rotation — the full history is exportable via offset paging
+        (call with increasing ``offset`` until fewer than ``limit`` rows
+        are returned). Optional ``event_type`` filter mirrors
+        ``list_mutation_events``.
+        """
+        events = self.list_mutation_events(
+            limit=limit, offset=offset, event_type=event_type,
+        )
+        if format == "csv":
+            import csv
+            import io
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            if events:
+                writer.writerow(events[0].keys())
+                for entry in events:
+                    writer.writerow([
+                        json.dumps(v) if isinstance(v, (dict, list)) else v
+                        for v in entry.values()
+                    ])
+            return buf.getvalue()
+        # Default: JSONL
+        import io
+        buf = io.StringIO()
+        for entry in events:
+            buf.write(json.dumps(entry) + "\n")
         return buf.getvalue()
 
     # -- Spec-07 (#71): file catalog + watcher -------------------------------

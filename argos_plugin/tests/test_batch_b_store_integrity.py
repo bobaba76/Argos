@@ -166,28 +166,33 @@ class TestDeleteMemoryPromoteTransaction:
 
     def test_promote_path_wrapped_in_transaction(self):
         """Structural check: the delete_memory promote path must be wrapped
-        in BEGIN TRANSACTION / COMMIT / ROLLBACK (#77)."""
+        in _begin_transaction_if_needed / _commit_if_started /
+        _rollback_if_started (#77, #347 round-3: nestable pattern)."""
         import inspect
         from store_write import StoreWriteMixin
         source = inspect.getsource(StoreWriteMixin.delete_memory)
-        assert "BEGIN TRANSACTION" in source
-        assert "COMMIT" in source
-        assert "ROLLBACK" in source
+        assert "_begin_transaction_if_needed" in source
+        assert "_commit_if_started" in source
+        assert "_rollback_if_started" in source
         # The transaction must wrap the multi-statement promote path
         # (UPDATE + tombstone + DELETE), not the single-statement paths.
         pred_branch = source[source.index("if pred:"):source.index("return", source.index("if pred:"))]
-        assert "BEGIN TRANSACTION" in pred_branch
-        assert "ROLLBACK" in pred_branch
+        assert "_begin_transaction_if_needed" in pred_branch
+        assert "_rollback_if_started" in pred_branch
 
     def test_non_head_paths_not_transactional(self):
-        """Structural check: the quarantine and hard-delete paths are
-        single-statement and do not need transactions (#77)."""
+        """Structural check: the quarantine path is now wrapped in a
+        transaction (#347 round-3: UPDATE + event must be atomic). The
+        hard-delete path is also transactional. Both use _tx_begin/
+        _begin_transaction_if_needed."""
         import inspect
         from store_write import StoreWriteMixin
         source = inspect.getsource(StoreWriteMixin.delete_memory)
         non_head_idx = source.index("if not is_head:")
-        non_head_block = source[non_head_idx:non_head_idx + 300]
-        assert "BEGIN TRANSACTION" not in non_head_block
+        non_head_block = source[non_head_idx:non_head_idx + 1200]
+        # #347 round-3: quarantine path must be wrapped in a transaction.
+        assert "_begin_transaction_if_needed" in non_head_block
+        assert "_rollback_if_started" in non_head_block
 
 
 # ---------------------------------------------------------------------------

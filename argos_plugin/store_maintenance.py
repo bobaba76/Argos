@@ -1430,7 +1430,7 @@ class StoreMaintenanceMixin:
             })
             with self._state.lock:
                 assert self.connection is not None
-                self.connection.execute("BEGIN TRANSACTION")
+                _started = self._begin_transaction_if_needed()
                 try:
                     # Receipt FIRST (append-only log) — inside the same
                     # transaction as the deletion so the proof and the
@@ -1462,9 +1462,24 @@ class StoreMaintenanceMixin:
                         " AND (user_scope IS NULL OR user_scope = ?)",
                         [memory_id, self.user_id],
                     )
-                    self.connection.execute("COMMIT")
+                    # #347: record the erase event in the same transaction.
+                    self._record_event(
+                        event_type="memory_erased",
+                        entity_type="memory",
+                        entity_key=memory_id,
+                        content_hash=content_hash,
+                        reason=f"erase_request:{request_id}",
+                        refs={
+                            "receipt_id": receipt_id,
+                            "request_id": request_id,
+                            "subject": subject,
+                            "category": category,
+                            "requested_by": requested_by or self.user_id,
+                        },
+                    )
+                    self._commit_if_started(_started)
                 except Exception:
-                    self.connection.execute("ROLLBACK")
+                    self._rollback_if_started(_started)
                     raise
             entry["outcome"] = "erased"
             entry["receipt_id"] = receipt_id
@@ -1962,15 +1977,44 @@ class StoreMaintenanceMixin:
         if mode == "apply":
             with self._state.lock:
                 assert self.connection is not None
-                self.connection.execute("BEGIN TRANSACTION")
+                _started = self._begin_transaction_if_needed()
                 try:
                     for row in rows:
                         if row["type"] == "record" and _record_blocked(row["data"]):
                             continue
                         self._import_row(row["type"], row["data"])
-                    self.connection.execute("COMMIT")
+                        # #347: emit a mutation event for each imported row
+                        # so the import path is auditable like every other
+                        # write (#353: import boundary must not skip the
+                        # event seam).
+                        _rtype = row["type"]
+                        _data = row["data"]
+                        _event_type = {
+                            "record": "memory_created",
+                            "evidence": "memory_created",
+                            "tombstone": "memory_deleted",
+                            "receipt": "memory_erased",
+                            # #347 round-2: imported candidates were never
+                            # reviewed — map to candidate_created, not
+                            # candidate_reviewed. Imported rejections are
+                            # rejection ledger state, not review decisions —
+                            # map to rejection_imported (not candidate_rejected
+                            # which implies a review happened).
+                            "candidate": "candidate_created",
+                            "rejection": "rejection_imported",
+                            "alias": "memory_created",
+                        }.get(_rtype, "memory_created")
+                        _entity_key = _identity(_rtype, _data)
+                        self._record_event(
+                            event_type=_event_type,
+                            entity_type=_rtype,
+                            entity_key=_entity_key,
+                            reason=f"import_portable:{_rtype}",
+                            refs={"type": _rtype, "imported": True},
+                        )
+                    self._commit_if_started(_started)
                 except Exception:
-                    self.connection.execute("ROLLBACK")
+                    self._rollback_if_started(_started)
                     raise
 
         # Final counts from the per-row outcomes.

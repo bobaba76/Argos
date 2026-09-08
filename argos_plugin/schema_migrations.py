@@ -219,11 +219,80 @@ def _migration_3_to_4(conn) -> None:
     """)
 
 
+def _create_mutation_events_ddl(conn) -> None:
+    """#347: Shared DDL for the mutation_events table + indexes.
+
+    Called from both ``_migration_4_to_5`` (for pre-existing stores at v4)
+    and ``store_core._init_db`` (for fresh DBs that skip the migration
+    runner). Idempotent (CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT
+    EXISTS). Keeping the DDL in one place avoids drift between the two
+    creation paths (round-2 review: schema DDL duplicated).
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mutation_events (
+            event_id     VARCHAR PRIMARY KEY,
+            seq          BIGINT,
+            ts           VARCHAR,
+            actor        VARCHAR,
+            actor_type   VARCHAR,
+            event_type   VARCHAR,
+            entity_type  VARCHAR,
+            entity_key   VARCHAR,
+            content_hash VARCHAR,
+            reason       VARCHAR,
+            refs         JSON,
+            delta        JSON,
+            user_scope   VARCHAR,
+            namespace    VARCHAR,
+            client_scope VARCHAR
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_mutation_events_scope_ts
+        ON mutation_events (user_scope, ts)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_mutation_events_type_ts
+        ON mutation_events (event_type, ts)
+    """)
+
+
+def _migration_4_to_5(conn) -> None:
+    """#347: Append-only mutation_events — actor-attributed audit log.
+
+    Creates the ``mutation_events`` table: an append-only, never-rotated
+    log of every store mutation (create, approve, reject, update, delete,
+    tombstone, rejection, purge, erase, import). Each event is written in
+    the SAME transaction as the mutation it records.
+
+    Design (from the issue addendum):
+    - The ledgers (deletion_tombstones, rejection_ledger) STAY
+      ``INSERT OR REPLACE`` — one row per key is load-bearing for the
+      tombstone_check/rejection_check gates. mutation_events is where
+      the history lives.
+    - NEVER rotates — no startup purge, no cap. A capped provenance log
+      cannot backfill; the "showable history" claim dies at the cap.
+    - Actor is server-derived (facade ctx.principal + principal_type;
+      local paths user_id) — never a client-passed string.
+    - No raw content/PII: content_hash like the tombstone; query text
+      stays hashed (SC3 precedent).
+
+    The additive layer in store_core._init_db() also creates this table
+    via ``_create_mutation_events_ddl`` (for fresh DBs that skip the
+    migration runner). This migration exists for pre-existing stores at v4.
+
+    Idempotent (CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS)
+    and transactional via the runner.
+    """
+    _create_mutation_events_ddl(conn)
+
+
 MIGRATIONS: List[Migration] = [
     (0, 1, _migration_0_to_1),
     (1, 2, _migration_1_to_2),
     (2, 3, _migration_2_to_3),
     (3, 4, _migration_3_to_4),
+    (4, 5, _migration_4_to_5),
 ]
 
 # The latest schema version = the last migration's version_to.

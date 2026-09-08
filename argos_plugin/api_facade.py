@@ -51,6 +51,7 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 from access_scoping import ACLConfig
 from inbound_security import scan_inbound_text
+from liveness import record_subsystem_failure
 from store_common import VALID_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -2581,8 +2582,9 @@ class ArgosAPIFacade:
                     excluded=True,
                     tenant=ctx.tenant,
                 )
-            except Exception:
-                logger.debug(
-                    "durable access_audit write failed for denial %s",
-                    request_id, exc_info=True,
+            except Exception as exc:
+                logger.error(
+                    "durable access_audit write failed for denial %s: %s",
+                    request_id, exc, exc_info=True,
                 )
+                record_subsystem_failure("audit_write", exc)

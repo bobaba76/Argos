@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,77 @@ def increment_counter(feature: str, amount: int = 1) -> None:
         _counters.increment(feature, amount)
     except Exception:
         pass  # counter failure must never break the feature
+
+
+class SubsystemHealth:
+    """#330: last-failure health signals for fail-loud subsystems.
+
+    Audit writes/exports/purges and the graph WAL flush are fail-soft by
+    design (a dead sink must not break the caller), which makes their
+    failures invisible. Every such failure is recorded here so a dead
+    audit sink is detectable via ``status()``; a subsequent success
+    clears the signal.
+    """
+
+    def __init__(self) -> None:
+        self._failures: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def record_failure(self, subsystem: str, error: BaseException | str) -> None:
+        """Record a failure for *subsystem* (keeps count + last error)."""
+        with self._lock:
+            entry = self._failures.get(subsystem)
+            if entry is None:
+                entry = {"failures": 0, "last_error": "", "last_failure_ts": 0.0}
+                self._failures[subsystem] = entry
+            entry["failures"] += 1
+            entry["last_error"] = str(error)[:500]
+            entry["last_failure_ts"] = time.time()
+
+    def record_ok(self, subsystem: str) -> None:
+        """Clear the failure signal for *subsystem* after a success."""
+        with self._lock:
+            self._failures.pop(subsystem, None)
+
+    def degraded(self) -> list[str]:
+        """Subsystems whose most recent outcome was a failure."""
+        with self._lock:
+            return sorted(self._failures)
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Read all recorded failures as a dict (sorted by subsystem)."""
+        with self._lock:
+            return {k: dict(v) for k, v in sorted(self._failures.items())}
+
+    def reset(self) -> None:
+        """Drop all recorded failures (for testing)."""
+        with self._lock:
+            self._failures.clear()
+
+
+# Module-level singleton — shared across the provider lifecycle.
+_health = SubsystemHealth()
+
+
+def get_health() -> SubsystemHealth:
+    """Get the module-level SubsystemHealth singleton."""
+    return _health
+
+
+def record_subsystem_failure(subsystem: str, error: BaseException | str) -> None:
+    """Record a fail-loud subsystem failure. Never raises."""
+    try:
+        _health.record_failure(subsystem, error)
+    except Exception:
+        pass  # health bookkeeping must never break the caller
+
+
+def record_subsystem_ok(subsystem: str) -> None:
+    """Clear a fail-loud subsystem's failure signal. Never raises."""
+    try:
+        _health.record_ok(subsystem)
+    except Exception:
+        pass
 
 
 def config_fingerprint(config: Any) -> str:
@@ -355,6 +427,8 @@ def status() -> Dict[str, Any]:
 
     Returns a dict with:
     - feature_counters: per-feature hit counters
+    - subsystem_health: last-failure detail per fail-loud subsystem (#330)
+    - degraded_subsystems: names of subsystems whose last outcome failed
 
     Note: config_fingerprint and self_test_results are exposed on the
     provider's status() method (provider_core.py), not here, because
@@ -363,4 +437,6 @@ def status() -> Dict[str, Any]:
     """
     return {
         "feature_counters": _counters.snapshot(),
+        "subsystem_health": _health.snapshot(),
+        "degraded_subsystems": _health.degraded(),
     }

@@ -36,6 +36,13 @@ try:
 except ImportError:  # store_retrieval.py imported as a top-level module
     from retriever import DuckDBRetriever
 
+# #330: audit paths stay fail-soft but must not be silent — a failure is
+# logged at ERROR and recorded on the liveness health surface.
+try:
+    from .liveness import record_subsystem_failure, record_subsystem_ok
+except ImportError:  # store_retrieval.py imported as a top-level module
+    from liveness import record_subsystem_failure, record_subsystem_ok
+
 # #248: tuning constants consolidated in tuning.py
 try:
     from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K
@@ -1436,7 +1443,7 @@ class StoreRetrievalMixin:
                             return result[0], "semantic"
                     except Exception as exc:
                         if not self._is_vector_search_unavailable(exc):
-                            logger.debug("Semantic dedup check failed: %s", exc)
+                            logger.warning("Semantic dedup check failed: %s", exc)
             return None, None
 
     # -- Spec-06 (#69): access audit log -------------------------------------
@@ -1497,8 +1504,10 @@ class StoreRetrievalMixin:
                 # operational telemetry. The mutation_events log is reserved
                 # for committed store mutations (writes), not read-path
                 # access decisions.
+            record_subsystem_ok("audit_write")
         except Exception as exc:
-            logger.warning("access_audit write failed: %s", exc)
+            logger.error("access_audit write failed: %s", exc, exc_info=True)
+            record_subsystem_failure("audit_write", exc)
 
     def export_access_audit(
         self,
@@ -1530,8 +1539,10 @@ class StoreRetrievalMixin:
                 columns = [desc[0] for desc in result.description]
                 rows = result.fetchall()
         except Exception as exc:
-            logger.warning("access_audit export failed: %s", exc)
+            logger.error("access_audit export failed: %s", exc, exc_info=True)
+            record_subsystem_failure("audit_export", exc)
             return ""
+        record_subsystem_ok("audit_export")
         # SR12: hash query_text in the export to avoid leaking sensitive
         # user queries. The hash is sufficient for audit correlation
         # (matching repeated queries) without exposing the raw text.

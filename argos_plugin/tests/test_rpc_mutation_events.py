@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,13 @@ for _path in (_plugin_dir.parent, _plugin_dir):
 
 # Group with other shared-service tests so xdist serializes the spawns.
 pytestmark = pytest.mark.xdist_group("shared_service")
+
+# Live-mode tests spawn a real shared memory service subprocess. They only
+# run under ARGOS_HERMETIC_TESTS=1 (CI / hermetic gate) so they don't hang
+# against a real local service on the same port (round-3 review: green-in-CI-
+# but-red-against-a-real-service). Structural tests run everywhere.
+_HERMETIC = os.environ.get("ARGOS_HERMETIC_TESTS", "").strip().lower() in {"1", "true", "yes"}
+_live_only = pytest.mark.skipif(not _HERMETIC, reason="requires ARGOS_HERMETIC_TESTS=1")
 
 
 class TestProxySignatures:
@@ -127,8 +135,13 @@ def _make_store(tmp_path, user_id="test_user"):
     return SharedMemoryStore(tmp_path, user_id=user_id, embedder=None)
 
 
+@_live_only
 class TestMutationEventsRpcEndToEnd:
-    """(5) Live-mode: mutation events appear via the RPC proxy."""
+    """(5) Live-mode: mutation events appear via the RPC proxy.
+
+    Skipped unless ARGOS_HERMETIC_TESTS=1 — these spawn a real shared
+    memory service subprocess and hang against a live local service on
+    the same port (round-3 review: test-hygiene fix)."""
 
     def test_remember_creates_event_via_rpc(self, tmp_path):
         """A remember() through SharedMemoryStore creates a memory_created

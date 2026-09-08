@@ -1989,8 +1989,8 @@ class ArgosAPIFacade:
         try:
             if hasattr(self._store, "set_user_scope"):
                 self._store.set_user_scope(ctx.user_id)
-            # Use list_memories if available (store_maintenance mixin);
-            # fall back to list_recent for SharedMemoryStore.
+            # Use list_memories if available (store_maintenance mixin and
+            # SharedMemoryStore); fall back to list_recent otherwise.
             category = params.get("category")
             limit = params["limit"]
             if hasattr(self._store, "list_memories"):
@@ -2011,8 +2011,7 @@ class ArgosAPIFacade:
             # doesn't accept namespace — the store's user_scope already
             # scopes to the caller).
             if params.get("namespace"):
-                rec_ns = item.get("namespace")
-                if rec_ns is not None and rec_ns != params["namespace"]:
+                if item.get("namespace") != params["namespace"]:
                     continue
             items.append({
                 "memory_id": item.get("memory_id"),
@@ -2149,9 +2148,9 @@ class ArgosAPIFacade:
         finally:
             if _scope_before is not None and hasattr(self._store, "set_user_scope"):
                 self._store.set_user_scope(_scope_before)
-        # Return the export metadata + counts; the jsonl/markdown are
-        # available for download but not included in the summary to
-        # keep the response bounded.
+        # Return the export metadata + counts alongside the full jsonl/
+        # markdown payloads (callers such as the admin console truncate
+        # for display only).
         header = result.get("header", {})
         return {
             "header": header,

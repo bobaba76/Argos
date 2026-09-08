@@ -1162,6 +1162,14 @@ class MemoryService:
                     limit=int(args.get("limit", 100)),
                 )
             ]
+        if method == "list_memories":
+            return [
+                _record_to_dict(record)
+                for record in store.list_memories(
+                    category=args.get("category"),
+                    limit=int(args.get("limit", 100)),
+                )
+            ]
         if method == "get_insights":
             return [
                 _record_to_dict(record)

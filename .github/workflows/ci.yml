@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -33,16 +35,28 @@ jobs:
         id: changed
         run: |
           # Base SHA for the diff: PR base for PRs, previous commit for pushes.
-          # Fall back to HEAD~1 if github.event.before is empty (e.g. first push
-          # to a branch or API-triggered runs).
+          # #368: the old fallback (HEAD~1 only) resolved empty on PR pushes
+          # where the base ref isn't present at checkout, or on the first
+          # commit of a new branch → "No base SHA available — skipping
+          # pytest (smoke only)" → the green badge was vacuous (the PR's own
+          # tests never ran). Fix: resolve a real merge-base against master
+          # before falling back to HEAD~1, and fail-closed if still empty.
+          # Ensure origin/master is present (fetch-depth: 0 above covers PR
+          # history, but master itself may not be in the shallow clone).
+          git fetch origin master --depth=1 2>/dev/null || true
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ]; then
+            BASE="$(git merge-base HEAD origin/master 2>/dev/null || echo '')"
+          fi
           if [ -z "$BASE" ]; then
             BASE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
           fi
           if [ -z "$BASE" ]; then
-            echo "No base SHA available — skipping pytest (smoke only)."
-            echo "TESTS=" >> "$GITHUB_ENV"
-            exit 0
+            # #368: fail-closed. An empty base must never masquerade as a
+            # green smoke-only run — the PR's tests would be silently
+            # skipped. Fail loudly instead.
+            echo "::error::Could not resolve a base SHA for change-scoped test selection (PR base, merge-base, and HEAD~1 all empty). Refusing to run smoke-only as a vacuously green pass."
+            exit 1
           fi
           # Changed test files (excluding known-env-dependent ones)
           TESTS=$(git diff --name-only "$BASE" HEAD -- argos_plugin/tests/ | grep '\\.py$' || true)
@@ -57,6 +71,7 @@ jobs:
           # env-broken failures). Empty must be truly empty.
           TESTS=$(echo "$TESTS" | xargs)
           echo "TESTS=$TESTS" >> "$GITHUB_ENV"
+          echo "Base: $BASE"
           echo "Running: ${TESTS:-<none - smoke only>}"
 
       - name: Run relevant tests
@@ -116,14 +131,20 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          # #368: same base-SHA resolution fix as the test job. Ensure
+          # origin/master is fetched (checkout has fetch-depth: 0 but
+          # master may not be in the clone for push events).
+          git fetch origin master --depth=1 2>/dev/null || true
           BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ]; then
+            BASE="$(git merge-base HEAD origin/master 2>/dev/null || echo '')"
+          fi
           if [ -z "$BASE" ]; then
             BASE="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
           fi
           if [ -z "$BASE" ]; then
-            echo "No base SHA — skipping tier 1."
-            echo "RUN=false" >> "$GITHUB_ENV"
-            exit 0
+            echo "::error::Could not resolve a base SHA for tier-1 trigger detection (PR base, merge-base, and HEAD~1 all empty)."
+            exit 1
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD || true)
           # The trigger list is the checked-in ci_retrieval_paths.txt —

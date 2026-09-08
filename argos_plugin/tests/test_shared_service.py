@@ -309,3 +309,30 @@ def test_shared_service_explain_retrieval_rpc(tmp_path):
             store._rpc.stop_service()
         finally:
             time.sleep(0.5)
+
+
+def test_shared_service_list_memories_category_filter_rpc(tmp_path):
+    """#339: the admin-console browse category filter must work on the
+    live path: SharedMemoryStore.list_memories -> dispatch -> store."""
+    from service_client import SharedMemoryStore
+
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        encoding="utf-8",
+    )
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        assert store.remember(category="preference", content="Prefers dark mode") is not None
+        assert store.remember(category="personal_fact", content="Lives in Cape Town") is not None
+
+        prefs = store.list_memories(category="preference", limit=10)
+        assert [r.content for r in prefs] == ["Prefers dark mode"]
+        assert all(r.category == "preference" for r in prefs)
+
+        everything = store.list_memories(limit=10)
+        assert {r.content for r in everything} == {"Prefers dark mode", "Lives in Cape Town"}
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)

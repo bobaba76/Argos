@@ -205,6 +205,7 @@ class StubStore:
             similarity=0.9,
             status="active",
             scope=kwargs.get("scope", "profile"),
+            namespace=kwargs.get("namespace", "conversation"),
         )
         self._memories[mid] = rec
         return rec
@@ -366,6 +367,30 @@ class TestBrowse:
         r = client.get("/browse", headers=_auth_headers())
         assert r.status_code == 200
         assert "No memories found" in r.text
+
+    def test_browse_namespace_filter_excludes_null_namespace(self):
+        """#339: a namespace filter must not match NULL-namespace records."""
+        store = StubStore()
+        store.remember(content="in project", namespace="project_x")
+        store.remember(content="other namespace", namespace="conversation")
+        store.remember(content="no namespace", namespace=None)
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        ctx = AuthContext(
+            principal="test", tenant="default", user_id="default_user",
+            transport="test", allowed_operations=READ_OPERATIONS,
+        )
+        result = facade.execute(
+            ctx, "browse", {"limit": 10, "namespace": "project_x"},
+        )
+        assert [r["content"] for r in result["results"]] == ["in project"]
+        assert result["count"] == 1
+
+    def test_shared_memory_store_exposes_list_memories(self):
+        """#339: the live store-client path must support the category
+        filter the browse UI renders, so StubStore and SharedMemoryStore
+        cannot diverge on this method."""
+        from service_client import SharedMemoryStore
+        assert callable(getattr(SharedMemoryStore, "list_memories", None))
 
 
 # ---------------------------------------------------------------------------

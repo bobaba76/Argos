@@ -904,6 +904,16 @@ class SharedMemoryStore:
             for value in (self._rpc.call("store", "list_recent", limit=limit) or [])
         ]
 
+    def list_memories(
+        self, category: str | None = None, limit: int = 100
+    ) -> List[MemoryRecord]:
+        return [
+            _record_from_dict(value)
+            for value in (self._rpc.call(
+                "store", "list_memories", category=category, limit=limit,
+            ) or [])
+        ]
+
     def get_insights(
         self,
         tags: List[str] | None = None,

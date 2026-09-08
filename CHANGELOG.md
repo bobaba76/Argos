@@ -22,7 +22,7 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 
 ### Removed
 
-- **Dead config knobs** (#359): `backup_enabled`, `backup_dst_root`, `backup_retention_snapshots` and `router_default_provider` were advertised in `config_schema.py` / `CONFIG_REFERENCE.md` but read by zero code (backup uses the nested `backup` dict; the router only reads `router_default_model`). Removed from schema, model, docs and parity tests. Any of these keys left in a live `hybrid_memory.json` are harmless (ignored) and can be deleted at leisure.
+- **Dead config knobs** (#359): `backup_enabled`, `backup_dst_root`, `backup_retention_snapshots` and `router_default_provider` were advertised in `config_schema.py` / `CONFIG_REFERENCE.md` but read by zero code (backup uses the nested `backup` dict; the router only reads `router_default_model`). Removed from schema, model, docs and parity tests. Any of these keys left in a live `hybrid_memory.json` are harmless — the production load paths (`provider_core._load_config`, `memory_service._load_config`) filter unknown keys before validation — and can be deleted at leisure.
 
 ### Fixed
 

@@ -347,9 +347,14 @@ class IdempotencyRegistry:
         """
         if not key:
             return False, None
+        # #332: partition by principal so two principals using the same
+        # idempotency key cannot collide (cross-tenant replay or false
+        # conflict). The principal is server-derived (AuthContext), not
+        # client-supplied.
+        cache_key = f"{principal}:{key}" if principal else key
         with self._lock:
             self._evict_expired()
-            existing = self._entries.get(key)
+            existing = self._entries.get(cache_key)
             if existing is None:
                 return False, None
             if existing["request_hash"] != request_hash:
@@ -372,9 +377,11 @@ class IdempotencyRegistry:
         """Record a completed mutation for idempotency replay."""
         if not key:
             return
+        # #332: partition by principal (mirrors check()).
+        cache_key = f"{principal}:{key}" if principal else key
         with self._lock:
             self._evict_expired()
-            self._entries[key] = {
+            self._entries[cache_key] = {
                 "key": key,
                 "principal": principal,
                 "operation": operation,

@@ -1546,6 +1546,98 @@ class KuzuGraphStore:
             self._flush()
         return changed
 
+    def purge_orphan_memory(self, memory_id: str) -> bool:
+        """#376: HARD-delete one orphaned memory node + its graph evidence.
+
+        Unlike :meth:`remove_memory` (which quarantines — the memory still
+        exists in DuckDB), this removes the ``memory:<id>`` node and any
+        edges that exist only because of it. Callers MUST verify the
+        memory_id is truly absent from DuckDB (any state) before invoking
+        this — it is an irreversible graph-only deletion.
+
+        Edge handling:
+        - Edges where the memory node is an endpoint are deleted outright.
+        - Edges between shared entities whose ``memory_ids`` list references
+          this memory get the id stripped; an edge with no remaining
+          evidence is deleted. Shared entity nodes are never deleted.
+        """
+        if not memory_id:
+            return False
+        memory_id = str(memory_id)
+        memory_node = self._internal_id(f"memory:{memory_id}")
+        changed = False
+        with self._shared_conn_lock:
+            # 1. Edges with the memory node as an endpoint → delete outright.
+            self.conn.execute(
+                """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+                   WHERE a.id = $memory_node OR b.id = $memory_node
+                   DELETE r""",
+                parameters={"memory_node": memory_node},
+            )
+            # 2. Edges referencing this memory in memory_ids → strip the
+            #    id; delete the edge if no evidence remains.
+            result = self.conn.execute(
+                """MATCH (a:Entity)-[r:RelatesTo]->(b:Entity)
+                   WHERE list_contains(r.memory_ids, $mid)
+                      OR (r.memory_ids IS NULL
+                         AND CONTAINS(r.attributes, $midq))
+                   RETURN a.id, r.relation_type, b.id, r.attributes""",
+                parameters={"mid": memory_id, "midq": '"' + memory_id + '"'},
+            )
+            edges = []
+            while result.has_next():
+                edges.append(result.get_next())
+            for source, relation, target, raw_attrs in edges:
+                try:
+                    attrs = json.loads(raw_attrs) if raw_attrs else {}
+                except Exception:
+                    attrs = {}
+                memory_ids = attrs.get("memory_ids", [])
+                if not isinstance(memory_ids, list):
+                    memory_ids = [memory_ids] if memory_ids else []
+                if not memory_ids and attrs.get("memory_id"):
+                    memory_ids = [str(attrs["memory_id"])]
+                if memory_id not in {str(item) for item in memory_ids}:
+                    continue
+                remaining = [item for item in memory_ids if str(item) != memory_id]
+                if remaining:
+                    attrs["memory_ids"] = remaining
+                    if str(attrs.get("memory_id")) == memory_id:
+                        attrs.pop("memory_id", None)
+                    self.conn.execute(
+                        """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
+                           WHERE r.relation_type = $relation
+                           SET r.attributes = $attrs, r.memory_ids = $mids""",
+                        parameters={
+                            "source": source, "target": target,
+                            "relation": relation, "attrs": json.dumps(attrs),
+                            "mids": remaining,
+                        },
+                    )
+                else:
+                    self.conn.execute(
+                        """MATCH (a:Entity {id: $source})-[r:RelatesTo]->(b:Entity {id: $target})
+                           WHERE r.relation_type = $relation
+                           DELETE r""",
+                        parameters={"source": source, "target": target,
+                                    "relation": relation},
+                    )
+                changed = True
+            # 3. Delete the memory node itself.
+            result = self.conn.execute(
+                "MATCH (n:Entity {id: $id}) RETURN n.id",
+                parameters={"id": memory_node},
+            )
+            if result.has_next():
+                self.conn.execute(
+                    "MATCH (n:Entity {id: $id}) DELETE n",
+                    parameters={"id": memory_node},
+                )
+                changed = True
+        if changed:
+            self._flush()
+        return changed
+
     # -- read operations ------------------------------------------------------
 
     @staticmethod

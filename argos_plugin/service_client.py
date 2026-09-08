@@ -1148,6 +1148,15 @@ class SharedGraphStore:
     def remove_memory(self, memory_id: str) -> bool:
         return bool(self._rpc.call("graph", "remove_memory", memory_id=memory_id))
 
+    def purge_orphan_memory(self, memory_id: str) -> bool:
+        """#376: HARD-delete one orphaned memory node + its graph evidence.
+
+        Graph-only, irreversible. Callers MUST verify the memory_id is
+        truly absent from DuckDB (any state) before calling — the
+        service does not re-check.
+        """
+        return bool(self._rpc.call("graph", "purge_orphan_memory", memory_id=memory_id))
+
     def quarantine_junk_entities(self) -> int:
         return int(self._rpc.call("graph", "quarantine_junk_entities") or 0)
 

@@ -1446,6 +1446,10 @@ class MemoryService:
         if method == "remove_memory":
             # MS9: strip server-set fields from client args.
             return graph.remove_memory(**_sanitize_args(args))
+        if method == "purge_orphan_memory":
+            # #376: hard-delete a memory node that is truly absent from
+            # DuckDB (caller-verified). Graph-only, irreversible.
+            return graph.purge_orphan_memory(**_sanitize_args(args))
         if method == "quarantine_junk_entities":
             return graph.quarantine_junk_entities()
         if method == "clear_scope":

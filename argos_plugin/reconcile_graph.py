@@ -223,9 +223,9 @@ def main() -> int:
             for mid in result["extra_in_graph"]:
                 print(f"  - {mid}")
             print()
-            print("To fix: these memories were deleted from DuckDB but still")
-            print("have graph nodes. Run backfill_graph.py or manually remove")
-            print("orphaned graph entries.")
+            print("To fix: run backfill_graph.py --prune-orphans to remove")
+            print("orphaned graph nodes (memory_id absent from DuckDB in any state).")
+            print("Use --dry-run first to list what would be deleted.")
         if not result["drift"]:
             print("No drift detected. DuckDB and graph are in sync.")
 

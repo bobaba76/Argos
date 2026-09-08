@@ -189,3 +189,170 @@ class TestReconcileOutputFormat:
         result = reconcile(store, graph, sample_size=3)
         assert result["missing_in_graph_count"] >= 5
         assert len(result["missing_in_graph"]) <= 3
+
+
+# ---------------------------------------------------------------------------
+# #376: --prune-orphans — remove graph nodes with no DuckDB record
+# ---------------------------------------------------------------------------
+
+def _index(store, graph, rec):
+    graph.index_memory(
+        memory_id=rec.memory_id,
+        category=rec.category,
+        content=rec.content,
+        tags=rec.tags or [],
+        created_at=rec.created_at,
+        use_llm=False,
+        flush=True,
+    )
+
+
+class TestPurgeOrphanMemory:
+    """Graph-level hard delete of a memory node + its evidence."""
+
+    def test_purge_removes_node_and_edges(self, store, graph):
+        """purge_orphan_memory removes the memory: node and edges touching
+        it; shared entity nodes survive."""
+        from backfill_graph import _graph_memory_ids
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Alice works at Acme Corp in Johannesburg",
+        )
+        _index(store, graph, rec)
+        assert rec.memory_id in _graph_memory_ids(graph)
+        # Purge the orphan node.
+        assert graph.purge_orphan_memory(rec.memory_id) is True
+        assert rec.memory_id not in _graph_memory_ids(graph)
+        # Shared entities remain (nodes that are not memory: nodes).
+        nodes = graph.list_nodes(limit=1000)
+        ids = [n["id"] for n in nodes]
+        assert not any(i.startswith("memory:") for i in ids)
+
+    def test_purge_unknown_id_returns_false(self, graph):
+        """Purge of a non-existent node is a no-op."""
+        assert graph.purge_orphan_memory("no-such-memory") is False
+
+
+class TestFindOrphans:
+    """Orphan detection cross-checks DuckDB in ANY state."""
+
+    def test_hard_deleted_memory_is_orphan(self, store, graph):
+        """A memory whose row was hard-deleted (head, no predecessor) is
+        an orphan — its memory_id is absent from DuckDB."""
+        from backfill_graph import _find_orphans
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Bob lives in Cape Town",
+        )
+        _index(store, graph, rec)
+        # Hard delete: head with no predecessor → tombstone + row DELETE.
+        store.delete_memory(rec.memory_id)
+        orphans = _find_orphans(store, [rec.memory_id])
+        assert rec.memory_id in orphans
+
+    def test_quarantined_memory_not_orphan(self, store, graph):
+        """A memory whose row still exists (quarantined non-head version)
+        is NOT an orphan — never prune a node whose base record exists in
+        any DuckDB state (acceptance criterion 3)."""
+        from backfill_graph import _find_orphans
+
+        rec1 = store.remember(
+            category="personal_fact",
+            content="Carol lives in Durban",
+        )
+        store.update_memory(rec1.memory_id, content="Carol lives in Durban now")
+        # rec1 is now a non-head version; deleting it quarantines the row
+        # (reversible — the row stays in DuckDB).
+        store.delete_memory(rec1.memory_id)
+        _index(store, graph, rec1)
+        orphans = _find_orphans(store, [rec1.memory_id])
+        assert rec1.memory_id not in orphans
+
+    def test_active_memory_not_orphan(self, store, graph):
+        """An active memory is never an orphan."""
+        from backfill_graph import _find_orphans
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Dan prefers tea over coffee",
+        )
+        _index(store, graph, rec)
+        orphans = _find_orphans(store, [rec.memory_id])
+        assert rec.memory_id not in orphans
+
+
+class TestPruneOrphansCli:
+    """prune_orphans dry-run / run semantics (backfill_graph #376)."""
+
+    def test_dry_run_lists_without_deleting(self, store, graph):
+        """--prune-orphans --dry-run reports orphans but deletes nothing."""
+        from backfill_graph import prune_orphans
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Eve works at Globex in Nairobi",
+        )
+        _index(store, graph, rec)
+        store.delete_memory(rec.memory_id)  # hard delete → orphan
+        summary = prune_orphans(store, graph, dry_run=True)
+        assert summary["orphans"] >= 1
+        assert summary["removed"] == 0
+        assert summary["errors"] == 0
+        # Node still present (dry run must not delete).
+        from backfill_graph import _graph_memory_ids
+        assert rec.memory_id in _graph_memory_ids(graph)
+
+    def test_run_removes_orphans(self, store, graph):
+        """A non-dry-run prune removes the orphaned nodes."""
+        from backfill_graph import prune_orphans, _graph_memory_ids
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Frank lives in Accra",
+        )
+        _index(store, graph, rec)
+        store.delete_memory(rec.memory_id)  # hard delete → orphan
+        summary = prune_orphans(store, graph, dry_run=False)
+        assert summary["orphans"] >= 1
+        assert summary["removed"] >= 1
+        assert rec.memory_id not in _graph_memory_ids(graph)
+
+    def test_no_orphans_nothing_removed(self, store, graph):
+        """A synced store has zero orphans to prune."""
+        from backfill_graph import prune_orphans
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Grace lives in Lagos",
+        )
+        _index(store, graph, rec)
+        summary = prune_orphans(store, graph, dry_run=False)
+        assert summary["orphans"] == 0
+        assert summary["removed"] == 0
+
+    def test_prune_then_reconcile_clean(self, store, graph):
+        """After prune, the reconcile probe reports 0 drift (acceptance 1/4)."""
+        from backfill_graph import prune_orphans
+        from reconcile_graph import reconcile
+
+        keep = store.remember(
+            category="personal_fact",
+            content="Hank works at Initech in Boston",
+        )
+        drop = store.remember(
+            category="personal_fact",
+            content="Iris lives in Seattle",
+        )
+        _index(store, graph, keep)
+        _index(store, graph, drop)
+        # Hard-delete Iris from DuckDB, leaving an orphan graph node.
+        store.delete_memory(drop.memory_id)
+        result = reconcile(store, graph, sample_size=10)
+        assert result["extra_in_graph_count"] >= 1
+        # Prune orphans → drift gone.
+        prune_orphans(store, graph, dry_run=False)
+        result = reconcile(store, graph, sample_size=10)
+        assert result["drift"] is False
+        assert result["extra_in_graph_count"] == 0

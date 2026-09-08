@@ -504,6 +504,16 @@ class SharedMemoryStore:
         self.user_id = user_id
         self._rpc.user_id = user_id
 
+    def get_subsystem_health(self) -> dict:
+        """#330: Read fail-loud subsystem health from the shared service.
+
+        Delegates to ``_SharedRPC.get_subsystem_health`` so
+        ``provider_core.status()`` can relay the subprocess's health
+        signals in shared_service mode (where audit writes/purges and
+        the graph WAL flush actually execute).
+        """
+        return self._rpc.get_subsystem_health()
+
     def search(
             self,
             query: str,
@@ -1069,6 +1079,15 @@ class SharedGraphStore:
         """Set the scope for the CURRENT thread only (#20, see SharedMemoryStore)."""
         self.user_id = user_id
         self._rpc.user_id = user_id
+
+    def get_subsystem_health(self) -> dict:
+        """#330: Read fail-loud subsystem health from the shared service.
+
+        Delegates to ``_SharedRPC.get_subsystem_health`` so
+        ``provider_core.status()`` can relay the subprocess's health
+        signals in shared_service mode.
+        """
+        return self._rpc.get_subsystem_health()
 
     def search_graph(
         self, term: str, limit: int = 100, as_of: str | None = None,

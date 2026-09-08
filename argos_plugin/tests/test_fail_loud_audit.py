@@ -219,6 +219,45 @@ class TestProviderStatusSurface:
         s = ProviderCoreMixin.status(object())
         assert s["degraded_subsystems"] == ["audit_write"]
 
+    def test_shared_memory_store_delegates_health(self):
+        """#330 B1 round-4: SharedMemoryStore.get_subsystem_health
+        delegates to _SharedRPC.get_subsystem_health (the real class
+        shape, not just a stub). Verifies the method exists and forwards
+        to self._rpc."""
+        from service_client import SharedMemoryStore
+        # The method must exist on the real class.
+        assert hasattr(SharedMemoryStore, "get_subsystem_health")
+        # Verify it delegates to self._rpc.get_subsystem_health by
+        # constructing an instance with a stubbed _rpc.
+        class _StubRPC:
+            def get_subsystem_health(self):
+                return {
+                    "subsystem_health": {"audit_write": {"failures": 1}},
+                    "degraded_subsystems": ["audit_write"],
+                }
+        store = SharedMemoryStore.__new__(SharedMemoryStore)
+        store._rpc = _StubRPC()
+        result = store.get_subsystem_health()
+        assert result["degraded_subsystems"] == ["audit_write"]
+        assert "audit_write" in result["subsystem_health"]
+
+    def test_shared_graph_store_delegates_health(self):
+        """#330 B1 round-4: SharedGraphStore.get_subsystem_health
+        delegates to _SharedRPC.get_subsystem_health."""
+        from service_client import SharedGraphStore
+        assert hasattr(SharedGraphStore, "get_subsystem_health")
+        class _StubRPC:
+            def get_subsystem_health(self):
+                return {
+                    "subsystem_health": {"graph_wal_flush": {"failures": 2}},
+                    "degraded_subsystems": ["graph_wal_flush"],
+                }
+        store = SharedGraphStore.__new__(SharedGraphStore)
+        store._rpc = _StubRPC()
+        result = store.get_subsystem_health()
+        assert result["degraded_subsystems"] == ["graph_wal_flush"]
+        assert "graph_wal_flush" in result["subsystem_health"]
+
 
 class TestDedupFailureCounter:
     """#330 W3: semantic-dedup swallow site increments a counter (spec

@@ -38,8 +38,8 @@ except ImportError:  # store_retrieval.py imported as a top-level module
 
 # #330: audit paths stay fail-soft but must not be silent — a failure is
 # logged at ERROR and recorded on the liveness health surface.
-# Import through the global `liveness` name (same spelling as store_common/
-# store_state and the test fixtures) so one canonical module drives the
+# Import liveness at the top level (consistent with api_facade.py's
+# top-level access_scoping import) so one canonical module drives the
 # health singleton across every import layout — package vs top-level.
 from liveness import record_subsystem_failure, record_subsystem_ok
 

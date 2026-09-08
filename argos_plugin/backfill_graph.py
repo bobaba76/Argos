@@ -83,7 +83,9 @@ def _graph_memory_ids(graph: Any) -> List[str]:
     return ids
 
 
-def _find_orphans(store: Any, graph_memory_ids: List[str]) -> List[str]:
+def _find_orphans(
+    store: Any, graph_memory_ids: List[str],
+) -> tuple[List[str], int]:
     """Find graph memory_ids with no DuckDB record in ANY state.
 
     Cross-check strategy (#376): a memory_id is preserved if it exists
@@ -94,10 +96,26 @@ def _find_orphans(store: Any, graph_memory_ids: List[str]) -> List[str]:
     being declared an orphan. Tombstoned memories are keyed by
     content_hash, not memory_id — their memory_id no longer exists in
     DuckDB at all, so a graph node for it is genuinely orphaned.
+
+    Fail-closed (#378 review fix): a verification exception is treated
+    as UNKNOWN, not absent. The id is skipped and counted as a
+    detection error; it is retried on the next run by the daily
+    drift-watch. Only a confirmed-empty history ([] returned normally)
+    may declare an orphan. A bulk-chunk failure skips every id in that
+    chunk (counted as detection errors) — they are NOT sent down the
+    per-id path, because if the bulk check is failing the per-id
+    confirmations will likely fail too.
+
+    Returns ``(orphans, detection_errors)``.
     """
     orphans: List[str] = []
-    # Bulk check in chunks (one RPC per chunk).
+    detection_errors = 0
+    # Bulk check in chunks (one RPC per chunk). A failed chunk's ids are
+    # skipped entirely (counted as detection errors) — they are NOT sent
+    # down the per-id path, because if the bulk check is failing the
+    # per-id confirmations will likely fail too.
     found: Set[str] = set()
+    skipped_ids: Set[str] = set()
     chunk_size = 100
     for i in range(0, len(graph_memory_ids), chunk_size):
         chunk = graph_memory_ids[i:i + chunk_size]
@@ -110,18 +128,26 @@ def _find_orphans(store: Any, graph_memory_ids: List[str]) -> List[str]:
                     found.add(str(rec.memory_id))
         except Exception as e:
             print(f"ERROR: bulk existence check failed for {len(chunk)} ids: {e}")
+            for mid in chunk:
+                skipped_ids.add(mid)
+                detection_errors += 1
     # Confirm each not-found id per-id (covers expired/edge cases the
-    # bulk check filters out).
+    # bulk check filters out). Ids from a failed chunk are skipped —
+    # never declared orphans on an exception.
     for mid in graph_memory_ids:
-        if mid in found:
+        if mid in found or mid in skipped_ids:
             continue
         try:
             history = store.get_memory_history(mid)
-        except Exception:
-            history = None
+        except Exception as e:
+            # Fail-closed: an exception is UNKNOWN, not absent. Skip
+            # the id; it will be retried on the next run.
+            print(f"WARNING: could not verify {mid}: {e}")
+            detection_errors += 1
+            continue
         if not history:
             orphans.append(mid)
-    return orphans
+    return orphans, detection_errors
 
 
 def prune_orphans(
@@ -134,23 +160,43 @@ def prune_orphans(
 
     Only `memory:` nodes are candidates; shared entity nodes and
     non-memory system nodes are never touched. Returns a summary dict
-    with orphans/removed/skipped/errors counts.
+    with orphans/removed/skipped/errors/detection_errors counts.
+
+    Fail-closed (#378 review fix): if any id could not be verified
+    (detection_errors > 0), a non-dry-run pass ABORTS before deleting a
+    single node — nothing is half-pruned. Dry-run still lists the
+    orphans found and reports detection errors as a warning.
     """
     graph_ids = _graph_memory_ids(graph)
     if not graph_ids:
         print("No graph memory nodes found — nothing to prune.")
-        return {"orphans": 0, "removed": 0, "skipped": 0, "errors": 0}
-    orphans = _find_orphans(store, graph_ids)
-    removed = 0
-    skipped = 0
-    errors = 0
+        return {"orphans": 0, "removed": 0, "skipped": 0,
+                "errors": 0, "detection_errors": 0}
+    orphans, detection_errors = _find_orphans(store, graph_ids)
+    if detection_errors > 0:
+        print(f"WARNING: {detection_errors} id(s) could not be verified "
+              f"(RPC/service error). They were skipped and will be "
+              f"retried on the next run.")
     if dry_run:
         print(f"[DRY RUN] Would prune {len(orphans)} orphaned graph node(s):")
         for mid in sorted(orphans)[:10]:
             print(f"  - {mid}")
         if len(orphans) > 10:
             print(f"  ... and {len(orphans) - 10} more")
-        return {"orphans": len(orphans), "removed": 0, "skipped": 0, "errors": 0}
+        return {"orphans": len(orphans), "removed": 0, "skipped": 0,
+                "errors": 0, "detection_errors": detection_errors}
+    # Fail-closed: refuse to delete when any id could not be verified.
+    # A wholesale RPC failure must not classify the entire graph as
+    # orphaned and purge every memory: node in one pass.
+    if detection_errors > 0:
+        print(f"ABORT: refusing to prune — {detection_errors} id(s) could "
+              f"not be verified. Re-run after the service stabilises; "
+              f"nothing has been deleted.")
+        return {"orphans": len(orphans), "removed": 0, "skipped": 0,
+                "errors": 0, "detection_errors": detection_errors}
+    removed = 0
+    skipped = 0
+    errors = 0
     for mid in sorted(orphans):
         try:
             if graph.purge_orphan_memory(mid):
@@ -160,7 +206,8 @@ def prune_orphans(
         except Exception as e:
             print(f"  ERROR pruning {mid}: {e}")
             errors += 1
-    return {"orphans": len(orphans), "removed": removed, "skipped": skipped, "errors": errors}
+    return {"orphans": len(orphans), "removed": removed, "skipped": skipped,
+            "errors": errors, "detection_errors": detection_errors}
 
 
 def main() -> int:
@@ -227,11 +274,13 @@ def main() -> int:
             summary = prune_orphans(store, graph, dry_run=args.dry_run)
             print()
             print(f"=== PRUNE SUMMARY ===")
-            print(f"Orphans found: {summary['orphans']}")
+            print(f"Orphans found:    {summary['orphans']}")
             if not args.dry_run:
-                print(f"Removed:       {summary['removed']}")
-                print(f"Skipped:       {summary['skipped']}")
-                print(f"Errors:        {summary['errors']}")
+                print(f"Removed:          {summary['removed']}")
+                print(f"Skipped:          {summary['skipped']}")
+                print(f"Errors:           {summary['errors']}")
+            if summary.get("detection_errors", 0):
+                print(f"Detection errors: {summary['detection_errors']}")
         graph.close()
         store._rpc.stop_service()
         return 0
@@ -244,7 +293,9 @@ def main() -> int:
             summary = prune_orphans(store, graph, dry_run=True)
             print()
             print(f"=== PRUNE SUMMARY ===")
-            print(f"Orphans found: {summary['orphans']}")
+            print(f"Orphans found:    {summary['orphans']}")
+            if summary.get("detection_errors", 0):
+                print(f"Detection errors: {summary['detection_errors']}")
         graph.close()
         store._rpc.stop_service()
         return 0
@@ -325,23 +376,33 @@ def main() -> int:
         pass
 
     # #376: prune orphaned graph nodes (explicit flag only, default OFF).
+    summary: Dict[str, int] | None = None
     if args.prune_orphans:
         print()
         summary = prune_orphans(store, graph, dry_run=args.dry_run)
         print()
         print(f"=== PRUNE SUMMARY ===")
-        print(f"Orphans found: {summary['orphans']}")
+        print(f"Orphans found:    {summary['orphans']}")
         if not args.dry_run:
-            print(f"Removed:       {summary['removed']}")
-            print(f"Skipped:       {summary['skipped']}")
-            print(f"Errors:        {summary['errors']}")
+            print(f"Removed:          {summary['removed']}")
+            print(f"Skipped:          {summary['skipped']}")
+            print(f"Errors:           {summary['errors']}")
+        if summary.get("detection_errors", 0):
+            print(f"Detection errors: {summary['detection_errors']}")
 
     print()
     print("You can now start Hermes. Graph-aware search and traversal will work for all memories.")
 
     graph.close()
     store._rpc.stop_service()
-    return 0 if errors == 0 else 1
+    # Exit non-zero if the backfill had errors OR the prune aborted
+    # due to detection errors (fail-closed — nothing was half-pruned).
+    prune_aborted = (
+        summary is not None
+        and not args.dry_run
+        and summary.get("detection_errors", 0) > 0
+    )
+    return 1 if (errors or prune_aborted) else 0
 
 
 if __name__ == "__main__":

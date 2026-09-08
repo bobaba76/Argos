@@ -66,7 +66,7 @@ Until then, the defaults are the validated configuration:
 
 ### Graph traversal
 
-`graph_traversal_enabled` (default `true`) with `graph_traversal_depth` (default `2`) and `graph_traversal_boost` (default `0.60`) controls multi-hop retrieval. The boost is applied to candidates found by traversing the graph from entities in the query.
+`graph_traversal_enabled` (default `true`) with `graph_traversal_depth` (default `2`) and `graph_traversal_boost` (default `0.60`) controls multi-hop retrieval. The boost is applied to candidates found by traversing the graph from entities in the query. Traversal only walks typed (LLM or pattern-typed) relations and needs at least one non-concept seed entity, so on a regex-only graph it rarely fires. Its retrieval value is unproven (#139 measured a graph on which it never engaged; see #364 and CLAIMS-AUDIT §4).
 
 ### Personalized PageRank
 

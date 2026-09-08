@@ -56,7 +56,7 @@ This page mirrors [`CONFIG_REFERENCE.md`](https://github.com/bobaba76/Argos/blob
 | `graph_retrieval_boost` | `0.0` | Max similarity boost for graph-supported memories (0.0–0.5). |
 | `graph_boost_min_similarity` | `0.15` | Minimum semantic similarity for a memory to receive the graph boost. |
 | `graph_inject_candidates` | `false` | Inject memories found only by the graph. Off by default (adds noise). |
-| `graph_traversal_enabled` | `true` | Enable graph-traversal boost for multi-hop retrieval. |
+| `graph_traversal_enabled` | `true` | Enable graph-traversal boost for multi-hop retrieval. **Unproven:** the only A/B (#139) ran on a regex-built graph where traversal never engaged, so there is no evidence for or against it (#364). Reported `false` in the live deployment config (#364). |
 | `graph_traversal_depth` | `2` | Traversal depth for graph-traversal boost. |
 | `graph_traversal_boost` | `0.60` | Boost strength for graph-traversal candidates. |
 | `alias_expansion_boost` | `0.7` | Similarity floor for alias-expanded candidates. |

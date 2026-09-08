@@ -116,12 +116,11 @@ REALISTIC_CONFIG: dict = {
     "answering_llm_model": "deepseek/deepseek-v4-pro",
     "answering_llm_provider": "openrouter",
     "role_alias_llm_fallback": "true",
-    # routing (8) — the keys that were silently dropped
+    # routing (7) — the keys that were silently dropped
     "router_enabled": "true",
     "router_smart_model": "deepseek/deepseek-v4-pro",
     "router_smart_provider": "openrouter",
     "router_default_model": "deepseek/deepseek-v4-flash",
-    "router_default_provider": "openrouter",
     "router_subcall_enabled": "true",
     "router_temporal_threshold": "0.6",
     "router_multihop_threshold": "0.4",
@@ -447,7 +446,6 @@ class TestT3RealisticFixtureCanary:
             assert cfg.get("router_smart_model") == "deepseek/deepseek-v4-pro"
             assert cfg.get("router_smart_provider") == "openrouter"
             assert cfg.get("router_default_model") == "deepseek/deepseek-v4-flash"
-            assert cfg.get("router_default_provider") == "openrouter"
             assert cfg.get("router_subcall_enabled") is True
             assert cfg.get("router_temporal_threshold") == 0.6
             assert cfg.get("router_multihop_threshold") == 0.4

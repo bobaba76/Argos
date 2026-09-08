@@ -33,7 +33,6 @@ _CFG = {
     "router_smart_model": "deepseek/deepseek-v4-pro-0813",
     "router_smart_provider": "openrouter",
     "router_default_model": "deepseek-v4-flash",
-    "router_default_provider": "opencode-go",
 }
 
 

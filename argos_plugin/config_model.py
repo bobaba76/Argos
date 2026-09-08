@@ -189,18 +189,13 @@ class MemoryConfig(BaseModel):
     router_smart_model: str = ""
     router_smart_provider: str = ""
     router_default_model: str = ""
-    router_default_provider: str = ""
     router_subcall_enabled: bool = False
     router_temporal_threshold: float = Field(0.5, ge=0.1, le=1.0)
     router_multihop_threshold: float = Field(0.5, ge=0.1, le=1.0)
 
     # -- backup (service-coordinated) ------------------------------------------
-    # Declared in config_schema.py; backup config is a nested dict in the
-    # live JSON (config.get("backup", {})). The scalar keys are kept as
-    # model fields for schema parity.
-    backup_enabled: bool = False
-    backup_dst_root: str = ""
-    backup_retention_snapshots: int = Field(6, ge=1, le=100)
+    # Nested dict in the live JSON (config.get("backup", {})), read by
+    # memory_service.py and backup_cli.py.
     backup: Optional[Dict[str, Any]] = None
 
     # -- ACL (optional, not in defaults dict) ----------------------------------
@@ -258,7 +253,7 @@ class MemoryConfig(BaseModel):
         "distillation_enabled", "archive_enabled", "forget_enabled",
         "rollup_enabled", "local_only",
         "external_sources_require_confirmation",
-        "router_enabled", "router_subcall_enabled", "backup_enabled",
+        "router_enabled", "router_subcall_enabled",
     })
 
     # Clamped int fields: {name: (lo, hi, default)}.
@@ -290,7 +285,6 @@ class MemoryConfig(BaseModel):
         "chain_max_inject": (1, 10000, 150),
         "chain_unfold_top_k": (1, 20, 3),
         "scale_warn_records": (1, 10000000, 5000),
-        "backup_retention_snapshots": (1, 100, 6),
     }
 
     # Clamped float fields: {name: (lo, hi, default)}.
@@ -320,8 +314,7 @@ class MemoryConfig(BaseModel):
         "answering_llm_provider", "deployment_mode", "data_residency",
         "evidence_retention", "reranker_model", "local_embedding_model",
         "router_smart_model", "router_smart_provider",
-        "router_default_model", "router_default_provider",
-        "backup_dst_root",
+        "router_default_model",
     })
 
     @model_validator(mode="before")

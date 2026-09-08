@@ -20,6 +20,10 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 
 - **SYNC_HANDOFF.md**: Step 3 now references `scripts/deploy.py` as the only sync path (manual md5/cp loop replaced).
 
+### Removed
+
+- **Dead config knobs** (#359): `backup_enabled`, `backup_dst_root`, `backup_retention_snapshots` and `router_default_provider` were advertised in `config_schema.py` / `CONFIG_REFERENCE.md` but read by zero code (backup uses the nested `backup` dict; the router only reads `router_default_model`). Removed from schema, model, docs and parity tests. Any of these keys left in a live `hybrid_memory.json` are harmless — the production load paths (`provider_core._load_config`, `memory_service._load_config`) filter unknown keys before validation — and can be deleted at leisure.
+
 ### Fixed
 
 - **consolidation_auto_apply default mismatch** (#361): the safe-default contract (dry-run/report-only unless explicit opt-in) was contradicted by every real default — `MemoryConfig` default `True`, session inline fallback `"true"`, doc row `true`. Enabling `consolidation_enabled` would silently trigger an irreversible auto-quarantine at session end. All three sites now default to `false`; explicit `"consolidation_auto_apply": "true"` still wins.

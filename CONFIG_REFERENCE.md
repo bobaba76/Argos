@@ -160,10 +160,7 @@ Three independent phases, all ship OFF by default. All are reversible (quarantin
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `backup_enabled` | `false` | Enable service-coordinated backups. The backup config is a nested dict in the live JSON. **When to change:** enable for production deployments. |
-| `backup_dst_root` | *(empty)* | Destination root directory for backups. **When to change:** set to a local or network backup path. |
-| `backup_retention_snapshots` | `6` | Number of backup snapshots to retain (1–100). **When to change:** raise for longer retention. |
-| `backup` *(JSON only)* | *(empty)* | Nested dict for backup configuration: `{"dst_root": "/path", "retention_snapshots": 10}`. Scalar keys above are kept as model fields for schema parity. **When to change:** set the nested dict for full backup config. |
+| `backup` *(JSON only)* | *(empty)* | Nested dict for backup configuration: `{"dst_root": "/path", "retention_snapshots": 10}`. **When to change:** set the nested dict for full backup config. |
 
 ## Scale triggers
 
@@ -196,7 +193,6 @@ Routes temporal/multi-hop queries to a smarter model; trivial turns stay on the 
 | `router_enabled` | `false` | Enable answerer routing. |
 | `router_subcall_enabled` | `false` | One trimmed sub-call injects a dated-memory hint before routing (fail-soft). |
 | `router_default_model` | *(empty)* | Cheap default answerer model. |
-| `router_default_provider` | *(empty)* | Cheap default answerer provider. |
 | `router_smart_model` | *(empty)* | Smart answerer for routed queries. |
 | `router_smart_provider` | *(empty)* | Smart answerer provider. |
 | `router_temporal_threshold` *(JSON only)* | `0.5` | Similarity threshold for routing temporal queries to the smart model (0.1–1.0). Higher = fewer queries routed. **When to change:** lower to route more temporal queries; raise for precision. |

@@ -54,9 +54,20 @@ ARMS = {
     "llm_graph": {"graph_aware_retrieval": "true",
                   "graph_retrieval_boost": "0.0"},
     # #139: A/B whether BFS graph traversal earns its keep in retrieval
-    # ranking. Baseline defaults to graph_traversal_enabled=false (provider
-    # default); this arm turns it on with the production-default boost
-    # (0.60) and depth (2). Compares MRR / nDCG@k / Recall@k vs baseline.
+    # ranking. The base arm config pins graph_traversal_enabled=false
+    # (MemoryConfig defaults it to true, so an unpinned baseline would be
+    # identical to this arm); this arm turns it on with the
+    # production-default boost (0.60) and depth (2). Compares MRR /
+    # nDCG@k / Recall@k vs baseline.
+    #
+    # #364: metrics alone cannot distinguish "traversal is flat" from
+    # "traversal never fired". Traversal walks TYPED/LLM relations only
+    # and requires a non-concept seed; the regex-only graph this harness
+    # builds (build_snapshot_graph(use_llm=False)) is dominated by generic
+    # edges and concept nodes, so the arm can be a no-op. run_arm records
+    # per-query engagement counters (see traversal_engagement) whenever
+    # graph_traversal_enabled is on; ~0 engaged queries means the arm's
+    # deltas are not evidence either way.
     "traversal_on": {"graph_aware_retrieval": "true",
                      "graph_traversal_enabled": "true",
                      "graph_traversal_depth": "2",
@@ -82,6 +93,7 @@ def build_arm_home(snapshot: Path, arm_cfg: dict, workdir: Path) -> Path:
         "graph_aware_retrieval": "true",
         "graph_retrieval_boost": "0.05",
         "graph_inject_candidates": "false",
+        "graph_traversal_enabled": "false",
         "graph_boost_min_similarity": "0.15",
         "alias_expansion_boost": "0.7",
         "consolidation_enabled": "false",
@@ -160,6 +172,28 @@ def build_snapshot_graph(home: Path, use_llm: bool = False) -> int:
     return n
 
 
+ENGAGEMENT_COUNTERS = ("seeds_resolved", "non_concept_seeds", "engaged")
+
+
+def summarize_engagement(per_query: list) -> dict:
+    """Aggregate per-query traversal_engagement dicts into arm-level counts.
+
+    Each counter is the number of queries where that stage was non-zero:
+    ``seeds_resolved`` (>=1 grounded seed), ``non_concept_seeds`` (>=1 seed
+    clearing the specific-seed gate), ``engaged`` (traversal returned >=1
+    memory id). ``n_queries`` is the denominator. An arm with
+    ``engaged == 0`` never exercised traversal, so its metric deltas vs
+    baseline say nothing about traversal.
+    """
+    rows = [r for r in per_query if r]
+    out = {"n_queries": len(rows)}
+    for key in ENGAGEMENT_COUNTERS:
+        out[key] = sum(1 for r in rows if r.get(key))
+    out["engaged_fraction"] = (
+        round(out["engaged"] / len(rows), 4) if rows else 0.0)
+    return out
+
+
 def run_arm(home: Path, eval_set: dict) -> dict:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from argos_plugin import ArgosProvider as Provider
@@ -172,6 +206,9 @@ def run_arm(home: Path, eval_set: dict) -> dict:
         user_id="default_user",
     )
 
+    graph = provider._graph  # direct mode: KuzuGraphStore
+    track_engagement = bool(provider._graph_traversal_enabled and graph is not None)
+    engagement_rows: list = []
     results = []
     lim = int(eval_set.get("limit", 10))
     ks = sorted({5, 10, lim})
@@ -195,15 +232,26 @@ def run_arm(home: Path, eval_set: dict) -> dict:
             next((1 / (i + 1) for i, m in enumerate(ranked) if m in hits), 0.0), 4)
         row["top_hits"] = [m for m in ranked[:lim] if m in hits]
         row["missed"] = sorted(hits - set(ranked))
+        if track_engagement:
+            try:
+                eng = graph.traversal_engagement(
+                    q["query"], depth=provider._graph_traversal_depth)
+            except Exception as exc:  # diagnostic only: never fail the arm
+                eng = {"error": str(exc)}
+            row["traversal_engagement"] = eng
+            engagement_rows.append(eng)
         results.append(row)
         for key in totals:
             totals[key].append(row[key])
     provider.shutdown()
-    return {
+    report = {
         "n_queries": len(results),
         "averages": {k: round(sum(v) / len(v), 4) for k, v in totals.items()},
         "per_query": results,
     }
+    if track_engagement:
+        report["traversal_engagement"] = summarize_engagement(engagement_rows)
+    return report
 
 
 def build_typed_graph(home: Path, llm_report: dict) -> int:
@@ -255,6 +303,7 @@ def main() -> int:
     if eval_set.get("reranker_top_n"):
         ARMS["reranker_on"]["reranker_top_n"] = str(eval_set["reranker_top_n"])
     summary = {}
+    engagement: dict = {}
 
     for arm, cfg in ARMS.items():
         if eval_set.get("arms") and arm not in eval_set["arms"]:
@@ -270,12 +319,17 @@ def main() -> int:
             print(f"  graph indexed: {n_indexed} records", flush=True)
             report = run_arm(home, eval_set)
         print(f"  averages: {report['averages']}", flush=True)
+        if "traversal_engagement" in report:
+            print(f"  traversal engagement: {report['traversal_engagement']}",
+                  flush=True)
         report["arm"] = arm
         report["graph_indexed"] = n_indexed
         report["config"] = cfg
         (out_dir / f"provider_{arm}.json").write_text(
             json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         summary[arm] = report["averages"]
+        if "traversal_engagement" in report:
+            engagement[arm] = report["traversal_engagement"]
 
     # Delta table vs baseline
     print("\n=== DELTAS vs baseline ===")
@@ -285,9 +339,15 @@ def main() -> int:
             continue
         deltas = {k: round(avg[k] - base[k], 4) for k in base}
         print(f"  {arm}: {deltas}")
+        if arm in engagement and not engagement[arm].get("engaged"):
+            print(f"    WARNING: {arm} traversal never engaged "
+                  f"({engagement[arm]}); deltas are not evidence about traversal")
 
+    out = {"arms": summary}
+    if engagement:
+        out["traversal_engagement"] = engagement
     (out_dir / "provider_summary.json").write_text(
-        json.dumps({"arms": summary}, indent=2), encoding="utf-8")
+        json.dumps(out, indent=2), encoding="utf-8")
     return 0
 
 

@@ -1592,6 +1592,79 @@ class KuzuGraphStore:
         ordered = sorted(scores, key=lambda memory_id: (-scores[memory_id], memory_id))
         return ordered[:max(1, min(int(limit), 500))]
 
+    def _traversal_seeds(
+        self, query: str, as_of: str | None = None,
+    ) -> tuple[List[str], set, Dict[str, str]]:
+        """Ground query terms to traversal seed entities.
+
+        Returns (terms, seeds, seed_types). Excludes the "user" hub node —
+        in a personal memory graph EVERYTHING touches user, so traversing
+        from it is meaningless — and memory: nodes.
+        """
+        stop_words = _GRAPH_STOP_ENTITIES | {
+            "about", "and", "are", "does", "from", "have", "into", "more",
+            "that", "the", "this", "what", "when", "where", "which", "with",
+            "who", "how", "why", "did", "was", "were", "been", "for", "our",
+        }
+        terms: List[str] = []
+        seen_terms = set()
+        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", str(query or "").lower()):
+            if term in stop_words or term in seen_terms:
+                continue
+            seen_terms.add(term)
+            terms.append(term)
+            if len(terms) >= 8:
+                break
+        seeds: set = set()
+        seed_types: Dict[str, str] = {}
+        if not terms:
+            return terms, seeds, seed_types
+        for term in terms:
+            try:
+                for edge in self.search_graph(term, limit=20, as_of=as_of):
+                    for endpoint in (edge["source"], edge["target"]):
+                        eid = str(endpoint)
+                        if eid != "user" and not eid.startswith("memory:"):
+                            seeds.add(eid)
+                            node = self._query_node(eid)
+                            if node:
+                                seed_types[eid] = str(
+                                    node.get("entity_type", "concept"))
+            except Exception:
+                continue
+        return terms, seeds, seed_types
+
+    def traversal_engagement(
+        self,
+        query: str,
+        depth: int = 2,
+        limit: int = 100,
+        as_of: str | None = None,
+    ) -> Dict[str, Any]:
+        """Diagnostic: did traversal actually engage for ``query``? (#364)
+
+        Reports the seed-gate stages traversal_memory_ids passes through so
+        an A/B arm can prove the path fired (or, as in #139, that it never
+        did): ``terms`` (query terms after stop-words), ``seeds_resolved``
+        (grounded non-user, non-memory nodes), ``non_concept_seeds`` (seeds
+        clearing the require_specific_seed gate), ``traversal_ids`` (memory
+        IDs the BFS returned) and ``engaged`` (traversal_ids > 0).
+        """
+        terms, seeds, seed_types = self._traversal_seeds(query, as_of=as_of)
+        non_concept = sum(1 for t in seed_types.values() if t != "concept")
+        ids: List[str] = []
+        if terms and seeds and non_concept >= 1:
+            ids = self.traversal_memory_ids(
+                query, depth=depth, limit=limit,
+                require_specific_seed=True, as_of=as_of)
+        return {
+            "terms": len(terms),
+            "seeds_resolved": len(seeds),
+            "non_concept_seeds": non_concept,
+            "traversal_ids": len(ids),
+            "engaged": bool(ids),
+        }
+
     def traversal_memory_ids(
         self,
         query: str,
@@ -1620,42 +1693,8 @@ class KuzuGraphStore:
 
         Returns memory IDs ordered by traversal weight (desc).
         """
-        stop_words = _GRAPH_STOP_ENTITIES | {
-            "about", "and", "are", "does", "from", "have", "into", "more",
-            "that", "the", "this", "what", "when", "where", "which", "with",
-            "who", "how", "why", "did", "was", "were", "been", "for", "our",
-        }
-        terms = []
-        seen_terms = set()
-        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", str(query or "").lower()):
-            if term in stop_words or term in seen_terms:
-                continue
-            seen_terms.add(term)
-            terms.append(term)
-            if len(terms) >= 8:
-                break
-        if not terms:
-            return []
-
-        # Ground: find seed entities for each query term (fuzzy node match).
-        # Exclude the "user" hub node — in a personal memory graph
-        # EVERYTHING touches user, so traversing from it is meaningless.
-        seeds = set()
-        seed_types: Dict[str, str] = {}
-        for term in terms:
-            try:
-                for edge in self.search_graph(term, limit=20, as_of=as_of):
-                    for endpoint in (edge["source"], edge["target"]):
-                        eid = str(endpoint)
-                        if eid != "user" and not eid.startswith("memory:"):
-                            seeds.add(eid)
-                            node = self._query_node(eid)
-                            if node:
-                                seed_types[eid] = str(
-                                    node.get("entity_type", "concept"))
-            except Exception:
-                continue
-        if not seeds:
+        terms, seeds, seed_types = self._traversal_seeds(query, as_of=as_of)
+        if not terms or not seeds:
             return []
         if require_specific_seed:
             non_concept = sum(1 for t in seed_types.values() if t != "concept")

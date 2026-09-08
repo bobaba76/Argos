@@ -67,7 +67,14 @@ def _get_hermes_home() -> Path:
 
 
 def _graph_memory_ids(graph: Any) -> List[str]:
-    """Collect all `memory:`-prefixed node ids from the graph."""
+    """Collect all `memory:`-prefixed node ids from the graph.
+
+    Only nodes whose id starts with ``memory:`` AND whose entity_type is
+    ``memory`` (or absent — legacy) are collected. A malformed legacy
+    concept/entity node can carry a ``memory:``-prefixed id (e.g.
+    ``memory:// resources`` with entity_type=concept); it is NOT a memory
+    node and must never be treated as one.
+    """
     ids: List[str] = []
     try:
         nodes = graph.list_nodes(limit=100000)
@@ -76,10 +83,14 @@ def _graph_memory_ids(graph: Any) -> List[str]:
         return ids
     for node in nodes:
         node_id = str(node.get("id", ""))
-        if node_id.startswith("memory:"):
-            mid = node_id[len("memory:"):]
-            if mid:
-                ids.append(mid)
+        if not node_id.startswith("memory:"):
+            continue
+        entity_type = node.get("entity_type")
+        if entity_type is not None and entity_type != "memory":
+            continue
+        mid = node_id[len("memory:"):]
+        if mid:
+            ids.append(mid)
     return ids
 
 

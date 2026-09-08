@@ -6,6 +6,7 @@ not a silent prod change.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -243,17 +244,22 @@ class TestLegacyKeysSurvival:
         from config_model import MemoryConfig
         fields = set(MemoryConfig.model_fields.keys())
         for key in ("router_enabled", "router_smart_model", "router_smart_provider",
-                     "router_default_model", "router_default_provider",
+                     "router_default_model",
                      "router_subcall_enabled", "router_temporal_threshold",
                      "router_multihop_threshold"):
             assert key in fields, f"{key} missing from MemoryConfig fields"
 
-    def test_backup_keys_in_model(self):
-        """All backup_* keys from config_schema.py are model fields."""
+    def test_dead_keys_absent_from_model_and_schema(self):
+        """#359: keys with zero read sites are not advertised anywhere."""
         from config_model import MemoryConfig
         fields = set(MemoryConfig.model_fields.keys())
-        for key in ("backup_enabled", "backup_dst_root", "backup_retention_snapshots"):
-            assert key in fields, f"{key} missing from MemoryConfig fields"
+        schema_src = (_plugin_dir / "config_schema.py").read_text(encoding="utf-8")
+        schema_keys = set(re.findall(r'key="(\w+)"', schema_src))
+        for key in ("backup_enabled", "backup_dst_root",
+                    "backup_retention_snapshots", "router_default_provider"):
+            assert key not in fields, f"{key} still a MemoryConfig field"
+            assert key not in schema_keys, f"{key} still in config_schema"
+        assert "backup" in fields
 
     def test_router_values_survive_load(self):
         """Router config values survive a round-trip through MemoryConfig."""
@@ -263,14 +269,12 @@ class TestLegacyKeysSurvival:
             "router_smart_model": "deepseek/deepseek-v4-pro",
             "router_smart_provider": "openrouter",
             "router_default_model": "deepseek-v4-flash",
-            "router_default_provider": "opencode-go",
             "router_subcall_enabled": "true",
         })
         assert c.router_enabled is True
         assert c.router_smart_model == "deepseek/deepseek-v4-pro"
         assert c.router_smart_provider == "openrouter"
         assert c.router_default_model == "deepseek-v4-flash"
-        assert c.router_default_provider == "opencode-go"
         assert c.router_subcall_enabled is True
 
     def test_router_get_returns_configured_value(self):
@@ -393,7 +397,6 @@ class TestLegacyKeysSurvival:
             "router_smart_model": "deepseek/deepseek-v4-pro-0813",
             "router_smart_provider": "openrouter",
             "router_default_model": "deepseek-v4-flash",
-            "router_default_provider": "opencode-go",
             "router_subcall_enabled": "true",
             "router_temporal_threshold": "0.6",
             "router_multihop_threshold": "0.4",
@@ -405,7 +408,6 @@ class TestLegacyKeysSurvival:
         assert c.get("router_smart_model") == "deepseek/deepseek-v4-pro-0813"
         assert c.get("router_smart_provider") == "openrouter"
         assert c.get("router_default_model") == "deepseek-v4-flash"
-        assert c.get("router_default_provider") == "opencode-go"
         assert c.get("router_subcall_enabled") is True
         assert c.get("router_temporal_threshold") == 0.6
         assert c.get("router_multihop_threshold") == 0.4

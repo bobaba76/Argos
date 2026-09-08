@@ -24,6 +24,10 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+# #330: a WAL flush failure stays non-fatal but must not be silent — it is
+# logged at ERROR and recorded on the liveness health surface.
+from liveness import record_subsystem_failure, record_subsystem_ok
+
 
 def _is_already_exists_error(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -1036,9 +1040,14 @@ class KuzuGraphStore:
                             self.database, new_conn, self._shared_conn_lock, shared[3]
                         )
             self._flush_dirty = False
+            record_subsystem_ok("graph_wal_flush")
         except Exception as exc:
             self._flush_dirty = True
-            logger.warning("Kuzu WAL flush failed (marked dirty): %s", exc)
+            logger.error(
+                "Kuzu WAL flush failed (marked dirty) — graph durability is "
+                "not guaranteed: %s", exc, exc_info=True,
+            )
+            record_subsystem_failure("graph_wal_flush", exc)
 
     # -- write operations -----------------------------------------------------
 

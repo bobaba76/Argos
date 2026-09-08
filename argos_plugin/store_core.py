@@ -17,6 +17,13 @@ except ImportError:  # store_core.py imported as a top-level module
     from store_common import _DEFAULT_TTL_DAYS
     from store_state import StoreMixinState
 
+# #330: audit paths stay fail-soft but must not be silent — a failure is
+# logged at ERROR and recorded on the liveness health surface.
+# Import through the global `liveness` name (same spelling as store_common/
+# store_state and the test fixtures) so one canonical module drives the
+# health singleton across every import layout — package vs top-level.
+from liveness import record_subsystem_failure, record_subsystem_ok
+
 import duckdb
 
 logger = logging.getLogger(__name__)
@@ -508,7 +515,11 @@ class StoreCoreMixin:
                     )
                 """)
             except Exception as exc:
-                logger.warning("access_audit table creation failed: %s", exc)
+                logger.error(
+                    "access_audit table creation failed — the audit trail is "
+                    "not being recorded: %s", exc, exc_info=True,
+                )
+                record_subsystem_failure("audit_write", exc)
 
             # #347: Append-only, actor-attributed mutation event log.
             # Every store mutation (create, approve, reject, update, delete,
@@ -542,7 +553,10 @@ class StoreCoreMixin:
                 try:
                     self._purge_access_audit(max_rows=100000)
                 except Exception as exc:
-                    logger.warning("access_audit purge failed: %s", exc)
+                    logger.error(
+                        "access_audit startup purge failed: %s", exc, exc_info=True,
+                    )
+                    record_subsystem_failure("audit_purge", exc)
 
             # Spec-09 (#112): form-level identity — layout_family column on
             # file_catalog. Additive migration for DBs that predate the
@@ -731,6 +745,7 @@ class StoreCoreMixin:
                     "SELECT COUNT(*) FROM access_audit"
                 ).fetchone()
                 if not count or count[0] <= max_rows:
+                    record_subsystem_ok("audit_purge")
                     return 0
                 # Delete the oldest rows beyond max_rows.
                 result = self.connection.execute(
@@ -744,8 +759,10 @@ class StoreCoreMixin:
                 deleted = int(result.fetchone()[0]) if result else 0
                 if deleted:
                     logger.info("access_audit purged %d old rows (kept %d)", deleted, max_rows)
+                record_subsystem_ok("audit_purge")
                 return deleted
         except Exception as exc:
-            logger.warning("access_audit purge failed: %s", exc)
+            logger.error("access_audit purge failed: %s", exc, exc_info=True)
+            record_subsystem_failure("audit_purge", exc)
             return 0
 

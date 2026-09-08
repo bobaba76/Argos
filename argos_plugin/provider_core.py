@@ -1038,19 +1038,28 @@ class ProviderCoreMixin:
         """#275: bounded status/health surface.
 
         Returns feature hit counters (LP2), config fingerprint (LP3),
-        and the last startup self-test results (LP1). A feature that
-        stops firing is visible as a counter that stops incrementing.
+        the last startup self-test results (LP1), and the fail-loud
+        subsystem health signals (#330). A feature that stops firing is
+        visible as a counter that stops incrementing; a dead audit sink
+        or a failing graph WAL flush is visible in degraded_subsystems.
         """
         try:
             try:
-                from .liveness import get_counters
+                from liveness import get_counters, get_health
             except ImportError:
-                from liveness import get_counters
+                from liveness import get_counters, get_health
             counters = get_counters().snapshot()
+            health = get_health()
+            subsystem_health = health.snapshot()
+            degraded = health.degraded()
         except Exception:
             counters = {}
+            subsystem_health = {}
+            degraded = []
         return {
             "feature_counters": counters,
+            "subsystem_health": subsystem_health,
+            "degraded_subsystems": degraded,
             "config_fingerprint": getattr(self, "_config_fingerprint", "unknown"),
             "self_test_results": getattr(self, "_self_test_results", {}),
         }

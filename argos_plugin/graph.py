@@ -26,10 +26,7 @@ logger = logging.getLogger(__name__)
 
 # #330: a WAL flush failure stays non-fatal but must not be silent — it is
 # logged at ERROR and recorded on the liveness health surface.
-try:
-    from .liveness import record_subsystem_failure, record_subsystem_ok
-except ImportError:  # graph.py imported as a top-level module
-    from liveness import record_subsystem_failure, record_subsystem_ok
+from liveness import record_subsystem_failure, record_subsystem_ok
 
 
 def _is_already_exists_error(exc: Exception) -> bool:

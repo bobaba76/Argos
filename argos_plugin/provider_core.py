@@ -1045,7 +1045,7 @@ class ProviderCoreMixin:
         """
         try:
             try:
-                from .liveness import get_counters, get_health
+                from liveness import get_counters, get_health
             except ImportError:
                 from liveness import get_counters, get_health
             counters = get_counters().snapshot()

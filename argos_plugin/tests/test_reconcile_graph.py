@@ -146,17 +146,12 @@ class TestReconcileDetectsDrift:
 
         # Delete from DuckDB (but leave graph intact — simulate drift).
         store.delete_memory(memory_id=rec.memory_id)
-
-        # Reconcile — should detect the extra graph entry.
+        # Head-with-no-predecessor delete = hard delete → row genuinely gone.
+        # The probe must report it as a true orphan (extra), not hide it.
         result = reconcile(store, graph, sample_size=10)
         assert result["drift"] is True
-        # The deleted memory should not appear in DuckDB's active set.
-        # If the graph still has it, it's extra.
-        # Note: delete_memory may quarantine rather than hard-delete,
-        # so the memory might still be in DuckDB but not active.
-        # The probe checks active memories, so quarantined ones
-        # won't be in duckdb_ids.
-        assert result["extra_in_graph_count"] >= 0  # may be 0 if graph also cleaned up
+        assert result["extra_in_graph_count"] == 1
+        assert rec.memory_id in result["extra_in_graph"]
 
 
 class TestReconcileOutputFormat:
@@ -171,6 +166,7 @@ class TestReconcileOutputFormat:
             "duckdb_count", "graph_count",
             "missing_in_graph_count", "missing_in_graph",
             "extra_in_graph_count", "extra_in_graph",
+            "detection_errors",
             "drift",
         }
         assert set(result.keys()) == required_keys
@@ -205,6 +201,89 @@ def _index(store, graph, rec):
         use_llm=False,
         flush=True,
     )
+
+
+class TestReconcileEntityLayerNotDrift:
+    """The probe must not report the graph's entity layer as drift.
+
+    Regression for the 8/9 live finding: reconcile reported 78 'extra'
+    nodes that were NOT orphans — quarantined/superseded memories plus a
+    malformed concept node with a memory:-prefixed id. 'Extra' must mean
+    a memory node whose memory_id is confirmed absent from DuckDB in ANY
+    state (the #376 orphan definition).
+    """
+
+    def test_quarantined_memory_not_extra(self, store, graph):
+        """A memory that exists in DuckDB as quarantined/non-head is NOT
+        extra — its row exists in some state."""
+        from reconcile_graph import reconcile
+
+        rec1 = store.remember(
+            category="personal_fact",
+            content="Eve lives in Pretoria",
+        )
+        store.update_memory(rec1.memory_id, content="Eve lives in Pretoria now")
+        # rec1 is now a non-head version; deleting it quarantines the row
+        # (reversible — the row stays in DuckDB).
+        store.delete_memory(rec1.memory_id)
+        # Index ALL active heads so the graph matches DuckDB's active set
+        # (the update created a new head — it must not show as 'missing').
+        for h in store.list_recent(limit=100):
+            _index(store, graph, h)
+
+        result = reconcile(store, graph, sample_size=10)
+        assert result["extra_in_graph_count"] == 0
+        assert result["detection_errors"] == 0
+        assert result["drift"] is False
+
+    def test_graph_memory_ids_excludes_concept_nodes(self):
+        """_get_graph_memory_ids skips nodes whose entity_type is not
+        memory, even when the id carries a memory: prefix (malformed
+        legacy node like 'memory:// resources')."""
+        from reconcile_graph import _get_graph_memory_ids
+
+        class _StubGraph:
+            def list_nodes(self, limit=100000):
+                return [
+                    {"id": "memory:mem-aaa", "entity_type": "memory"},
+                    {"id": "memory:// resources", "entity_type": "concept",
+                     "attributes": {"memory_id": "mem-bbb"}},
+                    {"id": "person:Alice", "entity_type": "person"},
+                    {"id": "memory:mem-ccc"},  # legacy node, no entity_type
+                ]
+
+        ids = _get_graph_memory_ids(_StubGraph())
+        assert ids == {"mem-aaa", "mem-ccc"}
+
+    def test_detection_error_not_extra(self, store, graph):
+        """An id that could not be verified is UNKNOWN — not extra, and
+        detection errors alone are not drift (fail-closed)."""
+        from reconcile_graph import reconcile
+
+        rec = store.remember(
+            category="personal_fact",
+            content="Grace lives in Durban",
+        )
+        _index(store, graph, rec)
+        store.delete_memory(rec.memory_id)  # hard delete → candidate extra
+
+        class _RaisingStore:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def list_recent(self, limit=10000):
+                return self._inner.list_recent(limit=limit)
+
+            def get_memories_by_ids(self, ids, include_quarantined=False):
+                raise RuntimeError("service wedged")
+
+            def get_memory_history(self, mid):
+                raise RuntimeError("service wedged")
+
+        result = reconcile(_RaisingStore(store), graph, sample_size=10)
+        assert result["extra_in_graph_count"] == 0
+        assert result["detection_errors"] >= 1
+        assert result["drift"] is False  # detection errors alone are not drift
 
 
 class TestPurgeOrphanMemory:

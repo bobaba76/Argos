@@ -60,6 +60,25 @@ def _get_duckdb_memory_ids(store: Any) -> Set[str]:
     return {r.memory_id for r in records if r.memory_id}
 
 
+def _is_memory_node(node: Dict[str, Any]) -> bool:
+    """True if a graph node is a memory node (not a concept/entity node).
+
+    Memory nodes have id ``memory:<memory_id>`` AND entity_type ``memory``.
+    A malformed legacy node can carry a ``memory:``-prefixed id while being
+    a concept/entity node (e.g. ``memory:// resources`` with
+    entity_type=concept) — those must never be treated as memory nodes.
+    """
+    node_id = str(node.get("id", ""))
+    if not node_id.startswith("memory:"):
+        return False
+    entity_type = node.get("entity_type")
+    # entity_type absent = legacy memory node (keep); explicit non-memory
+    # type = entity/concept node (exclude).
+    if entity_type is not None and entity_type != "memory":
+        return False
+    return True
+
+
 def _get_graph_memory_ids(graph: Any) -> Set[str]:
     """Get all memory_ids referenced in the Kuzu graph.
 
@@ -96,9 +115,8 @@ def _get_graph_memory_ids(graph: Any) -> Set[str]:
             # filter for those starting with 'memory:'.
             nodes = graph._rpc.call("graph", "list_nodes", limit=100000) or []
             for node in nodes:
-                node_id = node.get("id", "")
-                if node_id.startswith("memory:"):
-                    mid = node_id[len("memory:"):]
+                if _is_memory_node(node):
+                    mid = str(node.get("id", ""))[len("memory:"):]
                     if mid:
                         graph_ids.add(mid)
         except Exception as exc:
@@ -109,15 +127,54 @@ def _get_graph_memory_ids(graph: Any) -> Set[str]:
         try:
             nodes = graph.list_nodes(limit=100000)
             for node in nodes:
-                node_id = node.get("id", "")
-                if node_id.startswith("memory:"):
-                    mid = node_id[len("memory:"):]
+                if _is_memory_node(node):
+                    mid = str(node.get("id", ""))[len("memory:"):]
                     if mid:
                         graph_ids.add(mid)
         except Exception as exc:
             print(f"WARNING: Could not query graph nodes: {exc}", file=sys.stderr)
 
     return graph_ids
+
+
+def _confirm_absent(store: Any, candidate_ids: List[str]) -> Tuple[List[str], int]:
+    """Fail-closed existence check: return ids confirmed absent from DuckDB
+    in ANY state (active, quarantined, non-head, superseded, expired).
+
+    Mirrors ``backfill_graph._find_orphans`` semantics (#376): an id is an
+    orphan only when ``get_memory_history`` returns [] NORMALLY (row
+    genuinely gone). Exceptions are UNKNOWN — skipped and counted as
+    detection errors, never declared absent. Warnings go to stderr so JSON
+    stdout stays clean (the drift-watch wrapper parses stdout as JSON).
+    """
+    absent: List[str] = []
+    detection_errors = 0
+    found: Set[str] = set()
+    chunk_size = 100
+    for i in range(0, len(candidate_ids), chunk_size):
+        chunk = candidate_ids[i:i + chunk_size]
+        try:
+            records = store.get_memories_by_ids(chunk, include_quarantined=True)
+            for rec in records:
+                if rec.memory_id:
+                    found.add(str(rec.memory_id))
+        except Exception as e:
+            print(f"WARNING: bulk existence check failed for {len(chunk)} ids: {e}",
+                  file=sys.stderr)
+            detection_errors += len(chunk)
+            continue  # fail-closed: skip the whole chunk
+    for mid in candidate_ids:
+        if mid in found:
+            continue
+        try:
+            history = store.get_memory_history(mid)
+        except Exception as e:
+            print(f"WARNING: could not verify {mid}: {e}", file=sys.stderr)
+            detection_errors += 1
+            continue
+        if not history:
+            absent.append(mid)
+    return absent, detection_errors
 
 
 def reconcile(
@@ -133,18 +190,27 @@ def reconcile(
         graph_count: int — number of memory_ids referenced in the graph
         missing_in_graph: list[str] — in DuckDB but not in graph (sample)
         missing_in_graph_count: int — total count of missing
-        extra_in_graph: list[str] — in graph but not in DuckDB (sample)
+        extra_in_graph: list[str] — graph memory nodes whose memory_id is
+            absent from DuckDB in ANY state (true orphans, sample)
         extra_in_graph_count: int — total count of extra
-        drift: bool — True if missing_in_graph_count > 0 or extra_in_graph_count > 0
+        detection_errors: int — ids that could not be verified (UNKNOWN,
+            never counted as extra; not drift)
+        drift: bool — True if missing_in_graph_count > 0 or
+            extra_in_graph_count > 0 (detection errors alone are NOT drift)
     """
     duckdb_ids = _get_duckdb_memory_ids(store)
     graph_ids = _get_graph_memory_ids(graph)
 
     missing = duckdb_ids - graph_ids
-    extra = graph_ids - duckdb_ids
+    # "Extra" must mean: graph memory node whose memory_id is absent from
+    # DuckDB in ANY state (a true #376 orphan). A memory that exists as
+    # quarantined/superseded/expired is NOT extra — the active-only set
+    # would otherwise mislabel the graph's entity layer as drift.
+    extra_candidates = sorted(graph_ids - duckdb_ids)
+    extra, detection_errors = _confirm_absent(store, extra_candidates)
 
     missing_sample = sorted(missing)[:sample_size]
-    extra_sample = sorted(extra)[:sample_size]
+    extra_sample = extra[:sample_size]
 
     return {
         "duckdb_count": len(duckdb_ids),
@@ -153,6 +219,7 @@ def reconcile(
         "missing_in_graph": missing_sample,
         "extra_in_graph_count": len(extra),
         "extra_in_graph": extra_sample,
+        "detection_errors": detection_errors,
         "drift": bool(missing or extra),
     }
 
@@ -219,13 +286,17 @@ def main() -> int:
             print()
             print("To fix: run backfill_graph.py to re-index missing memories.")
         if result["extra_in_graph_count"] > 0:
-            print(f"EXTRA in graph (in graph but not in DuckDB): {result['extra_in_graph_count']}")
+            print(f"EXTRA in graph (true orphans — memory_id absent from DuckDB in any state): {result['extra_in_graph_count']}")
             for mid in result["extra_in_graph"]:
                 print(f"  - {mid}")
             print()
             print("To fix: run backfill_graph.py --prune-orphans to remove")
             print("orphaned graph nodes (memory_id absent from DuckDB in any state).")
             print("Use --dry-run first to list what would be deleted.")
+        if result.get("detection_errors", 0) > 0:
+            print(f"WARNING: {result['detection_errors']} id(s) could not be verified "
+                  f"(RPC/service error) — skipped, not counted as drift. Re-run after "
+                  f"the service stabilises.")
         if not result["drift"]:
             print("No drift detected. DuckDB and graph are in sync.")
 

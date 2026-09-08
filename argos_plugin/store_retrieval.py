@@ -38,8 +38,8 @@ except ImportError:  # store_retrieval.py imported as a top-level module
 
 # #330: audit paths stay fail-soft but must not be silent — a failure is
 # logged at ERROR and recorded on the liveness health surface.
-# Import through the global `liveness` name (same spelling as store_common/
-# store_state and the test fixtures) so one canonical module drives the
+# Import liveness at the top level (consistent with api_facade.py's
+# top-level access_scoping import) so one canonical module drives the
 # health singleton across every import layout — package vs top-level.
 from liveness import record_subsystem_failure, record_subsystem_ok
 
@@ -1444,6 +1444,16 @@ class StoreRetrievalMixin:
                     except Exception as exc:
                         if not self._is_vector_search_unavailable(exc):
                             logger.warning("Semantic dedup check failed: %s", exc)
+                            # #330: log + counter (spec Part 2 "other
+                            # swallow sites"). Fail-soft: never raises.
+                            try:
+                                try:
+                                    from liveness import increment_counter
+                                except ImportError:
+                                    from liveness import increment_counter
+                                increment_counter("dedup_failures")
+                            except Exception:
+                                pass
             return None, None
 
     # -- Spec-06 (#69): access audit log -------------------------------------

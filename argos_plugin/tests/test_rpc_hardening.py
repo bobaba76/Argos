@@ -509,6 +509,134 @@ class TestMS4NoTracebackLeak:
         )
 
 
+class TestErrorEnvelopeRedaction:
+    """#333: RPC error envelopes must not leak SQL or filesystem paths.
+
+    Deliberate caller-facing exceptions (PermissionError, ValueError, ...)
+    keep a redacted message + their class; anything else (DuckDB/Kùzu
+    errors, OSError, unexpected failures) is reported as a generic
+    InternalError. Full detail is only logged server-side.
+    """
+
+    @staticmethod
+    def _run_handler(exc: Exception) -> dict:
+        import io
+
+        class FailingService:
+            def dispatch(self, request):
+                raise exc
+
+        class FakeServer:
+            auth_token = "test-token"
+            gate_secret = "gate"
+            in_flight_lock = threading.Lock()
+            in_flight = 0
+            memory_service = FailingService()
+
+        request = {
+            "v": memory_service._PROTOCOL_VERSION, "token": "test-token",
+            "component": "store", "method": "count", "args": {},
+        }
+        handler = memory_service._RequestHandler.__new__(memory_service._RequestHandler)
+        handler.server = FakeServer()
+        handler.rfile = io.BytesIO((json.dumps(request) + "\n").encode("utf-8"))
+        handler.wfile = io.BytesIO()
+        handler.handle()
+        return json.loads(handler.wfile.getvalue().decode("utf-8"))
+
+    def test_duckdb_style_sql_error_is_generic(self):
+        class ParserException(Exception):
+            pass
+
+        resp = self._run_handler(ParserException(
+            'Parser Error: syntax error at or near "FORM" '
+            'LINE 1: SELECT memory_id FROM memories WHERE user_scope = ...'
+        ))
+        assert resp["ok"] is False
+        assert resp["error_class"] == "InternalError"
+        assert resp["error"] == memory_service._INTERNAL_ERROR_MESSAGE
+        assert "SELECT" not in json.dumps(resp)
+        assert "memories" not in json.dumps(resp)
+
+    def test_oserror_path_is_generic(self):
+        resp = self._run_handler(
+            FileNotFoundError(2, "No such file", "C:\\Users\\bob\\hermes\\mem.duckdb")
+        )
+        assert resp["error_class"] == "InternalError"
+        assert "bob" not in json.dumps(resp)
+        assert "duckdb" not in json.dumps(resp)
+
+    def test_kuzu_style_runtime_error_is_generic(self):
+        resp = self._run_handler(
+            RuntimeError("Binder exception: MATCH (m:Memory) RETURN m — table missing")
+        )
+        assert resp["error_class"] == "InternalError"
+        assert "MATCH" not in resp["error"]
+
+    def test_permission_error_message_preserved(self):
+        resp = self._run_handler(
+            PermissionError("Authentication failed: invalid or revoked credential")
+        )
+        assert resp["error_class"] == "PermissionError"
+        assert resp["error"] == "Authentication failed: invalid or revoked credential"
+
+    def test_value_error_message_preserved(self):
+        resp = self._run_handler(ValueError("Unsupported store method: nope"))
+        assert resp["error_class"] == "ValueError"
+        assert resp["error"] == "Unsupported store method: nope"
+
+    def test_graph_unavailable_is_client_facing(self):
+        resp = self._run_handler(
+            memory_service.ServiceUnavailableError("Relationship graph is unavailable")
+        )
+        assert resp["error_class"] == "ServiceUnavailableError"
+        assert resp["error"] == "Relationship graph is unavailable"
+
+    def test_safe_exception_paths_are_redacted(self):
+        resp = self._run_handler(
+            ValueError("Tenant 'a': database_filename='/home/bob/.hermes/a.duckdb' invalid")
+        )
+        assert resp["error_class"] == "ValueError"
+        assert "/home/bob" not in resp["error"]
+        assert "<path>" in resp["error"]
+
+    def test_safe_exception_sql_is_redacted(self):
+        resp = self._run_handler(
+            ValueError("bad query: SELECT * FROM memories WHERE 1=1")
+        )
+        assert resp["error_class"] == "ValueError"
+        assert resp["error"] == memory_service._INTERNAL_ERROR_MESSAGE
+
+    def test_redact_leaves_plain_messages_alone(self):
+        for msg in [
+            "Memory not found: abc-123",
+            "user a/b is not allowed",
+            "version 3/4 applied",
+        ]:
+            assert memory_service._redact_error_message(msg) == msg
+
+    def test_redact_windows_unc_and_home_paths(self):
+        assert memory_service._redact_error_message(
+            "open C:\\Users\\bob\\x.duckdb failed"
+        ) == "open <path> failed"
+        assert memory_service._redact_error_message(
+            "open \\\\server\\share\\x.duckdb failed"
+        ) == "open <path> failed"
+        assert memory_service._redact_error_message(
+            "open ~/.hermes/x.duckdb failed"
+        ) == "open <path> failed"
+
+    def test_redact_caps_message_length(self):
+        out = memory_service._redact_error_message("x" * 5000)
+        assert len(out) <= memory_service._MAX_ERROR_MESSAGE_CHARS + 3
+
+    def test_handler_never_writes_raw_str_exc(self):
+        source = Path(memory_service.__file__).read_text(encoding="utf-8")
+        assert '"error": str(exc)' not in source, (
+            "RPC error envelope must go through _classify_error (#333)"
+        )
+
+
 class TestMS6ResponseSizeLimit:
     """MS6: response size limit prevents unbounded memory."""
 

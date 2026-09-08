@@ -434,6 +434,40 @@ class TestIdempotency:
         save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
         assert len(save_calls) == 2
 
+    def test_same_key_different_principals_do_not_collide(self):
+        """#332: two principals using the same idempotency key must NOT
+        collide — the cache is partitioned by principal. Principal A's
+        replay must not be served to principal B (cross-tenant replay),
+        and B's first call must not 409 against A's entry (false
+        conflict)."""
+        store = StubStore()
+        facade = _make_facade(store)
+        params = {"content": "User works at TechCorp", "category": "personal_fact"}
+        # Principal A uses key "shared-key".
+        ctx_a = _make_ctx(principal="client-a", tenant="tenant-a", user_id="user-a")
+        r_a = facade.execute(ctx_a, "memory_propose", params, idempotency_key="shared-key")
+        assert r_a["status"] == "pending"
+        # Principal B uses the SAME key with the SAME body — must NOT be
+        # served A's cached result (cross-tenant replay), and must NOT 409.
+        ctx_b = _make_ctx(principal="client-b", tenant="tenant-b", user_id="user-b")
+        r_b = facade.execute(ctx_b, "memory_propose", params, idempotency_key="shared-key")
+        assert r_b["status"] == "pending"
+        assert r_b["candidate_id"] != r_a["candidate_id"], (
+            "Cross-principal idempotency collision: B received A's cached result"
+        )
+        # Both calls hit the store — two save_candidate calls.
+        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        assert len(save_calls) == 2
+        # A's own replay still works.
+        r_a2 = facade.execute(ctx_a, "memory_propose", params, idempotency_key="shared-key")
+        assert r_a2["candidate_id"] == r_a["candidate_id"]
+        # B's own replay still works.
+        r_b2 = facade.execute(ctx_b, "memory_propose", params, idempotency_key="shared-key")
+        assert r_b2["candidate_id"] == r_b["candidate_id"]
+        # Still only two save_candidate calls (all replays served from cache).
+        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        assert len(save_calls) == 2
+
 
 # ---------------------------------------------------------------------------
 # Spec test 5: Human-approval — model cannot approve its own candidate
@@ -863,13 +897,14 @@ class TestAPIFacadeAudit222:
         registry = IdempotencyRegistry(max_entries=3)
         for i in range(5):
             registry.record(f"key-{i}", "p", "op", f"hash-{i}", {"i": i})
+        # #332: entries are partitioned by principal — stored as "p:key-i".
         # Only the last 3 should remain.
         assert len(registry._entries) == 3
-        assert "key-0" not in registry._entries
-        assert "key-1" not in registry._entries
-        assert "key-2" in registry._entries
-        assert "key-3" in registry._entries
-        assert "key-4" in registry._entries
+        assert "p:key-0" not in registry._entries
+        assert "p:key-1" not in registry._entries
+        assert "p:key-2" in registry._entries
+        assert "p:key-3" in registry._entries
+        assert "p:key-4" in registry._entries
 
     def test_af5_constants_set(self):
         """AF5: TTL and max entries constants are defined."""

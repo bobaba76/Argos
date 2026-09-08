@@ -42,6 +42,7 @@ _SILENT_DEATH_FEATURES = (
     "recency_importance",
     "graph_injections",
     "extraction_facts",
+    "dedup_failures",
 )
 
 

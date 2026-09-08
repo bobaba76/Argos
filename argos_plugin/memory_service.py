@@ -1467,6 +1467,22 @@ class MemoryService:
                 }
                 for name, t in visible_tenants.items()
             }
+            # #330: surface fail-loud subsystem health from the
+            # subprocess's liveness singleton. In shared_service mode the
+            # audit writes/purges and graph WAL flush execute INSIDE this
+            # process, so the gateway's own liveness singleton is always
+            # empty — the health signal must come from here.
+            try:
+                try:
+                    from liveness import get_health
+                except ImportError:
+                    from .liveness import get_health
+                _health = get_health()
+                subsystem_health = _health.snapshot()
+                degraded_subsystems = _health.degraded()
+            except Exception:
+                subsystem_health = {}
+                degraded_subsystems = []
             return {
                 "status": "ok",
                 "pid": os.getpid(),
@@ -1484,6 +1500,8 @@ class MemoryService:
                 "default_tenant": self._default_tenant,
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
                 "lock_wait_count": self._lock_wait_count,
+                "subsystem_health": subsystem_health,
+                "degraded_subsystems": degraded_subsystems,
             }
         if request.get("method") == "stats":
             return {

@@ -174,3 +174,97 @@ class TestProviderStatusSurface:
         s = ProviderCoreMixin.status(object())
         assert s["degraded_subsystems"] == ["audit_write"]
         assert "dead sink" in s["subsystem_health"]["audit_write"]["last_error"]
+
+    def test_status_relays_shared_service_health(self, health):
+        """#330 B1: in shared_service mode, provider_core.status() relays
+        the subprocess's subsystem_health (where audit writes actually
+        happen). Verifies the merge logic with a stub store."""
+        from liveness import record_subsystem_failure
+        from provider_core import ProviderCoreMixin
+
+        # Local failure (gateway process) + remote failure (subprocess).
+        record_subsystem_failure("audit_export", RuntimeError("local fail"))
+
+        class _StubStore:
+            def get_subsystem_health(self):
+                return {
+                    "subsystem_health": {
+                        "audit_write": {
+                            "failures": 3,
+                            "last_error": "remote dead sink",
+                            "last_failure_ts": 1.0,
+                        }
+                    },
+                    "degraded_subsystems": ["audit_write"],
+                }
+
+        class _StubObj:
+            _store = None
+        obj = _StubObj()
+        obj._store = _StubStore()
+        s = ProviderCoreMixin.status(obj)
+        # Remote (subprocess) signal must be present.
+        assert "audit_write" in s["degraded_subsystems"]
+        assert "remote dead sink" in s["subsystem_health"]["audit_write"]["last_error"]
+        # Local-only signal must also be present (merged underneath).
+        assert "audit_export" in s["degraded_subsystems"]
+        assert "local fail" in s["subsystem_health"]["audit_export"]["last_error"]
+
+    def test_status_no_store_returns_local_only(self, health):
+        """#330 B1: without a shared store, status returns local-only
+        health (the pre-relay behavior)."""
+        from liveness import record_subsystem_failure
+        from provider_core import ProviderCoreMixin
+        record_subsystem_failure("audit_write", RuntimeError("local only"))
+        s = ProviderCoreMixin.status(object())
+        assert s["degraded_subsystems"] == ["audit_write"]
+
+
+class TestDedupFailureCounter:
+    """#330 W3: semantic-dedup swallow site increments a counter (spec
+    Part 2 'other swallow sites': log + counter)."""
+
+    def test_dedup_failures_counter_in_features(self):
+        """The dedup_failures counter is a registered feature counter."""
+        from liveness import _SILENT_DEATH_FEATURES
+        assert "dedup_failures" in _SILENT_DEATH_FEATURES
+
+    def test_dedup_failure_increments_counter(self, store, monkeypatch):
+        """A semantic-dedup check failure increments the dedup_failures
+        counter (fail-soft: the failure is swallowed, but visible)."""
+        from liveness import get_counters
+        counters = get_counters()
+        counters.reset()
+        # Force the semantic-dedup SQL to fail by breaking the connection
+        # only for the vector search (layer 3). Layers 1-2 must return
+        # empty results so we reach layer 3.
+        class _Layer3BrokenConnection:
+            def execute(self, sql, *args, **kwargs):
+                if "list_cosine_similarity" in sql:
+                    raise RuntimeError("vector search broken")
+                # Layers 1-2: return empty results.
+                class _Result:
+                    def fetchone(self):
+                        return None
+                    def fetchall(self):
+                        return []
+                return _Result()
+
+        class _StubEmbedder:
+            def embed(self, content):
+                return [0.1] * 8
+        store.embedder = _StubEmbedder()
+        store.connection = _Layer3BrokenConnection()
+        store._find_current_similar("unique content not in store", "personal_fact")
+        assert counters.get("dedup_failures") >= 1
+        counters.reset()
+
+    def test_dedup_counter_visible_in_status(self, store, monkeypatch):
+        """The dedup_failures counter is visible in liveness.status()."""
+        from liveness import get_counters, status
+        counters = get_counters()
+        counters.reset()
+        counters.increment("dedup_failures")
+        s = status()
+        assert s["feature_counters"]["dedup_failures"] >= 1
+        counters.reset()

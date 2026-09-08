@@ -1042,6 +1042,14 @@ class ProviderCoreMixin:
         subsystem health signals (#330). A feature that stops firing is
         visible as a counter that stops incrementing; a dead audit sink
         or a failing graph WAL flush is visible in degraded_subsystems.
+
+        #330 shared-service relay: in shared_service mode the audit
+        writes/purges and graph WAL flush execute INSIDE the service
+        subprocess, so the gateway's own liveness singleton is always
+        empty. We merge the subprocess's recorded failures into the
+        local snapshot so a dead audit sink is detectable from the
+        gateway. The subprocess's failures take precedence (they are
+        the real signals); local failures (if any) are appended.
         """
         try:
             try:
@@ -1056,6 +1064,25 @@ class ProviderCoreMixin:
             counters = {}
             subsystem_health = {}
             degraded = []
+        # #330: in shared_service mode, relay the subprocess's health
+        # signals — that's where the audit writes actually happen.
+        store = getattr(self, "_store", None)
+        if store is not None and hasattr(store, "get_subsystem_health"):
+            try:
+                remote = store.get_subsystem_health()
+                remote_health = remote.get("subsystem_health", {})
+                remote_degraded = remote.get("degraded_subsystems", [])
+                # Remote (subprocess) signals take precedence; merge
+                # local-only entries underneath so both are visible.
+                merged_health = dict(remote_health)
+                for k, v in subsystem_health.items():
+                    if k not in merged_health:
+                        merged_health[k] = v
+                merged_degraded = sorted(set(remote_degraded) | set(degraded))
+                subsystem_health = merged_health
+                degraded = merged_degraded
+            except Exception:
+                pass  # fail-soft: local-only health is still returned
         return {
             "feature_counters": counters,
             "subsystem_health": subsystem_health,

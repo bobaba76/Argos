@@ -1444,6 +1444,16 @@ class StoreRetrievalMixin:
                     except Exception as exc:
                         if not self._is_vector_search_unavailable(exc):
                             logger.warning("Semantic dedup check failed: %s", exc)
+                            # #330: log + counter (spec Part 2 "other
+                            # swallow sites"). Fail-soft: never raises.
+                            try:
+                                try:
+                                    from liveness import increment_counter
+                                except ImportError:
+                                    from liveness import increment_counter
+                                increment_counter("dedup_failures")
+                            except Exception:
+                                pass
             return None, None
 
     # -- Spec-06 (#69): access audit log -------------------------------------

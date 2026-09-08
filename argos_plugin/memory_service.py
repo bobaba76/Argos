@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import socket
@@ -47,6 +48,56 @@ _MAX_REQUEST_BYTES = 4 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 16 * 1024 * 1024  # 16 MB
 # MS8: single-instance guard probe read cap.
 _PROBE_MAX_BYTES = 65536
+
+
+class ServiceUnavailableError(RuntimeError):
+    """A requested subsystem is not available in this service process."""
+
+
+# #333: exception types whose message is written for the caller (auth
+# denials, validation errors, unknown methods) and may cross the wire.
+# Anything else (DuckDB/Kùzu errors, OSError, unexpected failures) is
+# reported with a generic message; the detail stays in the server log.
+_CLIENT_SAFE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    PermissionError,
+    ValueError,
+    LookupError,
+    TypeError,
+    ServiceUnavailableError,
+)
+_INTERNAL_ERROR_CLASS = "InternalError"
+_INTERNAL_ERROR_MESSAGE = "internal service error"
+_MAX_ERROR_MESSAGE_CHARS = 512
+# Windows drive paths, UNC paths, and POSIX/home paths with >= 2 segments.
+_PATH_RE = re.compile(
+    r"(?<![\w.])(?:"
+    r"[A-Za-z]:[\\/][^\s'\"<>|,;()]*"
+    r"|\\\\[^\s'\"<>|,;()]+"
+    r"|~?/(?:[^\s'\"<>|,;()/]+/)+[^\s'\"<>|,;()]*"
+    r")"
+)
+_SQL_RE = re.compile(
+    r"\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|FROM|WHERE|JOIN|"
+    r"MATCH|MERGE|RETURN)\b"
+)
+
+
+def _redact_error_message(message: str) -> str:
+    """Strip filesystem paths and SQL/Cypher fragments from a message."""
+    if _SQL_RE.search(message):
+        return _INTERNAL_ERROR_MESSAGE
+    message = _PATH_RE.sub("<path>", message)
+    if len(message) > _MAX_ERROR_MESSAGE_CHARS:
+        message = message[:_MAX_ERROR_MESSAGE_CHARS] + "..."
+    return message
+
+
+def _classify_error(exc: BaseException) -> tuple[str, str]:
+    """Map an exception to the (error, error_class) sent to the client."""
+    if isinstance(exc, _CLIENT_SAFE_EXCEPTIONS):
+        return _redact_error_message(str(exc)), type(exc).__name__
+    return _INTERNAL_ERROR_MESSAGE, _INTERNAL_ERROR_CLASS
+
 
 # MS1/MS9: server-set fields that clients may NOT inject via **args.
 # These are stripped from client-supplied args before passing to the store
@@ -1327,7 +1378,7 @@ class MemoryService:
 
     def _call_graph(self, method: str, args: dict, user_id: str, graph, store=None) -> Any:
         if graph is None:
-            raise RuntimeError("Relationship graph is unavailable")
+            raise ServiceUnavailableError("Relationship graph is unavailable")
         graph.set_user_scope(user_id)
         if method == "search_graph":
             return graph.search_graph(
@@ -1808,16 +1859,17 @@ class _RequestHandler(socketserver.StreamRequestHandler):
                 result = server.memory_service.dispatch(request)
                 self._write({"ok": True, "result": result})
             except Exception as exc:
-                # MS4: do NOT send traceback to the client — it could
-                # contain file paths, SQL queries, internal variable names,
-                # or secrets in stack frames. The full traceback is already
-                # logged server-side (exc_info=True). The error_class and
-                # str(exc) are sufficient for client-side error handling.
+                # MS4/#333: never send a traceback or raw str(exc) — both
+                # can carry file paths, SQL queries, or secrets. Only
+                # _CLIENT_SAFE_EXCEPTIONS surface a (redacted) message;
+                # everything else gets a generic envelope. The full
+                # detail is logged server-side (exc_info=True).
                 logger.warning("Memory service request failed: %s", exc, exc_info=True)
+                error, error_class = _classify_error(exc)
                 self._write({
                     "ok": False,
-                    "error": str(exc),
-                    "error_class": type(exc).__name__,
+                    "error": error,
+                    "error_class": error_class,
                 })
         finally:
             with server.in_flight_lock:

@@ -272,12 +272,23 @@ class RESTAuth:
         # Build the auth context. In v1 (trusted-local mode), the
         # principal/tenant/user_id come from env vars and max_* scope
         # fields are always None (open scope).
+        # Spec-11 (9/9): write tiers ON by default on loopback transports.
+        # Class A (propose) and Class C (direct write) are default-ON.
+        # Class B (feedback/approval) stays OFF — model self-approval, never.
+        # ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
+        is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+
         allowed = set(READ_OPERATIONS) | COLLECTION_READ_OPERATIONS
+        if not is_read_only:
+            allowed |= PROPOSAL_OPERATIONS
+            if is_loopback:
+                allowed |= WRITE_OPERATIONS
+                allowed |= COLLECTION_WRITE_OPERATIONS
+        # Explicit env vars still work as overrides.
         if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
             allowed |= PROPOSAL_OPERATIONS
         if os.environ.get("ARGOS_API_CAN_FEEDBACK", "").lower() in ("true", "1", "yes"):
             allowed |= FEEDBACK_OPERATIONS
-        # #200 PR-3: class C writes (loopback only).
         if is_loopback and os.environ.get("ARGOS_API_CAN_WRITE", "").lower() in ("true", "1", "yes"):
             allowed |= WRITE_OPERATIONS
             allowed |= COLLECTION_WRITE_OPERATIONS

@@ -562,13 +562,15 @@ class TestReviewQueue:
                         headers=_auth_headers())
         assert r.status_code == 404
 
-    def test_read_only_user_sees_no_review_buttons(self):
+    def test_read_only_user_sees_no_review_buttons(self, monkeypatch):
         """A read-only user sees 'read-only' instead of approve/reject
         buttons in the review queue."""
         store = StubStore()
         _seed_store(store)
+        # Spec-11: propose is ON by default; set READ_ONLY=1 to test the
+        # read-only surface.
+        monkeypatch.setenv("ARGOS_API_READ_ONLY", "1")
         client = _make_client(store=store)
-        # Without ARGOS_API_CAN_PROPOSE, the user is read-only.
         r = client.get("/review", headers=_auth_headers())
         assert r.status_code == 200
         assert "read-only" in r.text or "Approve" not in r.text

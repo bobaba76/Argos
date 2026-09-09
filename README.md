@@ -38,6 +38,7 @@ The API is a **read + write tier** (spec-09/10: transports are trust boundaries,
 - **Class A (propose):** external callers submit a candidate for human review. Nothing becomes active memory until a human approves it.
 - **Class B (review):** human principals approve/reject candidates. Model principals are denied — no self-approval, ever.
 - **Class C (direct write):** loopback-only trusted-local writes (`memory_save`, `memory_update`, collection writes). Same provider-level semantics as the native path (graph indexing, version chaining).
+- **Defaults (spec-11, 9/9):** MCP/REST transports boot **write-enabled** — Class A (propose→review) and Class C (direct write) are ON by default on loopback transports; `ARGOS_API_READ_ONLY=1` restores read-only for conservative/shared deployments. Class B (approvals) stays OFF — model self-approval, never.
 
 - **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio. Read: `memory_search`, `memory_fetch`, `memory_fetch_history`, `memory_explain`, `memory_why_not`, `memory_capabilities`, `collection_list`, `collection_items`. Write (loopback): `memory_save`, `memory_update`, `collection_create`, `collection_add_item`, `collection_update_item`, `collection_remove_item`. Review: `memory_candidate_review` (human only). Propose: `memory_propose`. Register with any MCP client.
 - **REST (HTTP):** `argos_plugin/rest_server.py` — bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
@@ -48,11 +49,13 @@ The API is a **read + write tier** (spec-09/10: transports are trust boundaries,
   - `Idempotency-Key` header required on all POSTs/PATCHes/DELETEs. CAS via `If-Match` header on PATCH/DELETE → 409 on conflict.
 
 ```bash
-# REST (read + write on loopback)
-ARGOS_REST_TOKEN=<token> ARGOS_API_CAN_WRITE=1 \
+# REST (read + write on loopback — write-enabled by default, spec-11)
+ARGOS_REST_TOKEN=<token> \
   python -m argos_plugin.rest_server --home <hermes-home> --port 8732
-# MCP (read + write on loopback)
-ARGOS_API_CAN_WRITE=1 python -m argos_plugin.mcp_server --home <hermes-home>
+# MCP (read + write on loopback — write-enabled by default, spec-11)
+python -m argos_plugin.mcp_server --home <hermes-home>
+# Read-only escape hatch (spec-09 default):
+ARGOS_API_READ_ONLY=1 python -m argos_plugin.mcp_server --home <hermes-home>
 ```
 
 **Collections** (spec-10 PR-2/3): exhaustive, structural stores (backlogs, reading lists). No ranking, no similarity — all items returned. Scope-isolated per tenant/user. Collection writes are class C (loopback only) and gated by a server-verified HMAC capability (boot-time `gate_secret`); a raw RPC caller without the secret cannot forge the proof.
@@ -82,7 +85,7 @@ Then open `http://127.0.0.1:8733` in your browser.
 - **Erase** — POPIA erase-request with preview-first and strict confirm (#293).
 - **Export** — portable JSONL + Markdown export (#294).
 
-Security: bound to `127.0.0.1` only (never `0.0.0.0`); server-derived identity (no client-supplied user identity); read-only by default (set `ARGOS_API_CAN_PROPOSE=1` to enable mutation actions); `Cache-Control: no-store` on all responses; no tokens in HTML output.
+Security: bound to `127.0.0.1` only (never `0.0.0.0`); server-derived identity (no client-supplied user identity); write-enabled by default (spec-11 — set `ARGOS_API_READ_ONLY=1` for read-only); `Cache-Control: no-store` on all responses; no tokens in HTML output.
 
 ## Tools
 

@@ -777,7 +777,7 @@ _NEVER_WHEN_RE = re.compile(
     re.IGNORECASE,
 )
 _ALWAYS_BEFORE_RE = re.compile(
-    r"\b(?:always|must)\s+(.+?)\s+before\s+(.+?)(?:\.|$)",
+    r"\b(?:always)\s+(.+?)\s+before\s+(.+?)(?:\.|$)",
     re.IGNORECASE,
 )
 _LESSON_RE = re.compile(
@@ -800,11 +800,30 @@ _DOESNT_WORK_RE = re.compile(
 
 # One-off outcome — routes to short-lived category, not durable.
 _OUTCOME_TRIED_RE = re.compile(
-    r"\b(?:i\s+)?(?:tried|attempted|did|ran|used)\s+(.+?)"
+    r"\b(?:i\s+)?(?:tried|attempted)\s+(.+?)"
     r"(?:\s+(?:yesterday|last\s+week|last\s+night|today|earlier))?"
     r"(?:\.|$)",
     re.IGNORECASE,
 )
+
+# #400 review 9/9 (blocker 1): constraint patterns describe the USER's own
+# behavior. Subject-less imperatives ("never X when Y") are fine, but a
+# third-person subject (name, pronoun, or thing-subject) must not mint a
+# durable constraint — the referent is dropped and the record becomes
+# durable noise about someone/something else ("Simone never drinks when
+# she is driving" / "My car doesn't work when it rains").
+_FIRST_PERSON_BEFORE_RE = re.compile(r"\b(?:i|we)\b", re.IGNORECASE)
+_OUTCOME_NEGATION_RE = re.compile(r"\b(?:not|n't|never|rarely|hardly)\b", re.IGNORECASE)
+
+
+def _constraint_subject_ok(sentence: str, match_start: int) -> bool:
+    """True when a constraint trigger is about the user: first-person
+    subject (I/we) before the trigger, or a subject-less imperative."""
+    prefix = sentence[:match_start]
+    if not prefix.strip():
+        return True
+    return bool(_FIRST_PERSON_BEFORE_RE.search(prefix))
+
 
 # "I have/own X" — possession attribute (scoped to have/own only so it
 # doesn't shadow _HAVE_USE_RE for "I use/take X" — issue #32).
@@ -1021,6 +1040,46 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
                 "payload": {"preference": directive, "assistant_side": True},
             }
 
+    # -- #400: constraint-form failure memory (never/always invariants) ------
+    # Checked BEFORE the habit pattern so "I never X when Y" reaches the
+    # constraint machinery — the habit path drops the negation and would
+    # store the inverted meaning as a durable preference (#400 review 9/9,
+    # blocker 4). _constraint_subject_ok anchors to the user so third-person
+    # subjects ("Simone never drinks when driving") don't mint constraints
+    # about someone else (blocker 1).
+    m = _NEVER_WHEN_RE.search(sentence)
+    if m and _constraint_subject_ok(sentence, m.start()):
+        action = m.group(1).strip().rstrip('.')
+        condition = m.group(2).strip().rstrip('.')
+        if len(action) > 3 and len(condition) > 3:
+            return {
+                "category": "insight",
+                "content": f"Constraint: never {action} when {condition}",
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "action": action,
+                    "condition": condition,
+                    "form": "never_when",
+                },
+            }
+    m = _ALWAYS_BEFORE_RE.search(sentence)
+    if m and _constraint_subject_ok(sentence, m.start()):
+        first = m.group(1).strip().rstrip('.')
+        second = m.group(2).strip().rstrip('.')
+        if len(first) > 3 and len(second) > 3:
+            return {
+                "category": "insight",
+                "content": f"Constraint: always {first} before {second}",
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "first": first,
+                    "second": second,
+                    "form": "always_before",
+                },
+            }
+
     # Habit: "I always test before deploying" / "I never push to main"
     m = _HABIT_RE.search(sentence)
     if m:
@@ -1059,45 +1118,11 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
 
     # -- #400: constraint-form failure memory ------------------------------
     # Failure/lesson content is classified as a durable CONSTRAINT
-    # (invariant form), not a one-off outcome. Checked AFTER insight so
-    # self-observations still match, but BEFORE event/ongoing so failure
-    # content doesn't land as a short-lived event.
+    # (invariant form), not a one-off outcome. The never/always invariant
+    # forms are checked earlier (above the habit pattern, #400 review 9/9);
+    # this block handles the remaining families.
     #
-    # 1. Explicit constraint: "never X when Y", "always X before Y"
-    m = _NEVER_WHEN_RE.search(sentence)
-    if m:
-        action = m.group(1).strip().rstrip('.')
-        condition = m.group(2).strip().rstrip('.')
-        if len(action) > 3 and len(condition) > 3:
-            return {
-                "category": "insight",
-                "content": f"Constraint: never {action} when {condition}",
-                "tags": ["constraint", "failure_lesson"],
-                "payload": {
-                    "constraint": True,
-                    "action": action,
-                    "condition": condition,
-                    "form": "never_when",
-                },
-            }
-    m = _ALWAYS_BEFORE_RE.search(sentence)
-    if m:
-        first = m.group(1).strip().rstrip('.')
-        second = m.group(2).strip().rstrip('.')
-        if len(first) > 3 and len(second) > 3:
-            return {
-                "category": "insight",
-                "content": f"Constraint: always {first} before {second}",
-                "tags": ["constraint", "failure_lesson"],
-                "payload": {
-                    "constraint": True,
-                    "first": first,
-                    "second": second,
-                    "form": "always_before",
-                },
-            }
-
-    # 2. Explicit lesson/mistake: "lesson: X", "learned: X"
+    # 1. Explicit lesson/mistake: "lesson: X", "learned: X"
     m = _LESSON_RE.search(sentence)
     if m:
         lesson = m.group(1).strip().rstrip('.')
@@ -1115,7 +1140,7 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
 
     # 3. Failure with cause: "tried X, failed because Y" → invariant form
     m = _FAILED_BECAUSE_RE.search(sentence)
-    if m:
+    if m and _constraint_subject_ok(sentence, m.start()):
         action = m.group(1).strip().rstrip('.')
         cause = m.group(2).strip().rstrip('.') if m.group(2) else None
         if len(action) > 3:
@@ -1138,16 +1163,21 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
     # 4. "X doesn't work when Y" → invariant form
     m = _DOESNT_WORK_RE.search(sentence)
     if m:
-        action = m.group(1).strip().rstrip('.')
+        subject = m.group(1).strip().rstrip('.')
         condition = m.group(2).strip().rstrip('.')
-        if len(action) > 3 and len(condition) > 3:
+        # #400 review 9/9 (blocker 1): this pattern captures the subject
+        # INSIDE the match, so the subject must be checked directly —
+        # thing-subjects ("My car", "That library") must not mint durable
+        # constraints (referent dropped, broken synthesis clause). Only
+        # first-person subjects (I/we) produce invariants.
+        if _FIRST_PERSON_BEFORE_RE.fullmatch(subject) and len(condition) > 3:
             return {
                 "category": "insight",
-                "content": f"Constraint: {action} does not work when {condition}; never {action} when {condition}",
+                "content": f"Constraint: {subject} do not work when {condition}",
                 "tags": ["constraint", "failure_lesson"],
                 "payload": {
                     "constraint": True,
-                    "action": action,
+                    "action": subject,
                     "condition": condition,
                     "form": "doesnt_work_when",
                 },
@@ -1158,18 +1188,22 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
     #    Only matches if no failure pattern above matched.
     m = _OUTCOME_TRIED_RE.search(sentence)
     if m:
-        outcome = m.group(1).strip().rstrip('.')
-        if len(outcome) > 5:
-            return {
-                "category": "context_note",
-                "content": f"User tried: {outcome}",
-                "tags": ["outcome", "one_off"],
-                "payload": {
-                    "outcome": True,
-                    "action": outcome,
-                    "form": "one_off_outcome",
-                },
-            }
+        # #400 review 9/9 (blocker 2): negation guard — "I never tried
+        # meditation" / "I didn't try X" is not a one-off outcome to record.
+        preceding = sentence[max(0, m.start() - 32):m.start()]
+        if not _OUTCOME_NEGATION_RE.search(preceding):
+            outcome = m.group(1).strip().rstrip('.')
+            if len(outcome) > 5:
+                return {
+                    "category": "context_note",
+                    "content": f"User tried: {outcome}",
+                    "tags": ["outcome", "one_off"],
+                    "payload": {
+                        "outcome": True,
+                        "action": outcome,
+                        "form": "one_off_outcome",
+                    },
+                }
 
     # Event: "I started a new job" / "I quit smoking" / "I launched the app"
     m = _EVENT_RE.search(sentence)

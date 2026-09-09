@@ -416,6 +416,24 @@ _META_REFERENCE_RE = re.compile(
 _SECOND_PERSON_RE = re.compile(r"\b(?:you|your|we|our)\b", re.IGNORECASE)
 _FRAGMENT_START_RE = re.compile(r"^(?:or|and|but|because|so|which)\b", re.IGNORECASE)
 _FRAGMENT_END_RE = re.compile(r"(?:\bto|\bwith|\bbecause|\band|\bbut|\bof|\bfor)$", re.IGNORECASE)
+# Dangling qualifier endings: a capture that stops on a bare adjective/adverb
+# is a truncated fragment, not a complete fact ("found a REALLY good" — #395).
+# #395 review: narrowed to only match when preceded by a determiner
+# (a/an/the) — this prevents false positives on complete facts like
+# "User likes dark mode better" or "User's favorite coffee is really
+# good" where the word is a predicate adjective in a complete clause,
+# not a truncated noun phrase. The middle word is optional so "a really"
+# and "a REALLY good" both match.
+_DANGLING_END_RE = re.compile(
+    r"\b(?:a|an|the)\s+(?:\w+\s+)?"
+    r"(?:really|very|quite|kinda|sorta|maybe|possibly|probably|good|great|"
+    r"nice|better|best|bad|worse|worst|new|old|big|small|fast|slow|high|low|"
+    r"much|more|most|less|least|some|any|many|few|enough|plenty|such|too|"
+    r"like|similar|different|same|other|only|just|even|also|still|already|"
+    r"almost|nearly|about|around|roughly|basically|actually|literally|"
+    r"seriously|honestly|pretty|fairly|rather|somewhat)$",
+    re.IGNORECASE,
+)
 _WRONG_SUBJECT_RE = re.compile(
     r"^user\s+is\s+(?:an?\s+)?(?:ai|the assistant|the agent)\b",
     re.IGNORECASE,
@@ -455,7 +473,7 @@ def quality_flags_for_fact(fact: Dict[str, Any]) -> List[str]:
         flags.append("unanchored_subject")
     if _ASSISTANT_INSTRUCTION_RE.search(content):
         flags.append("assistant_instruction")
-    if _FRAGMENT_START_RE.search(content) or _FRAGMENT_END_RE.search(content):
+    if _FRAGMENT_START_RE.search(content) or _FRAGMENT_END_RE.search(content) or _DANGLING_END_RE.search(content):
         flags.append("sentence_fragment")
     if "?" in content or content.lower().startswith(("who ", "what ", "why ", "how ")):
         flags.append("question_or_request")
@@ -1579,6 +1597,12 @@ def _extract_from_turn_impl(
             continue
         payload = dict(fact.get("payload") or {})
         flags = quality_flags_for_fact(fact)
+        # #395 (Part B): questions and fragments are not durable facts. These
+        # used to travel as advisory flags to the reviewer queue, which
+        # drowned in them ("User has: A 12GB CARD???", "User has: found a
+        # REALLY good") — reject at extraction time instead.
+        if any(f in flags for f in ("question_or_request", "sentence_fragment")):
+            continue
         if flags:
             payload["quality_flags"] = flags
         fact["payload"] = payload

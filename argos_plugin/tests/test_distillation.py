@@ -57,6 +57,25 @@ from _test_embedder import DeterministicTestEmbedder
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _bypass_egress_gate():
+    """Bypass the egress gate for distillation tests.
+
+    The egress gate reads ``distillation_enabled`` from the live
+    hybrid_memory.json config (default false). On the maintainer's machine
+    the config file exists with the flag enabled; on CI there is no config
+    file, so the gate blocks and every run_distillation call returns
+    ``skipped: 'egress_gate'`` before reaching the logic under test.
+
+    These tests exercise the distillation logic (clustering, LLM mocking,
+    proposal emission, run-state advancement), NOT the egress gate itself
+    (covered by test_egress.py / test_egress_audit.py). Patching the gate
+    here keeps the distillation suite hermetic and CI-portable.
+    """
+    with patch("egress.gate", return_value=True):
+        yield
+
+
 @pytest.fixture
 def store(tmp_path):
     """A fresh DuckDBMemoryStore with the deterministic test embedder."""

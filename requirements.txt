@@ -10,6 +10,9 @@ winsdk==1.0.0b10; sys_platform == "win32"
 fastapi==0.133.1
 uvicorn==0.41.0
 pydantic==2.13.4
+# Form data handling in admin_console.py (FastAPI requires python-multipart
+# for form-encoded POSTs — review/erase/export forms).
+python-multipart==0.0.32
 
 # Document extraction (watcher.py) — PDF, Excel, Word.
 PyPDF2==3.0.1

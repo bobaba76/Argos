@@ -134,7 +134,8 @@ class TestCredentialModeBasic:
     def test_get_status_reports_auth_mode(self, tmp_path):
         """get_status shows auth_mode=multi-user and credential_count."""
         svc = _make_credential_service(tmp_path)
-        status = svc.dispatch({"method": "get_status"})
+        # MS3: get_status requires a valid credential in multi-user mode.
+        status = _dispatch(svc, credential=_TENANT_A_TOKEN, method="get_status")
         assert status["auth_mode"] == "multi-user"
         assert status["credential_count"] == 3
 

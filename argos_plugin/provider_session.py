@@ -1518,7 +1518,16 @@ class ProviderSessionMixin:
                 return tool_error("Missing required parameter: memory_id")
             if not _valid_memory_id(memory_id):
                 return tool_error("Invalid memory_id format (expected UUID)")
-            result = self._store.delete_memory(memory_id=memory_id)
+            # #200 Spec-10: shared stores forbid raw delete_memory on the RPC
+            # boundary. Use the sanctioned facade path (facade_delete_memory)
+            # with CAS (expected_version = memory_id) when available; local
+            # stores still use delete_memory directly.
+            if hasattr(self._store, "facade_delete_memory"):
+                result = self._store.facade_delete_memory(
+                    memory_id=memory_id, expected_version=memory_id
+                )
+            else:
+                result = self._store.delete_memory(memory_id=memory_id)
             if not result:
                 return tool_error(f"Memory not found: {memory_id}")
             if getattr(self, "_graph", None):

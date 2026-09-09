@@ -261,14 +261,16 @@ class TestNoSelfApproval:
         assert "memory_quarantine" not in tool_names
 
     def test_approve_operation_not_in_public_operations(self):
-        """The facade does not expose approve/reject as public operations."""
+        """The facade does not expose approve/reject as public operations,
+        but review_candidate IS public (part of the proposal flow)."""
         assert "approve" not in PUBLIC_OPERATIONS
         assert "reject" not in PUBLIC_OPERATIONS
-        assert "review_candidate" not in PUBLIC_OPERATIONS
+        assert "review_candidate" in PUBLIC_OPERATIONS
+        assert "review_candidate" in PROPOSAL_OPERATIONS
 
     def test_review_candidate_is_forbidden(self):
-        """Attempting to call review_candidate through the facade is
-        rejected with method_not_allowed."""
+        """A model principal attempting to call review_candidate through
+        the facade is rejected with forbidden (class B is human-only)."""
         store = StubStore()
         facade = ArgosAPIFacade(store, acl=ACLConfig())
         auth = AuthContext(
@@ -276,12 +278,13 @@ class TestNoSelfApproval:
             tenant="default",
             user_id="model-user",
             transport="mcp-stdio",
+            principal_type="model",
             allowed_operations=READ_OPERATIONS | PROPOSAL_OPERATIONS,
         )
         with pytest.raises(APIError) as exc_info:
             facade.execute(auth, "review_candidate",
                            {"candidate_id": "cand-1", "decision": "approved"})
-        assert exc_info.value.code == "method_not_allowed"
+        assert exc_info.value.code == "forbidden"
 
     def test_attempting_approve_via_mcp_returns_error(self):
         """Calling a nonexistent approve tool via MCP returns

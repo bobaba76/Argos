@@ -1524,6 +1524,7 @@ class StoreRetrievalMixin:
         *,
         limit: int = 10000,
         format: str = "jsonl",
+        tenant_name: str | None = None,
     ) -> str:
         """Export the access audit log as JSONL or CSV.
 
@@ -1531,11 +1532,14 @@ class StoreRetrievalMixin:
         control on the export itself.
 
         SR1: filtered to the caller's tenant/user_id — no cross-tenant
-        audit leak.
+        audit leak. When ``tenant_name`` is provided (by the service
+        dispatch which knows the tenant), the tenant filter uses it
+        instead of the user_id (which is wrong for the tenant column).
         """
         try:
             with self._state.lock:
                 assert self.connection is not None
+                _tenant_filter = tenant_name or self.user_id
                 result = self.connection.execute(
                     """SELECT audit_id, ts, tenant, user_id, query_text,
                               granted_count, denied_count, denied_scopes, excluded
@@ -1543,7 +1547,7 @@ class StoreRetrievalMixin:
                        WHERE user_id = ? OR tenant = ?
                        ORDER BY ts DESC
                        LIMIT ?""",
-                    [self.user_id, self.user_id,
+                    [self.user_id, _tenant_filter,
                      max(1, min(int(limit), 100000))],
                 )
                 columns = [desc[0] for desc in result.description]

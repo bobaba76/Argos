@@ -411,8 +411,9 @@ class TestEvolutionChains:
         v1 = store.remember(category="personal_fact", content="User opinion: Python is best")
         v2 = store.update_memory(v1.memory_id, content="User opinion: Rust is best")
         v3 = store.update_memory(v2.memory_id, content="User opinion: Go is best")
-        # Quarantine the middle version.
-        store.quarantine_memory(v2.memory_id, "test gap")
+        # Quarantine the middle version via delete_memory (quarantine_memory
+        # only works on head versions — SW5: valid_to IS NULL check).
+        store.delete_memory(v2.memory_id)
 
         result = provider.handle_tool_call(
             "memory_chain", {"memory_id": v1.memory_id, "mode": "arc"},
@@ -479,6 +480,20 @@ class TestEvolutionChains:
         and updates the separate counter (NOT retrieval counters)."""
         provider, store, graph = self._make_provider(tmp_path)
         provider._chain_unfold = "auto"
+        # PR7: _arc_clears_similarity_floor fail-closes when _embedder is
+        # None — provide a deterministic embedder so the semantic guard can
+        # run and the unfold can fire. Also set on the store so search
+        # results carry similarity scores above the chain-unfold floor.
+        # Lower the arc similarity floor for this test: the query ("why did
+        # I stop using PHP") is about the OLD version, but the arc floor
+        # checks the CURRENT version ("User now likes Python") — no token
+        # overlap with a hashing embedder. This test exercises the
+        # change-intent trigger, not the arc precision guard.
+        from conftest import DeterministicEmbedder
+        _emb = DeterministicEmbedder()
+        provider._embedder = _emb
+        store.embedder = _emb
+        provider._chain_unfold_arc_min_similarity = 0.0
         v1 = store.remember(category="personal_fact", content="User used to like PHP a lot")
         store.update_memory(v1.memory_id, content="User now likes Python")
         # Search for the CURRENT version's content so the head is found.

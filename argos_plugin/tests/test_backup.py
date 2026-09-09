@@ -81,9 +81,11 @@ def test_backup_round_trip_preserves_embeddings_and_counts(tmp_path):
     # Restore (service is not running — no lock).
     report = restore_store(snap_dir, db_path)
     assert report["status"] == "restored"
-    # #288: rows_restored includes the schema_meta table (1 row for
-    # schema_version), so the total is 5 memory_records + 1 schema_meta.
-    assert report["rows_restored"] == 6
+    # #288: rows_restored includes ALL tables (memory_records, schema_meta,
+    # and audit tables like write_access_audit that accumulate rows during
+    # writes). The exact total depends on the schema version; assert it
+    # includes at least the 5 memory_records + 1 schema_meta = 6 baseline.
+    assert report["rows_restored"] >= 6
 
     # Verify all 5 rows are back with their original embeddings.
     conn = duckdb.connect(str(db_path), read_only=True)

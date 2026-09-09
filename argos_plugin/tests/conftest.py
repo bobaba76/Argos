@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import importlib.machinery
 import json
 import os
 import sys
@@ -85,6 +86,7 @@ def _install_hermes_stubs_if_missing() -> None:
 
         _mp.MemoryProvider = MemoryProvider
         _agent = types.ModuleType("agent")
+        _agent.__path__ = []  # mark as package so submodule imports work
         _agent.memory_provider = _mp
         sys.modules.setdefault("agent", _agent)
         sys.modules.setdefault("agent.memory_provider", _mp)
@@ -92,9 +94,98 @@ def _install_hermes_stubs_if_missing() -> None:
         _tr = types.ModuleType("tools.registry")
         _tr.tool_error = lambda msg: json.dumps({"error": str(msg)})
         _tools = types.ModuleType("tools")
+        _tools.__path__ = []  # mark as package so submodule imports work
         _tools.registry = _tr
         sys.modules.setdefault("tools", _tools)
         sys.modules.setdefault("tools.registry", _tr)
+
+    # agent.auxiliary_client: the extractor's LLM fallback imports
+    # ``from agent.auxiliary_client import call_llm`` lazily and degrades to
+    # a no-LLM path when it is absent.  Tests that exercise the LLM path
+    # patch ``agent.auxiliary_client.call_llm``, which requires the module
+    # to exist in sys.modules.  Install a stub whose ``call_llm`` returns
+    # None so the hermetic no-LLM behaviour is preserved for tests that do
+    # not patch it, while patchable for tests that do.
+    if _FORCE_HERMETIC or importlib.util.find_spec("agent.auxiliary_client") is None:
+        _aux = types.ModuleType("agent.auxiliary_client")
+        _aux.call_llm = lambda **kwargs: None
+        _agent_mod = sys.modules.get("agent")
+        if _agent_mod is not None:
+            _agent_mod.auxiliary_client = _aux
+        sys.modules.setdefault("agent.auxiliary_client", _aux)
+
+    # plugins.memory.config_schema: ``argos_plugin/config_schema.py`` imports
+    # from ``plugins.memory.config_schema`` at module level.  That package
+    # only exists inside a running Hermes installation.  Install a hermetic
+    # stub providing the same dataclass API so the plugin imports cleanly on
+    # a fresh clone.  The real module is used when available (deployed
+    # plugin) unless ARGOS_HERMETIC_TESTS=1 forces the stub.
+    if _FORCE_HERMETIC or importlib.util.find_spec("plugins.memory.config_schema") is None:
+        import dataclasses as _dc
+
+        KIND_TEXT = "text"
+        KIND_SELECT = "select"
+        KIND_SECRET = "secret"
+        KIND_BOOL = "bool"
+        KIND_NUMBER = "number"
+        STORAGE_FLAT_JSON = "flat_json"
+
+        @_dc.dataclass
+        class ProviderFieldOption:  # type: ignore[no-redef]
+            value: str
+            label: str = ""
+            description: str = ""
+
+        @_dc.dataclass
+        class ProviderField:  # type: ignore[no-redef]
+            key: str
+            label: str = ""
+            kind: str = KIND_TEXT
+            default: str = ""
+            description: str = ""
+            placeholder: str = ""
+            options: tuple = ()
+            env_key: object = None
+            aliases: tuple = ()
+            env_fallbacks: tuple = ()
+            inline: bool = False
+            group: str = ""
+            info: str = ""
+            scope: str = "host"
+
+        @_dc.dataclass
+        class ProviderConfigSchema:  # type: ignore[no-redef]
+            name: str
+            label: str = ""
+            storage: str = STORAGE_FLAT_JSON
+            docs_url: str = ""
+            config_file: object = None
+            fields: tuple = ()
+
+        _pcs = types.ModuleType("plugins.memory.config_schema")
+        _pcs.ProviderConfigSchema = ProviderConfigSchema
+        _pcs.ProviderField = ProviderField
+        _pcs.ProviderFieldOption = ProviderFieldOption
+        _pcs.KIND_TEXT = KIND_TEXT
+        _pcs.KIND_SELECT = KIND_SELECT
+        _pcs.KIND_SECRET = KIND_SECRET
+        _pcs.KIND_BOOL = KIND_BOOL
+        _pcs.KIND_NUMBER = KIND_NUMBER
+        _pcs.STORAGE_FLAT_JSON = STORAGE_FLAT_JSON
+        _plugins = sys.modules.get("plugins")
+        if _plugins is None:
+            _plugins = types.ModuleType("plugins")
+            _plugins.__path__ = []  # type: ignore[attr-defined]
+            _plugins.__spec__ = importlib.machinery.ModuleSpec("plugins", None)  # type: ignore[attr-defined]
+            sys.modules.setdefault("plugins", _plugins)
+        _plugins_mem = sys.modules.get("plugins.memory")
+        if _plugins_mem is None:
+            _plugins_mem = types.ModuleType("plugins.memory")
+            _plugins_mem.__path__ = []  # type: ignore[attr-defined]
+            _plugins_mem.__spec__ = importlib.machinery.ModuleSpec("plugins.memory", None)  # type: ignore[attr-defined]
+            sys.modules.setdefault("plugins.memory", _plugins_mem)
+        _plugins_mem.config_schema = _pcs
+        sys.modules.setdefault("plugins.memory.config_schema", _pcs)
 
 
 _install_hermes_stubs_if_missing()
@@ -108,9 +199,9 @@ _install_hermes_stubs_if_missing()
 # Exact keys, plus every submodule under the agent./tools. packages
 # (agent.auxiliary_client, agent.memory_provider, tools.registry, ...).
 _STUB_KEYS_EXACT = frozenset(
-    {"agent", "tools", "service_client", "inbound_security", "argos.inbound_security"}
+    {"agent", "tools", "plugins", "service_client", "inbound_security", "argos.inbound_security"}
 )
-_STUB_KEYS_PREFIX = ("agent.", "tools.")
+_STUB_KEYS_PREFIX = ("agent.", "tools.", "plugins.")
 
 
 def _is_stub_key(name: str) -> bool:
@@ -133,7 +224,10 @@ def _restore_import_state_after_test():
     saved = {name: sys.modules[name] for name in _stub_keys()}
     saved_meta_path = list(sys.meta_path)
     yield
-    for name in _stub_keys():
+    # Restore every key that was in the snapshot (including ones a test body
+    # may have deleted from sys.modules) and remove any new stub keys a test
+    # body added.
+    for name in set(saved) | set(_stub_keys()):
         if name in saved:
             sys.modules[name] = saved[name]
         else:

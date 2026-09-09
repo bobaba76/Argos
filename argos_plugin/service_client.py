@@ -660,8 +660,15 @@ class SharedMemoryStore:
         }
 
     def erase_subject(self, **kwargs: Any) -> dict:
-        """#293: POPIA erase-request workflow (provable deletion)."""
-        result = self._rpc.call("store", "erase_subject", **kwargs)
+        """#293: POPIA erase-request workflow (provable deletion).
+
+        Uses call_gated() so the _confirmed envelope flag is set — the
+        server-side dispatch trusts the envelope flag (not a client-
+        supplied confirm arg, which is stripped by _sanitize_args).
+        Same pattern as facade_delete_memory #200 PR-2.
+        """
+        kwargs.pop("confirm", None)  # strip — gate authority is in the envelope
+        result = self._rpc.call_gated("store", "erase_subject", **kwargs)
         return result or {
             "mode": kwargs.get("mode", "preview"), "wrote": False,
             "records": [],

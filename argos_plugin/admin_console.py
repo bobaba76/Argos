@@ -102,10 +102,9 @@ class AdminAuth:
     the internal service token, loaded from ARGOS_REST_TOKEN or
     api_credential.json. Server-derived identity from env vars.
 
-    The admin console grants proposal-tier operations when
-    ARGOS_API_CAN_PROPOSE is set (same env-var gate as the MCP server).
-    This means the UI is read-only by default; the operator opts in to
-    mutations via the env var.
+    The admin console grants proposal-tier operations by default (spec-11).
+    Set ARGOS_API_READ_ONLY=1 to make the console read-only (spec-09
+    default).
     """
 
     def __init__(self, expected_token: str) -> None:
@@ -152,7 +151,13 @@ class AdminAuth:
                 }},
             )
         # Build the auth context — server-derived identity.
+        # Spec-11 (9/9): propose ON by default (class A).
+        # ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
+        is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+
         allowed = set(READ_OPERATIONS)
+        if not is_read_only:
+            allowed |= PROPOSAL_OPERATIONS
         if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
             allowed |= PROPOSAL_OPERATIONS
         return AuthContext(
@@ -626,7 +631,7 @@ def create_app(
           <tr><th>ID</th><th>Category</th><th>Content</th><th>Source</th><th>Conf</th><th>Status</th><th>Provenance</th><th>Created</th><th>Actions</th></tr>
           {rows}
         </table>
-        <p class="muted">{result.get('count', 0)} candidates. {"Review actions enabled." if can_review else "Read-only — set ARGOS_API_CAN_PROPOSE=1 to enable review actions."}</p>
+        <p class="muted">{result.get('count', 0)} candidates. {"Review actions enabled." if can_review else "Read-only — set ARGOS_API_READ_ONLY=0 (or unset) to enable review actions."}</p>
         """
         return _base_page("Review Queue", body, ctx)
 
@@ -673,7 +678,7 @@ def create_app(
         if "erase_request" not in ctx.allowed_operations:
             body = """
             <h1>Erase (POPIA)</h1>
-            <div class="flash flash-err">Not authorized. Set ARGOS_API_CAN_PROPOSE=1 to enable erase operations.</div>
+            <div class="flash flash-err">Not authorized. Unset ARGOS_API_READ_ONLY (or set it to 0) to enable erase operations.</div>
             """
             return _base_page("Erase", body, ctx)
         body = """
@@ -836,8 +841,9 @@ def main() -> None:
         python argos_plugin/admin_console.py --home $HERMES_HOME
 
     The same ARGOS_REST_TOKEN / api_credential.json as the REST server
-    is used for auth. Set ARGOS_API_CAN_PROPOSE=1 to enable mutation
-    actions (review/erase); without it the console is read-only.
+    is used for auth. Mutation actions (review/erase) are enabled by
+    default (spec-11); set ARGOS_API_READ_ONLY=1 to make the console
+    read-only.
     """
     import argparse
     import uvicorn

@@ -1070,3 +1070,75 @@ class TestHMACGateThroughTransports:
         r = client.delete(f"/v1/collections/{col['collection_id']}/items/{item['item_id']}",
                          headers={**_auth_headers(), "Idempotency-Key": "hmac-del"})
         assert r.status_code == 200
+
+
+# ===========================================================================
+# Spec-11: write tiers ON by default, READ_ONLY escape hatch
+# ===========================================================================
+
+class TestSpec11WriteDefaults:
+    """Spec-11 (9/9): MCP/REST transports boot write-enabled by default.
+    Class A (propose) and Class C (direct write) are ON; Class B (approval)
+    stays OFF. ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
+    """
+
+    def test_mcp_no_env_exposes_write_ops(self):
+        """(a) No env vars → write ops are in the allowed set."""
+        from mcp_server import _load_auth_context
+        _restore_env()  # clear all ARGOS_API_* env vars
+        ctx = _load_auth_context(Path("/tmp/fake"))
+        # Class A (propose) is ON by default.
+        assert "memory_propose" in ctx.allowed_operations
+        # Class C (direct write) is ON by default (loopback).
+        assert "memory_save" in ctx.allowed_operations
+        assert "memory_update" in ctx.allowed_operations
+        # Collection writes are ON by default (loopback).
+        assert "collection_create" in ctx.allowed_operations
+        # Class B feedback is OFF by default (FEEDBACK_OPERATIONS not
+        # included). review_candidate is in PROPOSAL_OPERATIONS (shares
+        # the proposal tier for mechanics) but the facade denies it for
+        # model principals — tested in test (d) below.
+        assert "record_feedback" not in ctx.allowed_operations
+
+    def test_mcp_read_only_restores_old_surface(self):
+        """(b) ARGOS_API_READ_ONLY=1 → read tier only (spec-09 default)."""
+        from mcp_server import _load_auth_context
+        _set_env(ARGOS_API_READ_ONLY="1")
+        ctx = _load_auth_context(Path("/tmp/fake"))
+        # Read ops are present.
+        assert "search" in ctx.allowed_operations
+        assert "fetch" in ctx.allowed_operations
+        # Write ops are NOT present.
+        assert "memory_propose" not in ctx.allowed_operations
+        assert "memory_save" not in ctx.allowed_operations
+        assert "memory_update" not in ctx.allowed_operations
+        assert "collection_create" not in ctx.allowed_operations
+
+    def test_mcp_no_loopback_denies_class_c_even_with_defaults(self):
+        """(c) ARGOS_API_NO_LOOPBACK=1 → class C writes denied even though
+        write tiers are ON by default (loopback gate intact)."""
+        from mcp_server import _load_auth_context
+        _set_env(ARGOS_API_NO_LOOPBACK="1")
+        ctx = _load_auth_context(Path("/tmp/fake"))
+        # Class A (propose) is still ON (not loopback-gated).
+        assert "memory_propose" in ctx.allowed_operations
+        # Class C (direct write) is OFF (not loopback).
+        assert "memory_save" not in ctx.allowed_operations
+        assert "memory_update" not in ctx.allowed_operations
+        assert "collection_create" not in ctx.allowed_operations
+
+    def test_mcp_model_principal_denied_review_with_defaults(self):
+        """(d) Default principal_type=model → class B denied even with
+        write tiers ON by default (no self-approval, ever)."""
+        from mcp_server import _load_auth_context
+        _restore_env()  # clear all ARGOS_API_* env vars
+        ctx = _load_auth_context(Path("/tmp/fake"))
+        assert ctx.principal_type == "model"
+        store = StubStore()
+        store.save_candidate(content="test", category="context_note")
+        facade = _make_facade(store)
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(ctx, "review_candidate", {
+                "candidate_id": "cand-1", "decision": "approved",
+            }, idempotency_key="spec11-rev")
+        assert exc_info.value.code == "forbidden"

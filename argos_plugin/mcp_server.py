@@ -1264,14 +1264,27 @@ def _load_auth_context(home: Path) -> "AuthContext":
     # test non-loopback denial.
     is_loopback = os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
 
-    # Default: read-only + collection reads. Proposal, feedback, writes,
-    # and collection writes are opt-in via env vars.
+    # Spec-11 (9/9): write tiers ON by default on loopback transports.
+    # Class A (propose) and Class C (direct write) are default-ON so
+    # external MCP clients (OpenWebUI, Claude Desktop, Cursor, etc.) get
+    # a working read+write surface with no env-var discovery required.
+    # Class B (feedback/approval) stays OFF — model self-approval, never.
+    # ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default for
+    # conservative or shared deployments.
+    is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+
     allowed = set(READ_OPERATIONS) | COLLECTION_READ_OPERATIONS
+    if not is_read_only:
+        allowed |= PROPOSAL_OPERATIONS
+        if is_loopback:
+            allowed |= WRITE_OPERATIONS
+            allowed |= COLLECTION_WRITE_OPERATIONS
+    # Explicit env vars still work as overrides (belt-and-suspenders for
+    # deployments that set them intentionally).
     if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
         allowed |= PROPOSAL_OPERATIONS
     if os.environ.get("ARGOS_API_CAN_FEEDBACK", "").lower() in ("true", "1", "yes"):
         allowed |= FEEDBACK_OPERATIONS
-    # #200 PR-3: class C writes (loopback only).
     if is_loopback and os.environ.get("ARGOS_API_CAN_WRITE", "").lower() in ("true", "1", "yes"):
         allowed |= WRITE_OPERATIONS
         allowed |= COLLECTION_WRITE_OPERATIONS

@@ -44,17 +44,32 @@ Use the `memory_candidate_list` tool (or the CLI review tool) to see pending pro
 
 ## 6. Optional: start the external API
 
-If you want non-Hermes agents to read your memory store:
+Argos works with **any MCP or REST client** — not just Hermes. The MCP and
+REST transports boot **read + write enabled** by default (spec-11): propose
+candidates, save/update memories, and manage collections without any env-var
+setup.
 
 ```bash
-# REST server (loopback-only, token-authenticated)
+# REST server (loopback-only, token-authenticated, read + write by default)
 ARGOS_REST_TOKEN=<your-token> python -m argos_plugin.rest_server --home <hermes-home> --port 8732
 
-# MCP server (stdio)
+# MCP server (stdio, read + write by default)
 python -m argos_plugin.mcp_server --home <hermes-home>
 ```
 
-See [API reference](api/index.md) for the full operation set.
+**Trust model:**
+| Class | Operations | Default | When to turn off |
+|-------|-----------|---------|-------------------|
+| A (propose) | `memory_propose`, `ingest` | ON | Conservative deployments: `ARGOS_API_READ_ONLY=1` |
+| C (direct write) | `memory_save`, `memory_update`, collection writes | ON (loopback) | Non-loopback: `ARGOS_API_NO_LOOPBACK=1` |
+| B (approve) | `review_candidate` | OFF (model denied) | Never for model-driven clients |
+
+**Read-only escape hatch:** `ARGOS_API_READ_ONLY=1` restores the spec-09
+read-only default for conservative or shared deployments.
+
+See [Integration guide](integration.md) for MCP client registration JSON
+(OpenWebUI, Claude Desktop, Cursor) and [API reference](api/index.md) for
+the full operation set.
 
 ## Next steps
 

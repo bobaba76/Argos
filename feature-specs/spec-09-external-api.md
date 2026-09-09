@@ -1,5 +1,11 @@
 # Spec 9 — External API: MCP server, REST, MCP client (trust-boundary facade)
 
+> **Amended by spec-11 (9/9):** Write tiers (A/C) now default-ON on loopback
+> transports; REST writes promoted to v1. The facade spine described below
+> is unchanged — every write still passes through auth → ACL → validation →
+> idempotency → audit → redaction. See `spec-11-harness-agnostic-read-write.md`
+> for the default-flip rationale and `ARGOS_API_READ_ONLY=1` escape hatch.
+
 Status: **DRAFT 2026-09-02** — plan, not shipped behavior. Implementation is
 tracked as issues #123–#126 and lands behind this spec's Gate. Contents are
 read as the plan, never as a description of live behavior.

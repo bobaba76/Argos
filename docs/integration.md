@@ -94,34 +94,58 @@ Notes on the env block:
   `"python"` may resolve to a system interpreter without `duckdb`,
   `jsonschema`, etc.
 
-To enable the **write tier** (propose candidates, save/update memories,
-manage collections), add these env vars:
+### Write tier (enabled by default — spec-11)
+
+As of spec-11 (9/9), the MCP and REST transports boot **write-enabled** by
+default. Class A (propose → human review queue) and Class C (direct write,
+loopback-only) are ON out of the box — no env vars required. Class B
+(candidate approval) stays OFF (model self-approval, never).
+
+A minimal MCP registration with write support:
+
+```json
+{
+  "mcpServers": {
+    "argos": {
+      "command": "python",
+      "args": ["-m", "argos_plugin.mcp_server", "--home", "/path/to/hermes/home"],
+      "env": {
+        "PYTHONPATH": "/path/to/Argos;/path/to/Argos/argos_plugin"
+      }
+    }
+  }
+}
+```
+
+That's it — `memory_propose`, `memory_save`, `memory_update`, and collection
+writes are all available. No `ARGOS_API_CAN_PROPOSE` or `ARGOS_API_CAN_WRITE`
+needed.
+
+**Read-only escape hatch:** Set `ARGOS_API_READ_ONLY=1` to restore the
+spec-09 read-only default (reads + collection reads only). Use this for
+conservative or shared deployments where you don't want external clients
+writing to the store.
 
 ```json
 {
   "env": {
     "PYTHONPATH": "/path/to/Argos;/path/to/Argos/argos_plugin",
-    "ARGOS_API_CAN_PROPOSE": "1",
-    "ARGOS_API_CAN_WRITE": "1",
-    "ARGOS_API_CAN_FEEDBACK": "1"
+    "ARGOS_API_READ_ONLY": "1"
   }
 }
 ```
 
-- `ARGOS_API_CAN_PROPOSE=1` — allow `memory_propose` (class A, enters the
-  review queue; does NOT become active until a human approves).
-- `ARGOS_API_CAN_WRITE=1` — allow `memory_save` / `memory_update` and
-  collection writes (class C, loopback only — the MCP stdio transport is
-  treated as loopback since it's a local process).
-- `ARGOS_API_PRINCIPAL_TYPE` — controls `memory_candidate_review` (class
-  B). The default is `model` (fail-closed): a model principal cannot
-  approve its own candidates. **Do not set this to `human` for model-driven
-  clients** — it unlocks self-approval, the exact hole spec-09 closes. Only
-  set `human` for a single-user, local, human-driven UI where a human is
-  actually at the keyboard. Generic MCP clients should omit it entirely;
-  candidate review flows through a human via class A proposals.
+**Class B (candidate approval):** `ARGOS_API_PRINCIPAL_TYPE` controls
+`review_candidate`. The default is `model` (fail-closed): a model principal
+cannot approve its own candidates. **Do not set this to `human` for
+model-driven clients** — it unlocks self-approval, the exact hole spec-09
+closes. Only set `human` for a single-user, local, human-driven UI where a
+human is actually at the keyboard. Generic MCP clients should omit it
+entirely; candidate review flows through a human via class A proposals.
 
-Without these env vars the server starts read-only by design.
+**Non-loopback deployments:** `ARGOS_API_NO_LOOPBACK=1` disables class C
+direct writes even with write tiers ON — class C requires loopback
+regardless of the default flip. Class A (propose) still works.
 
 ## Adapters roadmap (#277)
 

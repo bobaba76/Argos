@@ -73,8 +73,13 @@ def main() -> int:
 
     # Count eligible records.
     from distillation import _count_eligible_since
-    eligible = _count_eligible_since(store, last_run)
-    print(f"Eligible records since last_run: {eligible}")
+    # #392 review: thread the exclude_system_internal flag through the
+    # count so the dry-run report matches the actual run (which defaults
+    # to exclude_system_internal=True).
+    eligible = _count_eligible_since(
+        store, last_run, exclude_system_internal=True,
+    )
+    print(f"Eligible records since last_run (excl system_internal): {eligible}")
 
     # Run distillation.
     print(f"\nRunning distillation (min_new={args.min_new_records}, "
@@ -87,6 +92,7 @@ def main() -> int:
         cooldown_hours=args.cooldown_hours,
         max_records_per_run=args.max_records,
         max_calls=args.max_calls,
+        exclude_system_internal=True,
     )
 
     print(f"\n--- Distillation Report ---")

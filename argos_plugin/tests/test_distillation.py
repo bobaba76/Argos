@@ -1251,3 +1251,32 @@ class TestSystemInternalExclusion:
             since=None, exclude_system_internal=False,
         )
         assert count_all >= 26  # 25 normal + 1 system-internal
+
+    def test_update_memory_carries_forward_record_class(self, store):
+        """#392 review: editing a system_internal record creates a new
+        version that preserves the record_class marker. The version-chain
+        INSERT in store_write.py carries record_class forward via
+        getattr(rec, 'record_class', None)."""
+        rec = store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+            record_class="system_internal",
+        )
+        assert rec is not None
+        assert rec.record_class == "system_internal"
+        # Edit the record — creates a new version via update_memory.
+        new_rec = store.update_memory(
+            rec.memory_id,
+            content="rollup config defaults to false (updated note)",
+        )
+        assert new_rec is not None
+        # The new version should carry forward the record_class marker.
+        assert getattr(new_rec, "record_class", None) == "system_internal"
+        # Verify by loading from the store.
+        records = store.load_eligible_records(
+            since=None, limit=100, exclude_system_internal=False,
+        )
+        new_versions = [r for r in records if r.memory_id == new_rec.memory_id]
+        assert len(new_versions) == 1
+        assert new_versions[0].record_class == "system_internal"

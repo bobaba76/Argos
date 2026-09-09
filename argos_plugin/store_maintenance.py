@@ -2127,6 +2127,7 @@ class StoreMaintenanceMixin:
         "compaction_last_count",
         "retention_last_run",  # #293
         "system_internal_sweep_done",  # #392 part 3
+        "system_internal_sweep_dry_run_done",  # #392 part 3 dry-run marker
     })
 
     def get_state(self, key: str) -> str | None:

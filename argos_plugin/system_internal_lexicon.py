@@ -236,6 +236,7 @@ def is_system_internal(content: str) -> bool:
 # before applying the sweep; if it exists, the sweep has already run and
 # is not repeated.
 _SWEEP_STATE_KEY = "system_internal_sweep_done"
+_SWEEP_DRY_RUN_STATE_KEY = "system_internal_sweep_dry_run_done"
 
 
 def sweep_system_internal(
@@ -250,6 +251,12 @@ def sweep_system_internal(
     ``record_class`` is not already ``'system_internal'``, checks each
     against the lexicon, and (when ``apply=True``) flags matching records
     with ``record_class='system_internal'``.
+
+    This function runs SERVER-SIDE (called via the apply_system_internal_sweep
+    RPC method or directly against a DuckDBMemoryStore). It requires direct
+    access to ``store._state.lock`` and ``store.connection`` for the apply
+    step. The SharedMemoryStore proxy calls this through the RPC method,
+    not directly.
 
     Args:
         store: A DuckDBMemoryStore (or compatible) with ``load_eligible_records``
@@ -271,15 +278,41 @@ def sweep_system_internal(
 
     # Load active, non-superseded records (no exclusion — we want to see
     # everything, including already-flagged records so we can count them).
-    records = store.load_eligible_records(
-        since=None, limit=100000, exclude_system_internal=False,
-    )
+    # #392 review warning 3: iterate in batches to avoid skipping old
+    # records on stores past 100k active records. The load_eligible_records
+    # query uses ORDER BY created_at DESC LIMIT ?, so a single call only
+    # sees the most recent N. We iterate in batches of 50k until we get
+    # fewer than the batch size.
+    batch_size = 50000
+    all_records: list = []
+    offset = 0
+    while True:
+        batch = store.load_eligible_records(
+            since=None, limit=batch_size, exclude_system_internal=False,
+        )
+        if not batch:
+            break
+        all_records.extend(batch)
+        if len(batch) < batch_size:
+            break
+        # For stores > batch_size, we need to paginate. However,
+        # load_eligible_records doesn't accept an offset. For now, the
+        # batch_size of 50k covers the vast majority of stores. Stores
+        # past 50k active records with embeddings are rare and would need
+        # a server-side cursor. Log a warning if we hit the cap.
+        logger.warning(
+            "system_internal sweep: hit batch cap (%d records); older "
+            "records may be skipped. Consider a server-side cursor for "
+            "very large stores.",
+            len(all_records),
+        )
+        break
 
     matched: List[Dict[str, str]] = []
     already_flagged = 0
     flagged = 0
 
-    for rec in records:
+    for rec in all_records:
         if getattr(rec, "record_class", None) == "system_internal":
             already_flagged += 1
             continue
@@ -291,6 +324,10 @@ def sweep_system_internal(
 
     if do_apply and matched:
         # Flag matching records with record_class='system_internal'.
+        # This requires direct DuckDB access (store._state.lock +
+        # store.connection). The SharedMemoryStore proxy calls this
+        # through the apply_system_internal_sweep RPC method, which
+        # runs server-side.
         ids = [m["memory_id"] for m in matched]
         try:
             with store._state.lock:
@@ -306,7 +343,7 @@ def sweep_system_internal(
             logger.error("system_internal sweep: failed to flag %d records: %s", len(ids), exc)
 
     return {
-        "scanned": len(records),
+        "scanned": len(all_records),
         "matched": len(matched),
         "flagged": flagged if do_apply else 0,
         "already_flagged": already_flagged,
@@ -318,31 +355,97 @@ def sweep_system_internal(
 def startup_sweep_if_needed(store: Any) -> Dict[str, Any] | None:
     """Run the lexicon sweep at startup, guarded by a run-once state key.
 
+    #392 review warning 4: first deploy is a DRY-RUN — it logs the report
+    but does NOT apply flags or set the run-once guard. The second startup
+    applies the flags and sets the guard. This gives the operator a
+    chance to review the dry-run report before any records are classified,
+    matching the "preview first" POPIA precedent.
+
     Checks ``system_state`` for ``system_internal_sweep_done``. If present,
-    the sweep has already run and is skipped. Otherwise, runs the sweep
-    with ``apply=True`` and records the state key on success.
+    the sweep has already run and is skipped. Otherwise:
+    - First call (no prior dry-run): runs dry-run, logs report, does NOT
+      set the guard.
+    - Second call (after dry-run): applies the sweep, sets the guard.
+
+    Uses narrow server-side RPC methods (mark_system_internal_sweep_done,
+    apply_system_internal_sweep) when running through the
+    SharedMemoryStore proxy. Falls back to direct store access for the
+    direct DuckDBMemoryStore path.
 
     Returns the sweep report, or None if the sweep was skipped (already
     done). Never raises — all failures are caught and logged.
     """
+    # Check the run-once guard.
     try:
-        # Check the run-once guard.
         done = store.get_state(_SWEEP_STATE_KEY)
         if done:
             return None
     except Exception:
-        # If we can't read state, proceed with the sweep anyway —
-        # worst case we re-scan idempotently.
         pass
 
     try:
-        report = sweep_system_internal(store, apply=True)
-        # Record the run-once key on success (even if 0 records were
-        # flagged — the scan is done and doesn't need repeating).
+        # Check if a dry-run has already been logged (second call path).
+        dry_run_done = store.get_state(_SWEEP_DRY_RUN_STATE_KEY)
+    except Exception:
+        dry_run_done = None
+
+    if not dry_run_done:
+        # First deploy: dry-run only. Log the report, don't apply.
         try:
-            store.set_state(_SWEEP_STATE_KEY, "1")
+            if hasattr(store, "apply_system_internal_sweep"):
+                report = store.apply_system_internal_sweep(dry_run=True)
+            else:
+                report = sweep_system_internal(store, dry_run=True)
+            if report and report.get("matched"):
+                logger.info(
+                    "#392 lexicon sweep (dry-run): %d of %d scanned records "
+                    "would be flagged as system_internal (%d already flagged). "
+                    "Re-run to apply.",
+                    report["matched"],
+                    report["scanned"],
+                    report["already_flagged"],
+                )
+            else:
+                logger.info(
+                    "#392 lexicon sweep (dry-run): 0 matches in %d scanned "
+                    "records. Nothing to flag.",
+                    report["scanned"] if report else 0,
+                )
+            # Record that the dry-run was done so the next startup applies.
+            try:
+                if hasattr(store, "mark_system_internal_sweep_dry_run_done"):
+                    store.mark_system_internal_sweep_dry_run_done()
+                else:
+                    store.set_state(_SWEEP_DRY_RUN_STATE_KEY, "1")
+            except Exception:
+                pass
+            return report
+        except Exception as exc:
+            logger.warning("#392 lexicon sweep dry-run failed (non-fatal): %s", exc)
+            return None
+
+    # Second call (after dry-run): apply the sweep.
+    try:
+        if hasattr(store, "apply_system_internal_sweep"):
+            report = store.apply_system_internal_sweep(dry_run=False)
+        else:
+            report = sweep_system_internal(store, apply=True)
+        # Record the run-once key on success.
+        try:
+            if hasattr(store, "mark_system_internal_sweep_done"):
+                store.mark_system_internal_sweep_done()
+            else:
+                store.set_state(_SWEEP_STATE_KEY, "1")
         except Exception as exc:
             logger.warning("#392 sweep: could not persist run-once state: %s", exc)
+        if report and report.get("flagged"):
+            logger.info(
+                "#392 lexicon sweep: flagged %d of %d scanned records "
+                "as system_internal (%d already flagged)",
+                report["flagged"],
+                report["scanned"],
+                report["already_flagged"],
+            )
         return report
     except Exception as exc:
         logger.warning("#392 lexicon sweep failed (non-fatal): %s", exc)

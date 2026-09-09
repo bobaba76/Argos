@@ -65,10 +65,19 @@ def _get_last_run(store) -> Optional[str]:
 
 
 def _advance_run_state(store, records_processed: int) -> None:
-    """Mark a run as completed (advances last_run + last_count)."""
+    """Mark a run as completed (advances last_run + last_count).
+
+    #392: uses the narrow advance_distillation_state RPC method when
+    running through the SharedMemoryStore proxy (set_state is in
+    _FORBIDDEN_STORE_METHODS MS7). Falls back to direct set_state for
+    the direct DuckDBMemoryStore path.
+    """
     now = datetime.now(timezone.utc).isoformat()
-    store.set_state(_STATE_KEY_LAST_RUN, now)
-    store.set_state(_STATE_KEY_LAST_COUNT, str(records_processed))
+    if hasattr(store, "advance_distillation_state"):
+        store.advance_distillation_state(records_processed)
+    else:
+        store.set_state(_STATE_KEY_LAST_RUN, now)
+        store.set_state(_STATE_KEY_LAST_COUNT, str(records_processed))
 
 
 # -- Gating ------------------------------------------------------------------

@@ -719,14 +719,44 @@ class SharedMemoryStore:
         return self._rpc.call("store", "get_state", key=key)
 
     def set_state(self, key: str, value: str) -> None:
-        # #392: route through set_sanctioned_state instead of set_state,
-        # because set_state is in _FORBIDDEN_STORE_METHODS (MS7) and would
-        # be blocked at the RPC boundary. The sanctioned alias delegates
-        # to store.set_state(), which still enforces the
-        # _STATE_KEY_ALLOWLIST (SM2) — only allowlisted keys can be
-        # written (distillation_last_run, distillation_last_count,
-        # system_internal_sweep_done, etc.).
-        self._rpc.call("store", "set_sanctioned_state", key=key, value=value)
+        # #392: set_state is in _FORBIDDEN_STORE_METHODS (MS7). Narrow
+        # server-side ops (advance_distillation_state,
+        # mark_system_internal_sweep_done) replace the broad alias.
+        # This method is kept for direct-store compatibility but raises
+        # on the proxy path.
+        if hasattr(self, '_rpc'):
+            raise PermissionError(
+                "set_state is forbidden on the RPC boundary (MS7). Use "
+                "advance_distillation_state or "
+                "mark_system_internal_sweep_done."
+            )
+        raise PermissionError(
+            "set_state is forbidden on the RPC boundary (MS7)."
+        )
+
+    def advance_distillation_state(self, records_processed: int) -> None:
+        """#392: narrow server-side op for distillation run-state advancement.
+        Writes distillation_last_run + distillation_last_count only."""
+        self._rpc.call("store", "advance_distillation_state",
+                        records_processed=records_processed)
+
+    def mark_system_internal_sweep_done(self) -> None:
+        """#392: narrow server-side op for the lexicon sweep run-once guard.
+        Writes system_internal_sweep_done only."""
+        self._rpc.call("store", "mark_system_internal_sweep_done")
+
+    def mark_system_internal_sweep_dry_run_done(self) -> None:
+        """#392: narrow server-side op for the lexicon sweep dry-run marker.
+        Writes system_internal_sweep_dry_run_done only."""
+        self._rpc.call("store", "mark_system_internal_sweep_dry_run_done")
+
+    def apply_system_internal_sweep(self, *, dry_run: bool = True) -> dict:
+        """#392: run the lexicon sweep server-side. The sweep needs direct
+        access to the DuckDB store (load_eligible_records, UPDATE
+        memory_records), which the proxy cannot provide. Follows the
+        run_compaction precedent (#281)."""
+        return self._rpc.call("store", "apply_system_internal_sweep",
+                              dry_run=dry_run) or {}
 
     def count_eligible_since(
         self, since: str | None, exclude_system_internal: bool = False,

@@ -296,9 +296,15 @@ class TestSweepExclusionAfterFlagging:
 
 
 class TestStartupSweepRunOnce:
-    """The startup sweep helper uses a run-once guard via system_state."""
+    """The startup sweep helper uses a run-once guard via system_state.
 
-    def test_runs_on_first_call(self, store):
+    #392 review warning 4: first deploy is a DRY-RUN — it logs the report
+    but does NOT apply flags or set the run-once guard. The second startup
+    applies the flags and sets the guard.
+    """
+
+    def test_first_call_is_dry_run(self, store):
+        """First call (no prior state) runs a dry-run, does NOT apply."""
         from system_internal_lexicon import startup_sweep_if_needed
         store.remember(
             category="context_note",
@@ -307,48 +313,43 @@ class TestStartupSweepRunOnce:
         )
         report = startup_sweep_if_needed(store)
         assert report is not None
-        assert report["flagged"] == 1
-
-    def test_skips_on_second_call(self, store):
-        from system_internal_lexicon import startup_sweep_if_needed
-        store.remember(
-            category="context_note",
-            content="rollup config defaults to false in config_model",
-            dedup=False,
-        )
-        report1 = startup_sweep_if_needed(store)
-        assert report1 is not None
-        assert report1["flagged"] == 1
-        # Second call: run-once guard kicks in, returns None.
-        report2 = startup_sweep_if_needed(store)
-        assert report2 is None
-
-    def test_does_not_re_scan_after_done(self, store):
-        """Even if new system-internal records are added after the first
-        sweep, the run-once guard prevents a re-scan at startup. This is
-        intentional — the sweep is a one-time catch-up, not a continuous
-        filter. New records should be flagged at write time via the
-        record_class kwarg."""
-        from system_internal_lexicon import startup_sweep_if_needed
-        store.remember(
-            category="context_note",
-            content="rollup config defaults to false in config_model",
-            dedup=False,
-        )
-        startup_sweep_if_needed(store)
-        # Add a new system-internal record after the sweep.
-        store.remember(
-            category="context_note",
-            content="distillation threshold is 0.75 in config",
-            dedup=False,
-        )
-        # Second call: skipped (run-once guard).
-        report2 = startup_sweep_if_needed(store)
-        assert report2 is None
-        # The new record was NOT flagged by the startup sweep.
+        assert report["dry_run"] is True
+        assert report["matched"] == 1
+        assert report["flagged"] == 0  # dry-run, no writes
+        # The record was NOT flagged.
         records = store.load_eligible_records(
             since=None, limit=100, exclude_system_internal=False,
         )
-        new_rec = [r for r in records if "distillation threshold" in r.content]
-        assert len(new_rec) == 1
-        assert new_rec[0].record_class is None
+        rec = [r for r in records if "rollup config" in r.content]
+        assert rec[0].record_class is None
+
+    def test_second_call_applies(self, store):
+        """Second call (after dry-run) applies the sweep and sets the guard."""
+        from system_internal_lexicon import startup_sweep_if_needed
+        store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+        )
+        # First call: dry-run.
+        report1 = startup_sweep_if_needed(store)
+        assert report1["dry_run"] is True
+        # Second call: apply.
+        report2 = startup_sweep_if_needed(store)
+        assert report2 is not None
+        assert report2["dry_run"] is False
+        assert report2["flagged"] == 1
+
+    def test_third_call_skips(self, store):
+        """Third call (after apply) is skipped (run-once guard)."""
+        from system_internal_lexicon import startup_sweep_if_needed
+        store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+        )
+        startup_sweep_if_needed(store)  # dry-run
+        startup_sweep_if_needed(store)  # apply
+        # Third call: skipped.
+        report3 = startup_sweep_if_needed(store)
+        assert report3 is None

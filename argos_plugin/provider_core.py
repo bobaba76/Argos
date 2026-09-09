@@ -975,6 +975,31 @@ class ProviderCoreMixin:
             self._self_test_results = {}
             self._config_fingerprint = "unknown"
 
+        # #392 part 3: catch-up hygiene lexicon sweep. Flag existing
+        # active records matching the implementation-machinery lexicon
+        # with record_class='system_internal' so distillation excludes them.
+        # Deterministic, zero-LLM, idempotent. Only runs when the exclusion
+        # is enabled (the default); when distillation_exclude_system_internal
+        # is false, the deployment wants system notes distilled, so flagging
+        # them would be wrong. Fail-soft: never blocks startup.
+        if self._distillation_exclude_system_internal:
+            try:
+                try:
+                    from .system_internal_lexicon import sweep_system_internal
+                except ImportError:
+                    from system_internal_lexicon import sweep_system_internal
+                sweep_report = sweep_system_internal(self._store, apply=True)
+                if sweep_report.get("flagged"):
+                    logger.info(
+                        "#392 lexicon sweep: flagged %d of %d scanned records "
+                        "as system_internal (%d already flagged)",
+                        sweep_report["flagged"],
+                        sweep_report["scanned"],
+                        sweep_report["already_flagged"],
+                    )
+            except Exception as exc:
+                logger.warning("#392 lexicon sweep failed (non-fatal): %s", exc)
+
         logger.info(
             "Argos initialized: %d memories, graph=%s, embeddings=%s, "
             "auto_extract=%s, auto_review=%s, paused=%s, storage=%s, proposals=on",

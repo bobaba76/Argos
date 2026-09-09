@@ -347,6 +347,9 @@ class MemoryRecord:
         "tier",
         # #286: dimension-generic vector provenance.
         "embedding_dim", "embedder_id", "embedded_at",
+        # #392: record class marker. NULL = normal user memory,
+        # 'system_internal' = engine-room noise excluded from distillation.
+        "record_class",
         # #280: transient marker set by the cross-encoder reranker blend
         # loop (store_retrieval.py). Not persisted — only lives on the
         # in-memory record during a retrieval pass. Used by the
@@ -399,6 +402,7 @@ class MemoryRecord:
         embedding_dim: int | None = None,
         embedder_id: str | None = None,
         embedded_at: str | None = None,
+        record_class: str | None = None,
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -462,6 +466,9 @@ class MemoryRecord:
         self.embedding_dim = embedding_dim
         self.embedder_id = embedder_id
         self.embedded_at = embedded_at
+        # #392: record class marker. NULL = normal user memory,
+        # 'system_internal' = engine-room noise excluded from distillation.
+        self.record_class = record_class
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -505,6 +512,7 @@ class MemoryRecord:
             "embedding_dim": self.embedding_dim,
             "embedder_id": self.embedder_id,
             "embedded_at": self.embedded_at,
+            "record_class": self.record_class,
         }
 
 

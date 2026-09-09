@@ -143,6 +143,10 @@ class MemoryConfig(BaseModel):
     distillation_cooldown_hours: int = Field(24, ge=0, le=720)
     distillation_max_records_per_run: int = Field(100, ge=10, le=1000)
     distillation_max_calls: int = Field(10, ge=1, le=100)
+    # #392: exclude system-internal records (record_class='system_internal')
+    # from distillation input. Default true — engine-room noise pollutes
+    # clustering and produces meta-prescriptions the reviewer rejects.
+    distillation_exclude_system_internal: bool = True
 
     # -- lifecycle -------------------------------------------------------------
     archive_enabled: bool = False
@@ -250,7 +254,8 @@ class MemoryConfig(BaseModel):
         "context_aware_retrieval", "query_expansion_enabled",
         "role_alias_llm_fallback", "watcher_enabled",
         "expiry_enabled", "expiry_auto_suggest",
-        "distillation_enabled", "archive_enabled", "forget_enabled",
+        "distillation_enabled", "distillation_exclude_system_internal",
+        "archive_enabled", "forget_enabled",
         "rollup_enabled", "local_only",
         "external_sources_require_confirmation",
         "router_enabled", "router_subcall_enabled",

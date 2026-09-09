@@ -157,7 +157,15 @@ class StoreCoreMixin:
                     -- when the vector was (re-)embedded. NULL on legacy rows.
                     embedding_dim      INTEGER,
                     embedder_id        VARCHAR,
-                    embedded_at        VARCHAR
+                    embedded_at        VARCHAR,
+                    -- #392: record class marker. NULL (default, normal user
+                    -- memory) or 'system_internal' (implementation/config/
+                    -- tuning notes about the memory system itself). Used by
+                    -- the distillation input filter to exclude engine-room
+                    -- noise from clustering. NOT overloaded with `tier`
+                    -- (lifecycle status) or `namespace` (partitioning). Zero-
+                    -- migration: existing rows default NULL (eligible).
+                    record_class       VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -331,6 +339,10 @@ class StoreCoreMixin:
                 "embedding_dim": "INTEGER",
                 "embedder_id": "VARCHAR",
                 "embedded_at": "VARCHAR",
+                # #392: record class marker. NULL = normal user memory,
+                # 'system_internal' = engine-room noise excluded from
+                # distillation input. Additive ALTER for pre-existing stores.
+                "record_class": "VARCHAR",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",

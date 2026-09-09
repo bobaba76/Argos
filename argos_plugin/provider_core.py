@@ -383,6 +383,8 @@ class ProviderCoreMixin:
         self._distillation_cooldown_hours: int = 24
         self._distillation_max_records_per_run: int = 100
         self._distillation_max_calls: int = 10
+        # #392: exclude system-internal records from distillation input.
+        self._distillation_exclude_system_internal: bool = True
         # Lifecycle (P5.1, #6): archival tier, forgetting, long-horizon rollups.
         self._archive_enabled: bool = False
         self._archive_after_days: int = 180
@@ -764,6 +766,7 @@ class ProviderCoreMixin:
         self._distillation_cooldown_hours = cfg.distillation_cooldown_hours
         self._distillation_max_records_per_run = cfg.distillation_max_records_per_run
         self._distillation_max_calls = cfg.distillation_max_calls
+        self._distillation_exclude_system_internal = cfg.distillation_exclude_system_internal
         # Lifecycle config (P5.1, #6)
         self._archive_enabled = cfg.archive_enabled
         self._archive_after_days = cfg.archive_after_days

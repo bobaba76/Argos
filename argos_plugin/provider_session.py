@@ -962,6 +962,7 @@ class ProviderSessionMixin:
                 cooldown_hours=self._distillation_cooldown_hours,
                 max_records_per_run=self._distillation_max_records_per_run,
                 max_calls=self._distillation_max_calls,
+                exclude_system_internal=self._distillation_exclude_system_internal,
             )
             if dream_report.get("ran"):
                 logger.info(

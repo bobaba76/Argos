@@ -734,6 +734,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Maximum LLM calls per run (1 per cluster + 1 high-signal scan). Bounds cost.",
             group="Distillation",
         ),
+        ProviderField(
+            key="distillation_exclude_system_internal",
+            label="Exclude system-internal records",
+            kind=KIND_BOOL,
+            default="true",
+            description="Exclude records marked record_class='system_internal' (implementation/config/tuning notes about the memory system) from distillation input. Prevents engine-room noise from polluting clusters and producing meta-prescriptions the reviewer rejects.",
+            info="Default ON. Set to false for deployments that want system notes distilled. The exclusion is distillation-scoped only — diagnostics (provenance, why_not, admin console, benchmarks) still see all records.",
+            inline=True,
+            group="Distillation",
+        ),
         # -- Lifecycle (P5.1, #6) -------------------------------------------
         ProviderField(
             key="archive_enabled",

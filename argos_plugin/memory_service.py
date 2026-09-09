@@ -1320,12 +1320,16 @@ class MemoryService:
             store.set_state(args.get("key", ""), args.get("value", ""))
             return True
         if method == "count_eligible_since":
-            return store.count_eligible_since(args.get("since"))
+            return store.count_eligible_since(
+                args.get("since"),
+                exclude_system_internal=bool(args.get("exclude_system_internal", False)),
+            )
         if method == "load_eligible_records":
             return [
                 _record_to_dict(record)
                 for record in store.load_eligible_records(
                     args.get("since"), int(args.get("limit", 100)),
+                    exclude_system_internal=bool(args.get("exclude_system_internal", False)),
                 )
             ]
         if method == "load_high_signal_records":

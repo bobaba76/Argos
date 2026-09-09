@@ -74,21 +74,29 @@ def _advance_run_state(store, records_processed: int) -> None:
 # -- Gating ------------------------------------------------------------------
 
 
-def _count_eligible_since(store, since: Optional[str]) -> int:
+def _count_eligible_since(
+    store, since: Optional[str], exclude_system_internal: bool = False,
+) -> int:
     """Count active, non-superseded records created/updated since *since*.
 
     If *since* is None (never run), counts all eligible records.
     Delegates to the store so this works against both a direct
     DuckDBMemoryStore and a SharedMemoryStore proxy.
+
+    #392: when *exclude_system_internal* is True, records marked
+    ``record_class = 'system_internal'`` are excluded from the count.
     """
     try:
-        return store.count_eligible_since(since)
+        return store.count_eligible_since(
+            since, exclude_system_internal=exclude_system_internal,
+        )
     except Exception:
         return 0
 
 
 def _load_eligible_records(
     store, since: Optional[str], limit: int,
+    exclude_system_internal: bool = False,
 ) -> List[Any]:
     """Load active, non-superseded records for distillation.
 
@@ -96,9 +104,14 @@ def _load_eligible_records(
     Falls back to most recent N if never run (since=None).
     Delegates to the store so this works against both a direct
     DuckDBMemoryStore and a SharedMemoryStore proxy.
+
+    #392: when *exclude_system_internal* is True, records marked
+    ``record_class = 'system_internal'`` are excluded from the load.
     """
     try:
-        return store.load_eligible_records(since, limit)
+        return store.load_eligible_records(
+            since, limit, exclude_system_internal=exclude_system_internal,
+        )
     except Exception:
         return []
 
@@ -461,6 +474,7 @@ def run_distillation(
     cooldown_hours: int = 24,
     max_records_per_run: int = 100,
     max_calls: int = 10,
+    exclude_system_internal: bool = True,
 ) -> Dict[str, Any]:
     """Run one distillation pass.
 
@@ -529,7 +543,9 @@ def run_distillation(
             pass  # corrupt state → treat as never run
 
     # -- Gate 3: novelty ---------------------------------------------------
-    eligible_count = _count_eligible_since(store, last_run)
+    eligible_count = _count_eligible_since(
+        store, last_run, exclude_system_internal=exclude_system_internal,
+    )
     if eligible_count < min_new_records:
         report["reason"] = f"novelty_gate ({eligible_count} < {min_new_records})"
         logger.debug(
@@ -539,7 +555,10 @@ def run_distillation(
         return report
 
     # -- Load records ------------------------------------------------------
-    records = _load_eligible_records(store, last_run, max_records_per_run)
+    records = _load_eligible_records(
+        store, last_run, max_records_per_run,
+        exclude_system_internal=exclude_system_internal,
+    )
     if len(records) < 2:
         report["reason"] = "too_few_records_with_embeddings"
         return report

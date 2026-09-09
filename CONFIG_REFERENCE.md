@@ -180,6 +180,7 @@ Three independent phases, all ship OFF by default. All are reversible (quarantin
 | `distillation_cooldown_hours` | `24` | Cooldown gate: minimum hours between runs. |
 | `distillation_max_records_per_run` | `100` | Budget: max records considered per run. |
 | `distillation_max_calls` | `10` | Budget: max LLM calls per run (1 per cluster + 1 feedback scan). |
+| `distillation_exclude_system_internal` | `true` | Exclude records marked `record_class='system_internal'` (implementation/config/tuning notes about the memory system) from distillation input. Prevents engine-room noise from polluting clusters. Exclusion is distillation-scoped only — diagnostics still see all records. |
 
 > The distillation pass reuses the auxiliary LLM (`llm_model`/`llm_provider`
 > above). To route it to a cheaper model without touching the plugin, set

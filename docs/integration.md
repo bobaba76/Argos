@@ -95,7 +95,7 @@ Notes on the env block:
   `jsonschema`, etc.
 
 To enable the **write tier** (propose candidates, save/update memories,
-manage collections, review candidates), add these env vars:
+manage collections), add these env vars:
 
 ```json
 {
@@ -103,8 +103,7 @@ manage collections, review candidates), add these env vars:
     "PYTHONPATH": "/path/to/Argos;/path/to/Argos/argos_plugin",
     "ARGOS_API_CAN_PROPOSE": "1",
     "ARGOS_API_CAN_WRITE": "1",
-    "ARGOS_API_CAN_FEEDBACK": "1",
-    "ARGOS_API_PRINCIPAL_TYPE": "human"
+    "ARGOS_API_CAN_FEEDBACK": "1"
   }
 }
 ```
@@ -114,10 +113,13 @@ manage collections, review candidates), add these env vars:
 - `ARGOS_API_CAN_WRITE=1` — allow `memory_save` / `memory_update` and
   collection writes (class C, loopback only — the MCP stdio transport is
   treated as loopback since it's a local process).
-- `ARGOS_API_PRINCIPAL_TYPE=human` — allow `memory_candidate_review`
-  (class B). The default is `model` (fail-closed): a model principal
-  cannot approve its own candidates. Set to `human` only for a
-  human-driven UI.
+- `ARGOS_API_PRINCIPAL_TYPE` — controls `memory_candidate_review` (class
+  B). The default is `model` (fail-closed): a model principal cannot
+  approve its own candidates. **Do not set this to `human` for model-driven
+  clients** — it unlocks self-approval, the exact hole spec-09 closes. Only
+  set `human` for a single-user, local, human-driven UI where a human is
+  actually at the keyboard. Generic MCP clients should omit it entirely;
+  candidate review flows through a human via class A proposals.
 
 Without these env vars the server starts read-only by design.
 

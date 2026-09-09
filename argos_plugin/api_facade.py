@@ -2207,7 +2207,37 @@ class ArgosAPIFacade:
             if _scope_before is not None and hasattr(self._store, "set_user_scope"):
                 self._store.set_user_scope(_scope_before)
         if rec is None:
-            return {"status": "deduplicated", "message": "Similar memory already exists"}
+            # Dedup: a very similar memory already exists. Recover the
+            # surviving memory_id so the caller can fetch/update/reference
+            # it — otherwise the client is left with no handle and
+            # downstream calls fail (e.g. memory_fetch with None).
+            existing_id = None
+            if hasattr(self._store, "_find_current_similar"):
+                try:
+                    existing_id, _reason = self._store._find_current_similar(
+                        params["content"], params["category"],
+                    )
+                except Exception:
+                    existing_id = None  # fail-soft
+            if existing_id is None and hasattr(self._store, "search"):
+                # SharedMemoryStore (RPC) has no _find_current_similar;
+                # fall back to a content search for the surviving record.
+                try:
+                    hits = self._store.search(
+                        query=params["content"], limit=1,
+                        category_filter=params["category"],
+                    )
+                    if hits:
+                        existing_id = getattr(hits[0], "memory_id", None)
+                except Exception:
+                    existing_id = None  # fail-soft
+            result: Dict[str, Any] = {
+                "status": "deduplicated",
+                "message": "Similar memory already exists",
+            }
+            if existing_id:
+                result["memory_id"] = existing_id
+            return result
         return {
             "status": "saved",
             "memory_id": rec.memory_id,

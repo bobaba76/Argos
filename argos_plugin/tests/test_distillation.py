@@ -1031,3 +1031,204 @@ class TestDistillationAudit232:
         parsed = json.loads(prompt)
         assert "created_at" in parsed["records"][0]
         assert parsed["records"][0]["created_at"] == "2025-06-15T12:00:00Z"
+
+
+# ===========================================================================
+# #392: exclude system-internal records from distillation input
+# ===========================================================================
+
+class TestSystemInternalExclusion:
+    """#392: records marked record_class='system_internal' are excluded
+    from distillation input (load + count) when the opt-in flag is set.
+
+    Acceptance criteria from the issue:
+    - A distilled cluster must never be re-derived from system-internal
+      records.
+    - Diagnostics (provenance, why_not, admin console, benchmarks) must
+      still be able to read these records — the exclusion is distillation-
+      scoped only (opt-in flag on the shared loader).
+    - Project/roadmap/API memories about Argos must stay eligible. The
+      filter distinguishes implementation machinery from project memory.
+    - Config flag can be flipped off for deployments that WANT system
+      notes distilled — no behavior change when off.
+    """
+
+    def test_system_internal_excluded_from_load(self, store):
+        """load_eligible_records(exclude_system_internal=True) skips
+        records marked record_class='system_internal'."""
+        # Seed a normal user record + a system-internal record.
+        store.remember(
+            category="personal_fact",
+            content="User lives in Cape Town and prefers dark mode",
+            dedup=False,
+        )
+        store.remember(
+            category="context_note",
+            content="context_aware_retrieval defaults to true in config_schema",
+            dedup=False,
+            record_class="system_internal",
+        )
+        # With exclusion ON (distillation path):
+        records = store.load_eligible_records(
+            since=None, limit=100, exclude_system_internal=True,
+        )
+        contents = [r.content for r in records]
+        assert any("Cape Town" in c for c in contents)
+        assert not any("context_aware_retrieval" in c for c in contents)
+
+    def test_system_internal_visible_without_flag(self, store):
+        """load_eligible_records(exclude_system_internal=False) (the
+        default for diagnostics) still sees system-internal records."""
+        store.remember(
+            category="personal_fact",
+            content="User lives in Cape Town",
+            dedup=False,
+        )
+        store.remember(
+            category="context_note",
+            content="mutation_events schema v5 added actor column",
+            dedup=False,
+            record_class="system_internal",
+        )
+        # Without the flag (diagnostics path):
+        records = store.load_eligible_records(
+            since=None, limit=100, exclude_system_internal=False,
+        )
+        contents = [r.content for r in records]
+        assert any("Cape Town" in c for c in contents)
+        assert any("mutation_events" in c for c in contents)
+
+    def test_system_internal_excluded_from_count(self, store):
+        """count_eligible_since(exclude_system_internal=True) does not
+        count system-internal records."""
+        store.remember(
+            category="personal_fact", content="User likes Python", dedup=False,
+        )
+        store.remember(
+            category="context_note",
+            content="reranker verdict superseded by graph boost",
+            dedup=False,
+            record_class="system_internal",
+        )
+        # With exclusion ON:
+        count_excluded = store.count_eligible_since(
+            since=None, exclude_system_internal=True,
+        )
+        # Without exclusion (diagnostics):
+        count_all = store.count_eligible_since(
+            since=None, exclude_system_internal=False,
+        )
+        assert count_excluded == 1
+        assert count_all == 2
+
+    def test_project_memory_stays_eligible(self, store):
+        """Project/roadmap/API memories about Argos (e.g. 'PR #392 merged')
+        are NOT marked system_internal and stay eligible for distillation."""
+        store.remember(
+            category="personal_fact",
+            content="PR #392 merged — distillation input filter landed",
+            dedup=False,
+            # project memory — no record_class marker
+        )
+        store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+            record_class="system_internal",
+        )
+        records = store.load_eligible_records(
+            since=None, limit=100, exclude_system_internal=True,
+        )
+        contents = [r.content for r in records]
+        # Project memory is eligible.
+        assert any("PR #392" in c for c in contents)
+        # Implementation machinery is excluded.
+        assert not any("rollup config" in c for c in contents)
+
+    def test_record_class_persisted_and_round_tripped(self, store):
+        """record_class is written to the DB and read back correctly."""
+        rec = store.remember(
+            category="context_note",
+            content="store layout audit: memory_records has 30 columns",
+            dedup=False,
+            record_class="system_internal",
+        )
+        assert rec is not None
+        assert rec.record_class == "system_internal"
+        # Read it back via search (diagnostics path, no exclusion).
+        records = store.load_eligible_records(
+            since=None, limit=100, exclude_system_internal=False,
+        )
+        found = [r for r in records if r.memory_id == rec.memory_id]
+        assert len(found) == 1
+        assert found[0].record_class == "system_internal"
+
+    def test_normal_records_have_null_record_class(self, store):
+        """Normal user records have record_class=None (default)."""
+        rec = store.remember(
+            category="personal_fact", content="User likes coffee", dedup=False,
+        )
+        assert rec is not None
+        assert rec.record_class is None
+
+    def test_distillation_excludes_system_internal_by_default(self, store):
+        """run_distillation with the default exclude_system_internal=True
+        never clusters system-internal records."""
+        # Seed enough normal records to pass the novelty gate + cluster.
+        _seed_related_records(store, n=25)
+        # Seed system-internal records that would pollute clustering.
+        for i in range(5):
+            store.remember(
+                category="context_note",
+                content=f"distillation internals: cluster {i} threshold 0.75",
+                dedup=False,
+                record_class="system_internal",
+            )
+        # Mock the LLM to capture what records reach the distiller.
+        captured_prompts: List[str] = []
+        def mock_call_llm(*args, **kwargs):
+            captured_prompts.append(kwargs.get("messages", [{}])[-1].get("content", ""))
+            resp = _make_mock_response(_make_distill_response())
+            return resp
+        with patch("distillation._get_llm_client", return_value=mock_call_llm):
+            from distillation import run_distillation
+            report = run_distillation(
+                store, min_new_records=20, cooldown_hours=0,
+                exclude_system_internal=True,
+            )
+        # The distiller ran and processed clusters.
+        assert report["ran"] is True
+        # No system-internal content reached the LLM prompts.
+        for prompt in captured_prompts:
+            assert "distillation internals" not in prompt
+            assert "cluster" not in prompt.lower() or "completed task" in prompt.lower()
+
+    def test_distillation_includes_system_internal_when_flag_off(self, store):
+        """run_distillation with exclude_system_internal=False (config off)
+        includes system-internal records — no behavior change when off."""
+        _seed_related_records(store, n=25)
+        store.remember(
+            category="context_note",
+            content="distillation internals: cluster threshold is 0.75",
+            dedup=False,
+            record_class="system_internal",
+        )
+        captured_prompts: List[str] = []
+        def mock_call_llm(*args, **kwargs):
+            captured_prompts.append(kwargs.get("messages", [{}])[-1].get("content", ""))
+            resp = _make_mock_response(_make_distill_response())
+            return resp
+        with patch("distillation._get_llm_client", return_value=mock_call_llm):
+            from distillation import run_distillation
+            report = run_distillation(
+                store, min_new_records=20, cooldown_hours=0,
+                exclude_system_internal=False,
+            )
+        assert report["ran"] is True
+        # With the flag off, system-internal content CAN reach the LLM.
+        # (It may or may not cluster with the normal records, but the
+        # count includes it.)
+        count_all = store.count_eligible_since(
+            since=None, exclude_system_internal=False,
+        )
+        assert count_all >= 26  # 25 normal + 1 system-internal

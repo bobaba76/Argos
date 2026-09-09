@@ -124,8 +124,9 @@ REALISTIC_CONFIG: dict = {
     "router_subcall_enabled": "true",
     "router_temporal_threshold": "0.6",
     "router_multihop_threshold": "0.4",
-    # distillation (1)
+    # distillation (2)
     "distillation_enabled": "false",
+    "distillation_exclude_system_internal": "true",
     # lifecycle — rollup (3)
     "rollup_enabled": "false",
     "rollup_interval_days": "30",

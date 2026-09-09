@@ -2170,10 +2170,19 @@ class StoreMaintenanceMixin:
     # against either a direct DuckDBMemoryStore or a SharedMemoryStore proxy
     # without reaching into _lock / connection / _fetch_records.
 
-    def count_eligible_since(self, since: str | None) -> int:
+    def count_eligible_since(
+        self, since: str | None, exclude_system_internal: bool = False,
+    ) -> int:
         """Count active, non-superseded records created/updated since *since*.
 
         If *since* is None (never run), counts all eligible records.
+
+        #392: when *exclude_system_internal* is True, records marked
+        ``record_class = 'system_internal'`` are excluded from the count.
+        This is an opt-in flag — diagnostics (provenance, why_not, admin
+        console, benchmarks) call without it and still see all records.
+        Only the distillation load path sets it (gated by config
+        ``distillation_exclude_system_internal``).
         """
         conditions = [
             "COALESCE(status, 'active') = 'active'",
@@ -2182,6 +2191,10 @@ class StoreMaintenanceMixin:
             "embedding IS NOT NULL",
         ]
         params: list[Any] = [self.user_id]
+        if exclude_system_internal:
+            conditions.append(
+                "(record_class IS NULL OR record_class != 'system_internal')"
+            )
         if since:
             conditions.append("(created_at > ? OR updated_at > ?)")
             params.extend([since, since])
@@ -2199,11 +2212,19 @@ class StoreMaintenanceMixin:
 
     def load_eligible_records(
         self, since: str | None, limit: int,
+        exclude_system_internal: bool = False,
     ) -> List[MemoryRecord]:
         """Load active, non-superseded records for distillation.
 
         If *since* is provided, only records created/updated after it.
         Falls back to most recent N if never run (since=None).
+
+        #392: when *exclude_system_internal* is True, records marked
+        ``record_class = 'system_internal'`` are excluded from the load.
+        This is an opt-in flag — diagnostics (provenance, why_not, admin
+        console, benchmarks) call without it and still see all records.
+        Only the distillation load path sets it (gated by config
+        ``distillation_exclude_system_internal``).
         """
         conditions = [
             "COALESCE(status, 'active') = 'active'",
@@ -2212,6 +2233,10 @@ class StoreMaintenanceMixin:
             "embedding IS NOT NULL",
         ]
         params: list[Any] = [self.user_id]
+        if exclude_system_internal:
+            conditions.append(
+                "(record_class IS NULL OR record_class != 'system_internal')"
+            )
         if since:
             conditions.append("(created_at > ? OR updated_at > ?)")
             params.extend([since, since])

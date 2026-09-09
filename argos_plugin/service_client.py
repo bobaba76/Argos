@@ -188,6 +188,7 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
         valid_from=value.get("valid_from"),
         valid_to=value.get("valid_to"),
         superseded_by=value.get("superseded_by"),
+        record_class=value.get("record_class"),
     )
 
 
@@ -720,14 +721,21 @@ class SharedMemoryStore:
     def set_state(self, key: str, value: str) -> None:
         self._rpc.call("store", "set_state", key=key, value=value)
 
-    def count_eligible_since(self, since: str | None) -> int:
-        return int(self._rpc.call("store", "count_eligible_since", since=since) or 0)
+    def count_eligible_since(
+        self, since: str | None, exclude_system_internal: bool = False,
+    ) -> int:
+        return int(self._rpc.call(
+            "store", "count_eligible_since",
+            since=since, exclude_system_internal=exclude_system_internal,
+        ) or 0)
 
     def load_eligible_records(
         self, since: str | None, limit: int,
+        exclude_system_internal: bool = False,
     ) -> list:
         values = self._rpc.call(
             "store", "load_eligible_records", since=since, limit=limit,
+            exclude_system_internal=exclude_system_internal,
         ) or []
         return [_record_from_dict(value) for value in values]
 

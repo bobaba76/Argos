@@ -209,6 +209,7 @@ class StoreWriteMixin:
         provenance_origin: Any = None,
         grounding: Any = None,
         created_at: Any = None,
+        record_class: str | None = None,
     ) -> MemoryRecord | None:
         """Insert a memory record. Returns None if deduped away.
 
@@ -461,8 +462,8 @@ class StoreWriteMixin:
                  verified_state, verified_at,
                  retrieval_count, helpful_count, dismissed_count,
                  valid_from, provenance_origin, grounding,
-                 embedding_dim, embedder_id, embedded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?)
+                 embedding_dim, embedder_id, embedded_at, record_class)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)
         """
         with self._state.lock:
             assert self.connection is not None
@@ -487,6 +488,7 @@ class StoreWriteMixin:
                     created_ts,  # valid_from = in-world creation time (issue #8)
                     prov, ground,
                     embedding_dim, embedder_id, embedded_at,
+                    record_class,
                 ])
                 # #347: record the creation event in the same transaction.
                 self._record_event(
@@ -3035,8 +3037,8 @@ class StoreWriteMixin:
                         verified_state, verified_at,
                         retrieval_count, helpful_count, dismissed_count,
                         valid_from, valid_to, superseded_by,
-                        provenance_origin, grounding)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
+                        provenance_origin, grounding, record_class)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)""",
                     [new_id, rec.category, new_content, new_tags,
                      json.dumps(new_payload), created_ts, now,
                      effective_expires,
@@ -3065,7 +3067,8 @@ class StoreWriteMixin:
                      # this, an external/ingested memory gets silently
                      # downgraded to internal/observed on edit.
                      getattr(rec, "provenance_origin", PROVENANCE_INTERNAL) or PROVENANCE_INTERNAL,
-                     getattr(rec, "grounding", GROUNDING_OBSERVED) or GROUNDING_OBSERVED],
+                     getattr(rec, "grounding", GROUNDING_OBSERVED) or GROUNDING_OBSERVED,
+                     getattr(rec, "record_class", None)],
                 )
                 # 2. Supersede the old version. D5 fix: guard with
                 #    AND valid_to IS NULL so an already-superseded record's

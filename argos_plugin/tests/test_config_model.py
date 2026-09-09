@@ -149,6 +149,7 @@ class TestConfigParity:
         assert c.distillation_cooldown_hours == 24
         assert c.distillation_max_records_per_run == 100
         assert c.distillation_max_calls == 10
+        assert c.distillation_exclude_system_internal is True
 
     def test_lifecycle_defaults(self):
         from config_model import MemoryConfig

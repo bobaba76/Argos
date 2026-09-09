@@ -213,6 +213,7 @@ class StoreRetrievalMixin:
             embedding_dim=row.get("embedding_dim"),
             embedder_id=row.get("embedder_id"),
             embedded_at=row.get("embedded_at"),
+            record_class=row.get("record_class"),
         )
 
     def _fetch_records(

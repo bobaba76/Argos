@@ -418,10 +418,17 @@ _FRAGMENT_START_RE = re.compile(r"^(?:or|and|but|because|so|which)\b", re.IGNORE
 _FRAGMENT_END_RE = re.compile(r"(?:\bto|\bwith|\bbecause|\band|\bbut|\bof|\bfor)$", re.IGNORECASE)
 # Dangling qualifier endings: a capture that stops on a bare adjective/adverb
 # is a truncated fragment, not a complete fact ("found a REALLY good" — #395).
+# #395 review: narrowed to only match when preceded by a determiner
+# (a/an/the) — this prevents false positives on complete facts like
+# "User likes dark mode better" or "User's favorite coffee is really
+# good" where the word is a predicate adjective in a complete clause,
+# not a truncated noun phrase. The middle word is optional so "a really"
+# and "a REALLY good" both match.
 _DANGLING_END_RE = re.compile(
-    r"\b(?:really|very|quite|kinda|sorta|maybe|possibly|probably|good|great|"
+    r"\b(?:a|an|the)\s+(?:\w+\s+)?"
+    r"(?:really|very|quite|kinda|sorta|maybe|possibly|probably|good|great|"
     r"nice|better|best|bad|worse|worst|new|old|big|small|fast|slow|high|low|"
-    r"much|more|most|less|least|some|any|many|few|enough|plenty|such|so|too|"
+    r"much|more|most|less|least|some|any|many|few|enough|plenty|such|too|"
     r"like|similar|different|same|other|only|just|even|also|still|already|"
     r"almost|nearly|about|around|roughly|basically|actually|literally|"
     r"seriously|honestly|pretty|fairly|rather|somewhat)$",

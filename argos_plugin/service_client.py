@@ -719,7 +719,14 @@ class SharedMemoryStore:
         return self._rpc.call("store", "get_state", key=key)
 
     def set_state(self, key: str, value: str) -> None:
-        self._rpc.call("store", "set_state", key=key, value=value)
+        # #392: route through set_sanctioned_state instead of set_state,
+        # because set_state is in _FORBIDDEN_STORE_METHODS (MS7) and would
+        # be blocked at the RPC boundary. The sanctioned alias delegates
+        # to store.set_state(), which still enforces the
+        # _STATE_KEY_ALLOWLIST (SM2) — only allowlisted keys can be
+        # written (distillation_last_run, distillation_last_count,
+        # system_internal_sweep_done, etc.).
+        self._rpc.call("store", "set_sanctioned_state", key=key, value=value)
 
     def count_eligible_since(
         self, since: str | None, exclude_system_internal: bool = False,

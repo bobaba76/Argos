@@ -487,6 +487,41 @@ class TestMS2ForbiddenMethods:
             })
 
 
+class TestSanctionedState:
+    """#392: set_sanctioned_state is a narrow alias for set_state that
+    bypasses the MS7 forbidden list. It delegates to store.set_state(),
+    which still enforces the _STATE_KEY_ALLOWLIST (SM2). This fixes the
+    bug where distillation's _advance_run_state was blocked at the RPC
+    boundary, preventing last_run from advancing."""
+
+    def test_set_sanctioned_state_not_forbidden(self):
+        """set_sanctioned_state is NOT in _FORBIDDEN_STORE_METHODS."""
+        assert "set_sanctioned_state" not in memory_service._FORBIDDEN_STORE_METHODS
+
+    def test_set_sanctioned_state_accepted_in_dispatch(self, tmp_path):
+        """set_sanctioned_state passes the MS7 check and delegates to
+        store.set_state(), which enforces the _STATE_KEY_ALLOWLIST.
+        Tested end-to-end through the real SharedMemoryStore proxy."""
+        store = _start_service(tmp_path)
+        try:
+            # SharedMemoryStore.set_state routes through set_sanctioned_state.
+            store.set_state("distillation_last_run", "2026-01-01T00:00:00Z")
+            val = store.get_state("distillation_last_run")
+            assert val == "2026-01-01T00:00:00Z"
+        finally:
+            store.close()
+
+    def test_set_sanctioned_state_rejects_non_allowlisted_key(self, tmp_path):
+        """set_sanctioned_state still enforces the _STATE_KEY_ALLOWLIST
+        via store.set_state() — a non-allowlisted key is rejected (SM2)."""
+        store = _start_service(tmp_path)
+        try:
+            store.set_state("non_allowlisted_key", "value")
+            assert store.get_state("non_allowlisted_key") is None
+        finally:
+            store.close()
+
+
 class TestMS4NoTracebackLeak:
     """MS4: error responses must not include traceback."""
 

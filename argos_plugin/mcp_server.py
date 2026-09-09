@@ -1113,19 +1113,25 @@ class MCPServer:
                 try:
                     import jsonschema
                     jsonschema.validate(instance=arguments, schema=schema)
-                except jsonschema.ValidationError as exc:
-                    self._send(_make_response(
-                        msg_id, error=_make_error(
-                            JSONRPC_INVALID_PARAMS,
-                            f"Invalid arguments: {exc.message}",
-                        ),
-                    ))
-                    return
-                except Exception:
-                    # jsonschema unavailable or broken — fall through to
-                    # facade validation (fail-open, not fail-closed, since
-                    # the facade does its own validation).
-                    pass
+                except Exception as exc:
+                    # jsonschema.ValidationError -> invalid params;
+                    # ImportError/other -> jsonschema unavailable, fall
+                    # through to facade validation (fail-open, not
+                    # fail-closed, since the facade does its own
+                    # validation).
+                    if (
+                        isinstance(exc, ImportError)
+                        or not hasattr(exc, "message")
+                    ):
+                        pass
+                    else:
+                        self._send(_make_response(
+                            msg_id, error=_make_error(
+                                JSONRPC_INVALID_PARAMS,
+                                f"Invalid arguments: {exc.message}",
+                            ),
+                        ))
+                        return
         # M1: pop idempotency_key for tools that require it. The key is
         # passed as a keyword arg to facade.execute, not in the params
         # dict. Schema validation (additionalProperties: false) ensures

@@ -58,6 +58,16 @@ _FORCE_HERMETIC = os.environ.get("ARGOS_HERMETIC_TESTS", "").strip().lower() in 
 # Hermes-runtime stand-ins (conftest scope, issue #51)
 # ---------------------------------------------------------------------------
 
+def _safe_find_spec(name: str):
+    """importlib.util.find_spec wrapper that returns None instead of
+    raising ModuleNotFoundError when a parent package is absent (Linux CI
+    raises where Windows returns None)."""
+    try:
+        return importlib.util.find_spec(name)
+    except ModuleNotFoundError:
+        return None
+
+
 def _install_hermes_stubs_if_missing() -> None:
     """Install synthetic ``agent``/``tools`` modules when the real Hermes
     runtime is not importable, so ``argos_plugin`` (and the ``argos``
@@ -78,7 +88,7 @@ def _install_hermes_stubs_if_missing() -> None:
         for _name in list(sys.modules):
             if _name == "agent" or _name == "tools" or _name.startswith("agent.") or _name.startswith("tools."):
                 del sys.modules[_name]
-    if _FORCE_HERMETIC or importlib.util.find_spec("agent") is None:
+    if _FORCE_HERMETIC or _safe_find_spec("agent") is None:
         _mp = types.ModuleType("agent.memory_provider")
 
         class MemoryProvider:  # minimal stand-in
@@ -90,7 +100,7 @@ def _install_hermes_stubs_if_missing() -> None:
         _agent.memory_provider = _mp
         sys.modules.setdefault("agent", _agent)
         sys.modules.setdefault("agent.memory_provider", _mp)
-    if _FORCE_HERMETIC or importlib.util.find_spec("tools") is None:
+    if _FORCE_HERMETIC or _safe_find_spec("tools") is None:
         _tr = types.ModuleType("tools.registry")
         _tr.tool_error = lambda msg: json.dumps({"error": str(msg)})
         _tools = types.ModuleType("tools")
@@ -106,7 +116,7 @@ def _install_hermes_stubs_if_missing() -> None:
     # to exist in sys.modules.  Install a stub whose ``call_llm`` returns
     # None so the hermetic no-LLM behaviour is preserved for tests that do
     # not patch it, while patchable for tests that do.
-    if _FORCE_HERMETIC or importlib.util.find_spec("agent.auxiliary_client") is None:
+    if _FORCE_HERMETIC or _safe_find_spec("agent.auxiliary_client") is None:
         _aux = types.ModuleType("agent.auxiliary_client")
         _aux.call_llm = lambda **kwargs: None
         _agent_mod = sys.modules.get("agent")
@@ -120,7 +130,7 @@ def _install_hermes_stubs_if_missing() -> None:
     # stub providing the same dataclass API so the plugin imports cleanly on
     # a fresh clone.  The real module is used when available (deployed
     # plugin) unless ARGOS_HERMETIC_TESTS=1 forces the stub.
-    if _FORCE_HERMETIC or importlib.util.find_spec("plugins.memory.config_schema") is None:
+    if _FORCE_HERMETIC or _safe_find_spec("plugins.memory.config_schema") is None:
         import dataclasses as _dc
 
         KIND_TEXT = "text"

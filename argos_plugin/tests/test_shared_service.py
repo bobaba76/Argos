@@ -198,8 +198,14 @@ def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
         assert reviewed["candidate"]["status"] == "approved"
         assert reviewed["memory"]["status"] == "active"
 
-        assert store.delete_memory(memory_id=reviewed["memory"]["memory_id"])
-        assert not store.delete_memory(memory_id=reviewed["memory"]["memory_id"])
+        # #200 Spec-10: raw delete_memory is forbidden on the RPC boundary;
+        # use the sanctioned facade path with CAS (expected_version).
+        mid = reviewed["memory"]["memory_id"]
+        assert store.facade_delete_memory(memory_id=mid, expected_version=mid)
+        # Second call raises (memory not found) — facade_delete_memory
+        # enforces CAS server-side and raises ValueError on missing records.
+        with pytest.raises(Exception):
+            store.facade_delete_memory(memory_id=mid, expected_version=mid)
     finally:
         try:
             store._rpc.stop_service()

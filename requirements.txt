@@ -19,6 +19,9 @@ python-docx==1.2.0
 # Config parsing (hermes_location.py, hermes_weather.py).
 PyYAML==6.0.3
 
+# MCP server schema validation (mcp_server.py).
+jsonschema==4.26.0
+
 # Test runner (README: python -m pytest hybrid_memory_plugin/tests/ -v)
 pytest==9.1.1
 pytest-xdist==3.8.0

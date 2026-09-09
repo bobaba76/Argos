@@ -815,9 +815,12 @@ class MemoryService:
             # ("requested_by" is in _FORBIDDEN_CLIENT_ARGS, stripped
             # above), so the receipt's audit trail cannot be forged over
             # RPC. STRICT confirm (bool("false") is True — only literal
-            # True passes).
+            # True passes). The confirm gate authority is the _confirmed
+            # envelope flag (set by call_gated), NOT a client-supplied
+            # confirm (which is stripped by _sanitize_args). Same fix as
+            # facade_delete_memory #200 PR-2.
             args = _sanitize_args(args)
-            confirm = args.get("confirm", False) is True
+            confirm = confirmed or (args.get("confirm", False) is True)
             return store.erase_subject(
                 subject=str(args.get("subject", "")),
                 mode=str(args.get("mode", "preview")),
@@ -1267,6 +1270,7 @@ class MemoryService:
             return store.export_access_audit(
                 limit=int(args.get("limit", 10000)),
                 format=args.get("format", "jsonl"),
+                tenant_name=tenant.name if tenant else None,
             )
         # #347: mutation_events read surface — same wheel/principals gate
         # as export_access_audit. No rotation; full history is exportable.
@@ -1414,7 +1418,13 @@ class MemoryService:
             )
         if method == "add_relationship":
             # MS9: strip server-set fields from client args.
-            return graph.add_relationship(**_sanitize_args(args))
+            # NOTE: _FORBIDDEN_CLIENT_ARGS includes "source" (provenance
+            # field for memory records), but add_relationship uses "source"
+            # as the source ENTITY ID — a completely different concept.
+            # Use a graph-specific sanitize that preserves source/target.
+            _graph_forbidden = _FORBIDDEN_CLIENT_ARGS - {"source"}
+            clean = {k: v for k, v in args.items() if k not in _graph_forbidden}
+            return graph.add_relationship(**clean)
         if method == "index_memory":
             # MS9: strip server-set fields from client args.
             args = _sanitize_args(args)
@@ -1956,7 +1966,7 @@ def serve(home: Path, port: int = 0) -> None:
             probe_sock = socket.create_connection(
                 (str(existing["host"]), int(existing["port"])), timeout=2.0
             )
-            probe_sock.sendall((json.dumps({"token": str(existing["token"]), "method": "health"}) + "\n").encode("utf-8"))
+            probe_sock.sendall((json.dumps({"v": _PROTOCOL_VERSION, "token": str(existing["token"]), "method": "health"}) + "\n").encode("utf-8"))
             _resp = b""
             while b"\n" not in _resp:
                 chunk = probe_sock.recv(65536)

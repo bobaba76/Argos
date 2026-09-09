@@ -1113,19 +1113,25 @@ class MCPServer:
                 try:
                     import jsonschema
                     jsonschema.validate(instance=arguments, schema=schema)
-                except jsonschema.ValidationError as exc:
-                    self._send(_make_response(
-                        msg_id, error=_make_error(
-                            JSONRPC_INVALID_PARAMS,
-                            f"Invalid arguments: {exc.message}",
-                        ),
-                    ))
-                    return
-                except Exception:
-                    # jsonschema unavailable or broken — fall through to
-                    # facade validation (fail-open, not fail-closed, since
-                    # the facade does its own validation).
-                    pass
+                except Exception as exc:
+                    # jsonschema.ValidationError -> invalid params;
+                    # ImportError/other -> jsonschema unavailable, fall
+                    # through to facade validation (fail-open, not
+                    # fail-closed, since the facade does its own
+                    # validation).
+                    if (
+                        isinstance(exc, ImportError)
+                        or not hasattr(exc, "message")
+                    ):
+                        pass
+                    else:
+                        self._send(_make_response(
+                            msg_id, error=_make_error(
+                                JSONRPC_INVALID_PARAMS,
+                                f"Invalid arguments: {exc.message}",
+                            ),
+                        ))
+                        return
         # M1: pop idempotency_key for tools that require it. The key is
         # passed as a keyword arg to facade.execute, not in the params
         # dict. Schema validation (additionalProperties: false) ensures
@@ -1283,6 +1289,31 @@ def _load_auth_context(home: Path) -> "AuthContext":
     )
 
 
+def _force_utf8_stdio() -> None:
+    """Force UTF-8 on stdout/stderr.
+
+    Tool descriptions and memory content carry non-ASCII characters
+    (e.g. the arrow in "Same key + different body -> 409 conflict").
+    On Windows the default stdio encoding is cp1252, which cannot
+    encode those characters and makes tools/list (and any non-ASCII
+    memory content) crash with UnicodeEncodeError. Reconfigure the
+    streams to UTF-8 so the server is correct regardless of the
+    client's env config (PYTHONIOENCODING / PYTHONUTF8).
+
+    reconfigure() is available on Python 3.7+ for the default
+    TextIOWrapper streams. If reconfigure is unavailable (non-standard
+    stream), fall back to reassigning a UTF-8 wrapper.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # Stream may be closed or not reconfigurable — skip.
+            pass
+
+
 def main() -> None:
     """Entry point for the MCP stdio server.
 
@@ -1291,6 +1322,11 @@ def main() -> None:
     import argparse
     from api_facade import ArgosAPIFacade, ACLConfig
     from service_client import SharedMemoryStore
+
+    # Force UTF-8 stdio before any output (Windows defaults to cp1252,
+    # which cannot encode the non-ASCII characters in tool descriptions
+    # and memory content — tools/list would crash with no tools listed).
+    _force_utf8_stdio()
 
     parser = argparse.ArgumentParser(description="Argos MCP stdio server (read + write tier)")
     parser.add_argument("--home", required=True, type=Path,

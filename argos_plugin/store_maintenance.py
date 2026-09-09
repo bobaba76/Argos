@@ -2116,6 +2116,7 @@ class StoreMaintenanceMixin:
     # force re-runs) or reading internal state to infer system activity.
     _STATE_KEY_ALLOWLIST = frozenset({
         "distillation_last_run",
+        "distillation_last_count",
         "surfaced_confirmation_ids",
         "rollup_last_run",
         "distillation_cursor",

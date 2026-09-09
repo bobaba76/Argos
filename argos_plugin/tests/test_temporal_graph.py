@@ -26,6 +26,8 @@ _plugin_dir = Path(__file__).resolve().parent.parent
 if str(_plugin_dir.parent) not in sys.path:
     sys.path.insert(0, str(_plugin_dir.parent))
 
+from schema_migrations import LATEST_GRAPH_SCHEMA_VERSION
+
 # Canonical ISO-8601 UTC timestamps (lexicographic == chronological).
 T0 = "2026-01-01T00:00:00+00:00"
 T1 = "2026-02-01T00:00:00+00:00"
@@ -54,7 +56,7 @@ class TestGraphMigrationTimestamps:
     def test_migration_adds_timestamp_columns(self, tmp_path):
         graph = _make_graph(tmp_path, "mig_cols")
         try:
-            assert graph.get_graph_schema_version() == 1
+            assert graph.get_graph_schema_version() == LATEST_GRAPH_SCHEMA_VERSION
             with graph._shared_conn_lock:
                 node_cols = _table_columns(graph.conn, "Entity")
                 edge_cols = _table_columns(graph.conn, "RelatesTo")
@@ -77,8 +79,8 @@ class TestGraphMigrationTimestamps:
         conn = kuzu.Connection(database)
         try:
             r1 = run_graph_migrations(conn)
-            assert r1["from_version"] == 1
-            assert r1["to_version"] == 1
+            assert r1["from_version"] == LATEST_GRAPH_SCHEMA_VERSION
+            assert r1["to_version"] == LATEST_GRAPH_SCHEMA_VERSION
             assert r1["applied"] == []
             assert 1 in r1["skipped"]
         finally:
@@ -173,8 +175,8 @@ class TestGraphMigrationTimestamps:
             )
 
             r = run_graph_migrations(conn)
-            assert r["to_version"] == 1
-            assert 1 in r["applied"]
+            assert r["to_version"] == LATEST_GRAPH_SCHEMA_VERSION
+            assert LATEST_GRAPH_SCHEMA_VERSION in r["applied"]
 
             # Columns added.
             assert "created_at" in _table_columns(conn, "Entity")
@@ -637,7 +639,7 @@ class TestGraphSchemaVersionIntrospection:
     def test_fresh_graph_at_version_1(self, tmp_path):
         graph = _make_graph(tmp_path, "ver_fresh")
         try:
-            assert graph.get_graph_schema_version() == 1
+            assert graph.get_graph_schema_version() == LATEST_GRAPH_SCHEMA_VERSION
         finally:
             graph.close()
 
@@ -646,6 +648,6 @@ class TestGraphSchemaVersionIntrospection:
         graph.close()
         graph2 = _make_graph(tmp_path, "ver_persist")
         try:
-            assert graph2.get_graph_schema_version() == 1
+            assert graph2.get_graph_schema_version() == LATEST_GRAPH_SCHEMA_VERSION
         finally:
             graph2.close()

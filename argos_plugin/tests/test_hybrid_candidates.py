@@ -70,12 +70,12 @@ class TestCandidateQueue:
             decision="reviewed_approved",
             reason="reviewed",
             durability="durable",
-            scope="project",
+            scope="context",
         )
         assert result is not None
         assert result["memory"] is not None
         assert result["memory"]["durability"] == "durable"
-        assert result["memory"]["scope"] == "project"
+        assert result["memory"]["scope"] == "context"
         store.close()
 
     def test_quarantine_hides_without_deleting(self, tmp_path):

@@ -126,7 +126,11 @@ class TestTwoTenantIsolation:
     def test_tombstone_isolation(self, stores):
         a, b, _ = stores
         rec = a.remember(category="context_note", content="gone from a")
-        a.delete_memory(memory_id=rec.memory_id)
+        # #200 Spec-10: raw delete_memory is forbidden on the RPC boundary;
+        # use the sanctioned facade path with CAS (expected_version).
+        a.facade_delete_memory(
+            memory_id=rec.memory_id, expected_version=rec.memory_id
+        )
         a_tombstones = a._rpc.call("store", "list_tombstones", limit=50)
         b_tombstones = b._rpc.call("store", "list_tombstones", limit=50)
         assert a_tombstones, "A's tombstone must exist for A"

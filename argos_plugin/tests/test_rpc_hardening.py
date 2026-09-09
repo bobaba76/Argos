@@ -316,7 +316,7 @@ class TestSC2EndpointPermissions:
         """_write_endpoint should chmod the file to 0o600 on POSIX."""
         import os
         path = tmp_path / "endpoint.json"
-        memory_service._write_endpoint(path, port=12345, token="secret")
+        memory_service._write_endpoint(path, port=12345, token="secret", gate_secret="gate")
         assert path.exists()
         if sys.platform != "win32":
             mode = os.stat(path).st_mode & 0o777

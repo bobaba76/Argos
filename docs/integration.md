@@ -59,18 +59,69 @@ curl -s http://127.0.0.1:8732/v1/memories/mem-1/explain \
 
 ### MCP client registration
 
-Register the Argos MCP server with your MCP client's config:
+Register the Argos MCP server with your MCP client's config. The server
+is a stdio JSON-RPC 2.0 process spawned on demand by the client.
+
+A minimal read-only registration (search, fetch, explain, collections,
+export — the default principal is `local`, read-only):
 
 ```json
 {
   "mcpServers": {
     "argos": {
       "command": "python",
-      "args": ["-m", "argos_plugin.mcp_server", "--home", "/path/to/hermes-home"]
+      "args": ["-m", "argos_plugin.mcp_server", "--home", "/path/to/hermes-home"],
+      "cwd": "/path/to/Argos",
+      "env": {
+        "PYTHONPATH": "/path/to/Argos;/path/to/Argos/argos_plugin"
+      }
     }
   }
 }
 ```
+
+Notes on the env block:
+
+- **`PYTHONPATH`** must include the repo root and `argos_plugin/` so
+  `python -m argos_plugin.mcp_server` can import the package. Without it,
+  a fresh checkout that isn't pip-installed will fail to start.
+- **`PYTHONIOENCODING=utf-8`** is recommended on Windows. The server
+  reconfigures its own stdio to UTF-8 at startup, but setting it in the
+  env block is belt-and-suspenders for older clients that may intercept
+  the stream before the server reconfigures it.
+- The `command` should point at a Python interpreter that has the
+  project's dependencies installed (e.g. the Hermes agent venv). A bare
+  `"python"` may resolve to a system interpreter without `duckdb`,
+  `jsonschema`, etc.
+
+To enable the **write tier** (propose candidates, save/update memories,
+manage collections), add these env vars:
+
+```json
+{
+  "env": {
+    "PYTHONPATH": "/path/to/Argos;/path/to/Argos/argos_plugin",
+    "ARGOS_API_CAN_PROPOSE": "1",
+    "ARGOS_API_CAN_WRITE": "1",
+    "ARGOS_API_CAN_FEEDBACK": "1"
+  }
+}
+```
+
+- `ARGOS_API_CAN_PROPOSE=1` — allow `memory_propose` (class A, enters the
+  review queue; does NOT become active until a human approves).
+- `ARGOS_API_CAN_WRITE=1` — allow `memory_save` / `memory_update` and
+  collection writes (class C, loopback only — the MCP stdio transport is
+  treated as loopback since it's a local process).
+- `ARGOS_API_PRINCIPAL_TYPE` — controls `memory_candidate_review` (class
+  B). The default is `model` (fail-closed): a model principal cannot
+  approve its own candidates. **Do not set this to `human` for model-driven
+  clients** — it unlocks self-approval, the exact hole spec-09 closes. Only
+  set `human` for a single-user, local, human-driven UI where a human is
+  actually at the keyboard. Generic MCP clients should omit it entirely;
+  candidate review flows through a human via class A proposals.
+
+Without these env vars the server starts read-only by design.
 
 ## Adapters roadmap (#277)
 

@@ -112,8 +112,17 @@ def test_shared_store_delete_memory_forwards_to_service(tmp_path):
             content="Temporary duplicate for delete regression",
         )
         assert record is not None
-        assert store.delete_memory(memory_id=record.memory_id)
-        assert not store.delete_memory(memory_id=record.memory_id)
+        # #200 Spec-10: raw delete_memory is forbidden on the RPC boundary;
+        # use the sanctioned facade path with CAS (expected_version).
+        assert store.facade_delete_memory(
+            memory_id=record.memory_id, expected_version=record.memory_id
+        )
+        # Second call raises (memory not found) — facade_delete_memory
+        # enforces CAS server-side and raises ValueError on missing records.
+        with pytest.raises(Exception):
+            store.facade_delete_memory(
+                memory_id=record.memory_id, expected_version=record.memory_id
+            )
     finally:
         try:
             store._rpc.stop_service()

@@ -32,6 +32,8 @@ _plugin_dir = Path(__file__).resolve().parent.parent
 if str(_plugin_dir) not in sys.path:
     sys.path.insert(0, str(_plugin_dir))
 
+from schema_migrations import LATEST_SCHEMA_VERSION
+
 # Deterministic clock.
 NOW = datetime(2026, 9, 6, 12, 0, 0, tzinfo=__import__("datetime").timezone.utc)
 
@@ -534,7 +536,7 @@ class TestSchemaMigrationReceipts:
     """The deletion_receipts table ships via the #288 migration runner."""
 
     def test_schema_version_is_3(self, store):
-        assert store.get_schema_version() == 3
+        assert store.get_schema_version() == LATEST_SCHEMA_VERSION
 
     def test_receipts_table_exists_and_append_only_shape(self, store):
         with store._state.lock:

@@ -111,8 +111,12 @@ def test_restore_quarantined_history_version_reattaches(tmp_path):
     v2 = store.update_memory(v1.memory_id, content="Alice works at Salty Co")
     v3 = store.update_memory(v2.memory_id, content="Alice works at Meridian Ltd")
 
-    # quarantine the MIDDLE version
-    assert store.quarantine_memory(v2.memory_id, reason="adversarial test") is True
+    # quarantine the MIDDLE version via delete_memory (quarantine_memory
+    # only works on head versions — SW5: valid_to IS NULL check; middle
+    # versions are quarantined by delete_memory which preserves the chain).
+    result = store.delete_memory(v2.memory_id)
+    assert result is not False
+    assert isinstance(result, dict) and result.get("action") == "quarantined"
     recs = _all_records(store, v2.memory_id)
     assert recs and recs[0].status == "quarantined"
     # chain still walks (history join is not status-filtered)

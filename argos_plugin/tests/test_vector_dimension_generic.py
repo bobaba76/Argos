@@ -24,6 +24,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from schema_migrations import LATEST_SCHEMA_VERSION
+
 from store import DuckDBMemoryStore
 
 
@@ -138,11 +140,11 @@ class TestDimensionGenericStorage:
             store2.close()
 
     def test_schema_version_is_2_after_init(self, tmp_path):
-        """The store is at schema version 2 after init (the 1→2 migration
-        for embedding provenance has run)."""
+        """The store is at the latest schema version after init (all
+        migrations have run)."""
         store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="alice")
         try:
-            assert store.get_schema_version() == 2
+            assert store.get_schema_version() == LATEST_SCHEMA_VERSION
         finally:
             store.close()
 
@@ -173,17 +175,17 @@ class TestMigrationIdempotency:
                 ["mem-1", "test", "content", [0.1] * 384],
             )
 
-            # Stamp at version 1, then run migrations (should do 1→2).
+            # Stamp at version 1, then run migrations (should reach latest).
             _ensure_schema_meta_table(conn)
             _set_schema_version(conn, 1)
             r1 = run_migrations(conn)
-            assert r1["to_version"] == 2
+            assert r1["to_version"] == LATEST_SCHEMA_VERSION
             assert 2 in r1["applied"]
 
             # Run again — should be a no-op.
             r2 = run_migrations(conn)
-            assert r2["from_version"] == 2
-            assert r2["to_version"] == 2
+            assert r2["from_version"] == LATEST_SCHEMA_VERSION
+            assert r2["to_version"] == LATEST_SCHEMA_VERSION
             assert len(r2["applied"]) == 0
             assert 2 in r2["skipped"]
         finally:
@@ -226,7 +228,7 @@ class TestMigrationIdempotency:
             _ensure_schema_meta_table(conn)
             _set_schema_version(conn, 1)
             r = run_migrations(conn)
-            assert r["to_version"] == 2
+            assert r["to_version"] == LATEST_SCHEMA_VERSION
             assert 2 in r["applied"]
 
             # Check backfilled dims.

@@ -55,6 +55,7 @@ class TestSharedStoreSurface:
             "search", "get_memories_by_ids", "remember", "update_memory",
             "consolidate", "save_candidate", "list_candidates", "review_candidate", "quarantine_memory",
             "restore_memory", "record_feedback", "delete_memory",
+            "facade_delete_memory",
             "cleanup_junk", "count", "get_insights", "close", "set_user_scope",
         }
         for method in required:

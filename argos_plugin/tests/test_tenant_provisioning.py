@@ -345,7 +345,8 @@ class TestStatusOutput:
             json.dumps(config), encoding="utf-8"
         )
         svc = MemoryService(tmp_path)
-        status = svc.dispatch({"method": "get_status"})
+        # MS3: get_status requires a valid credential in multi-user mode.
+        status = svc.dispatch({"method": "get_status", "credential": "super-secret-token"})
         status_str = json.dumps(status)
         assert "super-secret-token" not in status_str
         # But credential count should be visible.

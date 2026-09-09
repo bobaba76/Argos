@@ -170,8 +170,8 @@ GOLDEN: list[dict] = [
         "id": "habit",
         "input": "I always test before deploying. I never push to main.",
         "expected": [
-            {"category": "preference", "content": "User habit: test before deploying",
-             "tags": ["preference", "habit"], "durability": "durable"},
+            {"category": "insight", "content": "Constraint: always test before deploying",
+             "tags": ["constraint", "failure_lesson"], "durability": "durable"},
             {"category": "preference", "content": "User habit: push to main",
              "tags": ["preference", "habit"], "durability": "durable"},
         ],

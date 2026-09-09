@@ -131,6 +131,15 @@ class TestLexiconRejects:
         "The distillation feature is now enabled in production",
         "Rollup ran successfully and consolidated 50 records",
         "The reranker improved retrieval relevance in the eval",
+        # False-positive regressions (#392 review): project memory that
+        # mentions config keys / data structures / distillation terms but
+        # in a project-event context, not an internal-machinery context.
+        "the distillation pass is now stable",
+        "distillation cluster found 3 insights",
+        "context_aware_retrieval feature shipped in v2",
+        "query_expansion_enabled is a great feature",
+        "mutation_events table is useful for auditing",
+        "memory_records count reached 1000 today",
     ])
     def test_rejects_project_memory(self, content):
         assert not is_system_internal(content), f"Expected no match: {content!r}"
@@ -284,3 +293,62 @@ class TestSweepExclusionAfterFlagging:
         contents = [r.content for r in records]
         assert any("Python" in c for c in contents)
         assert not any("rollup config" in c for c in contents)
+
+
+class TestStartupSweepRunOnce:
+    """The startup sweep helper uses a run-once guard via system_state."""
+
+    def test_runs_on_first_call(self, store):
+        from system_internal_lexicon import startup_sweep_if_needed
+        store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+        )
+        report = startup_sweep_if_needed(store)
+        assert report is not None
+        assert report["flagged"] == 1
+
+    def test_skips_on_second_call(self, store):
+        from system_internal_lexicon import startup_sweep_if_needed
+        store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+        )
+        report1 = startup_sweep_if_needed(store)
+        assert report1 is not None
+        assert report1["flagged"] == 1
+        # Second call: run-once guard kicks in, returns None.
+        report2 = startup_sweep_if_needed(store)
+        assert report2 is None
+
+    def test_does_not_re_scan_after_done(self, store):
+        """Even if new system-internal records are added after the first
+        sweep, the run-once guard prevents a re-scan at startup. This is
+        intentional — the sweep is a one-time catch-up, not a continuous
+        filter. New records should be flagged at write time via the
+        record_class kwarg."""
+        from system_internal_lexicon import startup_sweep_if_needed
+        store.remember(
+            category="context_note",
+            content="rollup config defaults to false in config_model",
+            dedup=False,
+        )
+        startup_sweep_if_needed(store)
+        # Add a new system-internal record after the sweep.
+        store.remember(
+            category="context_note",
+            content="distillation threshold is 0.75 in config",
+            dedup=False,
+        )
+        # Second call: skipped (run-once guard).
+        report2 = startup_sweep_if_needed(store)
+        assert report2 is None
+        # The new record was NOT flagged by the startup sweep.
+        records = store.load_eligible_records(
+            since=None, limit=100, exclude_system_internal=False,
+        )
+        new_rec = [r for r in records if "distillation threshold" in r.content]
+        assert len(new_rec) == 1
+        assert new_rec[0].record_class is None

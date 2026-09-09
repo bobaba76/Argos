@@ -2126,6 +2126,7 @@ class StoreMaintenanceMixin:
         "compaction_last_run",
         "compaction_last_count",
         "retention_last_run",  # #293
+        "system_internal_sweep_done",  # #392 part 3
     })
 
     def get_state(self, key: str) -> str | None:

@@ -5,11 +5,16 @@ an implementation-machinery lexicon with ``record_class='system_internal'``.
 This retires existing pollution over time in addition to the one-off
 quarantine sweep applied 9/9.
 
-The lexicon is seeded from the 20 records the one-off sweep quarantined
-(the ground truth for what the filter must catch) plus the categories
-described in issue #392: mutation_events notes, rollup bug notes,
-reranker/benchmark decisions, store layout audits, and distillation
-internals.
+Lexicon provenance: the one-off sweep's 20 quarantined records were not
+recoverable from any accessible store (live or backup), so the lexicon is
+built from the categories and examples described in issue #392: mutation_events
+notes, rollup bug notes, reranker/benchmark decisions, store layout audits,
+distillation internals, config defaults, schema versions, internal
+module/function names, internal data structures, and tuning parameters.
+This is a hand-written approximation, not a data-seeded lexicon — it will
+have some false positives and false negatives at scale. The config flag
+``distillation_exclude_system_internal`` lets a deployment turn the whole
+filter off if the false-positive rate is unacceptable.
 
 Design constraints (from the issue):
 - **Deterministic, zero-LLM** — regex/substring matching only.
@@ -23,6 +28,8 @@ Design constraints (from the issue):
   is true (the default). When the exclusion is off, the sweep is a no-op
   (the deployment wants system notes distilled, so flagging them is
   wrong).
+- **Run-once** — the startup hook records a system_state key after a
+  successful apply so it does not re-scan on every startup.
 
 Usage::
 
@@ -43,19 +50,54 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Project-memory exclusion heuristic.
+#
+# Config key names and internal data-structure names can appear in both
+# system-internal notes ("context_aware_retrieval defaults to true") and
+# project memory ("context_aware_retrieval feature shipped in v2"). To
+# distinguish them, patterns for these names use a negative lookahead that
+# rejects matches when a project-memory word appears within 40 characters
+# after the name.
+#
+# This is an approximation — it will miss project memory where the
+# project word appears before the name, and it may false-positive on
+# internal notes that happen to contain one of these words. The list is
+# kept short and focused on event/evaluation verbs that are rare in
+# pure implementation notes.
+# ---------------------------------------------------------------------------
+_PROJECT_MEMORY_WORDS = (
+    "feature", "shipped", "released", "great", "useful", "helpful",
+    "love", "like", "ran", "found", "reached", "today", "yesterday",
+    "merged", "closed", "fixed", "resolved", "working", "broken",
+    "stable", "unstable", "fast", "slow", "nice", "cool",
+)
+_PROJECT_MEMORY_LOOKAHEAD = (
+    f"(?!.{{0,40}}(?:{'|'.join(_PROJECT_MEMORY_WORDS)}))"
+)
+
+
+def _ctx(pattern: str) -> re.Pattern:
+    """Compile *pattern* with a negative lookahead excluding project-memory
+    words. Used for config key names and data-structure names that can
+    appear in both internal notes and project memory.
+    """
+    return re.compile(pattern + _PROJECT_MEMORY_LOOKAHEAD, re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
 # Lexicon — implementation-machinery patterns.
 #
-# These patterns match content that describes the *internals* of the memory
-# system (config values, schema versions, function names, tuning parameters,
-# data structures, benchmark decisions) — NOT project memory (PRs, issues,
-# features, roadmap items).
-#
-# The patterns are intentionally specific to avoid false positives on
-# project memory like "PR #392 merged" or "rollup feature shipped".
+# Three tiers:
+# 1. Unambiguous patterns (function names, module names, schema versions,
+#    migrations, DDL, "defaults to", config file names) — always internal.
+# 2. Contextual patterns (config key names, data-structure names) — internal
+#    only when not followed by a project-memory word.
+# 3. Qualifier patterns (rollup/distillation + internal qualifier) — internal
+#    only when accompanied by a machinery word like "config", "threshold",
+#    "bug", "internals".
 # ---------------------------------------------------------------------------
 
-# Config key / config file references — matches records that describe
-# config defaults, config keys, or config schema details.
+# Tier 1: Config file / config schema references — unambiguous.
 _CONFIG_PATTERNS = [
     re.compile(r"\bconfig_schema\b", re.IGNORECASE),
     re.compile(r"\bconfig_model\b", re.IGNORECASE),
@@ -64,8 +106,7 @@ _CONFIG_PATTERNS = [
     re.compile(r"\bhybrid_memory\.json\b", re.IGNORECASE),
 ]
 
-# Schema version / migration references — matches records about schema
-# versions, migrations, or DDL changes.
+# Tier 1: Schema version / migration references — unambiguous.
 _SCHEMA_PATTERNS = [
     re.compile(r"\bschema v\d+\b", re.IGNORECASE),
     re.compile(r"\bschema_version\b", re.IGNORECASE),
@@ -75,9 +116,8 @@ _SCHEMA_PATTERNS = [
     re.compile(r"\bADD COLUMN\b.*memory_records", re.IGNORECASE),
 ]
 
-# Internal module / function names — matches records that reference
-# internal Python modules or functions by name (typically debug/audit
-# notes about how a function works or was changed).
+# Tier 1: Internal module / function names — unambiguous. A user would
+# never mention _sanitize_args or store_maintenance.py in project memory.
 _INTERNAL_NAME_PATTERNS = [
     re.compile(r"\b_sanitize_args\b"),
     re.compile(r"\bbackfill_graph\b"),
@@ -100,40 +140,49 @@ _INTERNAL_NAME_PATTERNS = [
     re.compile(r"\b_run_distillation\b"),
 ]
 
-# Internal data structures — matches records about internal tables,
-# ledgers, or data structures.
+# Tier 2: Internal data structures — contextual. Matches table/ledger
+# names only when NOT followed by a project-memory word within 40 chars.
+# This prevents false positives like "mutation_events table is useful for
+# auditing" while still matching "mutation_events schema v5 added actor
+# column" and "mutation_events is an append-only, actor-attributed log".
 _DATA_STRUCT_PATTERNS = [
-    re.compile(r"\bmutation_events\b", re.IGNORECASE),
-    re.compile(r"\bmemory_records\b", re.IGNORECASE),
-    re.compile(r"\bmemory_candidates\b", re.IGNORECASE),
-    re.compile(r"\bdeletion_tombstones\b", re.IGNORECASE),
-    re.compile(r"\brejection_ledger\b", re.IGNORECASE),
-    re.compile(r"\bmemory_evidence\b", re.IGNORECASE),
+    _ctx(r"\bmutation_events\b"),
+    _ctx(r"\bmemory_records\b"),
+    _ctx(r"\bmemory_candidates\b"),
+    _ctx(r"\bdeletion_tombstones\b"),
+    _ctx(r"\brejection_ledger\b"),
+    _ctx(r"\bmemory_evidence\b"),
 ]
 
-# Tuning / benchmark / threshold references — matches records about
-# retrieval tuning, similarity thresholds, or benchmark decisions.
+# Tier 2: Tuning config key names — contextual. Matches config key names
+# only when NOT followed by a project-memory word. Prevents false positives
+# like "context_aware_retrieval feature shipped" while still matching
+# "context_aware_retrieval defaults to true" and
+# "context_aware_retrieval is enabled by default".
 _TUNING_PATTERNS = [
     re.compile(r"\breranker verdict\b", re.IGNORECASE),
     re.compile(r"\bsimilarity floor\b", re.IGNORECASE),
     re.compile(r"\bcluster threshold\b", re.IGNORECASE),
     re.compile(r"\bthreshold 0\.\d+\b", re.IGNORECASE),
     re.compile(r"\bbenchmark (decision|result|finding)\b", re.IGNORECASE),
-    re.compile(r"\bcontext_aware_retrieval\b", re.IGNORECASE),
-    re.compile(r"\bquery_expansion_enabled\b", re.IGNORECASE),
-    re.compile(r"\bphrase_lift_alpha\b", re.IGNORECASE),
-    re.compile(r"\binjection_min_score\b", re.IGNORECASE),
+    _ctx(r"\bcontext_aware_retrieval\b"),
+    _ctx(r"\bquery_expansion_enabled\b"),
+    _ctx(r"\bphrase_lift_alpha\b"),
+    _ctx(r"\binjection_min_score\b"),
 ]
 
-# Rollup / distillation internals — matches records about the internal
-# mechanics of rollup or distillation (config, bugs, thresholds), NOT
-# records about the feature itself (e.g. "rollup feature shipped" is
-# project memory).
+# Tier 3: Rollup / distillation internals — qualifier-based. Matches
+# "rollup config/bug/internals/threshold/default" and
+# "distillation internals/threshold/config/default" (optionally with
+# "pass " or "cluster " before the qualifier) but NOT
+# "distillation pass is now stable" or "distillation cluster found 3
+# insights" (project memory). The bare words "pass" and "cluster" were
+# removed because they are too broad on their own.
 _ROLLUP_DISTILL_PATTERNS = [
     re.compile(r"\brollup (config|bug|internals|threshold|default)\b", re.IGNORECASE),
     re.compile(r"\brollup_enabled\b", re.IGNORECASE),
     re.compile(r"\brollup_after_days\b", re.IGNORECASE),
-    re.compile(r"\bdistillation (internals|pass|cluster|threshold|config|default)\b", re.IGNORECASE),
+    re.compile(r"\bdistillation (?:pass |cluster )?(internals|threshold|config|default)\b", re.IGNORECASE),
     re.compile(r"\bdistillation_enabled\b", re.IGNORECASE),
     re.compile(r"\bdistillation_exclude_system_internal\b", re.IGNORECASE),
     re.compile(r"\bdistillation_min_new_records\b", re.IGNORECASE),
@@ -142,8 +191,7 @@ _ROLLUP_DISTILL_PATTERNS = [
     re.compile(r"\bdistillation_max_calls\b", re.IGNORECASE),
 ]
 
-# Store layout / audit references — matches records about the store's
-# internal layout, column counts, or audit findings.
+# Tier 1: Store layout / audit references — unambiguous.
 _STORE_LAYOUT_PATTERNS = [
     re.compile(r"\bstore layout\b", re.IGNORECASE),
     re.compile(r"\bstore audit\b", re.IGNORECASE),
@@ -170,6 +218,10 @@ def is_system_internal(content: str) -> bool:
 
     Deterministic, zero-LLM. Matches any of the lexicon patterns (OR).
     Does NOT match project memory (PRs, issues, features, roadmap items).
+
+    The lexicon is a hand-written approximation (see module docstring for
+    provenance). It will have some false positives and false negatives at
+    scale.
     """
     if not content:
         return False
@@ -179,6 +231,12 @@ def is_system_internal(content: str) -> bool:
 # ---------------------------------------------------------------------------
 # Sweep
 # ---------------------------------------------------------------------------
+
+# system_state key for the run-once guard. The startup hook checks this
+# before applying the sweep; if it exists, the sweep has already run and
+# is not repeated.
+_SWEEP_STATE_KEY = "system_internal_sweep_done"
+
 
 def sweep_system_internal(
     store: Any,
@@ -255,3 +313,37 @@ def sweep_system_internal(
         "matches": matched,
         "dry_run": not do_apply,
     }
+
+
+def startup_sweep_if_needed(store: Any) -> Dict[str, Any] | None:
+    """Run the lexicon sweep at startup, guarded by a run-once state key.
+
+    Checks ``system_state`` for ``system_internal_sweep_done``. If present,
+    the sweep has already run and is skipped. Otherwise, runs the sweep
+    with ``apply=True`` and records the state key on success.
+
+    Returns the sweep report, or None if the sweep was skipped (already
+    done). Never raises — all failures are caught and logged.
+    """
+    try:
+        # Check the run-once guard.
+        done = store.get_state(_SWEEP_STATE_KEY)
+        if done:
+            return None
+    except Exception:
+        # If we can't read state, proceed with the sweep anyway —
+        # worst case we re-scan idempotently.
+        pass
+
+    try:
+        report = sweep_system_internal(store, apply=True)
+        # Record the run-once key on success (even if 0 records were
+        # flagged — the scan is done and doesn't need repeating).
+        try:
+            store.set_state(_SWEEP_STATE_KEY, "1")
+        except Exception as exc:
+            logger.warning("#392 sweep: could not persist run-once state: %s", exc)
+        return report
+    except Exception as exc:
+        logger.warning("#392 lexicon sweep failed (non-fatal): %s", exc)
+        return None

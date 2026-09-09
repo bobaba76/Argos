@@ -487,6 +487,53 @@ class TestMS2ForbiddenMethods:
             })
 
 
+class TestSanctionedState:
+    """#392: narrow server-side ops replace the broad set_sanctioned_state
+    alias. advance_distillation_state writes distillation_last_run +
+    distillation_last_count only. mark_system_internal_sweep_done writes
+    system_internal_sweep_done only. Both follow the run_compaction
+    precedent (#281): server-side ops, not in _FORBIDDEN_STORE_METHODS,
+    gated by the _STATE_KEY_ALLOWLIST (SM2)."""
+
+    def test_narrow_ops_not_forbidden(self):
+        """None of the narrow ops are in _FORBIDDEN_STORE_METHODS."""
+        assert "advance_distillation_state" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "mark_system_internal_sweep_done" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "mark_system_internal_sweep_dry_run_done" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "apply_system_internal_sweep" not in memory_service._FORBIDDEN_STORE_METHODS
+
+    def test_advance_distillation_state_works_through_proxy(self, tmp_path):
+        """advance_distillation_state writes distillation_last_run +
+        distillation_last_count end-to-end through the proxy."""
+        store = _start_service(tmp_path)
+        try:
+            store.advance_distillation_state(42)
+            assert store.get_state("distillation_last_run") is not None
+            assert store.get_state("distillation_last_count") == "42"
+        finally:
+            store.close()
+
+    def test_mark_sweep_done_works_through_proxy(self, tmp_path):
+        """mark_system_internal_sweep_done writes the run-once guard
+        end-to-end through the proxy."""
+        store = _start_service(tmp_path)
+        try:
+            store.mark_system_internal_sweep_done()
+            assert store.get_state("system_internal_sweep_done") == "1"
+        finally:
+            store.close()
+
+    def test_set_state_still_forbidden_on_proxy(self, tmp_path):
+        """set_state is still forbidden on the proxy path (MS7). The
+        narrow ops are the sanctioned exception, not set_state itself."""
+        store = _start_service(tmp_path)
+        try:
+            with pytest.raises(PermissionError):
+                store.set_state("distillation_last_run", "test")
+        finally:
+            store.close()
+
+
 class TestMS4NoTracebackLeak:
     """MS4: error responses must not include traceback."""
 

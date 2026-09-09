@@ -1319,6 +1319,29 @@ class MemoryService:
         if method == "set_state":
             store.set_state(args.get("key", ""), args.get("value", ""))
             return True
+        if method == "advance_distillation_state":
+            # #392: narrow server-side op for distillation run-state
+            # advancement. Replaces the broad set_sanctioned_state alias.
+            # Only writes distillation_last_run + distillation_last_count
+            # (both in _STATE_KEY_ALLOWLIST). Follows the run_compaction
+            # precedent (#281): server-side op, not in _FORBIDDEN.
+            records_processed = int(args.get("records_processed", 0))
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            store.set_state("distillation_last_run", now)
+            store.set_state("distillation_last_count", str(records_processed))
+            return True
+        if method == "mark_system_internal_sweep_done":
+            # #392: narrow server-side op for the lexicon sweep run-once
+            # guard. Only writes system_internal_sweep_done (in
+            # _STATE_KEY_ALLOWLIST). Follows the run_compaction precedent.
+            store.set_state("system_internal_sweep_done", "1")
+            return True
+        if method == "mark_system_internal_sweep_dry_run_done":
+            # #392: narrow server-side op for the lexicon sweep dry-run
+            # marker. Only writes system_internal_sweep_dry_run_done.
+            store.set_state("system_internal_sweep_dry_run_done", "1")
+            return True
         if method == "count_eligible_since":
             return store.count_eligible_since(
                 args.get("since"),
@@ -1381,6 +1404,20 @@ class MemoryService:
                 interval_days=int(args.get("interval_days", 7)),
                 aggressiveness=float(args.get("aggressiveness", 1.0)),
                 dry_run=bool(args.get("dry_run", False)),
+            )
+        if method == "apply_system_internal_sweep":
+            # #392: run the lexicon sweep SERVER-SIDE so it has direct
+            # access to the DuckDB store (load_eligible_records, UPDATE
+            # memory_records). The client-side SharedMemoryStore proxy
+            # cannot reach store._state.lock / store.connection. Follows
+            # the run_compaction precedent (#281).
+            try:
+                from system_internal_lexicon import sweep_system_internal as _sweep
+            except ImportError:
+                from argos_plugin.system_internal_lexicon import sweep_system_internal as _sweep
+            return _sweep(
+                store,
+                dry_run=bool(args.get("dry_run", True)),
             )
         raise ValueError(f"Unsupported store method: {method}")
 

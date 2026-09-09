@@ -481,6 +481,11 @@ def quality_flags_for_fact(fact: Dict[str, Any]) -> List[str]:
         flags.append("second_person_reference")
     if category in {"context_note", "event"}:
         flags.append("short_lived_category")
+    # #400: flag constraint candidates so the reviewer can apply stricter
+    # review (reject narration-only cause attributions).
+    tags = fact.get("tags", [])
+    if isinstance(tags, list) and "constraint" in tags:
+        flags.append("constraint_candidate")
     return sorted(set(flags))
 
 
@@ -746,6 +751,61 @@ _LOCATION_RE = _PATTERNS["LOCATION_RE"]
 # "I've been doing X for Y" / "I've been on X for Y" — ongoing states.
 _ONGOING_RE = _PATTERNS["ONGOING_RE"]
 
+# ---------------------------------------------------------------------------
+# #400: constraint-form failure memory — outcome vs constraint detection.
+#
+# Failure/lesson content is classified as a durable CONSTRAINT (invariant
+# form: "X fails when Y; never X when Z"), not a one-off outcome. One-off
+# outcomes ("I tried X, it didn't work") route to short-lived categories
+# (context_note/event) via the existing expiry TTL map.
+#
+# The distinction matters because:
+# - Constraints bound the operation space (reflexion-style failure memory)
+# - Outcomes are single-context samples that expire
+# - Wrong causal lessons (constraints from unverified narration) are
+#   actively harmful — the reviewer treats constraint candidates strictly
+#
+# Three pattern families:
+# 1. Explicit constraint/lesson: "never X when Y", "lesson: X", "learned: X"
+# 2. Failure with cause: "X failed because Y", "X didn't work when Y"
+# 3. One-off outcome: "I tried X", "X happened", "I did X yesterday"
+# ---------------------------------------------------------------------------
+
+# Explicit constraint phrasing — already in invariant form.
+_NEVER_WHEN_RE = re.compile(
+    r"\b(?:never|don\'t|do\s+not|avoid)\s+(.+?)\s+when\s+(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+_ALWAYS_BEFORE_RE = re.compile(
+    r"\b(?:always|must)\s+(.+?)\s+before\s+(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+_LESSON_RE = re.compile(
+    r"\b(?:lesson|learned|takeaway|mistake|rule)\s*[:\-]\s*(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+
+# Failure with cause — needs normalization to invariant form.
+_FAILED_BECAUSE_RE = re.compile(
+    r"\b(?:i\s+)?(?:tried|attempted)\s+(.+?)\s+(?:and\s+)?(?:it\s+)?"
+    r"(?:failed|didn\'t\s+work|didn\'t\s+work\s+out|broke|didn\'t\s+succeed)"
+    r"(?:\s+(?:because|when|if|since)\s+(.+?))?(?:\.|$)",
+    re.IGNORECASE,
+)
+_DOESNT_WORK_RE = re.compile(
+    r"\b(.+?)\s+(?:doesn\'t|does\s+not|don\'t|do\s+not)\s+work\s+"
+    r"(?:when|if|for|with)\s+(.+?)(?:\.|$)",
+    re.IGNORECASE,
+)
+
+# One-off outcome — routes to short-lived category, not durable.
+_OUTCOME_TRIED_RE = re.compile(
+    r"\b(?:i\s+)?(?:tried|attempted|did|ran|used)\s+(.+?)"
+    r"(?:\s+(?:yesterday|last\s+week|last\s+night|today|earlier))?"
+    r"(?:\.|$)",
+    re.IGNORECASE,
+)
+
 # "I have/own X" — possession attribute (scoped to have/own only so it
 # doesn't shadow _HAVE_USE_RE for "I use/take X" — issue #32).
 _ATTRIBUTE_RE = _PATTERNS["ATTRIBUTE_RE"]
@@ -997,6 +1057,120 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
                 "payload": {"insight": insight},
             }
 
+    # -- #400: constraint-form failure memory ------------------------------
+    # Failure/lesson content is classified as a durable CONSTRAINT
+    # (invariant form), not a one-off outcome. Checked AFTER insight so
+    # self-observations still match, but BEFORE event/ongoing so failure
+    # content doesn't land as a short-lived event.
+    #
+    # 1. Explicit constraint: "never X when Y", "always X before Y"
+    m = _NEVER_WHEN_RE.search(sentence)
+    if m:
+        action = m.group(1).strip().rstrip('.')
+        condition = m.group(2).strip().rstrip('.')
+        if len(action) > 3 and len(condition) > 3:
+            return {
+                "category": "insight",
+                "content": f"Constraint: never {action} when {condition}",
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "action": action,
+                    "condition": condition,
+                    "form": "never_when",
+                },
+            }
+    m = _ALWAYS_BEFORE_RE.search(sentence)
+    if m:
+        first = m.group(1).strip().rstrip('.')
+        second = m.group(2).strip().rstrip('.')
+        if len(first) > 3 and len(second) > 3:
+            return {
+                "category": "insight",
+                "content": f"Constraint: always {first} before {second}",
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "first": first,
+                    "second": second,
+                    "form": "always_before",
+                },
+            }
+
+    # 2. Explicit lesson/mistake: "lesson: X", "learned: X"
+    m = _LESSON_RE.search(sentence)
+    if m:
+        lesson = m.group(1).strip().rstrip('.')
+        if len(lesson) > 5:
+            return {
+                "category": "insight",
+                "content": f"Constraint: {lesson}",
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "lesson": lesson,
+                    "form": "explicit_lesson",
+                },
+            }
+
+    # 3. Failure with cause: "tried X, failed because Y" → invariant form
+    m = _FAILED_BECAUSE_RE.search(sentence)
+    if m:
+        action = m.group(1).strip().rstrip('.')
+        cause = m.group(2).strip().rstrip('.') if m.group(2) else None
+        if len(action) > 3:
+            if cause and len(cause) > 3:
+                content = f"Constraint: {action} fails when {cause}; never {action} when {cause}"
+            else:
+                content = f"Constraint: {action} does not work; avoid {action}"
+            return {
+                "category": "insight",
+                "content": content,
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "action": action,
+                    "cause": cause,
+                    "form": "failure_with_cause" if cause else "failure_no_cause",
+                },
+            }
+
+    # 4. "X doesn't work when Y" → invariant form
+    m = _DOESNT_WORK_RE.search(sentence)
+    if m:
+        action = m.group(1).strip().rstrip('.')
+        condition = m.group(2).strip().rstrip('.')
+        if len(action) > 3 and len(condition) > 3:
+            return {
+                "category": "insight",
+                "content": f"Constraint: {action} does not work when {condition}; never {action} when {condition}",
+                "tags": ["constraint", "failure_lesson"],
+                "payload": {
+                    "constraint": True,
+                    "action": action,
+                    "condition": condition,
+                    "form": "doesnt_work_when",
+                },
+            }
+
+    # 5. One-off outcome: "I tried X" (no failure/cause) → short-lived
+    #    Routes to context_note (short-lived, 30-day TTL) not insight.
+    #    Only matches if no failure pattern above matched.
+    m = _OUTCOME_TRIED_RE.search(sentence)
+    if m:
+        outcome = m.group(1).strip().rstrip('.')
+        if len(outcome) > 5:
+            return {
+                "category": "context_note",
+                "content": f"User tried: {outcome}",
+                "tags": ["outcome", "one_off"],
+                "payload": {
+                    "outcome": True,
+                    "action": outcome,
+                    "form": "one_off_outcome",
+                },
+            }
+
     # Event: "I started a new job" / "I quit smoking" / "I launched the app"
     m = _EVENT_RE.search(sentence)
     if m:
@@ -1209,6 +1383,19 @@ DO extract preferences and style directives — these are high value:
 - Endorsements of assistant behavior ("I like it when you push back",
   "don't be so formal with me")
 
+DO extract failure/lesson content as constraints (#400):
+- Failures and lessons are MORE valuable than successes — they bound the
+  operation space. When the user describes a failure, extract it as an
+  invariant-form constraint, not a one-off outcome.
+- Normalize "I tried X, it failed because Y" → "X fails when Y; never X
+  when Y" (constraint form, tagged "constraint", category "insight", durable).
+- Normalize "lesson: X" / "learned: X" / "mistake: X" → "Constraint: X".
+- One-off outcomes ("I tried X yesterday", "X happened today") are NOT
+  constraints — route them to "context_note" (short-lived, expires).
+- Do NOT include the model's causal narration unless the user explicitly
+  stated the cause. If the user said "X failed" without explaining why,
+  extract "X does not work" without inventing a cause.
+
 Do NOT extract:
 - Transient states ("I'm tired", "I'm busy right now")
 - Questions or requests
@@ -1219,7 +1406,7 @@ Do NOT extract:
 Return a JSON array of objects with these keys:
 - "category": one of "personal_fact", "preference", "insight", "event", "relationship", "goal", "context_note"
 - "content": a clear, self-contained statement of the fact
-- "tags": array of 1-3 short lowercase tags
+- "tags": array of 1-3 short lowercase tags (use "constraint" for failure/lesson facts)
 - "confidence": number from 0 to 1
 - "durability": "permanent", "durable", or "temporary"
 - "scope": "profile", "project", or "session"
@@ -1245,6 +1432,15 @@ Output: [{"category": "preference", "content": "User prefers short answers", "ta
 
 User: "I like it when you challenge my assumptions instead of just agreeing"
 Output: [{"category": "preference", "content": "User likes the assistant to challenge their assumptions rather than just agree", "tags": ["preference", "assistant_side"]}]
+
+User: "I tried deploying without migrations and it failed because the schema was stale"
+Output: [{"category": "insight", "content": "Constraint: deploying without migrations fails when the schema is stale; never deploy without migrations when the schema is stale", "tags": ["constraint", "failure_lesson", "deploy"]}]
+
+User: "Lesson learned: always run the test suite before pushing to main"
+Output: [{"category": "insight", "content": "Constraint: always run the test suite before pushing to main", "tags": ["constraint", "failure_lesson"]}]
+
+User: "I tried that new restaurant yesterday"
+Output: [{"category": "context_note", "content": "User tried: that new restaurant", "tags": ["outcome", "one_off"]}]
 
 User: "hey how are you"
 Output: []

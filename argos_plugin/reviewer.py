@@ -342,6 +342,17 @@ Reject or quarantine any proposal whose subject is unnamed or unresolved — e.g
 person. A durable memory must be self-contained: it must read correctly and
 unambiguously out of context. If a name or clear referent is missing, do not approve.
 
+CONSTRAINT CANDIDATES (#400): when the proposal is tagged "constraint" or
+"failure_lesson", apply stricter review:
+- The user must have explicitly stated the failure or cause in their evidence.
+  Reject constraint candidates whose cause rests on model narration only —
+  if the evidence shows the user describing a failure but the proposed
+  constraint invents a cause the user did not state, reject it.
+- A constraint without a user-stated cause ("X failed") is acceptable if
+  the user described the failure; a constraint with an invented cause
+  ("X fails when Y" where the user never mentioned Y) is not.
+- Constraints are durable (never auto-expire) — be conservative.
+
 Return one JSON object with exactly:
 - decision: approve, reject, quarantine, or pending_user_confirmation
 - confidence: number from 0 to 1

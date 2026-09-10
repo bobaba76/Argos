@@ -70,6 +70,7 @@ class StubStore:
 
     def set_user_scope(self, user_id: str) -> None:
         self.user_id = user_id
+        self.calls.append({"method": "set_user_scope", "args": {"user_id": user_id}})
 
     def search(self, **kwargs) -> List[MemoryRecord]:
         self.calls.append({"method": "search", "args": kwargs})
@@ -84,6 +85,20 @@ class StubStore:
 
     def save_candidate(self, **kwargs) -> Dict[str, Any]:
         self.calls.append({"method": "save_candidate", "args": kwargs})
+        cid = f"cand-{self._next_id}"
+        self._next_id += 1
+        candidate = {
+            "candidate_id": cid,
+            "status": "pending",
+            "content": kwargs.get("content", ""),
+            "category": kwargs.get("category", ""),
+            **kwargs,
+        }
+        self._candidates[cid] = candidate
+        return candidate
+
+    def save_api_candidate(self, **kwargs) -> Dict[str, Any]:
+        self.calls.append({"method": "save_api_candidate", "args": kwargs})
         cid = f"cand-{self._next_id}"
         self._next_id += 1
         candidate = {
@@ -272,10 +287,14 @@ class TestT2IdentitySpoof:
             "content": "test content",
             "category": "context_note",
         })
-        # The save_candidate call should have user_id="user-a" (from ctx)
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        # #422/AF3: the facade scopes the store to ctx.user_id for the
+        # duration of the propose (save/restore) instead of passing a
+        # user_id kwarg that the RPC sanitize boundary would strip.
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
-        assert save_calls[0]["args"].get("user_id") == "user-a"
+        assert "user_id" not in save_calls[0]["args"]
+        scope_calls = [c for c in store.calls if c["method"] == "set_user_scope"]
+        assert scope_calls and scope_calls[0]["args"]["user_id"] == "user-a"
 
 
 # -- T3: Malformed ACL — API fails closed ------------------------------------
@@ -316,7 +335,7 @@ class TestT4IdempotentIngest:
         r2 = facade.execute(ctx, "memory_propose", params, idempotency_key="key-1")
         # Same candidate_id — no duplicate
         assert r1["candidate_id"] == r2["candidate_id"]
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1  # only one store write
 
     def test_different_key_different_body_creates_two(self):
@@ -329,7 +348,7 @@ class TestT4IdempotentIngest:
         facade.execute(ctx, "memory_propose",
                        {"content": "second", "category": "context_note"},
                        idempotency_key="key-2")
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 2
 
     def test_same_key_different_body_raises_conflict(self):
@@ -357,7 +376,7 @@ class TestT4IdempotentIngest:
         # "Client timeout" — retry with same key
         r2 = facade.execute(ctx, "memory_propose", params, idempotency_key="timeout-key")
         assert r1 == r2
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
 
     def test_class_c_save_idempotent(self):

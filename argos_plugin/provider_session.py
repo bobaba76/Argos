@@ -1647,6 +1647,11 @@ class ProviderSessionMixin:
                     decision=decision,
                     reason=args.get("reason", ""),
                     supersedes_memory_id=supersedes_memory_id,
+                    # #423: this tool IS the human-confirmation surface —
+                    # the user-confirmed class. The shared-service client
+                    # auto-gates tool/manual claims onto the HMAC channel;
+                    # the service derives the class server-side.
+                    review_source="tool",
                 )
                 # Spec 1: pass expires_at through when expiry is enabled.
                 if getattr(self, "_expiry_enabled", False) and "expires_at" in args:

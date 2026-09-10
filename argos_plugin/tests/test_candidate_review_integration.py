@@ -42,6 +42,10 @@ def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
             candidate_id=candidate["candidate_id"],
             decision="approved",
             reason="confirmed",
+            # #423: user-confirmed class must ride the gated channel; the
+            # client auto-gates tool/manual claims (a no-class call is
+            # server-derived to auto_review and cannot approve).
+            review_source="tool",
         )
 
         assert reviewed is not None

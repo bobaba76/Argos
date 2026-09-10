@@ -1801,75 +1801,76 @@ class ArgosAPIFacade:
 
         Never creates active memory. The candidate goes through the
         inbound security scan, then enters the review queue for human
-        decision. Server-set provenance (D4):
-          source = "api"
-          transport = ctx.transport
-          provenance_origin = "external"
-          grounding = "extracted" (default; caller may not claim "observed")
+        decision. Server-set provenance (D4, #422): the write goes
+        through ``save_api_candidate``, which stamps inside the store
+        method — source = "api", provenance_origin = "external",
+        grounding = "extracted" (caller cannot claim "observed") — so
+        the RPC sanitize boundary cannot strip the stamping.
 
         AF10: the facade scans content with ``scan_inbound_text`` before
-        calling ``save_candidate``. The store also scans internally for
-        ``provenance_origin="external"`` (store_write.py). This double
-        scan is intentional defense-in-depth — the facade scan enables
-        early quarantine (before the candidate enters the review queue),
-        while the store scan is the authoritative boundary. The
-        redundancy is acceptable for v1; a future optimization can skip
-        the store-level scan when the facade has already quarantined.
+        the write; ``save_api_candidate(external=True)`` re-runs the
+        store's own inbound scan. This double scan is intentional
+        defense-in-depth — the facade scan enables early quarantine
+        (before the candidate enters the review queue), while the store
+        scan is the authoritative boundary. The redundancy is
+        acceptable for v1; a future optimization can skip the store-
+        level scan when the facade has already quarantined.
         """
         content = params["content"]
-        # AF3: pass user_id from ctx to save_candidate so API-proposed
-        # memories are stored under the caller's user scope, not the
-        # store's default.
-        user_id = ctx.user_id
-        # D9: scan inbound content for injection/poisoning patterns.
-        # No weakening for "trusted" senders.
-        scan_result = scan_inbound_text(content)
-        if scan_result.blocked:
-            # Quarantine the candidate — do not trigger any LLM call.
-            candidate = self._store.save_candidate(
+        # AF3/#422: scope the store to the caller's user for the duration
+        # of the operation (same save/restore pattern as _op_ingest).
+        # The write goes through save_api_candidate — the store stamps
+        # source/provenance (D4) inside the method, so the RPC sanitize
+        # boundary can never strip them (#422).
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            # D9: scan inbound content for injection/poisoning patterns.
+            # No weakening for "trusted" senders.
+            scan_result = scan_inbound_text(content)
+            if scan_result.blocked:
+                # Quarantine the candidate — do not trigger any LLM call.
+                candidate = self._store.save_api_candidate(
+                    category=params["category"],
+                    content=content,
+                    tags=params.get("tags", []),
+                    payload=params.get("payload", {}),
+                    pre_scan_blocked=True,
+                )
+                if candidate and candidate.get("candidate_id"):
+                    # Mark as quarantined with the injection reason.
+                    # review_source="system" rides the ungated channel
+                    # and is normalized server-side to auto_review —
+                    # the quarantined decision itself is unaffected.
+                    self._store.review_candidate(
+                        candidate_id=candidate["candidate_id"],
+                        decision="quarantined",
+                        reason=f"inbound_security: {scan_result.summary()}",
+                        review_source="system",
+                    )
+                return {
+                    "candidate_id": candidate.get("candidate_id") if candidate else None,
+                    "status": "quarantined",
+                    "reason": "inbound_security_scan_blocked",
+                    "scan_summary": scan_result.summary(),
+                }
+
+            # Pass through to the candidate queue with server-set
+            # provenance (stamped inside the store method).
+            candidate = self._store.save_api_candidate(
                 category=params["category"],
                 content=content,
                 tags=params.get("tags", []),
                 payload=params.get("payload", {}),
-                source="api",
-                confidence=0.0,
-                scope="profile",
-                provenance_origin="external",
-                grounding="speculative",
-                user_id=user_id,  # AF3
             )
-            if candidate and candidate.get("candidate_id"):
-                # Mark as quarantined with the injection reason.
-                self._store.review_candidate(
-                    candidate_id=candidate["candidate_id"],
-                    decision="quarantined",
-                    reason=f"inbound_security: {scan_result.summary()}",
-                    review_source="system",
-                )
             return {
                 "candidate_id": candidate.get("candidate_id") if candidate else None,
-                "status": "quarantined",
-                "reason": "inbound_security_scan_blocked",
-                "scan_summary": scan_result.summary(),
+                "status": candidate.get("status", "pending") if candidate else "error",
             }
-
-        # Pass through to the candidate queue with server-set provenance.
-        candidate = self._store.save_candidate(
-            category=params["category"],
-            content=content,
-            tags=params.get("tags", []),
-            payload=params.get("payload", {}),
-            source="api",
-            confidence=0.5,
-            scope="profile",
-            provenance_origin="external",
-            grounding="extracted",
-            user_id=user_id,  # AF3
-        )
-        return {
-            "candidate_id": candidate.get("candidate_id") if candidate else None,
-            "status": candidate.get("status", "pending") if candidate else "error",
-        }
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
 
     def _op_ingest(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
         """Proposal tier (class A): #289 structured ingestion.

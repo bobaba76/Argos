@@ -64,6 +64,10 @@ def review_pending(home: Path, limit: int) -> dict[str, int]:
                 review_model=result.get("review_model", "memory_review"),
                 durability=result.get("durability"),
                 scope=result.get("scope"),
+                # #423: unattended engine — the unprivileged auto_review
+                # class must be explicit so the storage boundary never
+                # mistakes a CLI review for a human confirmation.
+                review_source="auto_review",
             )
             counts[status] = counts.get(status, 0) + 1
     finally:

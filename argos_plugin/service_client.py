@@ -738,6 +738,17 @@ class SharedMemoryStore:
     def save_candidate(self, **kwargs: Any) -> dict | None:
         return self._rpc.call("store", "save_candidate", **kwargs)
 
+    def save_api_candidate(self, **kwargs: Any) -> dict | None:
+        """#422: external-API proposal write.
+
+        The service stamps provenance inside the store method
+        (save_api_candidate) — the wire args carry no provenance params,
+        so the RPC sanitize boundary cannot strip the source="api" /
+        provenance_origin="external" stamping (mirrors
+        ingest_structured, #289).
+        """
+        return self._rpc.call("store", "save_api_candidate", **kwargs)
+
     def ingest_structured(self, **kwargs: Any) -> dict:
         """#289: structured ingestion (JSON/CSV → memory with provenance)."""
         result = self._rpc.call("store", "ingest_structured", **kwargs)
@@ -885,7 +896,17 @@ class SharedMemoryStore:
         return self._rpc.call("store", "list_candidates", **kwargs) or []
 
     def review_candidate(self, **kwargs: Any) -> dict | None:
-        value = self._rpc.call("store", "review_candidate", **kwargs)
+        # #423: the user-confirmed privilege classes ride the gated
+        # channel. The service derives the class server-side — a raw RPC
+        # caller with only the endpoint token cannot claim tool/manual
+        # (ungated calls are forced to auto_review there). In-tree
+        # callers holding the boot gate_secret are auto-gated here;
+        # non-privileged classes stay on the plain channel.
+        review_source = str(kwargs.get("review_source", "") or "")
+        if review_source in {"tool", "manual"}:
+            value = self._rpc.call_gated("store", "review_candidate", **kwargs)
+        else:
+            value = self._rpc.call("store", "review_candidate", **kwargs)
         if value and value.get("memory"):
             value["memory"] = _record_from_dict(value["memory"]).to_dict()
         return value

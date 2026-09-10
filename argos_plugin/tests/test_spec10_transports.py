@@ -88,6 +88,7 @@ class StubStore:
 
     def set_user_scope(self, user_id: str) -> None:
         self.user_id = user_id
+        self.calls.append({"method": "set_user_scope", "args": {"user_id": user_id}})
 
     def search(self, **kwargs) -> List[MemoryRecord]:
         if self._should_fail:
@@ -106,6 +107,18 @@ class StubStore:
 
     def save_candidate(self, **kwargs) -> Dict[str, Any]:
         self.calls.append({"method": "save_candidate", "args": kwargs})
+        cid = f"cand-{self._next_id}"
+        self._next_id += 1
+        candidate = {
+            "candidate_id": cid, "status": "pending",
+            "content": kwargs.get("content", ""),
+            "category": kwargs.get("category", ""),
+        }
+        self._candidates[cid] = candidate
+        return candidate
+
+    def save_api_candidate(self, **kwargs) -> Dict[str, Any]:
+        self.calls.append({"method": "save_api_candidate", "args": kwargs})
         cid = f"cand-{self._next_id}"
         self._next_id += 1
         candidate = {
@@ -478,7 +491,7 @@ class TestT4IdempotentIngest:
         # Same candidate_id
         assert r1.json().get("candidate_id") == r2.json().get("candidate_id")
         # Only one save_candidate call
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
 
     def test_rest_missing_idempotency_key_rejected(self):

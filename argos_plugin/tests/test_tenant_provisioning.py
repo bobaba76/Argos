@@ -12,6 +12,8 @@ Tests cover:
   - The provisioning tool can add a tenant with a documented command.
 
 All deterministic, no LLM calls.
+
+Re-validated + re-included in change-scoped CI: 2026-09-10 (#405).
 """
 from __future__ import annotations
 

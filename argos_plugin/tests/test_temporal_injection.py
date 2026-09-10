@@ -14,6 +14,8 @@ Key invariants under test:
     normalized to UTC before sorting (raw lexicographic mis-orders them)
   * classifier failure -> injection unchanged (best-effort semantics)
   * flag parsing: string/bool truthy, defaults OFF
+
+Re-validated + re-included in change-scoped CI: 2026-09-10 (#405).
 """
 import re
 import sys

@@ -2,7 +2,7 @@ name: retrieval-weekly-gate (Tier 2)
 
 # #292 Tier 2: the full recall/bench gate on a weekly cadence (or on
 # demand). This is the REAL eval — the existing self-corpus gate
-# (eval/run_gate.py) over the frozen snapshot + gold_v1 — which is far
+# (eval/run_gate.py) over the frozen snapshot + gold_v3 — which is far
 # too slow/LLM-adjacent for per-PR use. Regression = DELTA vs the
 # recorded baseline (eval/verdict.py thresholds), never absolute; the
 # drift report tracks recall/MRR across runs.
@@ -19,9 +19,15 @@ name: retrieval-weekly-gate (Tier 2)
 # manifest) — a monitored failure, never a silent skip.
 
 on:
-  schedule:
-    # Mondays 04:00 UTC.
-    - cron: "0 4 * * 1"
+  # TIER-2 POSTURE (#403, 2026-09-10): on-demand only. The weekly schedule
+  # is disabled because no self-hosted runner is registered on this repo —
+  # a scheduled job with no runner is silently skipped, the one failure
+  # mode the provisioning preflight cannot catch. Re-enable only together
+  # with a registered runner and a provisioned artifact dir; rationale and
+  # upgrade path: docs/eval-gate-tier2.md.
+  # schedule:
+  #   # Mondays 04:00 UTC.
+  #   - cron: "0 4 * * 1"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -31,7 +37,7 @@ on:
       snapshot_id:
         description: "Snapshot dir name under argos_plugin/eval/snapshots/"
         required: false
-        default: "20260826_170626_224920_4d612e0f"
+        default: "20260906_162404_018897_1d9c5253"
 
 permissions:
   contents: read
@@ -50,11 +56,11 @@ jobs:
     runs-on: [self-hosted, windows]
     timeout-minutes: 180
     env:
-      SNAPSHOT_ID: ${{ github.event.inputs.snapshot_id || '20260826_170626_224920_4d612e0f' }}
-      SNAPSHOT_DIR: argos_plugin/eval/snapshots/${{ github.event.inputs.snapshot_id || '20260826_170626_224920_4d612e0f' }}
+      SNAPSHOT_ID: ${{ github.event.inputs.snapshot_id || '20260906_162404_018897_1d9c5253' }}
+      SNAPSHOT_DIR: argos_plugin/eval/snapshots/${{ github.event.inputs.snapshot_id || '20260906_162404_018897_1d9c5253' }}
       DRY_RUN: ${{ github.event.inputs.dry_run == true || github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'false' }}
       # Host-side directory holding the gitignored gate artifacts
-      # (snapshot dir + gold_v1.jsonl). Provisioned into the workspace
+      # (snapshot dir + gold_v3.jsonl). Provisioned into the workspace
       # by the step below — checkout's git clean -ffdx would otherwise
       # wipe them before preflight.
       ARGOS_GATE_ARTIFACTS_DIR: ${{ vars.ARGOS_GATE_ARTIFACTS_DIR || 'D:/argos-gate-artifacts' }}
@@ -73,7 +79,7 @@ jobs:
           #   $SRC/snapshots/<id>/hybrid_memory.duckdb.wal
           #   $SRC/snapshots/<id>/manifest.json
           #   $SRC/snapshots/<id>/gate_baseline.json
-          #   $SRC/gold/gold_v1.jsonl
+          #   $SRC/gold/gold_v3.jsonl
           for f in \
             "snapshots/$SNAPSHOT_ID/hybrid_memory.duckdb" \
             "snapshots/$SNAPSHOT_ID/hybrid_memory.duckdb.wal" \
@@ -86,10 +92,10 @@ jobs:
               exit 2
             fi
           done
-          if [ -f "$SRC/gold/gold_v1.jsonl" ]; then
-            cp "$SRC/gold/gold_v1.jsonl" argos_plugin/eval/gold/gold_v1.jsonl
+          if [ -f "$SRC/gold/gold_v3.jsonl" ]; then
+            cp "$SRC/gold/gold_v3.jsonl" argos_plugin/eval/gold/gold_v3.jsonl
           else
-            echo "MISSING gate artifact: gold_v1.jsonl" >&2
+            echo "MISSING gate artifact: gold_v3.jsonl" >&2
             exit 2
           fi
           echo "Gate artifacts provisioned."
@@ -99,11 +105,11 @@ jobs:
         run: |
           python argos_plugin/eval/ci_tier2_check.py --check \
             --snapshot "$SNAPSHOT_DIR" \
-            --gold argos_plugin/eval/gold/gold_v1.jsonl \
+            --gold argos_plugin/eval/gold/gold_v3.jsonl \
             --baseline "$SNAPSHOT_DIR/gate_baseline.json"
 
       - name: Run the full gate (delta vs recorded baseline)
-        # Skipped on an explicit dry_run dispatch; runs on schedule.
+        # Skipped on an explicit dry_run dispatch; executes on a real (non-dry-run) dispatch.
         if: ${{ github.event_name == 'schedule' || inputs.dry_run == false }}
         shell: bash
         run: |
@@ -117,7 +123,7 @@ jobs:
           echo "gate output: $GATE_OUT"
           python argos_plugin/eval/run_gate.py \
             --snapshot "$SNAPSHOT_DIR" \
-            --gold argos_plugin/eval/gold/gold_v1.jsonl \
+            --gold argos_plugin/eval/gold/gold_v3.jsonl \
             --out "$GATE_OUT" \
             --compare "$SNAPSHOT_DIR/gate_baseline.json"
         env:

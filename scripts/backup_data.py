@@ -76,7 +76,13 @@ def _service_healthy(endpoint: Path) -> bool:
 
 
 def stop_memory_service(home: Path) -> bool:
-    """Graceful RPC shutdown. True only when the service is verifiably down."""
+    """Graceful RPC shutdown. True only when the service is verifiably down.
+
+    force=True is deliberate here: this tool makes an INTENTIONAL stop
+    decision. Plain stop_service() only stops a service the calling process
+    itself spawned (2026-09-10), so teardown-style helpers cannot kill a
+    service that belongs to the app.
+    """
     endpoint = home / "hybrid_memory_service.json"
     if not endpoint.exists():
         return True  # nothing running
@@ -85,7 +91,8 @@ def stop_memory_service(home: Path) -> bool:
     code = (
         "import sys; sys.path.insert(0, r'%s'); "
         "from service_client import SharedMemoryStore; "
-        "s = SharedMemoryStore(r'%s'); s._rpc.stop_service(); print('stopped')"
+        "s = SharedMemoryStore(r'%s'); "
+        "s._rpc.stop_service(force=True); print('stopped')"
     ) % (plugin_dir, home)
     try:
         result = subprocess.run(

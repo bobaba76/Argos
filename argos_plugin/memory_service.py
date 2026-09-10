@@ -1951,6 +1951,10 @@ class _RequestHandler(socketserver.StreamRequestHandler):
 
 
 def _write_endpoint(path: Path, port: int, token: str, gate_secret: str) -> None:
+    try:
+        spawner_pid = int(os.environ.get("HERMES_SERVICE_SPAWNER_PID") or 0) or None
+    except ValueError:
+        spawner_pid = None
     payload = {
         "host": "127.0.0.1",
         "port": port,
@@ -1958,6 +1962,10 @@ def _write_endpoint(path: Path, port: int, token: str, gate_secret: str) -> None
         "gate_secret": gate_secret,
         "pid": os.getpid(),
         "version": 1,
+        # 2026-09-10: the process that spawned this service (set by
+        # service_client._ensure_service). stop_service() only stops a
+        # service this process started; intentional stops pass force=True.
+        "spawner_pid": spawner_pid,
     }
     temp = path.with_suffix(".tmp")
     temp.write_text(json.dumps(payload), encoding="utf-8")

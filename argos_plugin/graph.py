@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -570,6 +572,73 @@ Memory: "hey how are you"
 Output: []
 """
 
+_GRAPH_LLM_WARNED: set = set()
+_GRAPH_LLM_WARN_LOCK = threading.Lock()
+
+
+def _warn_graph_llm_once(message: str) -> None:
+    """Log a graph-LLM degradation at WARNING once per process.
+
+    2026-09-10: these conditions were debug-level and silent, which hid a
+    broken import path (service subprocess without the hermes-agent checkout
+    on sys.path) and provider call failures. Once per process keeps them
+    visible without flooding logs at one line per memory.
+    """
+    with _GRAPH_LLM_WARN_LOCK:
+        first = message not in _GRAPH_LLM_WARNED
+        if first:
+            _GRAPH_LLM_WARNED.add(message)
+    if first:
+        logger.warning("%s", message)
+    else:
+        logger.debug("%s", message)
+
+
+def _load_host_call_llm() -> Optional[Any]:
+    """Import the host's auxiliary LLM client, repairing sys.path if needed.
+
+    The shared memory service inherits its spawner's environment; spawners
+    with a stripped PYTHONPATH left ``agent`` unimportable and silently
+    disabled LLM graph extraction (fixed 2026-09-10). Try the plain import
+    first, then known checkout locations. Returns None when unavailable --
+    callers stay fail-soft and degrade to regex-only extraction.
+    """
+    try:
+        from agent.auxiliary_client import call_llm
+
+        return call_llm
+    except Exception:
+        pass
+    candidates: List[str] = []
+    env_root = os.environ.get("HERMES_AGENT_ROOT")
+    if env_root:
+        candidates.append(env_root)
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        candidates.append(os.path.join(home, "hermes-agent"))
+    # <hermes home>/plugins/hybrid_memory/graph.py -> <home>/hermes-agent
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.dirname(here)), "hermes-agent")
+        )
+    except Exception:
+        pass
+    for cand in candidates:
+        try:
+            if not cand or not os.path.isfile(
+                os.path.join(cand, "agent", "auxiliary_client.py")
+            ):
+                continue
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            from agent.auxiliary_client import call_llm
+
+            return call_llm
+        except Exception:
+            continue
+    return None
+
 
 def extract_graph_relations_llm(
     content: str,
@@ -589,13 +658,13 @@ def extract_graph_relations_llm(
         return []
 
 
-    try:
-        from agent.auxiliary_client import call_llm
-    except ImportError:
-        logger.debug("Graph LLM extraction unavailable: agent.auxiliary_client not importable")
-        return []
-    except Exception as e:
-        logger.debug("Graph LLM extraction unavailable: %s", e)
+    call_llm = _load_host_call_llm()
+    if call_llm is None:
+        _warn_graph_llm_once(
+            "Graph LLM extraction unavailable: agent.auxiliary_client is not "
+            "importable from this interpreter (service spawned without the "
+            "hermes-agent checkout on sys.path?)"
+        )
         return []
 
     messages = [
@@ -612,7 +681,7 @@ def extract_graph_relations_llm(
             timeout=_GRAPH_LLM_TIMEOUT,
         )
     except Exception as e:
-        logger.debug("Graph LLM extraction call failed: %s", e)
+        _warn_graph_llm_once(f"Graph LLM extraction call failed: {e}")
         return []
 
     if response is None:

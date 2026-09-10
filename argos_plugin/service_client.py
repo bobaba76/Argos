@@ -107,6 +107,37 @@ def _start_lock_is_stale(lock_path: Path) -> bool:
     return (time.time() - ts) > _START_LOCK_STALE_SECS
 
 
+def _find_agent_root() -> str | None:
+    """Best-effort location of the hermes-agent checkout (the directory
+    containing the ``agent`` package). Returns None when not found.
+
+    Used to guarantee service children can import ``agent.*`` even when the
+    spawning process has a stripped PYTHONPATH (2026-09-10: a stripped spawn
+    environment silently disabled in-service LLM graph extraction).
+    """
+    candidates: List[str] = []
+    env_root = os.environ.get("HERMES_AGENT_ROOT")
+    if env_root:
+        candidates.append(env_root)
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        candidates.append(str(Path(home) / "hermes-agent"))
+    # <hermes home>/plugins/hybrid_memory/service_client.py -> <home>/hermes-agent
+    try:
+        candidates.append(
+            str(Path(__file__).resolve().parent.parent.parent / "hermes-agent")
+        )
+    except Exception:
+        pass
+    for cand in candidates:
+        try:
+            if cand and (Path(cand) / "agent" / "auxiliary_client.py").is_file():
+                return str(Path(cand))
+        except OSError:
+            continue
+    return None
+
+
 class SharedMemoryServiceError(RuntimeError):
     """RPC failure carrying the server-reported error class (#20).
 
@@ -363,6 +394,28 @@ class _SharedRPC:
         except Exception:
             pass
 
+    def _service_child_env(self) -> Dict[str, str]:
+        """Environment for a freshly spawned service child.
+
+        2026-09-10 fixes, both from the drift-rebuild incident:
+        - ``HERMES_SERVICE_SPAWNER_PID``: records which process spawned the
+          service so ``stop_service()`` can refuse to kill a service this
+          process did not start (the daily drift-watch cron was killing the
+          live service every morning one minute after using it).
+        - PYTHONPATH repair: the child must be able to import the
+          hermes-agent checkout (``agent.auxiliary_client`` is used for LLM
+          graph extraction). Spawners with a stripped PYTHONPATH left it
+          unimportable, silently disabling LLM extraction in the service.
+        """
+        env: Dict[str, str] = dict(os.environ)
+        env["HERMES_SERVICE_SPAWNER_PID"] = str(os.getpid())
+        agent_root = _find_agent_root()
+        if agent_root:
+            parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+            if agent_root not in parts:
+                env["PYTHONPATH"] = os.pathsep.join([agent_root] + parts)
+        return env
+
     def _ensure_service(self) -> None:
         if self._healthy():
             return
@@ -399,9 +452,11 @@ class _SharedRPC:
             try:
                 script = Path(__file__).with_name("memory_service.py")
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                child_env = self._service_child_env()
                 subprocess.Popen(
                     [sys.executable, str(script), "--home", str(self.home)],
                     cwd=str(script.parent),
+                    env=child_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -448,7 +503,38 @@ class _SharedRPC:
         request["_needs_gate_hmac"] = True
         return self._request(request)
 
-    def stop_service(self) -> Any:
+    def stop_service(self, force: bool = False) -> Any:
+        """Shut the shared service down -- but ONLY if this process spawned it.
+
+        2026-09-10 incident: helper scripts (reconcile/backfill/rebuild/
+        backup) call stop_service() in their teardown to "leave the system
+        as found" -- in single-user mode that killed a service another
+        process (the app) had started and was using: the daily drift-watch
+        cron was killing the live service every morning one minute after
+        using it. The spawner PID is recorded in the endpoint file at start
+        (see ``_service_child_env``); teardown calls from other processes are
+        now no-ops. Pass force=True for an intentional stop (deploy/backup
+        tooling), or use taskkill for hard stops.
+        """
+        if not force:
+            endpoint = _read_endpoint(self.home)
+            spawner_pid: int | None = None
+            if isinstance(endpoint, dict):
+                try:
+                    spawner_pid = int(endpoint.get("spawner_pid") or 0) or None
+                except (TypeError, ValueError):
+                    spawner_pid = None
+            if spawner_pid != os.getpid():
+                reason = (
+                    "spawner_unknown" if spawner_pid is None
+                    else "not_started_by_this_process"
+                )
+                logger.info(
+                    "stop_service() skipped (%s): service was not started by "
+                    "this process; pass force=True to stop it anyway",
+                    reason,
+                )
+                return {"stopped": False, "reason": reason}
         return self._request({"method": "shutdown"})
 
     def backup(self, dst_root: str | None = None, retention: int | None = None,

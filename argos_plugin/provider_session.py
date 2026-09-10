@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -54,6 +55,23 @@ except ImportError:  # hermes runtime absent (conftest stub shape)
         return json.dumps({"error": str(msg)})
 
 logger = logging.getLogger(__name__)
+
+# 2026-09-10: graph indexing failures were swallowed at debug level; the
+# drift watch found drops hours later with no log trail. One bounded retry
+# covers transient service contention (30s client timeouts observed under
+# load) and the final failure is logged LOUDLY.
+_GRAPH_INDEX_RETRY_DELAY_S = 1.0
+_GRAPH_UNAVAILABLE_WARNED = False
+
+
+def _warn_graph_unavailable_once() -> None:
+    global _GRAPH_UNAVAILABLE_WARNED
+    if not _GRAPH_UNAVAILABLE_WARNED:
+        _GRAPH_UNAVAILABLE_WARNED = True
+        logger.warning(
+            "Graph indexing skipped: no graph client (self._graph is None) "
+            "-- memories will be saved without graph coverage"
+        )
 
 
 SEARCH_SCHEMA = {
@@ -1026,20 +1044,37 @@ class ProviderSessionMixin:
         """
         graph = getattr(self, "_graph", None)
         if not graph or not memory_id or not content:
+            if graph is None and memory_id and content:
+                _warn_graph_unavailable_once()
             return
-        try:
-            graph.index_memory(
-                memory_id=memory_id,
-                category=category,
-                content=content,
-                tags=tags or [],
-                created_at=created_at,
-                use_llm=self._llm_fallback,
-            )
-        except Exception as exc:
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                graph.index_memory(
+                    memory_id=memory_id,
+                    category=category,
+                    content=content,
+                    tags=tags or [],
+                    created_at=created_at,
+                    use_llm=self._llm_fallback,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(_GRAPH_INDEX_RETRY_DELAY_S)
+        if last_exc is not None:
             # Graph indexing is an enrichment path; a graph failure must not
-            # make a successful memory write fail.
-            logger.debug("Graph indexing failed for memory %s: %s", memory_id, exc)
+            # make a successful memory write fail -- but it must not be SILENT
+            # either (2026-09-10: the debug-level swallow hid contention-timeout
+            # drops from the drift watch for hours; one retry above absorbs the
+            # transient class). This warning is the visible signal.
+            logger.warning(
+                "Graph indexing failed for memory %s after retry: %s -- memory "
+                "is saved but missing from graph search until re-indexed",
+                memory_id, last_exc,
+            )
 
         # Index-time alias expansion: extract role→canonical-name mappings
         # from the same content and write aliases so both directions work:

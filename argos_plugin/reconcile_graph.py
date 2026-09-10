@@ -7,7 +7,10 @@ probe compares graph node/edge coverage vs DuckDB active memory_ids
 and reports missing/extra counts + sample IDs.  On hit, it prints a
 command to re-run backfill_graph.py for the affected memories.
 
-Run with Hermes STOPPED (the shared memory service holds locks):
+Safe to run against a LIVE service (2026-09-10): connects through the
+shared-service RPC client, and its teardown only stops a service this
+script itself started. The old "Hermes stopped" requirement no longer
+applies.
 
     python reconcile_graph.py
     python reconcile_graph.py --home /path/to/hermes_home

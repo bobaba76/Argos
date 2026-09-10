@@ -1316,6 +1316,13 @@ class ProviderSessionMixin:
                         with os.fdopen(fd, "w", encoding="utf-8") as f:
                             json.dump(cfg, f, indent=2)
                         os.replace(tmp_path, str(config_path))
+                        # #414: restrict the config file to owner-only on
+                        # POSIX (mirrors SC2). Fail-soft: no-op on Windows.
+                        try:
+                            from store_common import restrict_store_artifact
+                        except ImportError:
+                            from .store_common import restrict_store_artifact
+                        restrict_store_artifact(config_path, 0o600)
                     except Exception:
                         try:
                             os.unlink(tmp_path)

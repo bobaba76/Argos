@@ -341,9 +341,12 @@ class TestReviewModeEnforcement:
             f"Auto-mode tenant should allow auto_review approval, got status={status!r}"
         )
 
-    def test_manual_review_not_affected_by_confirm_mode(self, tmp_path):
-        """Manual review (review_source=manual) is not downgraded by
-        confirm mode — a human explicitly approved."""
+    def test_ungated_manual_claim_is_not_honored(self, tmp_path):
+        """#423: a raw dispatch claiming review_source="manual" without the
+        gated (_confirmed) envelope is NOT honored — the review class is
+        server-derived, so the claim is forced to auto_review and confirm
+        mode downgrades it (fail-closed). The gated manual path is covered
+        by the companion test below (and end-to-end in test_shared_service)."""
         svc = self._make_service(tmp_path)
         cand = svc.dispatch({
             "component": "store", "method": "save_candidate",
@@ -366,8 +369,40 @@ class TestReviewModeEnforcement:
         assert result is not None
         candidate = result.get("candidate", result) if isinstance(result, dict) else result
         status = candidate.get("status", "") if isinstance(candidate, dict) else ""
+        assert status == "pending_user_confirmation", (
+            f"Ungated manual claim must not survive confirm mode, got status={status!r}"
+        )
+
+    def test_gated_manual_review_survives_confirm_mode(self, tmp_path):
+        """#423: with the gated envelope flag set (_confirmed — simulated
+        post-HMAC-verification state; the handler verifies the gate HMAC
+        before honoring it), a manual review IS honored under confirm mode.
+        Only the auto_review class is downgraded."""
+        svc = self._make_service(tmp_path)
+        cand = svc.dispatch({
+            "component": "store", "method": "save_candidate",
+            "user_id": "user-r",
+            "args": {
+                "category": "personal_fact",
+                "content": "User likes tea",
+            },
+        })
+        cid = cand["candidate_id"]
+        result = svc.dispatch({
+            "component": "store", "method": "review_candidate",
+            "user_id": "user-r",
+            "_confirmed": True,
+            "args": {
+                "candidate_id": cid,
+                "decision": "approved",
+                "review_source": "manual",
+            },
+        })
+        assert result is not None
+        candidate = result.get("candidate", result) if isinstance(result, dict) else result
+        status = candidate.get("status", "") if isinstance(candidate, dict) else ""
         assert "approved" in status.lower(), (
-            f"Manual review should not be downgraded, got status={status!r}"
+            f"Gated manual review should not be downgraded, got status={status!r}"
         )
 
     def test_client_cannot_override_review_mode_in_request(self, tmp_path):

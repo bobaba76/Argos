@@ -452,6 +452,10 @@ class ProviderSessionMixin:
                 # confirmation tool (memory_candidate_review). The ceiling for
                 # auto-review approval is "reviewed_approved" (LLM-approved,
                 # awaiting user confirmation). Enforced in store.review_candidate.
+                # #429: materialize-await-lift — a reviewed_approved decision
+                # MATERIALIZES the record at its capped grounding tier (tagged
+                # via payload.materialized_memory_id); user confirmation LIFTS
+                # the tier instead of creating the record.
                 "approve": "reviewed_approved",
                 "reject": "rejected",
                 "quarantine": "quarantined",

@@ -112,3 +112,29 @@ class TestStoreArtifactPermissions:
         # Neither call should raise even though the paths do not exist.
         restrict_store_artifact(tmp_path / "does_not_exist.duckdb", 0o600)
         restrict_store_dir(tmp_path / "missing_kuzu_dir", 0o700)
+
+    def test_duckdb_wal_restored_after_checkpoint_recreate(self, tmp_path):
+        """#421: a checkpoint deletes the .wal; the next write recreates it
+        with default umask perms (new inode, 0644 under 022). The write
+        path must re-restrict it to 0600 without a process restart."""
+        from store import DuckDBMemoryStore
+
+        prev = os.umask(0o022)
+        try:
+            store = DuckDBMemoryStore(tmp_path / "hybrid_memory.duckdb",
+                                      user_id="test_user")
+            wal = tmp_path / "hybrid_memory.duckdb.wal"
+            # Write once so the WAL exists, then checkpoint — the exact
+            # sequence the service backup performs on a live store
+            # (CHECKPOINT; DuckDB deletes the .wal).
+            store.remember(category="personal_fact", content="wal probe one")
+            store.connection.execute("CHECKPOINT")
+            # The next write recreates the WAL with default umask perms;
+            # the commit funnel must re-restrict it before we observe it.
+            store.remember(category="personal_fact", content="wal probe two")
+            assert wal.exists(), "wal was not recreated by the follow-up write"
+            if _IS_POSIX:
+                assert _mode(wal) == 0o600, f"wal {oct(_mode(wal))}"
+            store.close()
+        finally:
+            os.umask(prev)

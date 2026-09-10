@@ -1118,6 +1118,12 @@ class KuzuGraphStore:
                             self.database, new_conn, self._shared_conn_lock, shared[3]
                         )
             self._flush_dirty = False
+            # #421: mid-run durability point — Kuzu checkpoints to disk on
+            # flush/close; re-restrict the store so files created mid-run
+            # (directory layouts) or rewritten in place (0.11+ single file)
+            # stay owner-only. No separate Kuzu .wal has ever been observed
+            # mid-run (0.11.3 probes) — this is the cheap cover-all. Fail-soft.
+            restrict_store_dir(self.db_dir, 0o700)
             record_subsystem_ok("graph_wal_flush")
         except Exception as exc:
             self._flush_dirty = True

@@ -7,6 +7,7 @@ sibling form used by tests and the benchmark clone).
 """
 from __future__ import annotations
 
+import os
 import re
 import html
 import unicodedata
@@ -43,6 +44,53 @@ def _tokenize(text: str) -> List[str]:
     the same token boundaries (issue #26).
     """
     return [m.group().lower() for m in _TOKEN_RE.finditer(text or "")]
+
+
+# --- store artifact permissions (#414) -------------------------------------
+# Store artifacts (duckdb, kuzu, wal, config) hold the full memory store —
+# business and client content. On POSIX they must be owner-only (0600 file /
+# 0700 dir) even under a default 022 umask; on a multi-user host a
+# world-readable artifact lets any local account read the whole store.
+# Mirrors the SC2 endpoint-file pattern (#218): chmod is best-effort and
+# non-fatal — Windows ignores POSIX permission bits, and a chmod failure
+# (read-only fs, missing file) must never block store init. Callers invoke
+# this right after create/open and on every store init so recreated .wal
+# files are covered each run, not only on first init.
+
+def restrict_store_artifact(path, mode: int = 0o600) -> None:
+    """Best-effort chmod a store artifact to *mode* (#414).
+
+    Fail-soft: never raises. No-op on Windows (POSIX bits ignored) and when
+    the path does not exist (e.g. a .wal not yet created by the DB engine).
+    """
+    try:
+        os.chmod(str(path), mode)
+    except OSError:
+        pass
+
+
+def restrict_store_dir(path, mode: int = 0o700) -> None:
+    """Best-effort restrict a Kuzu store path (file or directory) + .wal (#414).
+
+    Kuzu's on-disk layout is version-dependent: older versions store the DB
+    as a directory of files; 0.11+ stores it as a single file. Handle both
+    — a directory is chmod'd to 0700 with its files to 0600; a file is
+    chmod'd to 0600. The sibling ``<path>.wal`` (recreated per run) is also
+    restricted when present. Fail-soft: never raises.
+    """
+    p = str(path)
+    if os.path.isdir(p):
+        restrict_store_artifact(p, mode)
+        try:
+            for entry in os.scandir(p):
+                if entry.is_file(follow_symlinks=False):
+                    restrict_store_artifact(entry.path, 0o600)
+        except OSError:
+            pass
+    else:
+        restrict_store_artifact(p, 0o600)
+    # The .wal sibling (recreated per run) — name is <path>.wal.
+    restrict_store_artifact(p + ".wal", 0o600)
 
 
 try:

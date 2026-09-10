@@ -2587,11 +2587,11 @@ class ArgosAPIFacade:
         AF9: the INFO log is the fast path and always fires. #300:
         denials are ALSO routed to the durable ``access_audit`` table
         via ``store.write_access_audit(...)`` when the store handle
-        exposes it. In shared-service mode, ``SharedMemoryStore`` does
-        not yet expose ``write_access_audit`` (RPC threading is a
-        follow-up); in that case the log is the only record. When the
-        store is a direct ``DuckDBMemoryStore`` (tests, direct mode),
-        denials are durable and survive restarts.
+        exposes it. Since #312 this is durable in BOTH modes: the direct
+        ``DuckDBMemoryStore`` (tests, direct mode) writes the row itself,
+        and ``SharedMemoryStore.write_access_audit`` proxies over RPC to
+        the memory_service dispatch, which records denials durably. In
+        both cases denials survive restarts.
         """
         # Fast path: always log at INFO level.
         logger.info(

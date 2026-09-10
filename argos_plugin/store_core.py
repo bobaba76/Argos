@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Dict, Optional
 
 try:
-    from .store_common import _DEFAULT_TTL_DAYS
+    from .store_common import _DEFAULT_TTL_DAYS, restrict_store_artifact
     from .store_state import StoreMixinState
 except ImportError:  # store_core.py imported as a top-level module
-    from store_common import _DEFAULT_TTL_DAYS
+    from store_common import _DEFAULT_TTL_DAYS, restrict_store_artifact
     from store_state import StoreMixinState
 
 # #330: audit paths stay fail-soft but must not be silent — a failure is
@@ -49,6 +49,12 @@ class StoreCoreMixin:
         self.connection: Optional[duckdb.DuckDBPyConnection] = None
         self._connect()
         self._init_db()
+        # #414: restrict the DuckDB store artifacts to owner-only on POSIX.
+        # Runs every init so recreated .wal files are covered each run, not
+        # only on first init. Fail-soft (mirrors SC2): chmod is a no-op on
+        # Windows and never blocks init.
+        restrict_store_artifact(self.db_path, 0o600)
+        restrict_store_artifact(Path(str(self.db_path) + ".wal"), 0o600)
         # Expiry (Spec 1): configurable TTL tiers. When expiry_enabled is
         # False, the hardcoded _DEFAULT_TTL_DAYS is used (current behavior).
         # When True, the provider sets ttl_days from config and the tool

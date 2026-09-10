@@ -30,6 +30,11 @@ logger = logging.getLogger(__name__)
 # logged at ERROR and recorded on the liveness health surface.
 from liveness import record_subsystem_failure, record_subsystem_ok
 
+try:
+    from .store_common import restrict_store_dir
+except ImportError:  # graph.py imported as a top-level module
+    from store_common import restrict_store_dir
+
 
 def _is_already_exists_error(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -1064,6 +1069,10 @@ class KuzuGraphStore:
             KuzuGraphStore._shared[self._db_key] = (
                 self.database, _shared_conn, self._shared_conn_lock, ref_count + 1
             )
+        # #414: restrict the Kuzu store directory + files (incl. .wal) to
+        # owner-only on POSIX. Runs every init so recreated .wal files are
+        # covered each run. Fail-soft (mirrors SC2).
+        restrict_store_dir(self.db_dir, 0o700)
         logger.debug("Kuzu graph connected (shared, ref_count=%d)", ref_count + 1)
 
     def set_user_scope(self, user_id: str | None) -> None:
@@ -2847,6 +2856,10 @@ class KuzuGraphStore:
                 KuzuGraphStore._shared.pop(self._db_key, None)
                 self._closed = True  # G1
                 self.database = None
+                # #414: kuzu checkpoints the DB file to disk on close (0.11+
+                # stores it as a single file created here). Restrict it (and
+                # any .wal) to owner-only now that it exists. Fail-soft.
+                restrict_store_dir(self.db_dir, 0o700)
                 logger.debug("Kuzu graph closed (last instance, ref_count=0)")
             else:
                 # Other instances still using it — just decrement.

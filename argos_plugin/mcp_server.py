@@ -1237,7 +1237,7 @@ def _load_auth_context(home: Path) -> "AuthContext":
     multi-process or hosted environment, the env vars are controlled by
     the spawner, not the user — a malicious spawner can impersonate
     anyone. For non-trusted-local deployments, a credential file or
-    signed token MUST be used instead (future work, #129).
+    signed token MUST be used instead (tracked in #387).
     """
     from api_facade import (
         AuthContext, READ_OPERATIONS, PROPOSAL_OPERATIONS,

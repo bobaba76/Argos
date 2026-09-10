@@ -318,7 +318,10 @@ class ProviderCoreMixin:
         self._graph_inject_candidates: bool = False
         self._graph_boost_min_similarity: float = 0.15
         self._alias_expansion_boost: float = 0.7
-        self._graph_traversal_enabled: bool = False
+        # NOTE (#406): graph_traversal_enabled intentionally has NO
+        # pre-config placeholder here — the old `False` contradicted the
+        # model and schema defaults (True / "true"). initialize() sets it
+        # from config; readers assume a configured provider.
         self._graph_traversal_depth: int = 2
         self._graph_traversal_boost: float = 0.0
         self._conflict_surfacing_enabled: bool = False

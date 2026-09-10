@@ -1,0 +1,47 @@
+{
+  "run": "traversal-engagement-proof",
+  "date": "2026-09-10",
+  "harness": "argos_plugin/eval/run_eval_provider.py",
+  "repo_commit": "9f9e3bf24d7395fa8bfbe53b33d7a615cf6b886b",
+  "eval_set": "eval_set_traversal.json (300-query stratified sample; arms baseline+traversal_on)",
+  "snapshot_id": "20260906_162404_018897_1d9c5253",
+  "graph_variant": "regex-only (build_snapshot_graph(use_llm=False)) - the 'current graph' variant",
+  "id_coverage": "297/300 relevant ids present in snapshot (3 since TTL-expired)",
+  "cost": "$0 LLM (deterministic harness; local embeddings only)",
+  "note": "Engagement counters decide whether the arm exercised traversal. Metric deltas are NOT evidence about traversal if engaged == 0 (see #364).",
+  "arms": {
+    "baseline": {
+      "p5": 0.1833,
+      "r5": 0.9167,
+      "ndcg5": 0.6159,
+      "p10": 0.0927,
+      "r10": 0.9267,
+      "ndcg10": 0.619,
+      "p20": 0.0465,
+      "r20": 0.93,
+      "ndcg20": 0.6199,
+      "mrr": 0.5169
+    },
+    "traversal_on": {
+      "p5": 0.1833,
+      "r5": 0.9167,
+      "ndcg5": 0.6173,
+      "p10": 0.0927,
+      "r10": 0.9267,
+      "ndcg10": 0.6204,
+      "p20": 0.0465,
+      "r20": 0.93,
+      "ndcg20": 0.6213,
+      "mrr": 0.5187
+    }
+  },
+  "traversal_engagement": {
+    "traversal_on": {
+      "n_queries": 300,
+      "seeds_resolved": 298,
+      "non_concept_seeds": 131,
+      "engaged": 97,
+      "engaged_fraction": 0.3233
+    }
+  }
+}

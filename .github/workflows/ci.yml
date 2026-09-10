@@ -58,30 +58,55 @@ jobs:
             echo "::error::Could not resolve a base SHA for change-scoped test selection (PR base, merge-base, and HEAD~1 all empty). Refusing to run smoke-only as a vacuously green pass."
             exit 1
           fi
-          # Changed test files (excluding known-env-dependent ones)
-          TESTS=$(git diff --name-only "$BASE" HEAD -- argos_plugin/tests/ | grep '\\.py$' || true)
+          # Changed test files (#420): single-escaped pattern — the previous
+          # double-escaped form matched nothing, so changed test files never
+          # entered the selection. Kept as $DIFF_TESTS for the warning below.
+          DIFF_TESTS=$(git diff --name-only "$BASE" HEAD -- argos_plugin/tests/ | grep '\.py$' || true)
+          TESTS="$DIFF_TESTS"
           # Add test files matching changed source modules (e.g. store.py -> test_store*.py)
           SRC=$(git diff --name-only "$BASE" HEAD -- argos_plugin/ | grep -v '/tests/' | sed 's|.*/||; s|\.py$||' | sort -u)
           for m in $SRC; do
             TESTS="$TESTS $(ls argos_plugin/tests/ 2>/dev/null | grep -i "${m}" | sed 's|^|argos_plugin/tests/|' || true)"
           done
-          TESTS=$(echo "$TESTS" | tr ' ' '\n' | grep -vE 'test_popia_deployment|test_tenant_provisioning|test_temporal_injection|test_weather' | sort -u | tr '\n' ' ')
+          # (#405) Exclusions re-validated 2026-09-10: the previously excluded
+          # suites (popia / tenant provisioning / temporal injection) are
+          # deterministic with no LLM/network deps and are selected again; the
+          # stale 'test_weather' pattern (matched no file — the ambient suite is
+          # test_ambient_weather.py, mocked-network) was dropped. Ubuntu-CI
+          # validation for the re-included suites rides the #405 PR.
+          # If env-dependent tests return: marker-gate them, or exclude here
+          # with the reason recorded.
+          TESTS=$(echo "$TESTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
           # Trim trailing whitespace: an untrimmed " " makes `[ -n "$TESTS" ]`
           # true and runs pytest with no file args (full-suite collection →
           # env-broken failures). Empty must be truly empty.
           TESTS=$(echo "$TESTS" | xargs)
+          # (#420 hardening) Warn loudly when changed test files are listed
+          # but absent from the final selection — a silent drop hides them
+          # from CI entirely.
+          MISSING=""
+          for f in $DIFF_TESTS; do
+            case " $TESTS " in
+              *" $f "*) ;;
+              *) MISSING="$MISSING $f" ;;
+            esac
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::warning::changed test file(s) absent from final selection:$MISSING"
+          fi
           echo "TESTS=$TESTS" >> "$GITHUB_ENV"
           echo "Base: $BASE"
           echo "Running: ${TESTS:-<none - smoke only>}"
 
       - name: Run relevant tests
         run: |
-          # Tier 0 (#292/#350): deterministic retrieval smoke + claims-audit
-          # parity guard run on EVERY PR (seconds, no LLM/embedder/network) — always appended..
+          # Tier 0 (#292/#350/#405): deterministic retrieval smoke + claims-audit
+          # parity guard + watcher wiring/audit suites run on EVERY PR
+          # (seconds, no LLM/embedder/network) — always appended.
           if [ -n "$TESTS" ]; then
-            python -m pytest $TESTS argos_plugin/tests/test_retrieval_smoke_gate.py argos_plugin/tests/test_claims_audit_parity.py -q --timeout 300 -p no:cacheprovider
+            python -m pytest $TESTS argos_plugin/tests/test_retrieval_smoke_gate.py argos_plugin/tests/test_claims_audit_parity.py argos_plugin/tests/test_watcher.py argos_plugin/tests/test_watcher_audit2.py argos_plugin/tests/test_watcher_hardening_audit.py argos_plugin/tests/test_watcher_wiring_audit.py -q --timeout 300 -p no:cacheprovider
           else
-            python -m pytest argos_plugin/tests/test_retrieval_smoke_gate.py argos_plugin/tests/test_claims_audit_parity.py -q --timeout 300 -p no:cacheprovider
+            python -m pytest argos_plugin/tests/test_retrieval_smoke_gate.py argos_plugin/tests/test_claims_audit_parity.py argos_plugin/tests/test_watcher.py argos_plugin/tests/test_watcher_audit2.py argos_plugin/tests/test_watcher_hardening_audit.py argos_plugin/tests/test_watcher_wiring_audit.py -q --timeout 300 -p no:cacheprovider
           fi
         env:
           HF_HUB_OFFLINE: "1"

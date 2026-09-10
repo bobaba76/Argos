@@ -11,6 +11,9 @@ Tests (deterministic, no LLM calls):
    cloud_pilot, cloud).
 5. Full extraction pipeline — extract_facts_from_doc combines text
    extraction + LLM call.
+
+Re-validated + re-included in change-scoped CI: 2026-09-10 (#405).
+Deterministic — no LLM, no network.
 """
 import json
 import os

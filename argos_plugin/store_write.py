@@ -30,6 +30,7 @@ try:
         normalize_grounding,
         normalize_provenance,
         rejection_key,
+        restrict_wal,
         sanitize_content,
     )
 except ImportError:  # store_write.py imported as a top-level module
@@ -50,6 +51,7 @@ except ImportError:  # store_write.py imported as a top-level module
         normalize_grounding,
         normalize_provenance,
         rejection_key,
+        restrict_wal,
         sanitize_content,
     )
 try:
@@ -102,6 +104,10 @@ class StoreWriteMixin:
             assert self.connection is not None
             self.connection.execute("COMMIT")
             self._state.tx_depth -= 1
+            # #421: a checkpoint may have deleted the .wal since init and
+            # this transaction recreated it with default umask perms —
+            # re-restrict after every commit (fail-soft, POSIX-only).
+            restrict_wal(self.db_path)
 
     def _rollback_if_started(self, started: bool) -> None:
         """#347: ROLLBACK only if _begin_transaction_if_needed started one."""
@@ -109,6 +115,9 @@ class StoreWriteMixin:
             assert self.connection is not None
             self.connection.execute("ROLLBACK")
             self._state.tx_depth -= 1
+            # #421: see _commit_if_started — a rollback can leave a
+            # recreated .wal behind; re-restrict (fail-soft).
+            restrict_wal(self.db_path)
 
     def _tx_begin(self) -> None:
         """#347: Explicit BEGIN for call sites that manage their own
@@ -125,12 +134,16 @@ class StoreWriteMixin:
         assert self.connection is not None
         self.connection.execute("COMMIT")
         self._state.tx_depth -= 1
+        # #421: see _commit_if_started.
+        restrict_wal(self.db_path)
 
     def _tx_rollback(self) -> None:
         """#347: ROLLBACK for call sites that used ``_tx_begin``."""
         assert self.connection is not None
         self.connection.execute("ROLLBACK")
         self._state.tx_depth -= 1
+        # #421: see _commit_if_started.
+        restrict_wal(self.db_path)
 
     def _record_event(
         self,

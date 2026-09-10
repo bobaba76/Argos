@@ -93,6 +93,23 @@ def restrict_store_dir(path, mode: int = 0o700) -> None:
     restrict_store_artifact(p + ".wal", 0o600)
 
 
+def restrict_wal(db_path) -> None:
+    """#421: re-apply owner-only perms on a DuckDB ``.wal`` (fail-soft).
+
+    A checkpoint (explicit — e.g. the service backup — or DuckDB's internal
+    auto-checkpoint) deletes the ``.wal``; the next write recreates it with
+    default umask perms (0644 under 022). The init-time restriction (#414)
+    only runs at store open, so within a long-lived service the recreated
+    WAL would stay world-readable until a restart. Call after write
+    transactions commit/roll back so a recreated file is restricted at the
+    first transaction that touches it. POSIX-only: no-op elsewhere (Windows
+    ignores POSIX permission bits).
+    """
+    if os.name != "posix":
+        return
+    restrict_store_artifact(str(db_path) + ".wal", 0o600)
+
+
 try:
     import numpy as np
 except ImportError:

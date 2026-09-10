@@ -98,3 +98,27 @@ The Kùzu relationship graph is derived data — rebuild it from the restored me
 
 - **In:** the DuckDB database — memories, evidence rows, version chains, aliases, and relational state — plus a manifest that describes it.
 - **Not in:** the Kùzu graph files (derived — rebuild with `backfill_graph.py`), embedding model caches (re-downloaded on demand), and configuration such as `hybrid_memory.json` (version those settings separately).
+
+## Hardening artifact permissions (existing installs)
+
+Store artifacts hold the full memory dataset. Current versions restrict fresh artifacts to owner-only automatically — the DuckDB file and its `.wal` to `0600`, the Kùzu store to `0600`/`0700`, the config JSON to `0600` — including a `.wal` that is recreated mid-run after a checkpoint (#414, #421). Installs created before those restrictions keep their original modes; apply this one-time hardening pass:
+
+```bash
+# Adjust to your Hermes data directory (the one holding
+# hybrid_memory.duckdb, the kuzu store and hybrid_memory.json).
+cd <HERMES_DATA_DIR>
+
+chmod 700 .
+chmod 600 hybrid_memory.duckdb hybrid_memory.duckdb.wal 2>/dev/null || true
+chmod 600 hybrid_memory.json 2>/dev/null || true
+
+# Kùzu store: a single file (0.11+) or a directory (older layouts).
+if [ -d hybrid_memory_kuzu ]; then
+  chmod 700 hybrid_memory_kuzu
+  find hybrid_memory_kuzu -type f -exec chmod 600 {} \;
+else
+  chmod 600 hybrid_memory_kuzu hybrid_memory_kuzu.wal 2>/dev/null || true
+fi
+```
+
+Snapshots written by an unhardened install inherit the old modes — run a fresh backup after hardening, and check modes when copying snapshots between hosts. On Windows, POSIX permission bits do not apply; the default per-user profile ACLs already restrict the Hermes data directory to the owning account.

@@ -42,6 +42,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from .store_common import restrict_store_artifact, restrict_wal
+except ImportError:  # backup.py imported as a top-level module
+    from store_common import restrict_store_artifact, restrict_wal
+
 logger = logging.getLogger("argos.backup")
 
 _SCHEMA_VERSION = 1
@@ -204,6 +209,12 @@ def _export_for_backup(
     try:
         # 1. CHECKPOINT — flush WAL into main (service is sole writer, safe).
         conn.execute("CHECKPOINT")
+        # #421: checkpointing deletes the .wal and rewrites the main file —
+        # re-restrict both now (fail-soft; the .wal is usually recreated by
+        # the next write, whose commit funnel restricts it again).
+        if source_db_path is not None:
+            restrict_store_artifact(source_db_path, 0o600)
+            restrict_wal(source_db_path)
 
         # 2. EXPORT DATABASE (FORMAT PARQUET) — schema.sql + load.sql + .parquet
         conn.execute(f"EXPORT DATABASE '{snap.as_posix()}' (FORMAT PARQUET)")

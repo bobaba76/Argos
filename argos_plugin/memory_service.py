@@ -1364,6 +1364,28 @@ class MemoryService:
             store.set_state("distillation_last_run", now)
             store.set_state("distillation_last_count", str(records_processed))
             return True
+        if method == "advance_rollup_state":
+            # #427: narrow server-side op for rollup run-state advancement.
+            # The proxy cannot call set_state (MS7), so rollup_last_run
+            # never advanced in shared-service mode and the cooldown never
+            # engaged (rollup fired at every session boundary). Writes
+            # rollup_last_run + rollup_last_count only (both in
+            # _STATE_KEY_ALLOWLIST). Same shape as advance_distillation_state.
+            records_processed = int(args.get("records_processed", 0))
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            store.set_state("rollup_last_run", now)
+            store.set_state("rollup_last_count", str(records_processed))
+            return True
+        if method == "advance_retention_state":
+            # #427 sibling: POPIA retention run-state advancement.
+            # retention_last_run is in _STATE_KEY_ALLOWLIST (#293); the
+            # provider's direct set_state was swallowed on the proxy path.
+            from datetime import datetime, timezone
+            store.set_state(
+                "retention_last_run", datetime.now(timezone.utc).isoformat(),
+            )
+            return True
         if method == "mark_system_internal_sweep_done":
             # #392: narrow server-side op for the lexicon sweep run-once
             # guard. Only writes system_internal_sweep_done (in

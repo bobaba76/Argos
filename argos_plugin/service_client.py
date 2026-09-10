@@ -823,8 +823,9 @@ class SharedMemoryStore:
         # on the proxy path.
         if hasattr(self, '_rpc'):
             raise PermissionError(
-                "set_state is forbidden on the RPC boundary (MS7). Use "
-                "advance_distillation_state or "
+                "set_state is forbidden on the RPC boundary (MS7). Use a "
+                "narrow op: advance_distillation_state, "
+                "advance_rollup_state, advance_retention_state, or "
                 "mark_system_internal_sweep_done."
             )
         raise PermissionError(
@@ -836,6 +837,18 @@ class SharedMemoryStore:
         Writes distillation_last_run + distillation_last_count only."""
         self._rpc.call("store", "advance_distillation_state",
                         records_processed=records_processed)
+
+    def advance_rollup_state(self, records_processed: int) -> None:
+        """#427: narrow server-side op for rollup run-state advancement.
+        Writes rollup_last_run + rollup_last_count only (set_state is
+        forbidden on the RPC boundary, MS7)."""
+        self._rpc.call("store", "advance_rollup_state",
+                        records_processed=records_processed)
+
+    def advance_retention_state(self) -> None:
+        """#427: narrow server-side op for retention run-state
+        advancement. Writes retention_last_run only."""
+        self._rpc.call("store", "advance_retention_state")
 
     def mark_system_internal_sweep_done(self) -> None:
         """#392: narrow server-side op for the lexicon sweep run-once guard.

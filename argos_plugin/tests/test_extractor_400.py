@@ -391,3 +391,93 @@ class TestGerundNeverClause:
         # "never the deploy when…" is grammatically broken — must use "avoid"
         assert "avoid the deploy" in content
         assert "never the deploy" not in content
+
+
+class TestFirstPersonLeadingWord:
+    """#400 review 9/10 round 2 (blocker 1): the outcome/failed-because
+    regexes carry an optional (?:i\\s+)? *inside* the match. When "I"
+    directly precedes the verb, the match starts at "I" and consumes it —
+    the prefix alone is "Today "/"So " with no first-person word. The
+    gate must accept a match that itself begins with a first-person
+    pronoun so everyday phrasings are not silently dropped."""
+
+    @pytest.mark.parametrize("sentence", [
+        "Today I tried the new restaurant",
+        "So I tried that approach",
+        "Yesterday I tried journaling",
+        "Then I tried the fix again",
+        "Today we tried the new place",
+    ])
+    def test_leading_word_first_person_outcome(self, sentence):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(sentence)
+        outcomes = [f for f in facts if "outcome" in f.get("tags", [])]
+        assert len(outcomes) == 1, f"silently dropped: {sentence}"
+
+    def test_leading_word_first_person_failure_to_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(
+            "So I tried that approach and it failed because the schema was stale"
+        )
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+
+    def test_leading_word_first_person_gerund_failure(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(
+            "Today I tried deploying and it failed because the schema was stale"
+        )
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+        assert "deploying" in constraints[0]["content"].lower()
+
+    def test_leading_word_third_person_still_blocked(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("Today she tried the new place")
+        outcomes = [f for f in facts if "outcome" in f.get("tags", [])]
+        assert not outcomes, "third-person leading-word should be blocked"
+
+
+class TestPossessiveLessonGate:
+    """#400 review 9/10 round 2 (blocker 2): first-person possessive
+    ownership ("My lesson:", "Our takeaway:") is the user's own lesson —
+    the gate must accept it. Named possessives ("Sarah's takeaway:",
+    "My sister's lesson:") stay blocked."""
+
+    @pytest.mark.parametrize("sentence", [
+        "My lesson: never skip the backup",
+        "My rule: always ask before deploying",
+        "My takeaway: always test before shipping",
+        "Our takeaway: always test before shipping",
+        "My lesson learned: never skip backups",
+    ])
+    def test_first_person_possessive_lesson_passes(self, sentence):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(sentence)
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1, f"dropped user-owned lesson: {sentence}"
+
+    @pytest.mark.parametrize("sentence", [
+        "Sarah's takeaway: always test before shipping",
+        "My sister's lesson: always be careful",
+    ])
+    def test_named_possessive_lesson_still_blocked(self, sentence):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(sentence)
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert not constraints, f"named possessive should be blocked: {sentence}"
+
+
+class TestNeverWorkedOut:
+    """#400 review 9/10 round 2 (non-blocking): 'never worked out' is the
+    same failure class as 'never worked' — the optional 'out' is now
+    accepted so the terminal failure phrasing routes to the constraint
+    path, not a one-off outcome."""
+
+    def test_never_worked_out_routes_to_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("I tried freelancing and it never worked out")
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+        outcomes = [f for f in facts if "outcome" in f.get("tags", [])]
+        assert not outcomes

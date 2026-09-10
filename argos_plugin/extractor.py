@@ -789,11 +789,12 @@ _LESSON_RE = re.compile(
 # Failure with cause — needs normalization to invariant form.
 # #400 review 9/10: "never worked/works" is a failure phrasing, not a
 # one-off outcome ("I tried that approach and it never worked" →
-# constraint/failure path, not context_note).
+# constraint/failure path, not context_note). Round 2: "never worked out"
+# is the same failure class — accept the optional "out".
 _FAILED_BECAUSE_RE = re.compile(
     r"\b(?:i\s+)?(?:tried|attempted)\s+(.+?)\s+(?:and\s+)?(?:it\s+)?"
     r"(?:failed|didn\'t\s+work|didn\'t\s+work\s+out|broke|didn\'t\s+succeed"
-    r"|never\s+(?:worked|works))"
+    r"|never\s+(?:worked|works)(?:\s+out)?)"
     r"(?:\s+(?:because|when|if|since)\s+(.+?))?(?:\.|$)",
     re.IGNORECASE,
 )
@@ -819,6 +820,11 @@ _OUTCOME_TRIED_RE = re.compile(
 # she is driving" / "My car doesn't work when it rains").
 _FIRST_PERSON_BEFORE_RE = re.compile(r"\b(?:i|we)\b", re.IGNORECASE)
 _OUTCOME_NEGATION_RE = re.compile(r"\b(?:not|n't|never|rarely|hardly)\b", re.IGNORECASE)
+# #400 review 9/10 (round 2): first-person possessive ownership ("My
+# lesson:", "Our takeaway:") is the user's own lesson — accept it in the
+# lesson gate. Named possessives ("Sarah's takeaway:", "My sister's
+# lesson:") end with the name, not my/our → still blocked.
+_POSSESSIVE_TAIL_RE = re.compile(r"\b(?:my|our)\s*$", re.IGNORECASE)
 # #400 review 9/10: "never {action} when {cause}" is grammatical only for
 # gerund actions ("never deploying when…"); noun-phrase actions ("never
 # the deploy when…") are broken — use "avoid {action}" instead. The
@@ -827,13 +833,36 @@ _OUTCOME_NEGATION_RE = re.compile(r"\b(?:not|n't|never|rarely|hardly)\b", re.IGN
 _GERUND_RE = re.compile(r"^\w{3,}ing\b", re.IGNORECASE)
 
 
-def _constraint_subject_ok(sentence: str, match_start: int) -> bool:
+def _constraint_subject_ok(
+    sentence: str, match_start: int, *, allow_possessive: bool = False,
+) -> bool:
     """True when a constraint trigger is about the user: first-person
-    subject (I/we) before the trigger, or a subject-less imperative."""
+    subject (I/we) before the trigger, or a subject-less imperative.
+
+    #400 review 9/10 (round 2): the outcome/failed-because regexes carry
+    an optional ``(?:i\\s+)?`` *inside* the match. When "I" directly
+    precedes the verb, the match starts at "I" and consumes it — the
+    prefix alone (``sentence[:match_start]``) is "Today "/"So " with no
+    first-person word. Accept a match that *itself* begins with a
+    first-person pronoun so "Today I tried X" is not silently dropped.
+    "Today she tried…" still denies because its match starts at "tried".
+
+    When ``allow_possessive`` is True (lesson branch), a first-person
+    possessive tail in the prefix ("My lesson:", "Our takeaway:") is
+    accepted as user-owned. Named possessives stay blocked.
+    """
     prefix = sentence[:match_start]
     if not prefix.strip():
         return True
-    return bool(_FIRST_PERSON_BEFORE_RE.search(prefix))
+    if _FIRST_PERSON_BEFORE_RE.search(prefix):
+        return True
+    # The match itself may begin with a first-person pronoun (the
+    # (?:i\s+)? inside _OUTCOME_TRIED_RE / _FAILED_BECAUSE_RE).
+    if _FIRST_PERSON_BEFORE_RE.match(sentence[match_start:]):
+        return True
+    if allow_possessive and _POSSESSIVE_TAIL_RE.search(prefix):
+        return True
+    return False
 
 
 # "I have/own X" — possession attribute (scoped to have/own only so it
@@ -1138,9 +1167,11 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
     # ("Simone learned: never leave the kids unattended") must not mint the
     # user's durable invariant. Subject-less imperatives ("Lesson learned:
     # X") keep the pass (empty prefix → ok); first-person ("I learned: X")
-    # passes too.
+    # passes too. Round 2: first-person possessive ("My lesson:", "Our
+    # takeaway:") is user-owned → allow_possessive=True. Named possessives
+    # ("Sarah's takeaway:") stay blocked.
     m = _LESSON_RE.search(sentence)
-    if m and _constraint_subject_ok(sentence, m.start()):
+    if m and _constraint_subject_ok(sentence, m.start(), allow_possessive=True):
         lesson = m.group(1).strip().rstrip('.')
         if len(lesson) > 5:
             return {

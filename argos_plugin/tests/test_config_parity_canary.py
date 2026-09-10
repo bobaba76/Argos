@@ -155,14 +155,23 @@ class TestT1bDefaultValueParity:
 
     @staticmethod
     def _schema_defaults() -> dict:
-        """Extract {key: default_str} from config_schema.py via regex."""
+        """Extract {key: default_str} from config_schema.py via regex.
+
+        #406: the key→default span uses a paren-tolerant non-greedy match.
+        The previous `[^)]*?` version silently SKIPPED entries whose
+        label/description contains parentheses before `default=` (19 keys,
+        incl. graph_traversal_enabled) — those blind spots were why drift
+        could sit unnoticed. The tests below now see every entry.
+        """
         import re
         schema_path = Path(__file__).resolve().parent.parent / "config_schema.py"
         text = schema_path.read_text(encoding="utf-8")
-        pattern = r'ProviderField\(\s*key="(\w+)"[^)]*?default=("[^"]*"|True|False|None|[\d.]+)[^)]*?\)'
+        pattern = r'ProviderField\(\s*key="(\w+)".*?default=("[^"]*"|True|False|None|[\d.]+)'
         matches = re.findall(pattern, text, re.DOTALL)
         result = {}
         for key, default in matches:
+            if key in result:
+                continue
             if default.startswith('"'):
                 result[key] = default[1:-1]
             elif default in ('True', 'False'):
@@ -178,11 +187,23 @@ class TestT1bDefaultValueParity:
         (after coercion). CI fails on any mismatch."""
         from config_model import MemoryConfig
         schema_defaults = self._schema_defaults()
+        # #406: guard against parser rot — every ProviderField must be seen
+        # (the old pattern silently saw only 72 of 90).
+        assert len(schema_defaults) >= 85, (
+            f"schema parser found only {len(schema_defaults)} entries — "
+            "config_schema.py style changed; update _schema_defaults"
+        )
         model_fields = MemoryConfig.model_fields
         mismatches = []
         for key, schema_str in schema_defaults.items():
             if key not in model_fields:
                 continue  # T1 covers missing keys
+            if key == "expiry_ttl_days":
+                # Structured field: the schema exposes a scalar UI default
+                # (90 days) while the model default is a JSON map; parity
+                # is not meaningful (surfaced by the #406 blind-spot sweep
+                # as the only residual divergence).
+                continue
             model_default = model_fields[key].default
             # Coerce based on model default type
             if isinstance(model_default, bool):
@@ -204,6 +225,76 @@ class TestT1bDefaultValueParity:
             "schema defaults on save, so a mismatch silently flips "
             "runtime behavior):\n" + "\n".join(mismatches)
         )
+
+
+class TestT1cInitDefaultParity:
+    """T1c (#406): pre-config init defaults in provider_core.py must not
+    contradict the model/schema defaults for shared knobs.
+
+    provider_core.__init__ sets placeholder attributes that initialize()
+    later overwrites from config. A stale placeholder is harmless only if
+    nothing reads it before initialize() — but the historical bug
+    (graph_traversal_enabled=False vs model True) showed such drift can
+    sit unnoticed for years. This test pins init-defaults ==
+    model-defaults for every shared BOOLEAN knob parsed from the source,
+    so any new conflict fails CI instead of surfacing as a surprise.
+    """
+
+    @staticmethod
+    def _init_boolean_defaults() -> dict:
+        """Parse ``self._<name>: bool = True|False`` from provider_core.py."""
+        import re
+        src = (Path(__file__).resolve().parent.parent / "provider_core.py").read_text(
+            encoding="utf-8"
+        )
+        result: dict = {}
+        for m in re.finditer(r"self\._(\w+):\s*bool\s*=\s*(True|False)", src):
+            result.setdefault(m.group(1), m.group(2) == "True")
+        return result
+
+    def test_init_boolean_defaults_match_model_defaults(self):
+        from config_model import MemoryConfig
+
+        init_defaults = self._init_boolean_defaults()
+        assert len(init_defaults) >= 10, (
+            "provider_core init-boolean parse found too few entries — "
+            "did the __init__ block style change? Update this parser."
+        )
+        mismatches = []
+        for name, init_value in sorted(init_defaults.items()):
+            field = MemoryConfig.model_fields.get(name)
+            if field is None or not isinstance(field.default, bool):
+                continue  # internal-only knob: no parity requirement
+            if init_value != field.default:
+                mismatches.append(
+                    f"  {name}: init={init_value}, model={field.default}"
+                )
+        assert not mismatches, (
+            "provider_core init default contradicts the model default "
+            "(stale pre-config placeholder, #406 family):\n"
+            + "\n".join(mismatches)
+        )
+
+    def test_graph_traversal_enabled_surfaces_agree(self):
+        """#406 explicit pin: model True, schema "true", and no (or an
+        agreeing True) init default in provider_core.py."""
+        from config_model import MemoryConfig
+
+        model_default = MemoryConfig.model_fields["graph_traversal_enabled"].default
+        assert model_default is True, (
+            f"model default drifted: {model_default!r} (config_model.py)"
+        )
+        schema_defaults = TestT1bDefaultValueParity._schema_defaults()
+        assert schema_defaults.get("graph_traversal_enabled") == "true", (
+            "schema default drifted: "
+            f"{schema_defaults.get('graph_traversal_enabled')!r} (config_schema.py)"
+        )
+        init_defaults = self._init_boolean_defaults()
+        if "graph_traversal_enabled" in init_defaults:
+            assert init_defaults["graph_traversal_enabled"] is True, (
+                "provider_core.py re-introduced a contradictory pre-config "
+                f"placeholder: {init_defaults['graph_traversal_enabled']!r}"
+            )
 
 
 class TestT2LoaderModelParity:

@@ -57,6 +57,7 @@ nav:
       - REST (HTTP): api/rest.md
   - Tuning: tuning.md
   - Integration guides: integration.md
+  - Operations: operations.md
   - FAQ: faq.md
 
 markdown_extensions:

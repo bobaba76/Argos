@@ -21,6 +21,7 @@ This is the public docs site. The [README](https://github.com/bobaba76/Argos/blo
 - [API reference](api/index.md) — MCP (stdio) and REST (HTTP) surfaces, with the live facade operation allowlist.
 - [Tuning](tuning.md) — embedder/reranker matrix and retrieval knobs.
 - [Integration guides](integration.md) — adapters for non-Hermes agents (placeholder, tracking #277).
+- [Operations](operations.md) — backup, verify, and restore the memory store; weekly snapshot recipe.
 - [FAQ](faq.md) — common questions and troubleshooting.
 
 ## License

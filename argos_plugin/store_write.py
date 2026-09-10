@@ -1500,6 +1500,47 @@ class StoreWriteMixin:
                 raise
         return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
 
+    def save_api_candidate(
+        self,
+        category: str,
+        content: str,
+        tags: List[str] | None = None,
+        payload: Dict[str, Any] | None = None,
+        *,
+        pre_scan_blocked: bool = False,
+    ) -> dict | None:
+        """#422: API-proposal candidate with SERVER-stamped provenance.
+
+        The external API's ``memory_propose`` path (api_facade) writes
+        through this method. Mirroring ``ingest_structured`` (#289), the
+        signature carries no provenance parameters: the store stamps
+        source="api" / provenance_origin="external" / grounding
+        server-side, so the RPC sanitize boundary (memory_service) can
+        never strip — and a client can never claim or alter — the
+        stamping.
+
+        ``pre_scan_blocked`` only DOWNGRADES the candidate (confidence
+        0.0, grounding "speculative") for content the facade's inbound
+        scan already flagged; ``external=True`` re-runs the store's own
+        inbound scan, which remains the authoritative boundary (AF10,
+        defense in depth). Returns the stored candidate row, or None
+        when the standard dedup/tombstone/rejection gates refuse it.
+        """
+        return self.save_candidate(
+            category=category,
+            content=content,
+            tags=list(tags or []),
+            payload=dict(payload or {}),
+            source="api",
+            confidence=0.0 if pre_scan_blocked else 0.5,
+            scope="profile",
+            provenance_origin=PROVENANCE_EXTERNAL,
+            grounding=(
+                GROUNDING_SPECULATIVE if pre_scan_blocked else GROUNDING_EXTRACTED
+            ),
+            external=True,
+        )
+
     def list_candidates(
         self,
         status: str = "pending",

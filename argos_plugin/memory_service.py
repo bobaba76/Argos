@@ -129,6 +129,13 @@ _FORBIDDEN_CLIENT_ARGS = frozenset({
     "confirm",
 })
 
+# #423: review privilege classes a GATED (HMAC-confirmed) RPC call may
+# claim. The service honors these only on the gated channel; ungated
+# review calls are server-derived to "auto_review" regardless of what
+# the args claim, so a raw RPC caller with the endpoint token cannot
+# obtain the user-confirmed class (tool/manual) at the storage boundary.
+_GATED_REVIEW_SOURCES = frozenset({"tool", "manual", "auto_review", "system"})
+
 # MS2: destructive/admin methods forbidden on the RPC boundary (same as
 # the facade's FORBIDDEN_OPERATIONS). Any local process with the endpoint
 # token should NOT be able to call these.
@@ -780,6 +787,17 @@ class MemoryService:
         if method == "save_candidate":
             # MS1: strip server-set fields from client args.
             return store.save_candidate(**_sanitize_args(args))
+        if method == "save_api_candidate":
+            # #422: external-API proposal path. Provenance is server-set
+            # inside the store method (source="api",
+            # provenance_origin="external", grounding) — mirroring the
+            # ingest_structured branch below, the wire args carry no
+            # provenance params, so _sanitize_args cannot strip the
+            # stamping and a raw RPC caller cannot claim it.
+            # pre_scan_blocked can only downgrade (speculative/0.0); the
+            # store's own inbound scan (external=True) remains the
+            # authoritative boundary.
+            return store.save_api_candidate(**_sanitize_args(args))
         if method == "ingest_structured":
             # #289: structured ingestion (JSON/CSV → memory with
             # provenance). Provenance is server-set inside
@@ -889,8 +907,23 @@ class MemoryService:
             # in the args is stripped and ignored.
             args = dict(args)  # don't mutate the caller's dict
             args.pop("review_mode", None)  # policy is server-derived, not client
+            # #423: the review privilege class is SERVER-DERIVED. A raw
+            # RPC caller with the endpoint token must not be able to
+            # claim the user-confirmed class (review_source tool/manual)
+            # — it selects the grounding lift and bypasses the
+            # external-origin downgrade at the storage boundary. Gated
+            # calls (HMAC-verified via _SharedRPC.call_gated — the same
+            # channel as confirm, #200 PR-2) may set the class
+            # explicitly; ungated calls are auto_review-class regardless
+            # of what the args claim (omitting the field no longer
+            # defaults to "manual").
+            _claimed_source = str(args.pop("review_source", "") or "")
+            if confirmed and _claimed_source in _GATED_REVIEW_SOURCES:
+                args["review_source"] = _claimed_source
+            else:
+                args["review_source"] = "auto_review"
             if policy is not None and policy.review_mode == "confirm":
-                review_source = str(args.get("review_source", "manual"))
+                review_source = args["review_source"]
                 decision = str(args.get("decision", ""))
                 if review_source == "auto_review" and decision in {"approved", "reviewed_approved"}:
                     args["decision"] = "pending_user_confirmation"

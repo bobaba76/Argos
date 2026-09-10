@@ -57,6 +57,7 @@ class StubStore:
         self._memories: Dict[str, MemoryRecord] = {}
         self._candidates: Dict[str, Dict[str, Any]] = {}
         self._next_id = 1
+        self.user_id = "test_user"
         self._should_fail = False
 
     def search(self, **kwargs) -> List[MemoryRecord]:
@@ -82,6 +83,24 @@ class StubStore:
 
     def save_candidate(self, **kwargs) -> Dict[str, Any]:
         self.calls.append({"method": "save_candidate", "args": kwargs})
+        cid = f"cand-{self._next_id}"
+        self._next_id += 1
+        candidate = {
+            "candidate_id": cid,
+            "status": "pending",
+            "content": kwargs.get("content", ""),
+            "category": kwargs.get("category", ""),
+            **kwargs,
+        }
+        self._candidates[cid] = candidate
+        return candidate
+
+    def set_user_scope(self, user_id=None) -> None:
+        self.user_id = user_id
+        self.calls.append({"method": "set_user_scope", "args": {"user_id": user_id}})
+
+    def save_api_candidate(self, **kwargs) -> Dict[str, Any]:
+        self.calls.append({"method": "save_api_candidate", "args": kwargs})
         cid = f"cand-{self._next_id}"
         self._next_id += 1
         candidate = {
@@ -389,7 +408,7 @@ class TestIdempotency:
             "Same idempotency key should return the same candidate_id"
         )
         # Only one save_candidate call should have been made.
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1, (
             f"Expected 1 save_candidate call, got {len(save_calls)}"
         )
@@ -419,7 +438,7 @@ class TestIdempotency:
         r1 = facade.execute(ctx, "memory_propose", params, idempotency_key="key-a")
         r2 = facade.execute(ctx, "memory_propose", params, idempotency_key="key-b")
         assert r1["candidate_id"] != r2["candidate_id"]
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 2
 
     def test_no_key_no_idempotency(self):
@@ -431,7 +450,7 @@ class TestIdempotency:
         r1 = facade.execute(ctx, "memory_propose", params)
         r2 = facade.execute(ctx, "memory_propose", params)
         assert r1["candidate_id"] != r2["candidate_id"]
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 2
 
     def test_same_key_different_principals_do_not_collide(self):
@@ -456,7 +475,7 @@ class TestIdempotency:
             "Cross-principal idempotency collision: B received A's cached result"
         )
         # Both calls hit the store — two save_candidate calls.
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 2
         # A's own replay still works.
         r_a2 = facade.execute(ctx_a, "memory_propose", params, idempotency_key="shared-key")
@@ -465,7 +484,7 @@ class TestIdempotency:
         r_b2 = facade.execute(ctx_b, "memory_propose", params, idempotency_key="shared-key")
         assert r_b2["candidate_id"] == r_b["candidate_id"]
         # Still only two save_candidate calls (all replays served from cache).
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 2
 
 
@@ -577,7 +596,7 @@ class TestPoisoning:
         assert result["status"] == "quarantined"
         assert result["reason"] == "inbound_security_scan_blocked"
         # The candidate should have been saved AND reviewed as quarantined.
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
         review_calls = [c for c in store.calls if c["method"] == "review_candidate"]
         assert len(review_calls) == 1
@@ -829,10 +848,12 @@ class TestAPIFacadeAudit222:
                            {"memory_id": "nonexistent", "feedback": "helpful"})
         assert exc_info.value.code == "not_found"
 
-    # -- AF3: user_id passed to save_candidate -------------------------------
+    # -- AF3/#422: propose scopes the store to ctx.user_id -------------------
 
     def test_af3_propose_passes_user_id(self):
-        """AF3: memory_propose passes ctx.user_id to save_candidate."""
+        """AF3/#422: memory_propose scopes the store to ctx.user_id for
+        the duration of the write (save/restore pattern) instead of
+        passing a user_id kwarg that the RPC sanitize boundary strips."""
         store = StubStore()
         facade = _make_facade(store)
         ctx = _make_ctx(user_id="user-test-af3")
@@ -840,9 +861,11 @@ class TestAPIFacadeAudit222:
             "content": "User likes pizza",
             "category": "preference",
         })
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
-        assert save_calls[0]["args"].get("user_id") == "user-test-af3"
+        assert "user_id" not in save_calls[0]["args"]
+        scope_calls = [c for c in store.calls if c["method"] == "set_user_scope"]
+        assert scope_calls and scope_calls[0]["args"]["user_id"] == "user-test-af3"
 
     # -- AF4: thread-safe IdempotencyRegistry --------------------------------
 

@@ -77,6 +77,24 @@ class StubStore:
         self._candidates[cid] = candidate
         return candidate
 
+    def set_user_scope(self, user_id=None) -> None:
+        self.user_id = user_id
+        self.calls.append({"method": "set_user_scope", "args": {"user_id": user_id}})
+
+    def save_api_candidate(self, **kwargs) -> Dict[str, Any]:
+        self.calls.append({"method": "save_api_candidate", "args": kwargs})
+        cid = f"cand-{self._next}"
+        self._next += 1
+        candidate = {
+            "candidate_id": cid,
+            "status": "pending",
+            "content": kwargs.get("content", ""),
+            "category": kwargs.get("category", ""),
+            **kwargs,
+        }
+        self._candidates[cid] = candidate
+        return candidate
+
     def review_candidate(self, **kwargs) -> Dict[str, Any] | None:
         self.calls.append({"method": "review_candidate", "args": kwargs})
         cid = kwargs.get("candidate_id", "")
@@ -185,7 +203,7 @@ class TestProposeIdempotency:
             "Same idempotency key should return the same candidate_id"
         )
         # Only one save_candidate call to the store.
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1, (
             f"Expected 1 save_candidate call, got {len(save_calls)}"
         )
@@ -239,7 +257,7 @@ class TestProposeIdempotency:
         r1 = msgs[1]["result"]["structuredContent"]
         r2 = msgs[2]["result"]["structuredContent"]
         assert r1["candidate_id"] != r2["candidate_id"]
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 2
 
 
@@ -333,7 +351,7 @@ class TestPoisoning:
         assert result["status"] == "quarantined"
         assert result["reason"] == "inbound_security_scan_blocked"
         # The candidate was saved AND reviewed as quarantined.
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
         review_calls = [c for c in store.calls if c["method"] == "review_candidate"]
         assert len(review_calls) == 1
@@ -465,8 +483,10 @@ class TestProvenanceEnforcement:
         assert msgs[1]["error"]["code"] == -32602  # JSONRPC_INVALID_PARAMS
 
     def test_server_sets_provenance_on_clean_candidate(self):
-        """The facade sets source=api, provenance_origin=external on
-        clean candidates."""
+        """#422: the facade proposes through the server-stamped
+        save_api_candidate path — provenance is set inside the store
+        method, and the wire args must carry no provenance fields (a
+        raw RPC caller could otherwise try to claim them)."""
         store = StubStore()
         server, stdout, stderr = _make_server(
             store=store,
@@ -482,12 +502,14 @@ class TestProvenanceEnforcement:
             ),
         )
         server.run()
-        save_calls = [c for c in store.calls if c["method"] == "save_candidate"]
+        save_calls = [c for c in store.calls if c["method"] == "save_api_candidate"]
         assert len(save_calls) == 1
         args = save_calls[0]["args"]
-        assert args["source"] == "api"
-        assert args["provenance_origin"] == "external"
-        assert args["grounding"] == "extracted"
+        # #422: provenance is stamped inside store.save_api_candidate;
+        # the wire args must NOT carry provenance/grounding fields.
+        assert "source" not in args
+        assert "provenance_origin" not in args
+        assert "grounding" not in args
 
 
 # ---------------------------------------------------------------------------

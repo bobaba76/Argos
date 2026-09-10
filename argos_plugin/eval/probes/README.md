@@ -1,7 +1,7 @@
 # Deployment pre-flight probes
 
 Deterministic + small-LLM security probes for an Argos store that will run a crew
-of marketing bots on one shared instance (Bidvest Steiner). Run against a SCRATCH
+of marketing bots on one shared instance (a client marketing org). Run against a SCRATCH
 DuckDB — never the live store. All scenario content is synthetic; no personal or
 real company data.
 

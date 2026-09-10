@@ -40,9 +40,9 @@ _TWO_TENANT_CONFIG = {
             "database_filename": "default.duckdb",
             "graph_dirname": "default_kuzu",
         },
-        "brandon-bot": {
-            "database_filename": "tenants/brandon.duckdb",
-            "graph_dirname": "tenants/brandon_kuzu",
+        "acme-bot": {
+            "database_filename": "tenants/acme.duckdb",
+            "graph_dirname": "tenants/acme_kuzu",
             "config": {"phrase_lift_alpha": 0.25},
         },
     },
@@ -81,7 +81,7 @@ class TestTwoTenantIsolation:
     def stores(self, tmp_path):
         _write_config(tmp_path, _TWO_TENANT_CONFIG)
         a = SharedMemoryStore(tmp_path, user_id="default", embedder=None)
-        b = SharedMemoryStore(tmp_path, user_id="brandon-bot", embedder=None)
+        b = SharedMemoryStore(tmp_path, user_id="acme-bot", embedder=None)
         try:
             yield a, b, tmp_path
         finally:
@@ -139,7 +139,7 @@ class TestTwoTenantIsolation:
     def test_graph_isolation(self, stores):
         a, b, tmp_path = stores
         ga = SharedGraphStore(tmp_path, user_id="default")
-        gb = SharedGraphStore(tmp_path, user_id="brandon-bot")
+        gb = SharedGraphStore(tmp_path, user_id="acme-bot")
         try:
             ga.add_relationship(
                 source="alice", source_type="person", relation="knows",
@@ -191,7 +191,7 @@ class TestSingleTenantBackwardCompat:
         import memory_service
         svc = memory_service.MemoryService(tmp_path)
         try:
-            assert svc._tenants["brandon-bot"].store._phrase_lift_alpha == 0.25
+            assert svc._tenants["acme-bot"].store._phrase_lift_alpha == 0.25
             # Default tenant keeps the global default.
             assert svc._tenants["default"].store._phrase_lift_alpha == 0.0
         finally:
@@ -208,7 +208,7 @@ class TestSingleTenantBackwardCompat:
             assert svc._tenants["default"].store.user_id == "default_user"
             assert svc._tenants["default"].default_scope == "default_user"
             # Named tenants scope to their own name.
-            assert svc._tenants["brandon-bot"].store.user_id == "brandon-bot"
+            assert svc._tenants["acme-bot"].store.user_id == "acme-bot"
         finally:
             svc.close()
 
@@ -232,13 +232,13 @@ class TestPerTenantBackup:
 
     def test_backup_targets_tenant(self, tmp_path):
         _write_config(tmp_path, _TWO_TENANT_CONFIG)
-        store = SharedMemoryStore(tmp_path, user_id="brandon-bot", embedder=None)
+        store = SharedMemoryStore(tmp_path, user_id="acme-bot", embedder=None)
         try:
-            store.remember(category="context_note", content="brandon data")
+            store.remember(category="context_note", content="acme data")
             dst = tmp_path / "backups" / "cells"
-            manifest = store._rpc.backup(dst_root=str(dst), tenant="brandon-bot")
+            manifest = store._rpc.backup(dst_root=str(dst), tenant="acme-bot")
             # Routing proof: the manifest carries the tenant name.
-            assert manifest.get("tenant") == "brandon-bot"
+            assert manifest.get("tenant") == "acme-bot"
             # The export landed under dst_root (a timestamped snapshot dir).
             assert dst.exists() and any(dst.iterdir()), (
                 "backup must write a snapshot under dst_root"
@@ -259,10 +259,10 @@ _STRICT_TWO_TENANT_CONFIG = {
             "graph_dirname": "default_kuzu",
             "allowed_user_ids": ["alice", "bob"],
         },
-        "brandon-bot": {
-            "database_filename": "tenants/brandon.duckdb",
-            "graph_dirname": "tenants/brandon_kuzu",
-            "allowed_user_ids": ["brandon", "brandon-cli"],
+        "acme-bot": {
+            "database_filename": "tenants/acme.duckdb",
+            "graph_dirname": "tenants/acme_kuzu",
+            "allowed_user_ids": ["acme", "acme-cli"],
         },
     },
 }
@@ -279,7 +279,7 @@ class TestStrictTenantRouting:
     def stores(self, tmp_path):
         _write_config(tmp_path, _STRICT_TWO_TENANT_CONFIG)
         a = SharedMemoryStore(tmp_path, user_id="alice", embedder=None)
-        b = SharedMemoryStore(tmp_path, user_id="brandon", embedder=None)
+        b = SharedMemoryStore(tmp_path, user_id="acme", embedder=None)
         try:
             yield a, b, tmp_path
         finally:
@@ -289,11 +289,11 @@ class TestStrictTenantRouting:
         """An allowlisted user_id reaches its tenant's store."""
         a, b, _ = stores
         a.remember(category="context_note", content="alice's data")
-        b.remember(category="context_note", content="brandon's data")
+        b.remember(category="context_note", content="acme's data")
         assert any("alice" in r.content for r in a.search("alice", limit=5))
-        assert any("brandon" in r.content for r in b.search("brandon", limit=5))
+        assert any("acme" in r.content for r in b.search("acme", limit=5))
         # Cross-tenant isolation still holds.
-        assert not any("brandon" in r.content for r in a.search("brandon", limit=5))
+        assert not any("acme" in r.content for r in a.search("acme", limit=5))
 
     def test_spoofed_unknown_user_id_rejected(self, stores):
         """In strict mode, a user_id not in any tenant's allowlist is
@@ -349,8 +349,8 @@ class TestStrictTenantRouting:
             assert svc._user_tenant_map == {
                 "alice": "default",
                 "bob": "default",
-                "brandon": "brandon-bot",
-                "brandon-cli": "brandon-bot",
+                "acme": "acme-bot",
+                "acme-cli": "acme-bot",
             }
         finally:
             svc.close()

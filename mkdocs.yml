@@ -58,6 +58,7 @@ nav:
   - Tuning: tuning.md
   - Integration guides: integration.md
   - Operations: operations.md
+  - Eval gate (Tier 2): eval-gate-tier2.md
   - FAQ: faq.md
 
 markdown_extensions:

@@ -781,14 +781,19 @@ _ALWAYS_BEFORE_RE = re.compile(
     re.IGNORECASE,
 )
 _LESSON_RE = re.compile(
-    r"\b(?:lesson|learned|takeaway|mistake|rule)\s*[:\-]\s*(.+?)(?:\.|$)",
+    r"\b(?:(?:lesson|takeaway|mistake|rule)\s+)?"
+    r"(?:lesson|learned|takeaway|mistake|rule)\s*[:\-]\s*(.+?)(?:\.|$)",
     re.IGNORECASE,
 )
 
 # Failure with cause — needs normalization to invariant form.
+# #400 review 9/10: "never worked/works" is a failure phrasing, not a
+# one-off outcome ("I tried that approach and it never worked" →
+# constraint/failure path, not context_note).
 _FAILED_BECAUSE_RE = re.compile(
     r"\b(?:i\s+)?(?:tried|attempted)\s+(.+?)\s+(?:and\s+)?(?:it\s+)?"
-    r"(?:failed|didn\'t\s+work|didn\'t\s+work\s+out|broke|didn\'t\s+succeed)"
+    r"(?:failed|didn\'t\s+work|didn\'t\s+work\s+out|broke|didn\'t\s+succeed"
+    r"|never\s+(?:worked|works))"
     r"(?:\s+(?:because|when|if|since)\s+(.+?))?(?:\.|$)",
     re.IGNORECASE,
 )
@@ -814,6 +819,12 @@ _OUTCOME_TRIED_RE = re.compile(
 # she is driving" / "My car doesn't work when it rains").
 _FIRST_PERSON_BEFORE_RE = re.compile(r"\b(?:i|we)\b", re.IGNORECASE)
 _OUTCOME_NEGATION_RE = re.compile(r"\b(?:not|n't|never|rarely|hardly)\b", re.IGNORECASE)
+# #400 review 9/10: "never {action} when {cause}" is grammatical only for
+# gerund actions ("never deploying when…"); noun-phrase actions ("never
+# the deploy when…") are broken — use "avoid {action}" instead. The
+# gerund is the first word of the action (3+ char stem + "ing"); short
+# words like "ring"/"sing"/"king" are excluded by the stem-length floor.
+_GERUND_RE = re.compile(r"^\w{3,}ing\b", re.IGNORECASE)
 
 
 def _constraint_subject_ok(sentence: str, match_start: int) -> bool:
@@ -1123,8 +1134,13 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
     # this block handles the remaining families.
     #
     # 1. Explicit lesson/mistake: "lesson: X", "learned: X"
+    # #400 review 9/10 (blocker 1): subject gate — someone else's lesson
+    # ("Alex learned: never leave the kids unattended") must not mint the
+    # user's durable invariant. Subject-less imperatives ("Lesson learned:
+    # X") keep the pass (empty prefix → ok); first-person ("I learned: X")
+    # passes too.
     m = _LESSON_RE.search(sentence)
-    if m:
+    if m and _constraint_subject_ok(sentence, m.start()):
         lesson = m.group(1).strip().rstrip('.')
         if len(lesson) > 5:
             return {
@@ -1145,7 +1161,14 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
         cause = m.group(2).strip().rstrip('.') if m.group(2) else None
         if len(action) > 3:
             if cause and len(cause) > 3:
-                content = f"Constraint: {action} fails when {cause}; never {action} when {cause}"
+                # #400 review 9/10: "never {action} when {cause}" is
+                # grammatical only for gerund actions ("never deploying
+                # when…"); noun-phrase actions ("never the deploy when…")
+                # are broken — use "avoid {action}" instead.
+                if _GERUND_RE.search(action):
+                    content = f"Constraint: {action} fails when {cause}; never {action} when {cause}"
+                else:
+                    content = f"Constraint: {action} fails when {cause}; avoid {action}"
             else:
                 content = f"Constraint: {action} does not work; avoid {action}"
             return {
@@ -1186,8 +1209,14 @@ def _classify_sentence_locked(sentence: str) -> Dict[str, Any] | None:
     # 5. One-off outcome: "I tried X" (no failure/cause) → short-lived
     #    Routes to context_note (short-lived, 30-day TTL) not insight.
     #    Only matches if no failure pattern above matched.
+    #    #400 review 9/10 (blocker 2): subject gate — "She tried to fix it
+    #    and it failed because she was tired" must not mint a false
+    #    first-person "User tried:" record. The (?:i\s+)? prefix is
+    #    optional, so a third-person subject lands at the trigger with no
+    #    first-person before it → gate denies. First-person ("I tried X")
+    #    and subject-less ("Tried X yesterday") keep the pass.
     m = _OUTCOME_TRIED_RE.search(sentence)
-    if m:
+    if m and _constraint_subject_ok(sentence, m.start()):
         # #400 review 9/9 (blocker 2): negation guard — "I never tried
         # meditation" / "I didn't try X" is not a one-off outcome to record.
         preceding = sentence[max(0, m.start() - 32):m.start()]

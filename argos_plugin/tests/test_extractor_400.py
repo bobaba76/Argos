@@ -272,6 +272,10 @@ class TestOutcomeVerbs:
         "I used to be a developer",
         "I ran the tests and they all passed",
         "I never tried meditation",
+        # #400 review 9/10 (blocker 2): third-person subjects must not mint
+        # a false first-person "User tried:" record.
+        "She tried to fix it and it failed because she was tired",
+        "He attempted to call her and it didn't work out",
     ])
     def test_no_false_outcome(self, sentence):
         from extractor import _extract_facts_regex
@@ -292,3 +296,98 @@ class TestMustNotConstraint:
         facts = _extract_facts_regex(sentence)
         constraints = [f for f in facts if "constraint" in f.get("tags", [])]
         assert not constraints, f"minted constraint from obligation: {sentence}"
+
+
+class TestLessonSubjectGate:
+    """#400 review 9/10 (blocker 1): the lesson branch must apply the
+    subject gate — someone else's lesson must not mint the user's durable
+    invariant. Subject-less imperatives ("Lesson learned: X") and
+    first-person ("I learned: X") keep the pass."""
+
+    def test_third_person_learned_no_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("Alex learned: never leave the kids unattended")
+        assert not [f for f in facts if "constraint" in f.get("tags", [])]
+
+    def test_third_person_possessive_lesson_no_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("Alex's lesson: check the oil before long trips")
+        assert not [f for f in facts if "constraint" in f.get("tags", [])]
+
+    def test_third_person_name_lesson_no_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("Sarah's takeaway: always test before shipping")
+        assert not [f for f in facts if "constraint" in f.get("tags", [])]
+
+    def test_subjectless_lesson_compound_passes(self):
+        """'Lesson learned: X' is a subject-less imperative — the compound
+        form must match as a single phrase (match starts at 'Lesson',
+        empty prefix → gate passes)."""
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("Lesson learned: back up before migrating")
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+        assert constraints[0]["category"] == "insight"
+
+    def test_subjectless_lesson_single_passes(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("Lesson: always back up before migrating")
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+
+    def test_first_person_learned_passes(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("I learned: never trust user input without validation")
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+
+
+class TestNeverWorkedRouting:
+    """#400 review 9/10: 'I tried X and it never worked' is a failure
+    phrasing — routes to the constraint/failure path, not a one-off
+    outcome (context_note)."""
+
+    def test_never_worked_routes_to_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("I tried that approach and it never worked")
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+        assert constraints[0]["category"] == "insight"
+        # Must NOT be a one-off outcome
+        outcomes = [f for f in facts if "outcome" in f.get("tags", [])]
+        assert not outcomes
+
+    def test_never_works_routes_to_constraint(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex("I attempted that strategy and it never works")
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+
+
+class TestGerundNeverClause:
+    """#400 review 9/10: 'never {action} when {cause}' is grammatical only
+    for gerund actions; noun-phrase actions use 'avoid {action}' instead
+    to avoid garbled output ('never the deploy when…')."""
+
+    def test_gerund_action_uses_never_clause(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(
+            "I tried deploying without migrations and it failed because the schema was stale"
+        )
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+        content = constraints[0]["content"].lower()
+        assert "never" in content
+        assert "deploying" in content
+
+    def test_noun_phrase_action_uses_avoid(self):
+        from extractor import _extract_facts_regex
+        facts = _extract_facts_regex(
+            "I tried the deploy and it failed because the schema was stale"
+        )
+        constraints = [f for f in facts if "constraint" in f.get("tags", [])]
+        assert len(constraints) == 1
+        content = constraints[0]["content"].lower()
+        # "never the deploy when…" is grammatically broken — must use "avoid"
+        assert "avoid the deploy" in content
+        assert "never the deploy" not in content

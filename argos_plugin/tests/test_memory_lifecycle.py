@@ -22,6 +22,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from store import DuckDBMemoryStore
 
 
+@pytest.fixture(autouse=True)
+def _allow_egress_gate():
+    """Hermetic egress: run_rollup consults the live plugin config (egress
+    gate), which is host-dependent — a bare CI runner defaults to refusing
+    memory_rollup, while a dev machine with rollup_enabled=true allows it.
+    Stub the gate to allow by default so the LLM-path tests are
+    deterministic; the two tests that exercise the gate itself
+    (test_d4_egress_gate_checked, test_ru10_egress_gate_receives_content)
+    patch it again inside — the inner patch wins."""
+    with patch("egress.gate", return_value=True):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # 1. Archival tier
 # ---------------------------------------------------------------------------
@@ -837,6 +850,76 @@ class TestRollupAuditRU:
         assert report["ran"], (
             f"Expected ran=True, got skipped={report.get('skipped')}"
         )
+        store.close()
+
+    # -- #427: rollup/retention run-state advancement seam -------------------
+
+    def test_427_advance_prefers_server_op(self):
+        """#427: _advance_run_state routes through the narrow server-side
+        op when the store exposes it (shared-service proxy); its raising
+        set_state must never be called."""
+        from rollup import _advance_run_state
+
+        calls = []
+
+        class ProxyLikeStore:
+            def advance_rollup_state(self, records_processed):
+                calls.append(records_processed)
+
+            def set_state(self, key, value):
+                raise PermissionError(
+                    "set_state is forbidden on the RPC boundary (MS7)"
+                )
+
+        _advance_run_state(ProxyLikeStore(), 12)
+        assert calls == [12]
+
+    def test_427_advance_failure_warns(self, caplog):
+        """#427: an advance failure is logged at WARNING, not swallowed."""
+        from rollup import _advance_run_state
+
+        class FailingStore:
+            def advance_rollup_state(self, records_processed):
+                raise RuntimeError("boom")
+
+        with caplog.at_level("WARNING", logger="rollup"):
+            _advance_run_state(FailingStore(), 1)
+        assert "advance_rollup_state failed" in caplog.text
+
+    def test_428_rollup_skips_active_memory_duplicates(self, tmp_path):
+        """#428: proposals matching an ACTIVE memory are skipped and
+        counted (parity with session-extraction dedupe)."""
+        store = DuckDBMemoryStore(tmp_path / "test_428.duckdb", user_id="alice")
+        for i in range(15):
+            store.remember(category="context_note", content=f"record {i}")
+
+        class _Dup:
+            memory_id = "mem-active-1"
+
+        # Emulate the semantic seam: only the DUP-marked proposal matches.
+        store.find_semantic_duplicate = (
+            lambda content, min_similarity=0.88:
+            _Dup() if "DUP" in content else None
+        )
+
+        payload = (
+            '[{"content": "DUP already saved fact", "category": "insight",'
+            ' "source_loc": "x", "confidence": 0.8},'
+            ' {"content": "fresh new summary fact", "category": "insight",'
+            ' "source_loc": "y", "confidence": 0.8}]'
+        )
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=payload))]
+        )
+        mock_call = MagicMock(return_value=mock_response)
+        from rollup import run_rollup
+        with patch("rollup._get_llm_client", return_value=mock_call):
+            report = run_rollup(store, interval_days=30, max_records_per_run=15)
+        assert report["ran"], f"skipped={report.get('skipped')}"
+        assert report["proposals_emitted"] == 1
+        assert report["skipped_dupes"] == 1
+        # #427 trace: the run consumed the cooldown window on the local path.
+        assert store.get_state("rollup_last_run") is not None
         store.close()
 
     # -- RU4: cap proposals at 10 --------------------------------------------

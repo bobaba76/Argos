@@ -94,10 +94,29 @@ def _get_last_run(store) -> Optional[str]:
 
 
 def _advance_run_state(store, records_processed: int) -> None:
-    """Mark a run as completed (advances last_run + last_count)."""
+    """Mark a run as completed (advances last_run + last_count).
+
+    #427: prefer the narrow server-side ``advance_rollup_state`` op when
+    the store exposes it (shared-service proxy — its ``set_state`` raises,
+    MS7). The old direct set_state silently failed on the proxy and the
+    exception was swallowed upstream, so ``rollup_last_run`` never
+    advanced and the cooldown never engaged (rollup fired at every
+    session boundary). Failures are now logged at WARNING level — this
+    silence hid a production storm for days.
+    """
+    advance = getattr(store, "advance_rollup_state", None)
+    if callable(advance):
+        try:
+            advance(records_processed)
+        except Exception as e:
+            logger.warning("rollup: advance_rollup_state failed: %s", e)
+        return
     now = datetime.now(timezone.utc).isoformat()
-    store.set_state(_STATE_KEY_LAST_RUN, now)
-    store.set_state(_STATE_KEY_LAST_COUNT, str(records_processed))
+    try:
+        store.set_state(_STATE_KEY_LAST_RUN, now)
+        store.set_state(_STATE_KEY_LAST_COUNT, str(records_processed))
+    except Exception as e:
+        logger.warning("rollup: failed to advance run state: %s", e)
 
 
 def _is_within_cooldown(store, interval_days: int) -> bool:
@@ -235,6 +254,7 @@ def run_rollup(
         "proposals_emitted": 0,
         "llm_calls": 0,
         "skipped": None,
+        "skipped_dupes": 0,  # #428: proposals matching an active memory
     }
 
     # D4: egress gate — refuse in local_only mode (same as distillation).
@@ -332,7 +352,28 @@ def run_rollup(
 
     # Emit proposals through the standard review pipeline.
     emitted = 0
+    skipped_dupes = 0
     for prop in proposals:
+        # #428: parity with session extraction (provider_session) — skip
+        # proposals whose content is already covered by an ACTIVE memory.
+        # save_candidate(dedup=True) only checks the pending queue (exact
+        # match + substring overlap), so rollup kept re-proposing facts
+        # that were already saved. Same seam + threshold as the
+        # extraction dedupe. Fail-soft: any embedder/search error emits
+        # normally (dedupe must never block emission).
+        try:
+            dup = store.find_semantic_duplicate(
+                prop["content"], min_similarity=0.88
+            )
+        except Exception:
+            dup = None
+        if dup is not None:
+            skipped_dupes += 1
+            logger.debug(
+                "rollup: skipping duplicate proposal %r — matches active %s",
+                prop["content"][:80], getattr(dup, "memory_id", "?"),
+            )
+            continue
         try:
             store.save_candidate(
                 category=prop["category"],
@@ -358,8 +399,9 @@ def run_rollup(
     _advance_run_state(store, len(records))
     report["ran"] = True
     report["proposals_emitted"] = emitted
+    report["skipped_dupes"] = skipped_dupes
     logger.info(
-        "rollup: %d proposals from %d records (%d LLM calls)",
-        emitted, len(records), report["llm_calls"],
+        "rollup: %d proposals from %d records (%d LLM calls, %d dupes skipped)",
+        emitted, len(records), report["llm_calls"], skipped_dupes,
     )
     return report

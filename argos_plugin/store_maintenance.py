@@ -2119,6 +2119,7 @@ class StoreMaintenanceMixin:
         "distillation_last_count",
         "surfaced_confirmation_ids",
         "rollup_last_run",
+        "rollup_last_count",  # #427 — parity with distillation_last_count
         "distillation_cursor",
         "rollup_cursor",
         "last_session_end",

@@ -498,6 +498,8 @@ class TestSanctionedState:
     def test_narrow_ops_not_forbidden(self):
         """None of the narrow ops are in _FORBIDDEN_STORE_METHODS."""
         assert "advance_distillation_state" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "advance_rollup_state" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "advance_retention_state" not in memory_service._FORBIDDEN_STORE_METHODS
         assert "mark_system_internal_sweep_done" not in memory_service._FORBIDDEN_STORE_METHODS
         assert "mark_system_internal_sweep_dry_run_done" not in memory_service._FORBIDDEN_STORE_METHODS
         assert "apply_system_internal_sweep" not in memory_service._FORBIDDEN_STORE_METHODS
@@ -510,6 +512,28 @@ class TestSanctionedState:
             store.advance_distillation_state(42)
             assert store.get_state("distillation_last_run") is not None
             assert store.get_state("distillation_last_count") == "42"
+        finally:
+            store.close()
+
+    def test_advance_rollup_state_works_through_proxy(self, tmp_path):
+        """#427: advance_rollup_state writes rollup_last_run +
+        rollup_last_count end-to-end through the proxy — the cooldown
+        seam set_state could never reach on the RPC boundary."""
+        store = _start_service(tmp_path)
+        try:
+            store.advance_rollup_state(7)
+            assert store.get_state("rollup_last_run") is not None
+            assert store.get_state("rollup_last_count") == "7"
+        finally:
+            store.close()
+
+    def test_advance_retention_state_works_through_proxy(self, tmp_path):
+        """#427 sibling: advance_retention_state writes retention_last_run
+        end-to-end through the proxy."""
+        store = _start_service(tmp_path)
+        try:
+            store.advance_retention_state()
+            assert store.get_state("retention_last_run") is not None
         finally:
             store.close()
 

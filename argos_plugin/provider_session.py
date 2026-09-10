@@ -846,12 +846,22 @@ class ProviderSessionMixin:
                     "Retention: expired %d record(s) past class retention",
                     report["expired_count"],
                 )
+            # #427: prefer the narrow server-side op (the shared-service
+            # proxy cannot call set_state — MS7; the old swallowed
+            # failure left retention_last_run frozen). WARNING on
+            # failure: this class of silence hid a rollup storm.
+            advance = getattr(self._store, "advance_retention_state", None)
             try:
-                self._store.set_state(
-                    "retention_last_run", self._store._now(),
+                if callable(advance):
+                    advance()
+                else:
+                    self._store.set_state(
+                        "retention_last_run", self._store._now(),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Retention: failed to advance run state: %s", e,
                 )
-            except Exception:
-                pass
         except Exception as e:
             logger.debug("Retention enforcement failed: %s", e)
 
@@ -880,7 +890,9 @@ class ProviderSessionMixin:
                     rollup_report.get("llm_calls", 0),
                 )
         except Exception as e:
-            logger.debug("Rollup failed: %s", e)
+            # #427: WARNING — a swallowed failure here hid a rollup storm
+            # (cooldown never advanced → fired at every session boundary).
+            logger.warning("Rollup failed: %s", e)
 
     def _maybe_run_compaction(self) -> None:
         """Run the gated self-compaction pass (#281).

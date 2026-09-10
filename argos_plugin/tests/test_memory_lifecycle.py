@@ -22,6 +22,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from store import DuckDBMemoryStore
 
 
+@pytest.fixture(autouse=True)
+def _allow_egress_gate():
+    """Hermetic egress: run_rollup consults the live plugin config (egress
+    gate), which is host-dependent — a bare CI runner defaults to refusing
+    memory_rollup, while a dev machine with rollup_enabled=true allows it.
+    Stub the gate to allow by default so the LLM-path tests are
+    deterministic; the two tests that exercise the gate itself
+    (test_d4_egress_gate_checked, test_ru10_egress_gate_receives_content)
+    patch it again inside — the inner patch wins."""
+    with patch("egress.gate", return_value=True):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # 1. Archival tier
 # ---------------------------------------------------------------------------

@@ -7,12 +7,12 @@ was wired into the save/review paths.  This script re-indexes every
 active memory record through the graph, extracting entities and creating
 cross-memory links.
 
-Run with Hermes STOPPED (the shared memory service holds locks):
+Safe to run against a LIVE service (2026-09-10): connects through the
+shared-service RPC client and its teardown only stops a service this
+script itself started. The old "stop Hermes first, restart after" dance
+is no longer required.
 
-    # 1. Stop Hermes completely (close desktop app, kill any gateway).
-    # 2. Run the backfill:
     python backfill_graph.py
-    # 3. Start Hermes.
 
 Options:
     --dry-run          Show counts without writing to the graph.

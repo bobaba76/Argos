@@ -113,3 +113,4 @@ See [`CONFIG_REFERENCE.md`](https://github.com/bobaba76/Argos/blob/master/CONFIG
 
 - [Tuning](tuning.md) — embedder and reranker guidance.
 - [API reference](api/index.md) — MCP and REST endpoints.
+- [Operations](operations.md) — backup, verify, and restore the memory store.

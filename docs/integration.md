@@ -164,3 +164,4 @@ When the adapters land, this page will host per-framework walkthroughs. Until th
 
 - [API reference](api/index.md) — MCP and REST.
 - [Quickstart](quickstart.md) — get started in five minutes.
+- [Operations](operations.md) — backup, verify, and restore the memory store.

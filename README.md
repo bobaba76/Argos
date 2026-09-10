@@ -152,3 +152,4 @@ Business Source License 1.1 (BSL 1.1): free for personal and non-production use;
 - [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) — every setting, default, and description
 - [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md) — how the system works under the hood
 - [REINSTALL.md](REINSTALL.md) — reinstall, migration, graph rebuild
+- [docs/operations.md](docs/operations.md) — backup, verify, and restore the memory store

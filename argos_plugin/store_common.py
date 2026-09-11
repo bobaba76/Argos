@@ -428,6 +428,7 @@ class MemoryRecord:
         # persisted — mirror the _reranked pattern.
         "_ce_pool_member",
         "_ce_norm",
+        "_ce_raw",
         "_ce_promoted",
     )
 

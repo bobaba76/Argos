@@ -21,11 +21,31 @@ BM25_B = 0.75
 RRF_K = 20
 
 # #445: bounded CE-rescue slots (store_retrieval reranker block).
-#   CE_PROMOTE_MIN — normalized cross-encoder floor for a rescue candidate
 #   CE_PROMOTE_MAX — max rescued records per query (never displaces the
-#                    strict ranking lane beyond the window tail)
-CE_PROMOTE_MIN = 0.95
+#                    strict ranking lane beyond the window tail; rescue
+#                    eligibility is CE-vs-window-tail, no absolute floor)
 CE_PROMOTE_MAX = 2
+
+# #445: query-side template-dialect probes for the cross-encoder.
+# bge-reranker-* is verb-phrase locked: a natural NL query ("What do I
+# currently work as?") scores Argos's canonical record template ("User's
+# job title is ...") ~0.00, while the SAME query in the record's dialect
+# ("What is user's job title?") scores it 0.99 (measured 11/9). Each
+# family: (intent regex, probe list). Probes are scored per record and
+# the MAX is kept — unrelated queries pay nothing (no regex hit).
+CE_PROBE_ALIASES = {
+    "work": (
+        r"\b(work as|job title|current role|job|role|employed|occupation|"
+        r"profession|position)\b",
+        ("what is user's job title", "what does user work as",
+         "what is user's current role"),
+    ),
+    "location": (
+        r"\b(live|lives|living|address|resid(?:e|ence)|located|stay(?:ing)?)\b",
+        ("where does user live", "what is user's address",
+         "where is user located"),
+    ),
+}
 
 # -- Semantic dedup (store_retrieval._find_current_similar) ------------------
 # Cosine similarity above this means "same fact" — used to gate the

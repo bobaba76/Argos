@@ -1,27 +1,29 @@
-"""Tests for #445: per-retriever union before the CE cut + bounded CE-rescue.
+"""Tests for #445: recall band + bounded CE-rescue + template-dialect probes.
 
-The fused top-N cut can lose a record that is a strong VECTOR rank-1 but has
+The fused top-N cut can lose a record that is a strong VECTOR match but has
 ZERO lexical overlap (RRF rewards two-arm presence; the rank-1 survival guard
-needs a clear margin, which a flat semantic head does not produce). The fix:
+needs a clear margin, which a flat semantic head does not produce). Round-2:
+live data showed the answering record even below the vector head (rank ~13),
+so the recall band is wider than the pool, and rescue eligibility is a pure
+CE-vs-window-tail comparison (no normalized floor — an exact-lexical record
+can poison pool-max normalization).
 
-1. Union pool: the rerank pool appends each arm's head beyond the fused cut,
-   so the cross-encoder actually sees the best semantic candidate.
-2. Bounded CE-rescue: a union-pool record with a near-perfect normalized
-   cross-encoder match (>= CE_PROMOTE_MIN) gets rescued INTO the window —
-   at most CE_PROMOTE_MAX records. The strict ranking lane's strongest
-   members stay put; rescued records are flagged `_ce_promoted`.
+Round-3 (11/9): the cross-encoder itself is verb-phrase locked on the
+canonical "User's ..." record template (measured 0.0046 for the true answer
+vs 0.99 with the query spoken in the record's dialect). Template-dialect
+probes fix the INPUT side: matching intent families add probe queries that
+ARE in the record's dialect, and each record keeps the MAX CE score.
 
 Deterministic harness: real DuckDBMemoryStore on a temp file; retrieval arms
-stubbed with crafted lists; a stub reranker that scores "semantic" documents
-10.0 (-> normalized CE 1.0) and everything else by pool index.
+stubbed; a query-aware keyword reranker (strong keyword present in BOTH
+probe/query and doc -> 10.0; "gamma" -> -5.0 weak; else 0.0) so CE behavior
+is fully controlled.
 """
 from __future__ import annotations
 
 import math
 import os
 import tempfile
-
-import pytest
 
 try:
     from store import DuckDBMemoryStore, MemoryRecord
@@ -36,12 +38,24 @@ def _rec(mid: str, content: str, similarity: float) -> MemoryRecord:
     )
 
 
-class _SemanticReranker:
-    """CE score: 10.0 for "semantic" content (-> norm 1.0), else index."""
+class _KeywordReranker:
+    """Query-AWARE stub: a doc scores 10.0 only when a *strong* keyword
+    appears in BOTH the (possibly alias) probe and the doc; explicit weak
+    marker ("gamma") -> -5.0; otherwise 0.0."""
+
+    def __init__(self, strong=("semantic",)):
+        self._strong = strong
 
     def score(self, query, documents):
-        return [10.0 if "semantic" in d else float(i)
-                for i, d in enumerate(documents)]
+        out = []
+        for d in documents:
+            if any(k in query and k in d for k in self._strong):
+                out.append(10.0)
+            elif "gamma" in d:  # explicit weak marker ("gamma content")
+                out.append(-5.0)
+            else:
+                out.append(0.0)
+        return out
 
 
 class _HashEmbedder:
@@ -64,7 +78,8 @@ class _HashEmbedder:
         return [x / n for x in v] if n > 0 else v
 
 
-def _build(vector_arm, text_arm, *, limit=3, top_n=2, rescue_enabled=True):
+def _build(vector_arm, text_arm, *, limit=3, top_n=2, rescue_enabled=True,
+           strong=("semantic",)):
     tmp = tempfile.TemporaryDirectory()
 
     class _S(DuckDBMemoryStore):
@@ -76,7 +91,7 @@ def _build(vector_arm, text_arm, *, limit=3, top_n=2, rescue_enabled=True):
 
     store = _S(os.path.join(tmp.name, "r.duckdb"), user_id="test",
                embedder=_HashEmbedder())
-    store.reranker = _SemanticReranker()
+    store.reranker = _KeywordReranker(strong=strong)
     store._reranker_top_n = top_n
     store._ce_rescue_enabled = rescue_enabled
     return store, tmp
@@ -103,13 +118,13 @@ class TestCeRescue:
 
     def test_answer_rescued_into_window(self):
         vector, text = self._arms()
-        store, tmp = _build(vector, text, limit=3, top_n=2)
+        store, tmp = _build(vector, text, limit=3, top_n=2, strong=("alpha",))
         with tmp:
             results = store.search("alpha beta gamma", limit=3)
             mids = [r.memory_id for r in results]
             assert "mem-A" in mids, (
                 "vector rank-1 with zero lexical overlap must be rescued "
-                "into the window via the union pool + CE-rescue"
+                "into the window via the recall band + CE-rescue"
             )
             rescued = [r for r in results if getattr(r, "_ce_promoted", False)]
             assert len(rescued) == 1 and rescued[0].memory_id == "mem-A"
@@ -121,7 +136,8 @@ class TestCeRescue:
 
     def test_no_rescue_without_fix(self):
         vector, text = self._arms()
-        store, tmp = _build(vector, text, limit=3, top_n=2, rescue_enabled=False)
+        store, tmp = _build(vector, text, limit=3, top_n=2,
+                            rescue_enabled=False, strong=("alpha",))
         with tmp:
             results = store.search("alpha beta gamma", limit=3)
             assert "mem-A" not in {r.memory_id for r in results}, (
@@ -129,9 +145,10 @@ class TestCeRescue:
             )
 
     def test_rescue_bounded_at_two(self):
+        # Two band-only candidates that both carry a query keyword.
         vector = [
             _rec("mem-A", "alpha semantic content", 0.95),
-            _rec("mem-S1", "s1 semantic content", 0.90),
+            _rec("mem-S1", "s1 beta semantic content", 0.90),
             _rec("mem-S2", "s2 semantic content", 0.89),
             _rec("mem-S3", "s3 semantic content", 0.88),
         ]
@@ -139,18 +156,78 @@ class TestCeRescue:
             _rec("mem-B", "beta content", 0.90),
             _rec("mem-C", "gamma content", 0.80),
         ]
-        store, tmp = _build(vector, text, limit=3, top_n=1)
+        store, tmp = _build(vector, text, limit=3, top_n=1,
+                            strong=("alpha", "beta"))
         with tmp:
             results = store.search("alpha beta gamma", limit=3)
             promoted = [r for r in results if getattr(r, "_ce_promoted", False)]
-            assert len(promoted) <= 2
+            assert len(promoted) <= 2, (
+                "rescue must be bounded at CE_PROMOTE_MAX, never flood"
+            )
             assert len(results) == 3
 
     def test_low_ce_not_rescued(self):
+        # Window members (B/D/E) are the STRONG CE matches (10.0); the recall
+        # band candidate A is a weak match (0.0) -> below the window's worst
+        # CE -> must NOT be rescued.
         vector, text = self._arms()
-        store, tmp = _build(vector, text, limit=3, top_n=2)
-        store._CE_PROMOTE_MIN = 2.0  # floor above any possible CE norm
+        store, tmp = _build(vector, text, limit=3, top_n=2,
+                            strong=("beta", "delta", "epsilon"))
         with tmp:
             results = store.search("alpha beta gamma", limit=3)
             assert all(not getattr(r, "_ce_promoted", False) for r in results)
             assert "mem-A" not in {r.memory_id for r in results}
+
+
+class TestTemplateDialectProbes:
+    @staticmethod
+    def _arms():
+        # The record answers "what do I currently work as?" but ONLY in the
+        # record's own dialect ("User's job title is ...") — the natural
+        # query shares no CE-strong keyword with it. This mirrors the live
+        # 11/9 measurement (0.0046 natural vs 0.99 dialect).
+        vector = [
+            _rec("mem-A",
+                 "User's job title is 'National Product Manager' at an "
+                 "electronic security distribution company.", 0.95),
+            _rec("mem-B", "beta content", 0.94),
+            _rec("mem-D", "delta content", 0.93),
+            _rec("mem-E", "epsilon content", 0.92),
+        ]
+        text = [
+            _rec("mem-B", "beta content", 0.90),
+            _rec("mem-D", "delta content", 0.80),
+            _rec("mem-E", "epsilon content", 0.70),
+            _rec("mem-C", "gamma content", 0.60),
+        ]
+        return vector, text
+
+    def test_probe_lifts_record_in_record_dialect(self):
+        # "job title" is CE-strong ONLY via the work-family probe ("what is
+        # user's job title") — the natural query never contains it. The
+        # template-dialect probe must lift the record into rescue range.
+        vector, text = self._arms()
+        store, tmp = _build(vector, text, limit=3, top_n=2,
+                            strong=("job title",))
+        with tmp:
+            results = store.search("what do I currently work as", limit=3)
+            assert "mem-A" in {r.memory_id for r in results}, (
+                "work-intent query must rescue the answer record via the "
+                "template-dialect probe"
+            )
+            rescued = [r for r in results if getattr(r, "_ce_promoted", False)]
+            assert len(rescued) == 1 and rescued[0].memory_id == "mem-A"
+            assert results[-1].memory_id == "mem-A"
+
+    def test_probe_family_gated_by_intent_regex(self):
+        # Same arms; the query is location-family ("live") — the work probes
+        # must NOT fire, and no CE-strong kw matches -> no rescue.
+        vector, text = self._arms()
+        store, tmp = _build(vector, text, limit=3, top_n=2,
+                            strong=("job title",))
+        with tmp:
+            results = store.search("where does the user live", limit=3)
+            assert "mem-A" not in {r.memory_id for r in results}, (
+                "unrelated intent family must not trigger work probes"
+            )
+            assert all(not getattr(r, "_ce_promoted", False) for r in results)

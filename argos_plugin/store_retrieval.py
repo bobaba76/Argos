@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -45,9 +46,9 @@ from liveness import record_subsystem_failure, record_subsystem_ok
 
 # #248: tuning constants consolidated in tuning.py
 try:
-    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MIN, CE_PROMOTE_MAX
+    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES
 except ImportError:  # store_retrieval.py imported as a top-level module
-    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MIN, CE_PROMOTE_MAX
+    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -1304,16 +1305,20 @@ class StoreRetrievalMixin:
         # rather than overriding the bi-encoder's ranking.
         if self.reranker and len(fused) > 1:
             rerank_pool = fused[:reranker_top_n]
-            # #445: per-retriever union before the CE cut. A vector-top record
-            # with ZERO lexical overlap still loses the fused cut (RRF rewards
-            # presence in BOTH arms, and the rank-1 survival guard needs a
-            # clear margin — a flat semantic head does not produce one). Append
-            # each arm's head so the cross-encoder actually SEES the best
-            # semantic candidate instead of only the lexically-lifted ones.
+            # #445: per-retriever recall band before the CE cut. A vector-top
+            # record with ZERO lexical overlap still loses the fused cut (RRF
+            # rewards presence in BOTH arms, and the rank-1 survival guard
+            # needs a clear margin — a flat semantic head does not produce
+            # one). Live data (11/9) showed the answering record even below
+            # the VECTOR head (rank ~13), so the band is wider than the pool —
+            # the cross-encoder has to actually SEE the best semantic
+            # candidates. The band adds at most one head per arm beyond the
+            # pool, and rescues stay bounded (CE_PROMOTE_MAX, tail-only).
+            _band = max(reranker_top_n * 3, 30)
             union_added: List[MemoryRecord] = []
             _seen_ids = {r.memory_id for r in rerank_pool}
             for _src in (vector_results, text_results):
-                for _r in _src[:reranker_top_n]:
+                for _r in _src[:_band]:
                     if _r.memory_id not in _seen_ids:
                         _seen_ids.add(_r.memory_id)
                         _r._ce_pool_member = True
@@ -1329,7 +1334,27 @@ class StoreRetrievalMixin:
                 increment_counter("rerank_calls")
             except Exception:
                 pass
+            # #445: template-dialect probes. bge-reranker-* is verb-phrase
+            # locked: a natural NL query ("What do I currently work as?")
+            # scores the canonical record template ("User's job title is
+            # ...") ~0.00, while the SAME query spoken in the record's
+            # dialect ("What is user's job title?") scores it 0.99
+            # (measured 11/9 on both bge-reranker-base and v2-m3). When
+            # the query matches an intent family, also score every pool
+            # record against that family's probes and keep the MAX per
+            # record — so a record wins on the QUERY'S MEANING, not on
+            # whether the model happens to bridge the phrasing gap.
+            probes = [query]
+            _ql = query.lower()
+            for _fam_re, _alt in CE_PROBE_ALIASES.values():
+                if re.search(_fam_re, _ql):
+                    probes.extend(_alt)
             scores = self.reranker.score(query, documents)
+            if len(probes) > 1:
+                for _probe in probes[1:]:
+                    _ps = self.reranker.score(_probe, documents)
+                    if _ps and len(_ps) == len(scores):
+                        scores = [max(a, b) for a, b in zip(scores, _ps)]
             if scores and len(scores) == len(rerank_pool):
                 min_s, max_s = min(scores), max(scores)
                 range_s = max_s - min_s
@@ -1339,6 +1364,7 @@ class StoreRetrievalMixin:
                     else:
                         ce_norm = 0.5
                     record._ce_norm = ce_norm  # #445: for the rescue gate
+                    record._ce_raw = float(scores[i])  # #445: raw CE base
                     record.similarity = 0.8 * record.similarity + 0.2 * ce_norm
                     # #280: explicit transient marker so the explainability
                     # pack can distinguish an actual reranker pass from
@@ -1396,20 +1422,34 @@ class StoreRetrievalMixin:
         # them.
         if getattr(self, "_ce_rescue_enabled", True):
             _window = {r.memory_id for r in fused[:limit]}
-            rescue = [
-                r for r in fused
-                if getattr(r, "_ce_pool_member", False)
-                and r.memory_id not in _window
-                and getattr(r, "_ce_norm", 0.0) >= self._CE_PROMOTE_MIN
+            # Baseline: the WORST raw CE among the strict window members
+            # (pool-scored only). A recall-band record that beats it with
+            # the cross-encoder deserves the slot more than the weakest
+            # strict member. Pure pairwise comparison — no absolute
+            # thresholds, no pool-max normalization (an exact-lexical
+            # record can poison a normalized floor: nothing else ever
+            # reaches 95% of its score, round-2 finding).
+            _scored_in_window = [
+                r for r in fused[:limit]
+                if getattr(r, "_ce_raw", None) is not None
             ]
-            rescue.sort(key=lambda r: r._ce_norm, reverse=True)
-            rescue = rescue[:self._CE_PROMOTE_MAX]
-            if rescue:
-                _rescue_ids = {r.memory_id for r in rescue}
-                fused = [r for r in fused if r.memory_id not in _rescue_ids]
-                for r in rescue:
-                    r._ce_promoted = True
-                fused = fused[:limit - len(rescue)] + rescue
+            if _scored_in_window:
+                _tail_ce = min(r._ce_raw for r in _scored_in_window)
+                rescue = [
+                    r for r in fused
+                    if getattr(r, "_ce_pool_member", False)
+                    and r.memory_id not in _window
+                    and getattr(r, "_ce_raw", None) is not None
+                    and r._ce_raw > _tail_ce
+                ]
+                rescue.sort(key=lambda r: r._ce_raw, reverse=True)
+                rescue = rescue[:self._CE_PROMOTE_MAX]
+                if rescue:
+                    _rescue_ids = {r.memory_id for r in rescue}
+                    fused = [r for r in fused if r.memory_id not in _rescue_ids]
+                    for r in rescue:
+                        r._ce_promoted = True
+                    fused = fused[:limit - len(rescue)] + rescue
         final = fused[:limit]
         # #142: clamp final similarity to [0, 1] — additive stages (phrase-lift,
         # importance, graph boost) can push a high base similarity above 1.0.
@@ -1432,7 +1472,6 @@ class StoreRetrievalMixin:
     # that references them via the class.
     _DEDUP_SIMILARITY_THRESHOLD = DEDUP_SIMILARITY_THRESHOLD
     _MAX_EMBEDDING_DIM = MAX_EMBEDDING_DIM
-    _CE_PROMOTE_MIN = CE_PROMOTE_MIN  # #445: from tuning.py
     _CE_PROMOTE_MAX = CE_PROMOTE_MAX  # #445: from tuning.py
 
     def _content_exists(

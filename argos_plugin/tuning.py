@@ -26,6 +26,25 @@ RRF_K = 20
 #                    eligibility is CE-vs-window-tail, no absolute floor)
 CE_PROMOTE_MAX = 2
 
+# #445: VECTOR-ARM template-dialect probes. The bi-encoder is even more
+# phrasing-locked than the CE (measured 11/9: 'what is user's job title'
+# ranks the answering record #5, while 'what is user's role' / 'occupation'
+# / 'do for work' are all ≥#128 or absent — the record literally stores
+# "job title", so only probes carrying the STORED keyword hit). These
+# probes are embedded and merged into the vector candidate set so a
+# paraphrased query still surfaces the record to the ranker at all.
+VECTOR_PROBE_ALIASES = {
+    "work": (
+        r"\b(work as|job title|current role|job|role|employed|occupation|"
+        r"profession|position)\b",
+        ("what is user's job title",),
+    ),
+    "location": (
+        r"\b(live|lives|living|address|resid(?:e|ence)|located|stay(?:ing)?)\b",
+        ("where does user live", "what is user's address"),
+    ),
+}
+
 # #445: query-side template-dialect probes for the cross-encoder.
 # bge-reranker-* is verb-phrase locked: a natural NL query ("What do I
 # currently work as?") scores Argos's canonical record template ("User's

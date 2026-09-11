@@ -46,11 +46,28 @@ from liveness import record_subsystem_failure, record_subsystem_ok
 
 # #248: tuning constants consolidated in tuning.py
 try:
-    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES
+    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES, VECTOR_PROBE_ALIASES
 except ImportError:  # store_retrieval.py imported as a top-level module
-    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES
+    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES, VECTOR_PROBE_ALIASES
 
 logger = logging.getLogger(__name__)
+
+
+def _vector_probe_queries(query: str):
+    """#445: intent-gated template-dialect probes for the VECTOR arm.
+
+    Returns the canonical stored-keyword probe phrasings for any intent
+    family the query matches; [] otherwise (so unrelated queries pay zero
+    extra work). Kept intentionally small — the bi-encoder is phrasing-
+    locked, and measured 11/9 only the probe carrying the record's STORED
+    keyword ('what is user's job title') escaped the ~190-deep wall.
+    """
+    _ql = query.lower()
+    probes = []
+    for _fam_re, _alts in VECTOR_PROBE_ALIASES.values():
+        if re.search(_fam_re, _ql):
+            probes.extend(_alts)
+    return probes
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1294,38 @@ class StoreRetrievalMixin:
                 if not self._is_vector_search_unavailable(exc):
                     logger.warning("Vector search error: %s", exc)
                 vector_results = []
+            # #445: VECTOR-ARM template probes. A natural NL query can bury
+            # the answering record hundreds deep in the vector arm (measured
+            # 11/9: 'What do I currently work as?' ranks the answer record
+            # ~#190 behind a mid-similarity wall) — before any reranker can
+            # see it. Intent-gated probes spoken in the record's OWN dialect
+            # ('what is user's job title' -> #0, measured) are embedded and
+            # PREPENDED to the vector candidate set (top-15 each): appended
+            # hits landed at the tail, beyond the recall band's head slice,
+            # so the pool never saw them (11/9 instrumented). Prepended
+            # hits enter the band, get CE-scored, and rank on merit.
+            # Probes only fire on intent-family matches (regex), so
+            # unrelated queries pay nothing extra.
+            _probe_hits = []
+            _seen_prim = {r.memory_id for r in vector_results}
+            for _probe in _vector_probe_queries(query):
+                try:
+                    _pv = self._vector_search_raw(
+                        self.embedder.embed(_probe, is_query=True), pool_size, excluded,
+                        category_filter, project_id=project_id,
+                        namespace=namespace, client_scope=client_scope,
+                        as_of=as_of, include_expired=include_expired,
+                        include_closed=include_closed,
+                        include_archived=include_archived,
+                        trust_class=trust_class,
+                    )
+                except Exception:
+                    continue
+                for _r in _pv[:15]:
+                    if _r.memory_id not in _seen_prim:
+                        _seen_prim.add(_r.memory_id)
+                        _probe_hits.append(_r)
+            vector_results = _probe_hits + vector_results
 
         # Fuse or select.
         if vector_results and text_results:

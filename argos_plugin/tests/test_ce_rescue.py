@@ -30,6 +30,11 @@ try:
 except ImportError:  # pragma: no cover
     pass
 
+try:
+    from store_retrieval import _vector_probe_queries
+except ImportError:  # pragma: no cover
+    _vector_probe_queries = None
+
 
 def _rec(mid: str, content: str, similarity: float) -> MemoryRecord:
     return MemoryRecord(
@@ -231,3 +236,41 @@ class TestTemplateDialectProbes:
                 "unrelated intent family must not trigger work probes"
             )
             assert all(not getattr(r, "_ce_promoted", False) for r in results)
+
+
+class TestVectorArmProbes:
+    def test_probe_selection(self):
+        assert _vector_probe_queries is not None
+        # Work-family phrasings all yield the canonical stored-keyword probe.
+        for q in ("What do I currently work as?",
+                  "What is my current role?",
+                  "my job title"):
+            assert _vector_probe_queries(q) == ["what is user's job title"], q
+        # Location family yields its own dialect probes.
+        assert _vector_probe_queries("Where do I currently live?") == [
+            "where does user live", "what is user's address"]
+        # Unrelated query -> zero extra work (no probes).
+        assert _vector_probe_queries("alpha beta gamma") == []
+
+    def test_probe_wiring_fires_vector_searches(self):
+        # A work-family query must issue 1 + (work probes) vector searches
+        # (the primary plus the template probes); an unrelated query exactly
+        # 1. The probe results are unioned (empty arms here, so just count).
+        class _Counting(DuckDBMemoryStore):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.calls = 0
+
+            def _vector_search_raw(self, *args, **kwargs):
+                self.calls += 1
+                return []
+
+        tmp = tempfile.TemporaryDirectory()
+        store = _Counting(os.path.join(tmp.name, "r.duckdb"), user_id="test",
+                          embedder=_HashEmbedder())
+        with tmp:
+            store.search("what do I currently work as", limit=3)
+            assert store.calls == 2, "primary + 1 work probe"
+            store.calls = 0
+            store.search("alpha beta gamma", limit=3)
+            assert store.calls == 1, "no probes for an unrelated query"

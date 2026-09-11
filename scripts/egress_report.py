@@ -16,6 +16,11 @@ import sys
 from pathlib import Path
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent / "hybrid_memory_plugin"
+if not _PLUGIN_DIR.is_dir():
+    # Repo layout: the plugin source directory is argos_plugin (the
+    # deployed copy is renamed hybrid_memory). Without this fallback the
+    # script was dead in-repo since the rename (ModuleNotFoundError).
+    _PLUGIN_DIR = Path(__file__).resolve().parent.parent / "argos_plugin"
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
@@ -26,6 +31,7 @@ from egress import (  # noqa: E402
     load_config,
     local_only,
     report,
+    store_derived_identifier_mode,
     site_live,
 )
 
@@ -48,6 +54,7 @@ def _json_report(cfg: dict) -> dict:
             )
     return {
         "local_only": local_only(cfg),
+        "store_derived_identifier_mode": store_derived_identifier_mode(cfg),
         "sites": sites,
         "context_providers": [
             {"kind": s["kind"], "payload": s["payload"], "note": s["note"]}

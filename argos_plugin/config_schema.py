@@ -869,5 +869,19 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             info="When ON, no stored or conversational memory data is sent to any LLM by this plugin — all egress sites fail soft (regex-only extraction, proposals wait for user review, no expansion, no sub-call hints). Embeddings are always local. See scripts/egress_report.py for the full inventory.",
             group="Privacy",
         ),
+        ProviderField(
+            key="store_derived_identifier_mode",
+            label="Store-derived identifier mode",
+            kind=KIND_SELECT,
+            default="redact",
+            description="How plugin LLM calls built from STORED memories (graph typing, distillation, rollup) treat personal identifiers (emails, phone numbers, ID/card digit runs).",
+            info="redact (default): identifiers are masked to [redacted: ...] markers before the payload leaves the machine — the call still runs on cleansed text. gate: refuse those calls when an identifier is present. off: send stored content unchanged (pre-#404 behavior). Conversation-derived calls (extraction, review, expansion) always refuse identifiers outright, regardless of this setting.",
+            options=(
+                ProviderFieldOption("redact", "Redact identifiers (recommended)"),
+                ProviderFieldOption("gate", "Refuse calls with identifiers"),
+                ProviderFieldOption("off", "Send unchanged (legacy)"),
+            ),
+            group="Privacy",
+        ),
     ),
 )

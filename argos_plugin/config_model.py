@@ -173,6 +173,11 @@ class MemoryConfig(BaseModel):
 
     # -- egress ----------------------------------------------------------------
     local_only: bool = False
+    # #404: how store-derived LLM payloads (graph typing, distillation,
+    # rollup) treat personal identifiers — "redact" masks them to
+    # [redacted: label] markers before egress (default); "gate" refuses
+    # such calls; "off" restores the pre-#404 send-unchanged behavior.
+    store_derived_identifier_mode: str = "redact"
     external_sources_require_confirmation: bool = True
 
     # -- scale triggers --------------------------------------------------------

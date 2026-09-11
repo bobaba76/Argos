@@ -658,8 +658,12 @@ def extract_graph_relations_llm(
     """
     if not content or len(content.strip()) < _GRAPH_LLM_MIN_LENGTH:
         return []
-    from egress import gate as _egress_gate
-    if not _egress_gate("graph_typing", content):
+    # #404: gate_payload applies the store-derived identifier policy —
+    # default "redact" proceeds with identifiers masked; "gate" refuses;
+    # "off" sends unchanged.
+    from egress import gate_payload as _egress_gate_payload
+    _egress_allowed, _send_content = _egress_gate_payload("graph_typing", content)
+    if not _egress_allowed:
         return []
 
 
@@ -674,7 +678,7 @@ def extract_graph_relations_llm(
 
     messages = [
         {"role": "system", "content": _GRAPH_LLM_PROMPT},
-        {"role": "user", "content": f"Memory ({category}): {content}"},
+        {"role": "user", "content": f"Memory ({category}): {_send_content}"},
     ]
 
     try:

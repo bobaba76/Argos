@@ -20,11 +20,18 @@ Gate semantics
   are refused when they contain PII identifiers (emails, phone numbers,
   ID/card digit runs) — the call site then fails soft (no proposal, no
   review, no expansion, original results, empty hint).
-* Store-derived payloads (graph typing, distillation) are governed by
-  their own config flags plus ``local_only``; the sensitive-identifier
-  gate does not apply to them, because stored memories legitimately
-  contain identifiers the user chose to keep, and these features are
-  explicitly configured on/off.
+* Store-derived payloads (graph typing, distillation, rollup) run under
+  ``store_derived_identifier_mode`` (#404). ``redact`` (the default)
+  masks identifiers (emails, phones, ID/card digit runs) to
+  ``[redacted: label]`` markers before the call — the call still runs,
+  on cleansed text. ``gate`` refuses such calls outright. ``off``
+  restores the pre-#404 behavior (config flags + ``local_only`` only).
+  The default tightened because in multi-tenant use (Cells) the stored
+  store holds third-party PII, and "send stored content raw to a cloud
+  LLM" must not be the silent default; installs that prefer raw egress
+  of their own single-user data can set ``off``. Conversation-derived
+  sites keep refusing identifiers outright; document-derived
+  watcher_extraction likewise.
 """
 from __future__ import annotations
 
@@ -235,9 +242,58 @@ def all_sensitive_labels(text: str) -> list[str]:
     return [label for pattern, label in SENSITIVE_PATTERNS if pattern.search(text)]
 
 
+# ---------------------------------------------------------------------------
+# Store-derived identifier policy (#404).
+# ---------------------------------------------------------------------------
+
+# Kinds whose payloads are built from STORED memories rather than from
+# the live conversation. Before #404 these were "config-gated only": a
+# stored memory containing an identifier could be re-sent to a cloud
+# LLM (graph typing, distillation, rollup) with no scan — in a
+# multi-tenant Cell that is an exfiltration path for third-party PII
+# the conversation gate would have refused.
+STORE_DERIVED_KINDS = {"graph_typing", "distillation", "memory_rollup"}
+_STORE_DERIVED_MODES = ("redact", "gate", "off")
+DEFAULT_STORE_DERIVED_IDENTIFIER_MODE = "redact"
+
+
+def store_derived_identifier_mode(cfg: dict | None = None) -> str:
+    """The configured store-derived identifier policy: redact|gate|off.
+
+    Unknown values fall back to the safe default (redact) rather than
+    silently disabling the protection.
+    """
+    cfg = cfg if cfg is not None else load_config()
+    raw = str(cfg.get("store_derived_identifier_mode", "")).strip().lower()
+    if raw in _STORE_DERIVED_MODES:
+        return raw
+    return DEFAULT_STORE_DERIVED_IDENTIFIER_MODE
+
+
+def redact(text: str) -> tuple[str, list[str]]:
+    """Mask every sensitive identifier in *text* with ``[redacted: label]``.
+
+    Returns ``(redacted_text, labels_found)``. Reuses the same
+    ``SENSITIVE_PATTERNS`` the conversation gate refuses on, so the two
+    surfaces can never drift. Falsy text returns ``(text, [])``.
+    """
+    if not text:
+        return text, []
+    found: list[str] = []
+    out = text
+    for pattern, label in SENSITIVE_PATTERNS:
+        if pattern.search(out) is None:
+            continue
+        if label not in found:
+            found.append(label)
+        out = pattern.sub(f"[redacted: {label}]", out)
+    return out, found
+
+
 # Grouping for the report: conversation-derived kinds get the
-# sensitive-identifier gate; store-derived kinds are governed by their
-# own config flags plus local_only.
+# sensitive-identifier gate; store-derived kinds run under
+# store_derived_identifier_mode (#404, default: redact) plus their own
+# config flags and local_only.
 GROUPS = [
     (
         "Conversation-derived (sensitive-identifier gated)",
@@ -386,6 +442,11 @@ def gate(kind: str, text: str = "", cfg: dict | None = None) -> bool:
     could make a call the report showed as OFF. Now the gate is the single
     enforcement point — a site whose flag is OFF is refused here regardless
     of what the caller does.
+
+    Note (#404): store-derived call sites (graph typing, distillation,
+    rollup) must use ``gate_payload`` instead — it applies the configured
+    store-derived identifier policy (default: redact) and returns the
+    text to actually send. This function alone cannot cleanse a payload.
     """
     if kind not in _KNOWN_KINDS:
         logger.warning("egress gate: unknown kind %r (defaulting to blocked)", kind)
@@ -409,6 +470,62 @@ def gate(kind: str, text: str = "", cfg: dict | None = None) -> bool:
             )
             return False
     return True
+
+
+def gate_payload(
+    kind: str, text: str = "", cfg: dict | None = None
+) -> tuple[bool, str]:
+    """Gate + cleanse: ``(allowed, text_to_send)``.
+
+    For ``STORE_DERIVED_KINDS`` the payload is processed per
+    ``store_derived_identifier_mode``:
+
+    * ``redact`` (default) — identifiers masked to ``[redacted: label]``
+      markers; the call proceeds on the masked text.
+    * ``gate`` — identifiers present: the call is refused.
+    * ``off`` — legacy behavior; text returned unchanged.
+
+    ``local_only`` and the per-site config flag are enforced in every
+    mode (via ``gate``, so there is still a single enforcement point).
+
+    For every other kind this is exactly ``gate()`` (text unchanged) —
+    conversation-derived sites keep refusing identifiers outright.
+
+    Store-derived call sites MUST route through this helper (not bare
+    ``gate``) so the policy actually reaches the wire: ``gate`` alone
+    cannot cleanse a payload the caller then sends verbatim.
+    """
+    cfg = cfg if cfg is not None else load_config()
+    if kind in STORE_DERIVED_KINDS:
+        mode = store_derived_identifier_mode(cfg)
+        if mode == "off":
+            return gate(kind, text, cfg), text
+        if mode == "gate":
+            if not gate(kind, text, cfg):
+                return False, text
+            label = contains_sensitive(text)
+            if label is not None:
+                logger.info(
+                    "egress gate: refusing %s call (sensitive payload: %s; "
+                    "store_derived_identifier_mode=gate)",
+                    kind,
+                    label,
+                )
+                return False, text
+            return True, text
+        # mode == "redact": the call proceeds on masked text.
+        if not gate(kind, text, cfg):
+            return False, text
+        redacted, labels = redact(text)
+        if labels:
+            logger.info(
+                "egress gate: redacted %s payload for %s call",
+                labels,
+                kind,
+            )
+        return True, redacted
+    allowed = gate(kind, text, cfg)
+    return allowed, text
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +552,7 @@ def report(cfg: dict | None = None) -> str:
         "argos egress report",
         "=========================",
         f"local_only: {lo}",
+        f"store_derived_identifier_mode: {store_derived_identifier_mode(cfg)}",
         "",
         "LLM-bound auxiliary calls (plugin-owned):",
     ]

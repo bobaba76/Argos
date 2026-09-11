@@ -95,6 +95,7 @@ class ConflictSurfacingAnnotation(unittest.TestCase):
             def __init__(self, recs):
                 self._records = recs
                 self._conflict_surfacing_enabled = enabled
+                self._conflict_judge = lambda a, b: True  # loud by default in tests
 
             def _record_injected(self, records):
                 pass
@@ -195,6 +196,67 @@ class ConflictSurfacingAnnotation(unittest.TestCase):
         attached = prov._attach_conflict_notes(recs)
         self.assertEqual([r.memory_id for r in attached[:2]], ["a", "b"])
         self.assertIn("CONFLICT NOTE", attached[2].content)
+
+    def test_judge_true_emits_note(self):
+        # #450: deterministic gate + judge = YES -> note (true contradiction)
+        recs = [
+            _rec("a", "The beta program is active for all users.", "2026-06-05T12:00:00"),
+            _rec("b", "The beta program ended.", "2026-08-15T09:20:00"),
+        ]
+        prov = self._make(recs)
+        prov._conflict_judge = lambda a, b: True
+        notes = prov._conflict_annotations(recs)
+        self.assertEqual(len(notes), 1)
+
+    def test_judge_false_suppresses_note(self):
+        # #450: gate passes but judge says "no real contradiction" -> no note
+        recs = [
+            _rec("a", "Beta users get 10GB of storage.", "2026-06-05T12:00:00"),
+            _rec("b", "The beta program ended.", "2026-08-15T09:20:00"),
+        ]
+        prov = self._make(recs)
+        prov._conflict_judge = lambda a, b: False
+        self.assertEqual(prov._conflict_annotations(recs), [])
+
+    def test_judge_failure_suppresses_note(self):
+        # #450: judge outage must fail closed (no note), never crash
+        recs = [
+            _rec("a", "Beta users get 10GB of storage.", "2026-06-05T12:00:00"),
+            _rec("b", "The beta program ended.", "2026-08-15T09:20:00"),
+        ]
+        def boom(a, b):
+            raise RuntimeError("judge down")
+        prov = self._make(recs)
+        prov._conflict_judge = boom
+        self.assertEqual(prov._conflict_annotations(recs), [])
+
+    def test_judge_not_consulted_for_value_conflicts(self):
+        # #450: numeric value conflicts stay deterministic (no LLM)
+        recs = [
+            _rec("a", "The early payment discount is 2% for invoices paid within 10 days.",
+                 "2026-06-10T15:00:00"),
+            _rec("b", "The early payment discount is 1.5%.", "2026-08-20T12:00:00"),
+        ]
+        prov = self._make(recs)
+        prov._conflict_judge = lambda a, b: False
+        notes = prov._conflict_annotations(recs)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("differing values", notes[0].content)
+
+    def test_residual_generic_word_pair_judge_false(self):
+        # #450 residual class: generic business words next to the marker
+        # ("clause"/"employer" near "limited to") + a third record that
+        # mentions the same generic words -> deterministic gate passes,
+        # judge vetoes -> no note
+        recs = [
+            _rec("a", "The employment clause is limited to the employer's business.",
+                 "2026-08-01T10:00:00"),
+            _rec("b", "The clause audit covers employer paperwork.",
+                 "2026-08-15T10:00:00"),
+        ]
+        prov = self._make(recs)
+        prov._conflict_judge = lambda a, b: False
+        self.assertEqual(prov._conflict_annotations(recs), [])
 
     def test_corroboration_no_note(self):
         recs = [

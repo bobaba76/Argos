@@ -141,6 +141,33 @@ _MARKER_DOUBLE = {"no longer", "no current", "scoped to", "limited to", "only in
 _CONFLICT_PROX_WINDOW = 4
 _CONFLICT_NOTE_SCORE = 0.25   # #447: notes are info, never answers -> capped
 
+# #450: final verdict layer. Deterministic gates (marker/proximity) cannot
+# distinguish "the same claim is contradicted" from "the same generic word
+# appears in both records" (e.g. "clause"/"employer" quietly sitting next to
+# "limited to", and a third unrelated record that also says "employer").
+# A tiny LLM reads the candidate pair and confirms an ACTUAL contradiction
+# before a note is emitted. Fires only when the deterministic gate already
+# passed (rare) so cost is cents. Fail-closed: judge unavailable, times out,
+# or says "no" => no note.
+_CONFLICT_JUDGE_TIMEOUT = 5.0
+_CONFLICT_JUDGE_CACHE_TTL = 3600
+_CONFLICT_JUDGE_SYSTEM_PROMPT = (
+    "You are a strict contradiction checker for a personal memory store.\n"
+    "Two records are given. A REAL conflict means the records are about the "
+    "SAME subject and one claim directly contradicts the other (one says "
+    "something exists / happens / is current, the other says it ended, was "
+    "discontinued, removed, or scoped away).\n"
+    "Do NOT call it a conflict when: the records merely share a word but are "
+    "about different things; one record states a general policy or scoping "
+    "rule and the other never addresses that exact subject; the two are "
+    "compatible or complementary.\n"
+    'Reply with JSON only, e.g. {"conflict": true, "reason": "..."} or '
+    '{"conflict": false, "reason": "..."}.'
+)
+
+_conflict_judge_cache: dict = {}
+
+
 
 def _conflict_significant_tokens(text: str) -> set:
     toks = {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
@@ -159,6 +186,79 @@ def _conflict_shared_subject(a: str, b: str) -> bool:
     """True if two records share a significant token (same subject)."""
     sa, sb = _conflict_significant_tokens(a), _conflict_significant_tokens(b)
     return bool(sa & sb)
+
+
+def _conflict_judge_default(a: str, b: str) -> bool:
+    """Host-LLM verdict on whether *a* and *b* ACTUALLY contradict (#450).
+
+    Same transport as query expansion: egress gate -> agent.auxiliary_client.
+    Fail-closed (any error/timeout/gate-refusal => False => no note).
+    Cached by (a, b) hash for an hour so repeat queries do not re-bill.
+    """
+    import hashlib
+    import json
+    import time
+
+    key = hashlib.sha256((a + "\x00" + b).encode("utf-8")).hexdigest()[:16]
+    hit = _conflict_judge_cache.get(key)
+    if hit is not None:
+        ts, verdict = hit
+        if time.time() - ts < _CONFLICT_JUDGE_CACHE_TTL:
+            return verdict
+
+    try:
+        from egress import gate as _egress_gate
+        if not _egress_gate("conflict_judge", a):
+            return False
+    except Exception:  # noqa: BLE001 — fail-closed
+        return False
+    try:
+        from agent.auxiliary_client import call_llm
+    except Exception:  # noqa: BLE001
+        return False
+
+    messages = [
+        {"role": "system", "content": _CONFLICT_JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": "Record 1:\n" + a + "\n\nRecord 2:\n" + b},
+    ]
+    try:
+        response = call_llm(
+            task="conflict_judge",
+            messages=messages,
+            temperature=0.0,
+            max_tokens=120,
+            timeout=_CONFLICT_JUDGE_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+    text = response
+    if hasattr(response, "choices"):
+        try:
+            text = response.choices[0].message.content
+        except (IndexError, AttributeError, TypeError):
+            return False
+    if not isinstance(text, str):
+        return False
+
+    verdict = False
+    try:
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+            stripped = re.sub(r"\s*```$", "", stripped).strip()
+        data = json.loads(stripped)
+        verdict = bool(data.get("conflict")) if isinstance(data, dict) else False
+    except Exception:  # noqa: BLE001
+        return False
+
+    _conflict_judge_cache[key] = (time.time(), verdict)
+    if len(_conflict_judge_cache) > 2000:
+        now = time.time()
+        for k in [k for k, (ts, _) in _conflict_judge_cache.items()
+                  if now - ts > _CONFLICT_JUDGE_CACHE_TTL]:
+            _conflict_judge_cache.pop(k, None)
+    return verdict
 
 
 def _disjunction_proximate_subject(a: str, b: str) -> bool:
@@ -1101,6 +1201,13 @@ class ProviderRetrievalMixin:
                 ):
                     reason = "differing values"
                 elif _disjunction_proximate_subject(a, b):
+                    judge = getattr(self, "_conflict_judge", _conflict_judge_default)
+                    try:
+                        confirmed = judge(a, b)
+                    except Exception:  # noqa: BLE001 — judge veto must not break surfacing
+                        confirmed = False
+                    if not confirmed:
+                        continue
                     reason = "one record says it was discontinued, removed, or is scoped elsewhere"
                 if not reason:
                     continue

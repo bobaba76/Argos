@@ -26,6 +26,20 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Safety: disable tqdm's monitor thread globally for this process.
+# tqdm's TMonitor can deadlock with concurrent bar construction in
+# multi-threaded contexts (service wedges observed 2026-09-03 and
+# 2026-09-11), and sentence-transformers constructs tqdm objects
+# internally even when show_progress_bar=False.  monitor_interval=0
+# means no monitor thread is ever started (tqdm std.py: "set to 0 to
+# disable the thread").
+try:  # pragma: no cover - best-effort safety net
+    import tqdm as _tqdm_safety
+
+    _tqdm_safety.tqdm.monitor_interval = 0
+except Exception:  # pragma: no cover
+    pass
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
@@ -473,7 +487,7 @@ class CrossEncoderReranker:
             return []
         try:
             pairs = [(query, doc) for doc in documents]
-            scores = model.predict(pairs)
+            scores = model.predict(pairs, show_progress_bar=False)
             return [float(s) for s in scores]
         except Exception as e:
             logger.debug("Reranker scoring failed: %s", e)

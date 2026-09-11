@@ -401,6 +401,38 @@ class TestCarryForward:
 # Service boundary: server-derived policy, client values stripped
 # ===========================================================================
 
+class TestRpcRoundTrip:
+    """Spec-13 (#393 S1): trust_class survives the RPC serialization seam.
+
+    The live acceptance probe caught this gap: the store row and to_dict()
+    carried the marker, but the client-side _record_from_dict whitelist
+    dropped it, so consumers saw trust_class=None for every record.
+    """
+
+    def test_record_from_dict_carries_trust_class(self):
+        from argos.service_client import _record_from_dict
+
+        rec = _record_from_dict({
+            "memory_id": "mem-roundtrip",
+            "category": "context_note",
+            "content": "round-trip carrier",
+            "source": "llm_extraction",
+            "trust_class": "unreviewed",
+        })
+        assert rec.trust_class == "unreviewed"
+
+    def test_record_from_dict_missing_trust_class_defaults_none(self):
+        from argos.service_client import _record_from_dict
+
+        rec = _record_from_dict({
+            "memory_id": "mem-plain",
+            "category": "context_note",
+            "content": "no marker",
+            "source": "llm_extraction",
+        })
+        assert rec.trust_class is None
+
+
 class TestServiceBoundary:
     def test_approval_mode_is_forbidden_client_arg(self):
         from memory_service import _FORBIDDEN_CLIENT_ARGS

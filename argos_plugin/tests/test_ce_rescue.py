@@ -184,6 +184,32 @@ class TestCeRescue:
             assert "mem-A" not in {r.memory_id for r in results}
 
 
+def test_initial_pool_member_rescued():
+        # Regression (11/9): the rescue gate tested _ce_pool_member, but that
+        # flag was only set on band-union additions. A record that makes the
+        # INITIAL top-N fused slice (high vector rank via probe, ZERO lexical
+        # overlap) was in the pool and CE-scored ~perfect, yet ineligible for
+        # rescue — its blended similarity (0.8*RRF-sim + 0.2*CE) kept it
+        # buried. A sits at fused position #2 (inside fused[:top_n=2]) and
+        # must be flagged + rescued into the limit-1 window.
+        vector = [
+            _rec("mem-A", "alpha semantic content", 0.99),
+            _rec("mem-B", "beta content", 0.50),
+        ]
+        text = [
+            _rec("mem-B", "beta content", 0.99),
+        ]
+        store, tmp = _build(vector, text, limit=1, top_n=2,
+                            strong=("alpha",))
+        with tmp:
+            results = store.search("alpha beta gamma", limit=1)
+            assert results[0].memory_id == "mem-A", (
+                "initial-pool (top-N slice) member with near-perfect CE must "
+                "be rescue-eligible — the flag must cover the whole pool"
+            )
+            assert getattr(results[0], "_ce_promoted", False)
+
+
 class TestTemplateDialectProbes:
     @staticmethod
     def _arms():

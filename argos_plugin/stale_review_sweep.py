@@ -13,9 +13,12 @@ parsed but never read:
 
 The sweep rides on the existing review_pending.py engine — it calls
 ``review_candidate_with_llm`` for each stale candidate and records the
-outcome via ``store.review_candidate``. No auto-promotion: the decision
-map is identical to the manual CLI; low-risk approvals become
-``reviewed_approved`` and still require explicit promotion.
+outcome via ``store.review_candidate``. The decision map is identical to
+the manual CLI: the sweep never reaches the user-confirmed class — a
+low-risk approval becomes ``reviewed_approved``, which under the
+materialize-await-lift semantic (#429) materializes (or keeps) the record
+at its capped grounding tier; explicit user confirmation is still
+required to LIFT the tier. It never promotes a candidate to ``approved``.
 
 Runs as a daemon thread on the provider side (piggybacks on the existing
 thread pattern). Fail-soft on LLM error — a failed sweep is a no-op,
@@ -31,7 +34,9 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Decision map — identical to review_pending.py (no auto-promotion).
+# Decision map — identical to review_pending.py (no auto-promotion of the
+# user-confirmed class; reviewed_approved materializes at the capped tier
+# per #429 and still awaits explicit user confirmation to LIFT).
 _DECISION_MAP = {
     "approve": "reviewed_approved",
     "reject": "rejected",
@@ -91,8 +96,10 @@ def run_stale_review_sweep(
         {"reviewed_approved": 3, "rejected": 1}).
 
     Never raises — a failed sweep is a no-op, not a crash. The sweep
-    preserves the no-auto-promotion invariant: low-risk approvals become
-    ``reviewed_approved`` and still require explicit promotion.
+    preserves the no-auto-promotion invariant for the user-confirmed
+    class: low-risk approvals become ``reviewed_approved``, which
+    materializes at the capped grounding tier (#429, materialize-await-
+    lift) and still awaits explicit user confirmation to LIFT the tier.
     """
     counts: Dict[str, int] = {}
     try:

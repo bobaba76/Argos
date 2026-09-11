@@ -552,3 +552,119 @@ class TestQuoteVerification:
             assert cand["grounding"] == "inferred"
         finally:
             store.close()
+
+
+# ===========================================================================
+# #429 — materialize-await-lift (review materialization contract)
+# ===========================================================================
+
+class TestReviewMaterializationContract:
+    """#429: reviewed_approved materializes the record at its capped tier
+    and tags the candidate; user confirmation LIFTS the tier instead of
+    creating the record (and lifts an existing twin instead of no-op'ing)."""
+
+    def test_reviewed_approved_materialization_is_tagged(self, tmp_path):
+        """A reviewed_approved pass materializes at the capped tier and tags
+        the candidate with payload.materialized_memory_id so surfaces can
+        distinguish 'awaiting confirmation' from 'already live'."""
+        import json
+        store = _make_store(tmp_path)
+        try:
+            cand = store.save_candidate(
+                category="context_note",
+                content="User keeps a bike in the garage",
+                source="llm_extraction",
+                confidence=0.6,
+            )
+            result = store.review_candidate(
+                candidate_id=cand["candidate_id"],
+                decision="reviewed_approved",
+                reason="auto ok",
+                review_source="auto_review",
+            )
+            memory = result["memory"]
+            assert memory is not None, (
+                "materialize-await-lift expects a record at the capped tier"
+            )
+            row = store.list_candidates(
+                candidate_id=cand["candidate_id"], limit=1,
+            )[0]
+            payload = row.get("payload")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            assert (payload or {}).get("materialized_memory_id") == (
+                memory["memory_id"]
+            )
+        finally:
+            store.close()
+
+    def test_confirmation_lifts_twin_instead_of_noop(self, tmp_path):
+        """User confirmation that resolves to an existing twin must LIFT the
+        twin's grounding, not silently no-op as 'deduplicated'."""
+        store = _make_store(tmp_path)
+        try:
+            # The twin: an inferred-tier record already in the store.
+            twin = store.remember(
+                category="context_note",
+                content="User is temporarily on the night shift",
+                grounding="inferred",
+            )
+            assert twin is not None
+            # Resolution needs the embedder, which a bare test store lacks —
+            # pin the semantic seam deterministically.
+            store.find_semantic_duplicate = (
+                lambda content, min_similarity=0.90: twin
+            )
+            cand = store.save_candidate(
+                category="context_note",
+                content="User is temporarily on the night shift",
+                source="llm_extraction",
+                confidence=0.6,
+            )
+            result = store.review_candidate(
+                candidate_id=cand["candidate_id"],
+                decision="approved",
+                reason="user confirmed",
+                review_source="tool",
+            )
+            # remember() deduplicated against the twin...
+            assert result["candidate"]["status"] == "deduplicated"
+            # ...and the confirmation LIFTED the twin's grounding
+            # (inferred -> extracted for a confirmed 'approved').
+            refreshed = store.get_memories_by_ids([twin.memory_id])[0]
+            assert refreshed.grounding == "extracted"
+        finally:
+            store.close()
+
+    def test_auto_confirmation_cannot_lift_twin(self, tmp_path):
+        """The lift is user-confirmed only: an auto_review resolution that
+        dedups must NOT lift the twin's tier."""
+        store = _make_store(tmp_path)
+        try:
+            twin = store.remember(
+                category="context_note",
+                content="User is temporarily on the night shift",
+                grounding="inferred",
+            )
+            store.find_semantic_duplicate = (
+                lambda content, min_similarity=0.90: twin
+            )
+            cand = store.save_candidate(
+                category="context_note",
+                content="User is temporarily on the night shift",
+                source="llm_extraction",
+                confidence=0.6,
+            )
+            result = store.review_candidate(
+                candidate_id=cand["candidate_id"],
+                decision="reviewed_approved",
+                reason="auto ok",
+                review_source="auto_review",
+            )
+            assert result["candidate"]["status"] == "deduplicated"
+            refreshed = store.get_memories_by_ids([twin.memory_id])[0]
+            assert refreshed.grounding == "inferred", (
+                "auto_review must never lift the twin's grounding"
+            )
+        finally:
+            store.close()

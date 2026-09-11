@@ -2,8 +2,10 @@
 """Review pending memory proposals through the shared service.
 
 This is safe to run with Hermes stopped or running because the service owns the
-canonical database. It never promotes a proposal automatically; low-risk
-approvals become ``reviewed_approved`` and still require explicit promotion.
+canonical database. It never promotes a proposal to the user-confirmed class
+automatically; low-risk approvals become ``reviewed_approved``, which
+materializes at the capped grounding tier (#429, materialize-await-lift) and
+still awaits explicit user confirmation to LIFT the tier.
 """
 from __future__ import annotations
 

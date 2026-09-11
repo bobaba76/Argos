@@ -1742,6 +1742,13 @@ class StoreWriteMixin:
         # ceiling moves with grounding, not with use); auto-review is capped
         # and downgrades to the ceiling instead. Recall counts are never
         # verification — they cannot reach this path.
+        #
+        # #429: review materialization is materialize-await-lift — a
+        # reviewed_approved decision MATERIALIZES the record at its capped
+        # tier (tagged via payload.materialized_memory_id); user
+        # confirmation LIFTS the tier instead of creating the record. A
+        # confirmation that resolves to an existing twin lifts that twin
+        # (see the dedup branch below) rather than no-op'ing.
         candidate_grounding = candidate.get("grounding", GROUNDING_SPECULATIVE)
         user_confirmed = review_source in {"tool", "manual"}
         if decision in {"approved", "reviewed_approved"}:
@@ -1822,6 +1829,47 @@ class StoreWriteMixin:
                     memory = self.remember(**remember_kwargs)
                     if memory is None:
                         final_status = "deduplicated"
+                        # #429: user confirmation of a candidate whose
+                        # content already materialized (typically this
+                        # candidate's own earlier reviewed_approved pass)
+                        # must LIFT the existing twin's tier instead of
+                        # silently no-op'ing. Fail-soft: resolution needs
+                        # the embedder; without it the confirmation is
+                        # still recorded status-only.
+                        if review_source in {"tool", "manual"}:
+                            try:
+                                _target = (
+                                    GROUNDING_EXTRACTED
+                                    if _original_decision == "approved"
+                                    else GROUNDING_INFERRED
+                                )
+                                _g_rank = {
+                                    "speculative": 0, "inferred": 1,
+                                    "extracted": 2, "observed": 3,
+                                }
+                                _twin = self.find_semantic_duplicate(
+                                    candidate["content"], min_similarity=0.90,
+                                )
+                                _mid = getattr(_twin, "memory_id", None)
+                                _cur = normalize_grounding(
+                                    getattr(_twin, "grounding", None)
+                                )
+                                if (
+                                    _mid
+                                    and _g_rank.get(_cur, 0)
+                                    < _g_rank.get(_target, 3)
+                                ):
+                                    self.connection.execute(
+                                        """UPDATE memory_records
+                                           SET grounding = ?, updated_at = ?
+                                           WHERE memory_id = ?""",
+                                        [_target, self._now(), _mid],
+                                    )
+                            except Exception as _exc:
+                                logger.debug(
+                                    "#429: confirmation twin-lift failed: %s",
+                                    _exc,
+                                )
                     elif supersedes_memory_id:
                         # Chain the new memory behind the named current record.
                         # Same supersession semantics as update_memory, but the
@@ -1875,6 +1923,28 @@ class StoreWriteMixin:
                                 logger.debug(
                                     "Supersession tombstone write failed: %s", exc
                                 )
+                # #429: tag a reviewed_approved materialization so surfaces
+                # can distinguish "awaiting confirmation" from "awaiting
+                # confirmation — already live at the capped tier"
+                # (materialize-await-lift). The candidate status stays
+                # reviewed_approved; user confirmation LIFTS the record.
+                if memory is not None and decision == "reviewed_approved":
+                    try:
+                        _pl = candidate.get("payload") or {}
+                        if isinstance(_pl, str):
+                            _pl = json.loads(_pl) or {}
+                        _pl = dict(_pl)
+                        _pl["materialized_memory_id"] = memory.memory_id
+                        self.connection.execute(
+                            """UPDATE memory_candidates
+                               SET payload = ?
+                               WHERE candidate_id = ?""",
+                            [json.dumps(_pl), candidate_id],
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "#429: materialized marker write failed: %s", exc
+                        )
                 self.connection.execute(
                     """UPDATE memory_candidates
                        SET status = ?, updated_at = ?, reviewed_at = ?, review_reason = ?,

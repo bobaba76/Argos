@@ -1358,6 +1358,13 @@ class StoreRetrievalMixin:
         # rather than overriding the bi-encoder's ranking.
         if self.reranker and len(fused) > 1:
             rerank_pool = fused[:reranker_top_n]
+            # #445-fix: the rescue gate tests _ce_pool_member, but the flag
+            # was only set on band-union additions — a record that makes the
+            # INITIAL top-N slice (e.g. via a vector-arm probe at fused
+            # position ~2) was forever ineligible for rescue despite a
+            # near-perfect CE raw. Flag the whole pool.
+            for _r in rerank_pool:
+                _r._ce_pool_member = True
             # #445: per-retriever recall band before the CE cut. A vector-top
             # record with ZERO lexical overlap still loses the fused cut (RRF
             # rewards presence in BOTH arms, and the rank-1 survival guard

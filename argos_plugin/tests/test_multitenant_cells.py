@@ -35,6 +35,9 @@ pytestmark = pytest.mark.xdist_group("shared_service")
 
 _TWO_TENANT_CONFIG = {
     "local_embedding_model": "nonexistent-model-xyz",
+    # Spec-13 (#393): the candidate-queue isolation test pins the human
+    # write policy so saves queue (the auto default materializes them).
+    "approval_mode": "human",
     "tenants": {
         "default": {
             "database_filename": "default.duckdb",

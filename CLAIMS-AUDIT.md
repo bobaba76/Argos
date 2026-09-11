@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 162 test modules in `argos_plugin/tests/` (3,105 `def test_` definitions; counts generated via AST 2026-09-11 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 164 test modules in `argos_plugin/tests/` (3,162 `def test_` definitions; counts generated via AST 2026-09-11 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -301,3 +301,10 @@ committed, re-runnable artifact:
   merge waves since the last refresh (#427/#428, #429, #425, #404 — trust-model,
   tenant-policy, sweep-coordination, RPC and egress tests). No measurement claims
   changed; the row's "last recorded full-suite green run" line is unchanged.
+
+- **2026-09-11 (#393 S1)** — §2 test-suite row + README Verification bullet refreshed
+  again: 162 modules / 3,105 `def test_` definitions (this morning's refresh) now
+  164 / 3,162, counted the same way (AST via `scripts/count_test_fns.py::count_suite`).
+  The increase covers #439's in-service drift-watch suite and #393 S1's write-policy
+  suite (`test_approval_mode.py`, plus approval-mode dispatch coverage in
+  `test_tenant_policy.py`). No measurement claims changed.

@@ -102,6 +102,20 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="approval_mode",
+            label="Write approval mode",
+            kind=KIND_SELECT,
+            default="auto",
+            description="How new memories from background extraction, watchers, and the external API are written.",
+            info="auto (default): saves become active immediately - medium/high-risk signals are stamped as unreviewed (rank-penalized by at most 3 positions, never auto-promoted, resolvable only by an explicit human action). human: v1 behavior - nothing becomes active without human approval. Invalid values fail closed to human. Per-tenant tenants can override this in their own cell config.",
+            options=(
+                ProviderFieldOption("auto", "Auto-save with trust tiers (recommended)"),
+                ProviderFieldOption("human", "Human approval required (v1)"),
+            ),
+            inline=True,
+            group="Extraction",
+        ),
+        ProviderField(
             key="confirmation_surfacing",
             label="Surface confirmations",
             kind=KIND_BOOL,

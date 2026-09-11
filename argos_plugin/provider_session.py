@@ -691,6 +691,11 @@ class ProviderSessionMixin:
                         evidence_text=user_content,
                         evidence_role="user_turn",
                         dedup=True,
+                        # Spec-13 (#393 S1): write policy. In shared mode the
+                        # service re-derives this from the tenant policy (a
+                        # client value is stripped); in direct mode this
+                        # carries the config value through.
+                        approval_mode=getattr(self, "_approval_mode", None),
                     )
                     if candidate:
                         proposed += 1

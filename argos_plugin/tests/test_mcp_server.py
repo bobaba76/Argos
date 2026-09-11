@@ -79,6 +79,10 @@ class StubStore:
         self._next += 1
         return {"candidate_id": cid, "status": "pending", **kwargs}
 
+    def save_api_candidate(self, **kwargs) -> Dict[str, Any]:
+        # #422: the facade propose path writes through save_api_candidate.
+        return self.save_candidate(**{k: v for k, v in kwargs.items()})
+
     def review_candidate(self, **kwargs) -> Dict[str, Any] | None:
         return {"candidate": {"candidate_id": kwargs.get("candidate_id")}, "memory": None}
 

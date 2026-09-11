@@ -259,6 +259,12 @@ class TestReviewModeEnforcement:
                     "allowed_user_ids": ["user-r"],
                     "config": {
                         "review_mode": "confirm",
+                        # Spec-13 (#393 S1): this suite pins the REVIEW
+                        # mechanics, which now run under the human write
+                        # policy (saves queue, then review_mode steers the
+                        # reviewer). The auto-write default has its own
+                        # dispatch tests in TestApprovalModeDispatch.
+                        "approval_mode": "human",
                         "external_sources_require_confirmation": "true",
                     },
                 },
@@ -268,6 +274,7 @@ class TestReviewModeEnforcement:
                     "allowed_user_ids": ["user-p"],
                     "config": {
                         "review_mode": "auto",
+                        "approval_mode": "human",
                         "external_sources_require_confirmation": "false",
                     },
                 },
@@ -488,3 +495,78 @@ class TestBackwardCompat:
         config = {"local_only": "true"}
         tenants, _, _, _cm, _cd = _parse_tenants(config, tmp_path, None, None)
         assert tenants["default"].policy.local_only is True
+
+
+# ===========================================================================
+# Spec-13 (#393 S1): approval_mode through the real dispatch path
+# ===========================================================================
+
+class TestApprovalModeDispatch:
+    """The write policy is server-derived per tenant; the default is
+    auto (materialize immediately), explicit human keeps the v1 queue,
+    and a client-supplied value can never flip it."""
+
+    def _make_service(self, tmp_path) -> MemoryService:
+        config = {
+            "tenants": {
+                "autowriter": {
+                    "database_filename": "auto.duckdb",
+                    "graph_dirname": "auto_kuzu",
+                    "allowed_user_ids": ["user-a"],
+                    # No approval_mode key: spec default ("auto").
+                },
+                "humanwriter": {
+                    "database_filename": "human.duckdb",
+                    "graph_dirname": "human_kuzu",
+                    "allowed_user_ids": ["user-h"],
+                    "config": {"approval_mode": "human"},
+                },
+            },
+        }
+        (tmp_path / "hybrid_memory.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        return MemoryService(tmp_path)
+
+    def test_default_tenant_materializes_immediately(self, tmp_path):
+        svc = self._make_service(tmp_path)
+        cand = svc.dispatch({
+            "component": "store", "method": "save_candidate",
+            "user_id": "user-a",
+            "args": {
+                "category": "personal_fact",
+                "content": "User works at TechCorp on the harbour account",
+                "source": "llm_extraction",
+                "evidence_text": "User said it during the call",
+            },
+        })
+        assert cand["status"] == "auto_saved"
+        mid = cand["payload"]["materialized_memory_id"]
+        mems = svc.dispatch({
+            "component": "store", "method": "get_memories_by_ids",
+            "user_id": "user-a", "args": {"memory_ids": [mid]},
+        })
+        assert isinstance(mems, list) and len(mems) == 1
+        assert mems[0]["memory_id"] == mid
+
+    def test_human_tenant_queues(self, tmp_path):
+        svc = self._make_service(tmp_path)
+        cand = svc.dispatch({
+            "component": "store", "method": "save_candidate",
+            "user_id": "user-h",
+            "args": {"category": "personal_fact", "content": "User likes coffee"},
+        })
+        assert cand["status"] == "pending"
+
+    def test_client_cannot_force_auto_on_human_tenant(self, tmp_path):
+        svc = self._make_service(tmp_path)
+        cand = svc.dispatch({
+            "component": "store", "method": "save_candidate",
+            "user_id": "user-h",
+            "args": {
+                "category": "personal_fact",
+                "content": "User likes rooibos tea",
+                "approval_mode": "auto",  # stripped at the boundary
+            },
+        })
+        assert cand["status"] == "pending"

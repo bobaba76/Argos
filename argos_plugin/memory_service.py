@@ -111,6 +111,10 @@ _FORBIDDEN_CLIENT_ARGS = frozenset({
     "user_scope",
     "confidence",
     "review_mode",  # policy is server-derived (#127)
+    "approval_mode",  # Spec-13 (#393 S1): write policy is server-derived —
+                      # a client-supplied value could flip a tenant's
+                      # approval policy; the service applies the tenant
+                      # policy value in _call_store.
     "requested_by",  # #293: erase-receipt attribution is server-derived —
                      # a client-supplied requested_by would forge the
                      # audit trail of a provable deletion.
@@ -250,6 +254,9 @@ class TenantPolicy:
 
     Captures all policy fields that must be tenant-scoped:
     - review_mode: "confirm" (default, human approval required) or "auto"
+    - approval_mode: "auto" (default, writes materialize immediately with
+      a server-classified trust tier) or "human" (v1 queue behavior);
+      Spec-13 #393
     - max_injected_items: injection cap per turn
     - inject_content_char_cap: per-memory char cap in injection
     - external_sources_require_confirmation: external-origin auto-activate gate
@@ -265,7 +272,8 @@ class TenantPolicy:
     """
 
     __slots__ = (
-        "review_mode", "max_injected_items", "inject_content_char_cap",
+        "review_mode", "approval_mode", "max_injected_items",
+        "inject_content_char_cap",
         "external_sources_require_confirmation", "local_only",
     )
 
@@ -275,6 +283,15 @@ class TenantPolicy:
         ).strip().lower()
         if self.review_mode not in ("confirm", "auto"):
             self.review_mode = "confirm"  # fail closed
+        # Spec-13 (#393 S1): write policy. "auto" (default): saves
+        # materialize immediately, medium/high-risk signals stamped
+        # unreviewed (never auto-promoted). "human": v1 queue behavior.
+        # Invalid values fail closed to "human".
+        self.approval_mode: str = str(
+            config.get("approval_mode", "auto")
+        ).strip().lower()
+        if self.approval_mode not in ("auto", "human"):
+            self.approval_mode = "human"  # fail closed
         self.max_injected_items: int = max(
             0, min(_cfg_int(config.get("max_injected_items"), 5), 50)
         )
@@ -291,6 +308,7 @@ class TenantPolicy:
     def to_dict(self) -> dict:
         return {
             "review_mode": self.review_mode,
+            "approval_mode": self.approval_mode,
             "max_injected_items": self.max_injected_items,
             "inject_content_char_cap": self.inject_content_char_cap,
             "external_sources_require_confirmation": self.external_sources_require_confirmation,
@@ -786,7 +804,16 @@ class MemoryService:
             return [_record_to_dict(record) for record in records]
         if method == "save_candidate":
             # MS1: strip server-set fields from client args.
-            return store.save_candidate(**_sanitize_args(args))
+            _args = _sanitize_args(args)
+            # Spec-13 (#393 S1): approval_mode is SERVER-derived - a
+            # client-supplied value was stripped above; the tenant policy
+            # value is applied here (same trust model as review_mode,
+            # #127). Defaults to "auto" when no policy is in context:
+            # the service IS the deployment boundary.
+            _args["approval_mode"] = (
+                policy.approval_mode if policy is not None else "auto"
+            )
+            return store.save_candidate(**_args)
         if method == "save_api_candidate":
             # #422: external-API proposal path. Provenance is server-set
             # inside the store method (source="api",
@@ -797,7 +824,11 @@ class MemoryService:
             # pre_scan_blocked can only downgrade (speculative/0.0); the
             # store's own inbound scan (external=True) remains the
             # authoritative boundary.
-            return store.save_api_candidate(**_sanitize_args(args))
+            _args = _sanitize_args(args)
+            _args["approval_mode"] = (
+                policy.approval_mode if policy is not None else "auto"
+            )
+            return store.save_api_candidate(**_args)
         if method == "ingest_structured":
             # #289: structured ingestion (JSON/CSV → memory with
             # provenance). Provenance is server-set inside
@@ -1652,6 +1683,7 @@ class MemoryService:
                     ),
                     "acl_enforcement": t.acl.enforcement_on,
                     "review_mode": t.policy.review_mode,
+                    "approval_mode": t.policy.approval_mode,
                 }
                 for name, t in visible_tenants.items()
             }

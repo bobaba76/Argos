@@ -415,6 +415,8 @@ class MemoryRecord:
         # #392: record class marker. NULL = normal user memory,
         # 'system_internal' = engine-room noise excluded from distillation.
         "record_class",
+        # Spec-13 (#393): write-policy trust class ('unreviewed' or NULL).
+        "trust_class",
         # #280: transient marker set by the cross-encoder reranker blend
         # loop (store_retrieval.py). Not persisted — only lives on the
         # in-memory record during a retrieval pass. Used by the
@@ -468,6 +470,7 @@ class MemoryRecord:
         embedder_id: str | None = None,
         embedded_at: str | None = None,
         record_class: str | None = None,
+        trust_class: str | None = None,
     ) -> None:
         self.memory_id = memory_id
         self.category = category
@@ -534,6 +537,10 @@ class MemoryRecord:
         # #392: record class marker. NULL = normal user memory,
         # 'system_internal' = engine-room noise excluded from distillation.
         self.record_class = record_class
+        # Spec-13 (#393): write-policy trust class. NULL = clean/normal;
+        # 'unreviewed' = auto-saved with medium/high risk signals - rank-
+        # penalized at retrieval, resolvable only by explicit human action.
+        self.trust_class = trust_class
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -578,6 +585,7 @@ class MemoryRecord:
             "embedder_id": self.embedder_id,
             "embedded_at": self.embedded_at,
             "record_class": self.record_class,
+            "trust_class": self.trust_class,
         }
 
 

@@ -214,6 +214,7 @@ class StoreRetrievalMixin:
             embedder_id=row.get("embedder_id"),
             embedded_at=row.get("embedded_at"),
             record_class=row.get("record_class"),
+            trust_class=row.get("trust_class"),
         )
 
     def _fetch_records(
@@ -838,6 +839,54 @@ class StoreRetrievalMixin:
             return float("-inf")
         return parsed.timestamp()
 
+    @staticmethod
+    def _apply_trust_penalty(
+        records: List[MemoryRecord], limit: int | None = None
+    ) -> None:
+        """Spec-13 (#393): bounded rank penalty for 'unreviewed' records.
+
+        Auto-saved unreviewed-tier records stay retrievable but must not
+        outrank clean memories on raw similarity alone. Each unreviewed
+        record is delayed by at most 3 emitted clean slots (a stable,
+        budgeted delay - not a score hack), and a record that was inside
+        the returned window can never be pushed out of it: its budget is
+        clamped to the room between its position and the window edge.
+        Relative order among clean records is preserved. Zero effect
+        when no record carries the marker.
+        """
+        max_sink = 3
+        try:
+            if __package__:
+                from .trust_tier import RANK_PENALTY_MAX as max_sink
+            else:
+                from trust_tier import RANK_PENALTY_MAX as max_sink
+        except Exception:
+            pass
+        pending: list = []  # [record, remaining_budget]
+        out: List[MemoryRecord] = []
+        window = len(records) if limit is None else max(0, min(int(limit), len(records)))
+        for idx, rec in enumerate(records):
+            marker = str(getattr(rec, "trust_class", None) or "").strip().lower()
+            if marker != "unreviewed":
+                out.append(rec)
+                for item in pending:
+                    item[1] -= 1
+                released = [p[0] for p in pending if p[1] <= 0]
+                if released:
+                    out.extend(released)
+                    pending = [p for p in pending if p[1] > 0]
+                continue
+            budget = max_sink
+            if idx < window:
+                # Never push an in-window record out of the window.
+                budget = max(0, min(budget, (window - 1) - idx))
+            if budget <= 0:
+                out.append(rec)  # window edge: no room below - stays put
+                continue
+            pending.append([rec, budget])
+        out.extend(p[0] for p in pending)
+        records[:] = out
+
     @classmethod
     def _apply_p2c(cls, records: List[MemoryRecord]) -> None:
         """If enabled, promote the newer member of each near-duplicate pair above the older.
@@ -1232,6 +1281,8 @@ class StoreRetrievalMixin:
         # Apply feedback weighting and recency boost, then truncate.
         self._apply_feedback_and_recency(fused)
         self._apply_p2c(fused)  # P2C: demote older of a near-duplicate pair (flag-gated)
+        # Spec-13 (#393): bounded rank penalty for unreviewed-class records.
+        self._apply_trust_penalty(fused, limit)
         final = fused[:limit]
         # #142: clamp final similarity to [0, 1] — additive stages (phrase-lift,
         # importance, graph boost) can push a high base similarity above 1.0.

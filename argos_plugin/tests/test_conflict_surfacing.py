@@ -50,6 +50,21 @@ class ConflictSurfacingHelpers(unittest.TestCase):
         self.assertFalse(_has_discontinuation_marker(
             "The contractor day rate is R1,350."))
 
+    def test_no_marker_inside_words(self):
+        # #442: substring matching fired markers inside unrelated words
+        self.assertFalse(_has_discontinuation_marker("The account was suspended."))
+        self.assertFalse(_has_discontinuation_marker("status=pending_user_confirmation"))
+        self.assertFalse(_has_discontinuation_marker("They attended the demo."))
+        # genuine word-boundary markers still detected
+        self.assertTrue(_has_discontinuation_marker("The beta program ended."))
+        self.assertTrue(_has_discontinuation_marker("FTP uploads were discontinued."))
+
+    def test_function_word_not_shared_subject(self):
+        # #442: a single shared function word ("than") no longer counts
+        self.assertFalse(_conflict_shared_subject(
+            "Batch exports finish faster than the nightly run.",
+            "We prefer Postgres rather than MySQL."))
+
 
 class ConflictSurfacingAnnotation(unittest.TestCase):
     def _make(self, records, enabled=True):
@@ -105,6 +120,28 @@ class ConflictSurfacingAnnotation(unittest.TestCase):
         recs = [
             _rec("a", "The company was founded in 2011.", "2026-08-01T10:00:00"),
             _rec("b", "The product ships weekly.", "2026-08-03T09:30:00"),
+        ]
+        prov = self._make(recs)
+        self.assertEqual(prov._conflict_annotations(recs), [])
+
+    def test_function_word_overlap_no_note(self):
+        # #442 repro 1: shared "than" + a real marker elsewhere must not fire
+        recs = [
+            _rec("a", "Backups to the DR site complete slower than the primary.",
+                 "2026-08-01T10:00:00"),
+            _rec("b", "We prefer Postgres rather than MySQL; the old FTP upload "
+                      "workaround ended.", "2026-08-15T10:00:00"),
+        ]
+        prov = self._make(recs)
+        self.assertEqual(prov._conflict_annotations(recs), [])
+
+    def test_substring_marker_no_note(self):
+        # #442 repro 2: "pending"/"suspended" previously matched "ending"/"ended"
+        recs = [
+            _rec("a", "The billing pipeline reports are pending review.",
+                 "2026-08-01T10:00:00"),
+            _rec("b", "Auto-scaling switches suspended during the review window.",
+                 "2026-08-15T10:00:00"),
         ]
         prov = self._make(recs)
         self.assertEqual(prov._conflict_annotations(recs), [])

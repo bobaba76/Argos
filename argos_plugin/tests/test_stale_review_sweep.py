@@ -12,6 +12,7 @@ Tests (deterministic, no LLM calls):
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,8 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from stale_review_sweep import (
     StaleReviewSweepThread,
+    _eligible_for_sweep,
     _is_stale,
     _parse_iso,
+    _sweep_backoff,
     run_stale_review_sweep,
 )
 
@@ -459,3 +462,183 @@ class TestStoreIntegration:
         assert "fresh fact" in pending_contents
         assert "stale fact" not in pending_contents
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. Coordination (#425): single-flight claim + no-progress cooldown
+# ---------------------------------------------------------------------------
+
+
+class TestSweepCoordination425:
+    """#425: cross-process single-flight claim (one pass per interval across
+    all providers) + per-candidate no-progress cooldown so a never-finalized
+    backlog is not re-reviewed on every pass."""
+
+    def _store(self, tmp_path):
+        from store import DuckDBMemoryStore
+
+        return DuckDBMemoryStore(
+            tmp_path / "sweep425.duckdb", user_id="test_user",
+        )
+
+    @staticmethod
+    def _payload(store, cid):
+        rows = store.list_candidates(candidate_id=cid, limit=1)
+        payload = rows[0].get("payload")
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return payload or {}
+
+    def test_claim_single_flight(self, tmp_path):
+        store = self._store(tmp_path)
+        try:
+            assert store.claim_stale_review_pass(60.0) is True
+            assert store.claim_stale_review_pass(60.0) is False
+            # Zero-length window: immediately claimable again.
+            assert store.claim_stale_review_pass(0.0) is True
+            # Timestamp is observable via get_state (allowlist).
+            val = store.get_state("stale_sweep_last_pass")
+            assert val is not None
+            float(val)
+        finally:
+            store.close()
+
+    def test_eligible_for_sweep_cooldown(self):
+        now = datetime.now(timezone.utc)
+        assert _eligible_for_sweep({}, now) is True
+        future = (now + timedelta(hours=5)).isoformat()
+        past = (now - timedelta(hours=5)).isoformat()
+        assert _eligible_for_sweep(
+            {"payload": {"sweep_next_review_at": future}}, now) is False
+        assert _eligible_for_sweep(
+            {"payload": {"sweep_next_review_at": past}}, now) is True
+        # Rows may carry the payload as a JSON string.
+        assert _eligible_for_sweep(
+            {"payload": json.dumps({"sweep_next_review_at": future})}, now,
+        ) is False
+        # Unparseable cooldown -> err toward reviewing.
+        assert _eligible_for_sweep(
+            {"payload": {"sweep_next_review_at": "not-a-date"}}, now) is True
+
+    def test_sweep_backoff_escalates_and_caps(self):
+        assert _sweep_backoff(1) == timedelta(hours=24)
+        assert _sweep_backoff(2) == timedelta(hours=48)
+        assert _sweep_backoff(3) == timedelta(hours=96)
+        assert _sweep_backoff(4) == timedelta(hours=168)  # 7-day cap
+        assert _sweep_backoff(9) == timedelta(hours=168)
+
+    def test_no_progress_escalates_and_skips_until_cooldown(self, tmp_path):
+        """A candidate that keeps resolving to the same state accrues
+        attempts + a cooldown; while inside the cooldown it is not even
+        handed to the reviewer."""
+        store = self._store(tmp_path)
+        try:
+            # Speculative grounding -> an 'approve' decision is downgraded
+            # to 'pending' by the grounding ceiling, so the candidate stays
+            # in the same state = no progress, with no materialization.
+            cand = store.save_candidate(
+                category="context_note",
+                content="User is between projects",
+                source="llm_extraction",
+                confidence=0.6,
+                payload={"grounding": "speculative"},
+            )
+            cid = cand["candidate_id"]
+
+            # Pass 1: pending -> pending_user_confirmation (speculative
+            # ceiling downgrade, _GROUNDING_CEILING[speculative]) — a state
+            # change, so it resets: attempts=0, no cooldown.
+            with patch("reviewer.review_candidate_with_llm",
+                       return_value={"decision": "approve", "reason": "ok"}):
+                run_stale_review_sweep(store, min_age_min=0, max_batch=25)
+            payload = self._payload(store, cid)
+            assert payload.get("sweep_attempts") == 0
+            assert "sweep_next_review_at" not in payload
+
+            # Pass 2: pending_user_confirmation -> pending_user_confirmation
+            # (same never-finalized state) = no progress -> attempts=1 with
+            # a 24h cooldown.
+            with patch("reviewer.review_candidate_with_llm",
+                       return_value={"decision": "approve", "reason": "ok"}):
+                run_stale_review_sweep(store, min_age_min=0, max_batch=25)
+            payload = self._payload(store, cid)
+            assert payload.get("sweep_attempts") == 1
+            first_next = _parse_iso(payload.get("sweep_next_review_at"))
+            assert first_next is not None
+            assert first_next > datetime.now(timezone.utc)
+
+            # Pass 3 (immediately): inside the cooldown -> reviewer not called.
+            with patch("reviewer.review_candidate_with_llm",
+                       return_value={"decision": "approve", "reason": "ok"}) as r3:
+                run_stale_review_sweep(store, min_age_min=0, max_batch=25)
+                assert r3.call_count == 0
+
+            # Force the cooldown open; the next no-progress review escalates.
+            store.note_stale_review_outcome(
+                cid, attempts=1,
+                next_review_at=(
+                    datetime.now(timezone.utc) - timedelta(minutes=1)
+                ).isoformat(),
+            )
+            with patch("reviewer.review_candidate_with_llm",
+                       return_value={"decision": "approve", "reason": "ok"}) as r4:
+                run_stale_review_sweep(store, min_age_min=0, max_batch=25)
+                assert r4.call_count == 1
+            payload = self._payload(store, cid)
+            assert payload.get("sweep_attempts") == 2
+            second_next = _parse_iso(payload.get("sweep_next_review_at"))
+            assert second_next is not None
+            assert second_next > first_next
+        finally:
+            store.close()
+
+    def test_progress_resets_attempts(self, tmp_path):
+        """A review that moves the candidate to a new state resets the
+        no-progress counter and clears the cooldown."""
+        store = self._store(tmp_path)
+        try:
+            cand = store.save_candidate(
+                category="context_note",
+                content="User is learning Portuguese",
+                source="llm_extraction",
+                confidence=0.6,
+            )
+            cid = cand["candidate_id"]
+            with patch("reviewer.review_candidate_with_llm",
+                       return_value={"decision": "approve", "reason": "ok"}):
+                run_stale_review_sweep(store, min_age_min=0, max_batch=25)
+            payload = self._payload(store, cid)
+            # pending -> reviewed_approved is progress: reset, no cooldown.
+            assert payload.get("sweep_attempts") == 0
+            assert "sweep_next_review_at" not in payload
+        finally:
+            store.close()
+
+    def test_thread_gate_skips_when_not_claimed(self):
+        store = MagicMock()
+        store.claim_stale_review_pass.return_value = False
+        thread = StaleReviewSweepThread(
+            store, interval_min=15, min_age_min=30, max_batch=25,
+        )
+        thread._interval_s = 0.05
+        with patch("stale_review_sweep.run_stale_review_sweep") as sweep:
+            thread.start()
+            time.sleep(0.2)
+            thread.stop()
+            thread._thread.join(timeout=1)
+        assert store.claim_stale_review_pass.call_count >= 1
+        assert sweep.call_count == 0
+
+    def test_thread_gate_runs_when_claimed(self):
+        store = MagicMock()
+        store.claim_stale_review_pass.return_value = True
+        thread = StaleReviewSweepThread(
+            store, interval_min=15, min_age_min=30, max_batch=25,
+        )
+        thread._interval_s = 0.05
+        with patch("stale_review_sweep.run_stale_review_sweep") as sweep:
+            thread.start()
+            time.sleep(0.15)
+            thread.stop()
+            thread._thread.join(timeout=1)
+        assert sweep.call_count >= 1

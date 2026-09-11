@@ -81,6 +81,14 @@ SITES = [
         "default": True,
     },
     {
+        "kind": "conflict_judge",
+        "file": "provider_retrieval.py",
+        "trigger": "conflict-note candidate pair passed the deterministic gate (#450)",
+        "payload": "the two memory records under review",
+        "gate": "conflict_surfacing",
+        "default": True,
+    },
+    {
         "kind": "temporal_subcall",
         "file": "temporal_subcall.py",
         "trigger": "temporal/multi-hop intent route",
@@ -299,7 +307,7 @@ GROUPS = [
         "Conversation-derived (sensitive-identifier gated)",
         ["extractor", "reviewer", "query_expansion", "role_word", "temporal_subcall"],
     ),
-    ("Store-derived (config-gated)", ["graph_typing", "distillation"]),
+    ("Store-derived (config-gated)", ["graph_typing", "distillation", "conflict_judge"]),
     ("Document-derived (sensitive-identifier gated)", ["watcher_extraction"]),
     ("Lifecycle-derived (config-gated)", ["memory_rollup"]),
 ]

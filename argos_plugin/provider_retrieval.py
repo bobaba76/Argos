@@ -127,6 +127,19 @@ _CONFLICT_STOPWORDS = {
 }
 _CONFLICT_SUBJECT_MIN_TOKENS = 1   # shared significant tokens required
 _CONFLICT_MAX_NOTES = 2            # cap annotations to bound injection bloat
+# #447: the discontinuation trigger is NOT a conflict unless the shared subject
+# token actually sits near the marker. Otherwise a record that merely CONTAINS a
+# real "stopped/cancelled/limited to" phrase can pair with any other record
+# sharing a domain word ("sensor"/"role"/"employment") and earn a false note.
+# Window is in tokens; keeps every known true positive (beta1beta = 1 token,
+# workaround/reverted = 2, weekly rule + discontinued = 4) and drops the
+# measured false-positive distances (sensor ~ 8+, role vs open-ended ~ 5+,
+# employment vs limited to ~ 8+).
+_MARKER_SINGLE = {"stopped", "ended", "ending", "retired", "removed", "scrapped",
+                  "closed", "reverted", "cancelled", "disbanded"}
+_MARKER_DOUBLE = {"no longer", "no current", "scoped to", "limited to", "only in"}
+_CONFLICT_PROX_WINDOW = 4
+_CONFLICT_NOTE_SCORE = 0.25   # #447: notes are info, never answers -> capped
 
 
 def _conflict_significant_tokens(text: str) -> set:
@@ -146,6 +159,33 @@ def _conflict_shared_subject(a: str, b: str) -> bool:
     """True if two records share a significant token (same subject)."""
     sa, sb = _conflict_significant_tokens(a), _conflict_significant_tokens(b)
     return bool(sa & sb)
+
+
+def _disjunction_proximate_subject(a: str, b: str) -> bool:
+    """True when a discontinuation marker sits within a token window of a shared
+    significant token in the same record (#447)."""
+    sa, sb = _conflict_significant_tokens(a), _conflict_significant_tokens(b)
+    shared = sa & sb
+    if not shared:
+        return False
+    for toks in (re.findall(r"[a-z0-9]+", (a or "").lower()),
+                 re.findall(r"[a-z0-9]+", (b or "").lower())):
+        n = len(toks)
+        for i, t in enumerate(toks):
+            span = 0
+            if t in _MARKER_SINGLE or t.startswith("discontinu"):
+                if t == "ended" and i > 0 and toks[i - 1] == "open":
+                    continue  # "open-ended" compounds: adjectives, not stops
+                span = 1
+            elif i + 1 < n and " ".join(toks[i:i + 2]) in _MARKER_DOUBLE:
+                span = 2
+            if not span:
+                continue
+            lo = max(0, i - _CONFLICT_PROX_WINDOW)
+            hi = min(n, i + span + _CONFLICT_PROX_WINDOW)
+            if shared & set(toks[lo:hi]):
+                return True
+    return False
 
 
 class ProviderRetrievalMixin:
@@ -993,15 +1033,29 @@ class ProviderRetrievalMixin:
                     _fail_count, exc,
                 )
         final_results = results[:limit]
-        if getattr(self, "_conflict_surfacing_enabled", False):
-            try:
-                notes = self._conflict_annotations(final_results)
-                if notes:
-                    final_results = notes + final_results
-            except Exception as exc:  # noqa: BLE001 — surfacing must never break retrieval
-                logger.warning("Conflict surfacing failed (fail-soft): %s", exc)
+        final_results = self._attach_conflict_notes(final_results)
         self._record_injected(final_results)
         return final_results
+
+    def _attach_conflict_notes(self, records: List[Any]) -> List[Any]:
+        """#447: conflict notes are informational, never answers.
+
+        They are (a) computed only from the already-retrieved set, (b) appended
+        AFTER the records they annotate (never prepended — a note must not
+        out-rank the substantive answer), and (c) score-capped to a constant so a
+        later score-sort still keeps them at the bottom. Fail-soft: an exception
+        here must never break retrieval.
+        """
+        if not getattr(self, "_conflict_surfacing_enabled", False):
+            return records
+        try:
+            notes = self._conflict_annotations(records)
+        except Exception as exc:  # noqa: BLE001 — surfacing must never break retrieval
+            logger.warning("Conflict surfacing failed (fail-soft): %s", exc)
+            return records
+        if not notes:
+            return records
+        return list(records) + notes
 
     def _conflict_annotations(
         self, records: List[Any], max_notes: int = _CONFLICT_MAX_NOTES,
@@ -1046,10 +1100,7 @@ class ProviderRetrievalMixin:
                     pre_values[i], pre_values[j], subject_threshold=0.2,
                 ):
                     reason = "differing values"
-                elif (
-                    _conflict_shared_subject(a, b)
-                    and (_has_discontinuation_marker(a) or _has_discontinuation_marker(b))
-                ):
+                elif _disjunction_proximate_subject(a, b):
                     reason = "one record says it was discontinued, removed, or is scoped elsewhere"
                 if not reason:
                     continue
@@ -1080,10 +1131,7 @@ class ProviderRetrievalMixin:
                     category="system_note",
                     content=note,
                     created_at=now,
-                    similarity=max(
-                        getattr(ri, "similarity", 0.0) or 0.0,
-                        getattr(rj, "similarity", 0.0) or 0.0,
-                    ),
+                    similarity=_CONFLICT_NOTE_SCORE,
                 ))
         return notes
 

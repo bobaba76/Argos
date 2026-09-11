@@ -16,6 +16,9 @@ from provider_retrieval import (
     _conflict_shared_subject,
     _has_discontinuation_marker,
     _conflict_significant_tokens,
+    _disjunction_proximate_subject,
+    _CONFLICT_NOTE_SCORE,
+    _CONFLICT_MAX_NOTES,
 )
 from provider_retrieval import ProviderRetrievalMixin
 from store_common import MemoryRecord
@@ -64,6 +67,26 @@ class ConflictSurfacingHelpers(unittest.TestCase):
         self.assertFalse(_conflict_shared_subject(
             "Batch exports finish faster than the nightly run.",
             "We prefer Postgres rather than MySQL."))
+
+    def test_marker_proximity(self):
+        # #447: shared domain word far from a real discontinued phrase = no
+        self.assertFalse(_disjunction_proximate_subject(
+            "Sensor business lines are recorded quarterly.",
+            "The older SKUs were discontinued long ago; and here the sensor "
+            "summary sits in the yearly document."))
+        # shared subject adjacent to the marker still qualifies
+        self.assertTrue(_disjunction_proximate_subject(
+            "Beta users get 10GB.",
+            "The beta program ended."))
+
+    def test_open_ended_is_not_a_stop_marker(self):
+        # #447: "open-ended" is an adjective compound, not a discontinuation
+        self.assertFalse(_disjunction_proximate_subject(
+            "Unclear role mandate is documented.",
+            "He struggles with open-ended role work."))
+        self.assertTrue(_disjunction_proximate_subject(
+            "The nightly build pipeline for releases.",
+            "The nightly build pipeline was retired."))
 
 
 class ConflictSurfacingAnnotation(unittest.TestCase):
@@ -145,6 +168,33 @@ class ConflictSurfacingAnnotation(unittest.TestCase):
         ]
         prov = self._make(recs)
         self.assertEqual(prov._conflict_annotations(recs), [])
+
+    def test_distant_domain_word_no_note(self):
+        # #447 residual class: both mention "sensor", one record contains a
+        # real discontinued phrase far from it -> no note
+        recs = [
+            _rec("a", "Sensor business lines are recorded quarterly.",
+                 "2026-08-01T10:00:00"),
+            _rec("b", "The older SKU line was discontinued long ago; and the "
+                      "sensor summary sits in the yearly document.",
+                 "2026-08-15T10:00:00"),
+        ]
+        prov = self._make(recs)
+        self.assertEqual(prov._conflict_annotations(recs), [])
+
+    def test_note_capped_and_appended(self):
+        # #447: note must never out-rank the records it annotates
+        recs = [
+            _rec("a", "Beta users get 10GB of storage.", "2026-06-05T12:00:00"),
+            _rec("b", "The beta program ended.", "2026-08-15T09:20:00"),
+        ]
+        prov = self._make(recs)
+        notes = prov._conflict_annotations(recs)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0].similarity, _CONFLICT_NOTE_SCORE)
+        attached = prov._attach_conflict_notes(recs)
+        self.assertEqual([r.memory_id for r in attached[:2]], ["a", "b"])
+        self.assertIn("CONFLICT NOTE", attached[2].content)
 
     def test_corroboration_no_note(self):
         recs = [

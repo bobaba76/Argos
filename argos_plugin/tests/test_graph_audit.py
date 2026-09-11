@@ -181,6 +181,9 @@ class TestG5RelationCap:
         import types
         egress_mod = types.ModuleType("egress")
         egress_mod.gate = lambda *a, **k: True
+        # #404: graph.py routes through gate_payload now (redact default);
+        # the stub must provide it or the import raises ImportError.
+        egress_mod.gate_payload = lambda kind, text="", cfg=None: (True, text)
         monkeypatch.setitem(sys.modules, "egress", egress_mod)
         aux_mod = types.ModuleType("agent.auxiliary_client")
         aux_mod.call_llm = fake_call_llm

@@ -66,6 +66,9 @@ READ_OPERATIONS: Set[str] = {
     "capabilities",
     "explain",
     "explain_retrieval",
+    # #393 S2: unreviewed-class observability — count + oldest age of
+    # the live unreviewed backlog. Read-only, caller-scoped.
+    "unreviewed",
     # #295: admin console browse — list memories by namespace/scope/
     # category without a semantic query. Read-only, ACL-scoped.
     "browse",
@@ -444,6 +447,17 @@ def _validate_search_params(params: Dict[str, Any]) -> Dict[str, Any]:
         val = params.get(opt_key)
         if val is not None:
             cleaned[opt_key] = str(val)
+    # #393 S2: trust-class filter — enum-validated, normalized to lower.
+    _tc = params.get("trust_class")
+    if _tc is not None:
+        _tc = str(_tc).strip().lower()
+        if _tc and _tc not in ("unreviewed", "clean"):
+            raise APIError(
+                "invalid_input",
+                "trust_class must be 'unreviewed' or 'clean'",
+            )
+        if _tc:
+            cleaned["trust_class"] = _tc
     # Reject forbidden client flags.
     for flag in FORBIDDEN_CLIENT_FLAGS:
         if params.get(flag):
@@ -1341,6 +1355,8 @@ class ArgosAPIFacade:
         try:
             if operation == "search":
                 validated = _validate_search_params(params)
+            elif operation == "unreviewed":
+                validated = {}
             elif operation == "fetch":
                 validated = _validate_fetch_params(params)
             elif operation == "fetch_history":
@@ -1426,6 +1442,8 @@ class ArgosAPIFacade:
         try:
             if operation == "search":
                 result = self._op_search(ctx, validated)
+            elif operation == "unreviewed":
+                result = self._op_unreviewed(ctx, validated)
             elif operation == "fetch":
                 result = self._op_fetch(ctx, validated)
             elif operation == "fetch_history":
@@ -1619,6 +1637,7 @@ class ArgosAPIFacade:
                 project_id=params.get("project_id"),
                 namespace=params.get("namespace"),
                 client_scope=params.get("client_scope"),
+                trust_class=params.get("trust_class"),
             )
         finally:
             # #301: always restore the store's user scope to what it was
@@ -1645,6 +1664,30 @@ class ArgosAPIFacade:
                 "scope": item.get("scope"),
             })
         return {"results": items, "count": len(items)}
+
+    def _op_unreviewed(self, ctx: AuthContext, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Read tier (#393 S2): unreviewed-class backlog report.
+
+        Count + oldest age of live memories carrying the ``unreviewed``
+        trust class. Scoping follows the search convention (#301): the
+        store scope is set to the caller and restored on exit — an
+        exception still restores it (finally).
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            result = self._store.unreviewed_stats()
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        result = result or {}
+        return {
+            "count": int(result.get("count", 0) or 0),
+            "oldest_created_at": result.get("oldest_created_at"),
+            "oldest_age_days": result.get("oldest_age_days"),
+            "scope": ctx.user_id,
+        }
 
     def scope_check(self, ctx: AuthContext, record: Any) -> bool:
         """#303: unified scope check for all facade operations that

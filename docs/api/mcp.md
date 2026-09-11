@@ -96,8 +96,17 @@ Search memories by natural-language query.
     | `query` | string | yes | Natural-language search query (max 2000 chars). |
     | `limit` | integer | no | Maximum results (1–50, default 10). |
     | `category_filter` | string | no | Filter to a specific memory category. |
+    | `trust_class` | string | no | Filter by write-policy class: `unreviewed` or `clean` (#393 S2). |
 
 - **Output:** `{ results: [{ memory_id, category, content, tags, similarity, created_at, updated_at, status, scope }], count }`
+
+### `memory_unreviewed`
+
+Report the live unreviewed trust-class backlog: how many memories currently carry the `unreviewed` marker (server-stamped for medium-risk saves under `approval_mode: auto`) and how old the oldest one is. Read-only, scoped to the authenticated principal.
+
+- **Facade op:** `unreviewed`
+- **Input:** none
+- **Output:** `{ count, oldest_created_at, oldest_age_days, scope }`
 
 ### `memory_why_not`
 

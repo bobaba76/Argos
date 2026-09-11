@@ -74,6 +74,7 @@ Search memories by natural-language query.
 | `project_id` | string | no | Narrow to a project. |
 | `namespace` | string | no | Narrow to a namespace. |
 | `client_scope` | string | no | Narrow to a client scope. |
+| `trust_class` | string | no | Filter by write-policy class: `unreviewed` or `clean` (#393 S2). |
 
 **Response:**
 
@@ -93,6 +94,23 @@ Search memories by natural-language query.
     }
   ],
   "count": 1
+}
+```
+
+### `GET /v1/memory/unreviewed`
+
+Report the live unreviewed trust-class backlog: count and oldest age of memories server-stamped `unreviewed` (medium-risk saves under `approval_mode: auto`). Read-only, scoped to the authenticated principal.
+
+**Auth:** required
+
+**Response:**
+
+```json
+{
+  "count": 4,
+  "oldest_created_at": "2026-09-11T05:00:00+00:00",
+  "oldest_age_days": 0.6,
+  "scope": "alice"
 }
 ```
 

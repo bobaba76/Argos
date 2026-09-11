@@ -74,6 +74,11 @@ def _search_input_schema() -> Dict[str, Any]:
                 "type": "string",
                 "description": "Optional: filter to a specific memory category.",
             },
+            "trust_class": {
+                "type": "string",
+                "enum": ["unreviewed", "clean"],
+                "description": "Optional: filter by write-policy class (#393 S2).",
+            },
         },
     }
 
@@ -148,6 +153,15 @@ def _explain_retrieval_input_schema() -> Dict[str, Any]:
                 "default": 20,
             },
         },
+    }
+
+
+def _unreviewed_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_unreviewed (no parameters)."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
     }
 
 
@@ -753,6 +767,21 @@ TOOL_DEFINITIONS: tuple = (
         },
     },
     {
+        "name": "memory_unreviewed",
+        "description": "Report the live unreviewed trust-class backlog: count and oldest age. Read-only.",
+        "inputSchema": _unreviewed_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "count": {"type": "integer"},
+                "oldest_created_at": {"type": ["string", "null"]},
+                "oldest_age_days": {"type": ["number", "null"]},
+                "scope": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "memory_update",
         "description": (
             "Update an existing memory, creating a new version (class C "
@@ -818,6 +847,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_explain": "explain",
     "memory_why_not": "explain_retrieval",
     "memory_capabilities": "capabilities",
+    "memory_unreviewed": "unreviewed",
     "memory_propose": "memory_propose",
     # #200 Spec-10 PR-3: write tier + collection tools.
     "memory_save": "memory_save",

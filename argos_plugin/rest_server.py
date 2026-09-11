@@ -78,6 +78,9 @@ class SearchRequest(BaseModel):
     limit: conint(ge=1, le=50) = 10
     # R8: cap category_filter length to prevent wasteful large strings.
     category_filter: Optional[constr(max_length=100)] = None
+    # #393 S2: trust-class filter ('unreviewed' | 'clean'), enum-validated
+    # by the facade.
+    trust_class: Optional[constr(min_length=1, max_length=32)] = None
     # No project_id, client_scope, namespace, user_id, tenant — those
     # are server-derived from the credential. The facade enforces this.
 
@@ -481,7 +484,21 @@ def create_app(
             params: Dict[str, Any] = {"query": body.query, "limit": body.limit}
             if body.category_filter:
                 params["category_filter"] = body.category_filter
+            if body.trust_class:
+                params["trust_class"] = body.trust_class
             result = facade.execute(ctx, "search", params)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- Unreviewed report: GET /v1/memory/unreviewed (#393 S2) --------------
+
+    @app.get("/v1/memory/unreviewed")
+    async def unreviewed(ctx: AuthContext = Depends(auth)):
+        """Report the live unreviewed trust-class backlog (count + age)."""
+        try:
+            result = facade.execute(ctx, "unreviewed", {})
             return result
         except APIError as exc:
             status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)

@@ -706,6 +706,7 @@ class MemoryService:
                                 include_expired=bool(args.get("include_expired", False)),
                                 include_closed=bool(args.get("include_closed", False)),
                                 include_archived=bool(args.get("include_archived", False)),
+                                trust_class=args.get("trust_class"),
                             )
             # #128: ACL enforcement — filter results by the user's ACL
             # mask. Denied content is hidden (not merely removed after
@@ -725,6 +726,10 @@ class MemoryService:
                 )
                 records = visible
             return [_record_to_dict(record) for record in records]
+        if method == "unreviewed_stats":
+            # #393 S2: live unreviewed-class backlog (count + oldest
+            # age). Scope = server-resolved caller identity.
+            return store.unreviewed_stats(user_scope=user_id)
         if method == "remember":
             # MS1: strip server-set fields from client args.
             rec = store.remember(**_sanitize_args(args))
@@ -1687,6 +1692,19 @@ class MemoryService:
                 }
                 for name, t in visible_tenants.items()
             }
+            # #393 S2: live unreviewed backlog per visible tenant
+            # (global view — this is the admin/status surface).
+            tenant_unreviewed = {}
+            for name, t in visible_tenants.items():
+                try:
+                    _t_store = getattr(t, "store", None)
+                    tenant_unreviewed[name] = (
+                        _t_store.unreviewed_stats(user_scope=None)
+                        if _t_store is not None
+                        else None
+                    )
+                except Exception:
+                    tenant_unreviewed[name] = None
             # #330: surface fail-loud subsystem health from the
             # subprocess's liveness singleton. In shared_service mode the
             # audit writes/purges and graph WAL flush execute INSIDE this
@@ -1732,6 +1750,7 @@ class MemoryService:
                 "tenant_policies": tenant_policies,
                 "tenant_acl_status": tenant_acl_status,
                 "tenant_cells": tenant_cells,
+                "unreviewed": tenant_unreviewed,
                 "default_tenant": self._default_tenant,
                 "lock_wait_total_s": round(self._lock_wait_total_s, 4),
                 "lock_wait_count": self._lock_wait_count,

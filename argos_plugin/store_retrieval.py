@@ -65,6 +65,21 @@ logger = logging.getLogger(__name__)
 # from caller data. Only values are parameterized.
 # ---------------------------------------------------------------------------
 
+def _normalize_trust_class_filter(value: object) -> str | None:
+    """Normalize a trust-class filter value (#393 S2).
+
+    Returns 'unreviewed', 'clean', or None (no filter). Anything else
+    fails loud - silent fallbacks would widen the result set.
+    """
+    _tc = str(value).strip().lower()
+    if _tc in ("", "unreviewed", "clean"):
+        return _tc or None
+    raise ValueError(
+        "Invalid trust_class filter %r - expected 'unreviewed' or 'clean'"
+        % (value,)
+    )
+
+
 def _build_memory_where(
     *,
     user_scope: str | None = None,
@@ -74,6 +89,7 @@ def _build_memory_where(
     category: str | None = None,
     excluded: set[str] | None = None,
     tier: str | None = None,
+    trust_class: str | None = None,
     as_of: str | None = None,
     include_closed: bool = False,
     include_expired: bool = False,
@@ -85,7 +101,7 @@ def _build_memory_where(
 
     Canonical clause order:
         status → temporal → expiry → user_scope → project → namespace →
-        client_scope → category/excluded → tier → extra
+        client_scope → category/excluded → tier → trust_class → extra
 
     The returned *sql_fragment* starts with ``COALESCE(status, 'active') =
     'active'`` and is ready to be placed after ``WHERE`` in the caller's
@@ -158,6 +174,18 @@ def _build_memory_where(
     if tier:
         fragments.append("AND COALESCE(tier, 'active') = 'active'")
 
+    # 9b. Trust class (#393 S2) — write-policy class filter.
+    #     'unreviewed' → only stamped rows; 'clean' → rows WITHOUT the
+    #     marker (pre-policy rows are NULL and count as clean).
+    #     Normalization/validation lives in the helper (fail loud).
+    if trust_class is not None:
+        _tc = _normalize_trust_class_filter(trust_class)
+        if _tc == "unreviewed":
+            fragments.append("AND trust_class = ?")
+            params.append("unreviewed")
+        elif _tc == "clean":
+            fragments.append("AND COALESCE(trust_class, '') != 'unreviewed'")
+
     # 10. Extra — caller-specific fixed SQL text (no params), e.g.
     #     "AND embedding IS NOT NULL".
     if extra_sql:
@@ -165,6 +193,11 @@ def _build_memory_where(
 
     sql = " ".join(fragments)
     return sql, params
+
+
+# Sentinel: distinguish "scope not supplied" from an explicit None
+# (global view) in unreviewed_stats (#393 S2).
+_SCOPE_UNSET = object()
 
 
 class StoreRetrievalMixin:
@@ -255,6 +288,7 @@ class StoreRetrievalMixin:
         include_expired: bool = False,
         include_closed: bool = False,
         include_archived: bool = False,
+        trust_class: str | None = None,
     ) -> List[MemoryRecord]:
         """BM25-lite text search. Returns filtered records ranked by BM25.
 
@@ -298,6 +332,7 @@ class StoreRetrievalMixin:
             include_closed=include_closed,
             include_expired=include_expired,
             now=expiry_ref,
+            trust_class=trust_class,
         )
         sql = (
             f"SELECT * FROM memory_records WHERE {where_sql} "
@@ -359,6 +394,7 @@ class StoreRetrievalMixin:
         include_expired: bool = False,
         include_closed: bool = False,
         include_archived: bool = False,
+        trust_class: str | None = None,
     ) -> List[MemoryRecord]:
         """Vector similarity search. Returns filtered records ranked by cosine.
 
@@ -433,6 +469,7 @@ class StoreRetrievalMixin:
             include_closed=include_closed,
             include_expired=include_expired,
             now=expiry_ref,
+            trust_class=trust_class,
             extra_sql="AND embedding IS NOT NULL",
         )
         sql = (
@@ -1086,6 +1123,47 @@ class StoreRetrievalMixin:
             "warn_records": self._state.scale_warn_records,
         }
 
+    def unreviewed_stats(self, user_scope: str | None | object = _SCOPE_UNSET) -> Dict[str, Any]:
+        """Report the live ``unreviewed`` trust-class backlog (#393 S2).
+
+        Count + oldest age of current (valid_to IS NULL, non-expired)
+        active memories carrying the ``unreviewed`` marker. Scope follows
+        the search convention by default (the store's current user scope,
+        set via ``set_user_scope``); pass an explicit value to override —
+        ``user_scope=None`` gives the global/admin view.
+
+        Returns ``{"count", "oldest_created_at", "oldest_age_days"}``.
+        """
+        scope = self.user_id if user_scope is _SCOPE_UNSET else user_scope
+        where_sql, where_params = _build_memory_where(
+            user_scope=scope,
+            trust_class="unreviewed",
+            now=self._now(),
+        )
+        sql = (
+            f"SELECT COUNT(*), MIN(created_at) FROM memory_records "
+            f"WHERE {where_sql}"
+        )
+        with self._state.lock:
+            assert self.connection is not None
+            row = self.connection.execute(sql, where_params).fetchone()
+        count = int(row[0] or 0) if row else 0
+        oldest_raw = row[1] if row and len(row) > 1 else None
+        oldest_created_at = str(oldest_raw) if oldest_raw else None
+        oldest_age_days: float | None = None
+        if oldest_created_at:
+            parsed = self._parse_timestamp(oldest_created_at)
+            if parsed is not None:
+                _now_dt = datetime.now(timezone.utc)
+                oldest_age_days = round(
+                    max(0.0, (_now_dt - parsed).total_seconds()) / 86400.0, 2
+                )
+        return {
+            "count": count,
+            "oldest_created_at": oldest_created_at,
+            "oldest_age_days": oldest_age_days,
+        }
+
     def set_retriever(self, retriever: Any) -> None:
         """Swap the retrieval engine (advanced; must match the protocol)."""
         self._state.retriever = retriever
@@ -1104,6 +1182,7 @@ class StoreRetrievalMixin:
         include_expired: bool = False,
         include_closed: bool = False,
         include_archived: bool = False,
+        trust_class: str | None = None,
     ) -> List[MemoryRecord]:
         """Hybrid search: RRF-fused vector + text, with optional cross-encoder
         re-ranking, feedback, and recency.
@@ -1179,6 +1258,7 @@ class StoreRetrievalMixin:
             client_scope=client_scope, as_of=as_of,
             include_expired=include_expired, include_closed=include_closed,
             include_archived=include_archived,
+            trust_class=trust_class,
         )
 
         if emb:
@@ -1190,6 +1270,7 @@ class StoreRetrievalMixin:
                     include_expired=include_expired,
                     include_closed=include_closed,
                     include_archived=include_archived,
+                    trust_class=trust_class,
                 )
             except Exception as exc:
                 if not self._is_vector_search_unavailable(exc):

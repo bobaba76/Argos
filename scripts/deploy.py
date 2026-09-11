@@ -68,6 +68,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -124,6 +125,22 @@ def _is_backfill(name: str) -> bool:
 
 def _is_backup_artifact(name: str) -> bool:
     return ".bak-" in name or ".pre_" in name
+
+
+def _plugin_version(directory: Path) -> str:
+    """Read __version__ from <dir>/version.py, or "unknown" (#360).
+
+    Works on both the repo source tree and the live copy before/after a
+    sync, so --check can show repo/live version drift alongside file
+    drift. Purely textual — never imports the module (the live copy may
+    be half-synced and unimportable).
+    """
+    try:
+        text = (directory / "version.py").read_text(encoding="utf-8")
+    except Exception:
+        return "unknown"
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, flags=re.MULTILINE)
+    return match.group(1) if match else "unknown"
 
 
 def source_files(source: Path) -> List[Path]:
@@ -293,6 +310,19 @@ def check_mode(source: Path, target: Path, state: Path) -> int:
         print(f"last deployed HEAD: {last_head[:12]} ({tag})")
     else:
         print(f"last deployed HEAD: none (no deploy_state.json yet)")
+    print(
+        f"plugin version: {_plugin_version(source)} (repo) / "
+        f"{_plugin_version(target)} (live)"
+    )
+    src_mods = {_rel_key(p, source) for p in source_files(source)}
+    live_mods = {_rel_key(p, target) for p in source_files(target)}
+    print(f"module inventory: repo {len(src_mods)}, live {len(live_mods)}")
+    missing_live = sorted(src_mods - live_mods)
+    extra_live = sorted(live_mods - src_mods)
+    if missing_live:
+        print(f"missing in live: {', '.join(missing_live)}")
+    if extra_live:
+        print(f"extra in live:   {', '.join(extra_live)}")
 
     for name in diff["changed"]:
         print(f"CHANGED   {name}")
@@ -384,6 +414,7 @@ def copy_mode(
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "head": repo_head(),
+        "plugin_version": _plugin_version(source),
         "copied": copied,
         "pruned": pruned,
     }

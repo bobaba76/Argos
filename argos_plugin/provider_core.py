@@ -958,6 +958,17 @@ class ProviderCoreMixin:
         except Exception:
             pass
 
+        # #360: stamp the running code version — support sessions compare
+        # this against the repo to confirm which build is live.
+        try:
+            from .version import __version__ as _plugin_version
+        except ImportError:
+            try:
+                from version import __version__ as _plugin_version
+            except ImportError:
+                _plugin_version = "unknown"
+        logger.info("Argos plugin version %s", _plugin_version)
+
         self._initialized = True
 
         # #275: LP1 — startup self-smoke test. Run a tiny canned probe

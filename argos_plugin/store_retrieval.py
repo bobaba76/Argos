@@ -45,9 +45,9 @@ from liveness import record_subsystem_failure, record_subsystem_ok
 
 # #248: tuning constants consolidated in tuning.py
 try:
-    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K
+    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MIN, CE_PROMOTE_MAX
 except ImportError:  # store_retrieval.py imported as a top-level module
-    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K
+    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MIN, CE_PROMOTE_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -1304,6 +1304,21 @@ class StoreRetrievalMixin:
         # rather than overriding the bi-encoder's ranking.
         if self.reranker and len(fused) > 1:
             rerank_pool = fused[:reranker_top_n]
+            # #445: per-retriever union before the CE cut. A vector-top record
+            # with ZERO lexical overlap still loses the fused cut (RRF rewards
+            # presence in BOTH arms, and the rank-1 survival guard needs a
+            # clear margin — a flat semantic head does not produce one). Append
+            # each arm's head so the cross-encoder actually SEES the best
+            # semantic candidate instead of only the lexically-lifted ones.
+            union_added: List[MemoryRecord] = []
+            _seen_ids = {r.memory_id for r in rerank_pool}
+            for _src in (vector_results, text_results):
+                for _r in _src[:reranker_top_n]:
+                    if _r.memory_id not in _seen_ids:
+                        _seen_ids.add(_r.memory_id)
+                        _r._ce_pool_member = True
+                        union_added.append(_r)
+            rerank_pool = rerank_pool + union_added
             documents = [r.content for r in rerank_pool]
             # #275 LP2: increment the rerank_calls counter.
             try:
@@ -1323,6 +1338,7 @@ class StoreRetrievalMixin:
                         ce_norm = (scores[i] - min_s) / range_s
                     else:
                         ce_norm = 0.5
+                    record._ce_norm = ce_norm  # #445: for the rescue gate
                     record.similarity = 0.8 * record.similarity + 0.2 * ce_norm
                     # #280: explicit transient marker so the explainability
                     # pack can distinguish an actual reranker pass from
@@ -1332,7 +1348,13 @@ class StoreRetrievalMixin:
                     # reranker.
                     record._reranked = True
                 rerank_pool.sort(key=lambda r: r.similarity, reverse=True)
-                fused = rerank_pool + fused[reranker_top_n:]
+                # Exclude union-added ids from the tail (they are already in
+                # the rerank pool — otherwise the same record would appear
+                # twice in `fused` and duplicate into the final window).
+                fused = rerank_pool + [
+                    r for r in fused[reranker_top_n:]
+                    if r.memory_id not in _seen_ids
+                ]
 
         # Preserve raw similarity (pre-importance) for gates that need
         # pure retrieval strength (e.g. query expansion trigger).
@@ -1364,6 +1386,30 @@ class StoreRetrievalMixin:
         self._apply_p2c(fused)  # P2C: demote older of a near-duplicate pair (flag-gated)
         # Spec-13 (#393): bounded rank penalty for unreviewed-class records.
         self._apply_trust_penalty(fused, limit)
+        # #445: bounded CE-rescue. A union-pool record that scored near-perfect
+        # with the cross-encoder but still sits outside the window (the
+        # conservative 0.8/0.2 blend keeps fused signal dominant) gets a
+        # bounded rescue INTO the window — at most CE_PROMOTE_MAX, only the
+        # strongest CE matches, replacing the weakest strict members. The
+        # strict ranking lane's head is never displaced; rescued records are
+        # flagged `_ce_promoted` so the explainability pack can account for
+        # them.
+        if getattr(self, "_ce_rescue_enabled", True):
+            _window = {r.memory_id for r in fused[:limit]}
+            rescue = [
+                r for r in fused
+                if getattr(r, "_ce_pool_member", False)
+                and r.memory_id not in _window
+                and getattr(r, "_ce_norm", 0.0) >= self._CE_PROMOTE_MIN
+            ]
+            rescue.sort(key=lambda r: r._ce_norm, reverse=True)
+            rescue = rescue[:self._CE_PROMOTE_MAX]
+            if rescue:
+                _rescue_ids = {r.memory_id for r in rescue}
+                fused = [r for r in fused if r.memory_id not in _rescue_ids]
+                for r in rescue:
+                    r._ce_promoted = True
+                fused = fused[:limit - len(rescue)] + rescue
         final = fused[:limit]
         # #142: clamp final similarity to [0, 1] — additive stages (phrase-lift,
         # importance, graph boost) can push a high base similarity above 1.0.
@@ -1386,6 +1432,8 @@ class StoreRetrievalMixin:
     # that references them via the class.
     _DEDUP_SIMILARITY_THRESHOLD = DEDUP_SIMILARITY_THRESHOLD
     _MAX_EMBEDDING_DIM = MAX_EMBEDDING_DIM
+    _CE_PROMOTE_MIN = CE_PROMOTE_MIN  # #445: from tuning.py
+    _CE_PROMOTE_MAX = CE_PROMOTE_MAX  # #445: from tuning.py
 
     def _content_exists(
         self, content: str, category: str,

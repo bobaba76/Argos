@@ -618,6 +618,7 @@ class SharedMemoryStore:
             include_expired: bool = False,
             include_closed: bool = False,
             include_archived: bool = False,
+            trust_class: str | None = None,
         ) -> List[MemoryRecord]:
             values = self._rpc.call(
                 "store", "search", query=query, limit=limit,
@@ -631,8 +632,19 @@ class SharedMemoryStore:
                 include_expired=include_expired,
                 include_closed=include_closed,
                 include_archived=include_archived,
+                trust_class=trust_class,
             )
             return [_record_from_dict(value) for value in (values or [])]
+
+    def unreviewed_stats(self) -> dict:
+        """#393 S2: live unreviewed-class backlog — count + oldest age.
+
+        Scoped server-side to the caller (same envelope convention as
+        search). Returns an empty-shape dict when the service returns
+        nothing usable.
+        """
+        result = self._rpc.call("store", "unreviewed_stats")
+        return result if isinstance(result, dict) else {}
 
     def get_memories_by_ids(
         self,

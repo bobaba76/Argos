@@ -31,6 +31,18 @@ def _write(path: Path, content: str = "x = 1\n") -> Path:
     return path
 
 
+def _live_plugin_dir() -> Path:
+    """The deployed plugin copy (#360 canary target)."""
+    import os as _os
+
+    return (
+        Path(_os.environ.get("LOCALAPPDATA", ""))
+        / "hermes"
+        / "plugins"
+        / "hybrid_memory"
+    )
+
+
 class TestDiffFiles:
     """diff_files should classify drift correctly."""
 
@@ -161,3 +173,85 @@ class TestCheckMode:
         src = tmp_path / "src"
         _write(src / "a.py")
         assert deploy.check_mode(src, tmp_path / "missing", tmp_path / "s.json") == 2
+
+
+class TestVersionStamp360:
+    """#360: version stamp + repo-vs-live module inventory parity."""
+
+    def test_version_consistent_across_files(self):
+        import re as _re
+
+        vfile = (_plugin_dir / "version.py").read_text(encoding="utf-8")
+        m = _re.search(r'__version__\s*=\s*"([^"]+)"', vfile)
+        assert m, "version.py must define __version__"
+        ver = m.group(1)
+        assert _re.match(r"^\d+\.\d+\.\d+$", ver), ver
+        yaml_text = (_plugin_dir / "plugin.yaml").read_text(encoding="utf-8")
+        assert "version: %s" % ver in yaml_text
+        init_text = (_plugin_dir / "__init__.py").read_text(encoding="utf-8")
+        assert "__version__" in init_text
+
+    def test_deploy_reads_plugin_version(self, tmp_path):
+        d = tmp_path / "src"
+        _write(d / "version.py", '__version__ = "9.9.9"\n')
+        assert deploy._plugin_version(d) == "9.9.9"
+        assert deploy._plugin_version(tmp_path / "missing") == "unknown"
+        (d / "version.py").write_text("no version literal", encoding="utf-8")
+        assert deploy._plugin_version(d) == "unknown"
+
+    def test_check_reports_version_and_inventory(self, tmp_path, capsys):
+        src, tgt = tmp_path / "src", tmp_path / "tgt"
+        _write(src / "a.py")
+        _write(src / "version.py", '__version__ = "1.2.3"\n')
+        _write(src / "plugin.yaml", "name: x\nversion: 1.2.3\n")
+        tgt.mkdir()
+        rc = deploy.check_mode(src, tgt, tmp_path / "state.json")
+        out = capsys.readouterr().out
+        assert "plugin version: 1.2.3 (repo) / unknown (live)" in out
+        assert "module inventory: repo 3, live 0" in out
+        assert "missing in live: a.py" in out
+        assert rc == 1  # drift present
+        rc = deploy.copy_mode(
+            src, tgt, tmp_path / "state.json", prune=False, restart=False
+        )
+        assert rc == 0
+        rc = deploy.check_mode(src, tgt, tmp_path / "state.json")
+        out = capsys.readouterr().out
+        assert "module inventory: repo 3, live 3" in out
+        assert "plugin version: 1.2.3 (repo) / 1.2.3 (live)" in out
+        assert rc == 0
+
+    def test_state_entry_records_plugin_version(self, tmp_path):
+        import json as _json
+
+        src, tgt = tmp_path / "src", tmp_path / "tgt"
+        _write(src / "a.py")
+        _write(src / "version.py", '__version__ = "4.5.6"\n')
+        tgt.mkdir()
+        state = tmp_path / "state.json"
+        rc = deploy.copy_mode(src, tgt, state, prune=False, restart=False)
+        assert rc == 0
+        data = _json.loads(state.read_text(encoding="utf-8"))
+        entry = data["deployments"][-1]
+        assert entry.get("plugin_version") == "4.5.6"
+
+    @pytest.mark.skipif(
+        not _live_plugin_dir().is_dir(), reason="no live install on this machine"
+    )
+    def test_canary_repo_modules_present_in_live(self):
+        """#360 acceptance: fails when a repo module is missing from the
+        live install (enforced on dev machines; CI has no live install
+        and skips)."""
+        src_mods = {
+            deploy._rel_key(p, _plugin_dir)
+            for p in deploy.source_files(_plugin_dir)
+        }
+        live_mods = {
+            deploy._rel_key(p, _live_plugin_dir())
+            for p in deploy.source_files(_live_plugin_dir())
+        }
+        missing = sorted(src_mods - live_mods)
+        assert not missing, (
+            "repo modules missing from the live install (run "
+            "scripts/deploy.py): %s" % missing
+        )

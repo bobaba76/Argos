@@ -21,6 +21,14 @@ Categories:
 """
 from __future__ import annotations
 
+try:  # pragma: no cover - import-context dependent (#360)
+    from .version import __version__  # noqa: F401
+except ImportError:
+    try:
+        from version import __version__  # noqa: F401
+    except ImportError:
+        __version__ = "unknown"
+
 import difflib
 import json
 import re

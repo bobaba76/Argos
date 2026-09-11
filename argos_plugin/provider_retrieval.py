@@ -96,17 +96,34 @@ def _load_system_prompt() -> str:
 #   2. discontinuation -> the records share a significant token AND at least one
 #      record marks the rule/feature as stopped/removed/scoped (the poster's
 #      "workaround documented an incident" class).
-_CONFLICT_MARKERS = (
-    "stopped", "ended", "ending", "discontinu", "retired", "removed",
-    "scrapped", "closed", "reverted", "cancelled", "cancelled", "no longer",
-    "no current", "disbanded", "scoped to", "limited to", "only in",
-    "was retired", "was scrapped", "was removed", "was discontinued",
-    "was reverted", "program ended", "period removed",
+# #442: markers are matched on WORD BOUNDARIES, not substrings — the old
+# substring check fired inside unrelated words ("ended" in "suspended",
+# "ending" in "pending_user_confirmation") and produced false conflict notes.
+# "discontinu" stays a prefix match (discontinued / discontinue /
+# discontinuation). The old "was X" / "program ended" / "period removed"
+# variants are redundant under word boundaries and folded into the base words.
+_CONFLICT_MARKER_RE = re.compile(
+    r"\b(?:"
+    r"stopped|ended|ending|discontinu\w*|retired|removed|scrapped|closed|"
+    r"reverted|cancelled|disbanded|no longer|no current|scoped to|"
+    r"limited to|only in"
+    r")\b"
 )
 _CONFLICT_STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "for",
     "with", "is", "are", "was", "were", "we", "they", "it", "our", "your",
     "this", "that", "now", "get", "gets", "use", "used", "do", "does", "by",
+    # #442 (11/9 precision audit): generic function words + verbs were being
+    # counted as "shared subject" tokens, so almost any two records could
+    # "share a subject" on words like "than" / "from" / "work" and earn a
+    # false conflict note.
+    "than", "from", "into", "over", "about", "after", "before", "when",
+    "where", "which", "while", "who", "whom", "whose", "been", "being",
+    "has", "have", "had", "did", "done", "its", "their", "them", "these",
+    "those", "work", "works", "working", "also", "only", "more", "most",
+    "much", "many", "very", "just", "even", "still", "yet", "ever", "never",
+    "there", "here", "what", "within", "without", "between", "under",
+    "above", "below", "uses", "using", "user", "users", "during",
 }
 _CONFLICT_SUBJECT_MIN_TOKENS = 1   # shared significant tokens required
 _CONFLICT_MAX_NOTES = 2            # cap annotations to bound injection bloat
@@ -122,8 +139,7 @@ def _conflict_significant_tokens(text: str) -> set:
 
 
 def _has_discontinuation_marker(text: str) -> bool:
-    t = (text or "").lower()
-    return any(m in t for m in _CONFLICT_MARKERS)
+    return bool(_CONFLICT_MARKER_RE.search((text or "").lower()))
 
 
 def _conflict_shared_subject(a: str, b: str) -> bool:

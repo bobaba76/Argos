@@ -860,6 +860,23 @@ class SharedMemoryStore:
         Writes system_internal_sweep_dry_run_done only."""
         self._rpc.call("store", "mark_system_internal_sweep_dry_run_done")
 
+    def claim_stale_review_pass(self, interval_s: float) -> bool:
+        """#425: narrow store op — stale-review sweep single-flight claim.
+        Returns True when this caller may run a sweep pass."""
+        return bool(self._rpc.call(
+            "store", "claim_stale_review_pass", interval_s=float(interval_s),
+        ))
+
+    def note_stale_review_outcome(self, candidate_id: str, *, attempts: int,
+                                  next_review_at: str | None = None) -> None:
+        """#425: narrow store op — sweep re-review bookkeeping on the
+        candidate payload (attempts + next eligible review time)."""
+        self._rpc.call(
+            "store", "note_stale_review_outcome",
+            candidate_id=candidate_id, attempts=int(attempts),
+            next_review_at=next_review_at,
+        )
+
     def apply_system_internal_sweep(self, *, dry_run: bool = True) -> dict:
         """#392: run the lexicon sweep server-side. The sweep needs direct
         access to the DuckDB store (load_eligible_records, UPDATE

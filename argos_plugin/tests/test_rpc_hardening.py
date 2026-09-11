@@ -503,6 +503,8 @@ class TestSanctionedState:
         assert "mark_system_internal_sweep_done" not in memory_service._FORBIDDEN_STORE_METHODS
         assert "mark_system_internal_sweep_dry_run_done" not in memory_service._FORBIDDEN_STORE_METHODS
         assert "apply_system_internal_sweep" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "claim_stale_review_pass" not in memory_service._FORBIDDEN_STORE_METHODS
+        assert "note_stale_review_outcome" not in memory_service._FORBIDDEN_STORE_METHODS
 
     def test_advance_distillation_state_works_through_proxy(self, tmp_path):
         """advance_distillation_state writes distillation_last_run +
@@ -554,6 +556,46 @@ class TestSanctionedState:
         try:
             with pytest.raises(PermissionError):
                 store.set_state("distillation_last_run", "test")
+        finally:
+            store.close()
+
+
+    def test_claim_stale_review_pass_through_proxy(self, tmp_path):
+        """#425: single-flight claim works end-to-end through the proxy —
+        the first claim is granted, the immediate second is refused."""
+        store = _start_service(tmp_path)
+        try:
+            assert store.claim_stale_review_pass(60.0) is True
+            assert store.claim_stale_review_pass(60.0) is False
+            assert store.get_state("stale_sweep_last_pass") is not None
+        finally:
+            store.close()
+
+    def test_note_stale_review_outcome_through_proxy(self, tmp_path):
+        """#425: sweep bookkeeping round-trips through the proxy onto the
+        candidate payload."""
+        store = _start_service(tmp_path)
+        try:
+            cand = store.save_candidate(
+                category="context_note",
+                content="User is between projects",
+                source="llm_extraction",
+                confidence=0.5,
+            )
+            store.note_stale_review_outcome(
+                cand["candidate_id"], attempts=2,
+                next_review_at="2026-12-01T00:00:00+00:00",
+            )
+            rows = store.list_candidates(
+                candidate_id=cand["candidate_id"], limit=1,
+            )
+            payload = rows[0].get("payload")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            assert payload.get("sweep_attempts") == 2
+            assert payload.get("sweep_next_review_at") == (
+                "2026-12-01T00:00:00+00:00"
+            )
         finally:
             store.close()
 

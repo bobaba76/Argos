@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from .store_common import MemoryRecord, np
@@ -2129,6 +2130,7 @@ class StoreMaintenanceMixin:
         "retention_last_run",  # #293
         "system_internal_sweep_done",  # #392 part 3
         "system_internal_sweep_dry_run_done",  # #392 part 3 dry-run marker
+        "stale_sweep_last_pass",  # #425 — last stale-review pass (epoch float)
     })
 
     def get_state(self, key: str) -> str | None:
@@ -2167,6 +2169,95 @@ class StoreMaintenanceMixin:
                 )
         except Exception as exc:
             logger.debug("set_state(%s) failed: %s", key, exc)
+
+    # -- stale-review sweep coordination (#425) -------------------------------
+
+    # #425: single-flight claim key for the stale-review sweep. Written with
+    # its own SQL (not via set_state) so a bookkeeping failure can never be
+    # silently swallowed by the allowlist; listed in _STATE_KEY_ALLOWLIST so
+    # operators can read the last-pass timestamp via get_state.
+    _STALE_SWEEP_CLAIM_KEY = "stale_sweep_last_pass"
+
+    def claim_stale_review_pass(self, interval_s: float) -> bool:
+        """#425: cross-process single-flight for the stale-review sweep.
+
+        Atomically compares-and-sets ``stale_sweep_last_pass`` so that at
+        most one sweep pass runs per *interval_s* across ALL providers
+        sharing this store (desktop sessions, gateway, cron — previously
+        43 daemon starts/day raced the same backlog). Returns True when
+        the caller may run a pass, False when another provider ran one
+        recently. With the shared service, the service is the single
+        authority for every process.
+
+        Fail-open: any bookkeeping error returns True so the sweep reverts
+        to legacy behavior rather than wedging.
+        """
+        try:
+            with self._state.lock:
+                assert self.connection is not None
+                row = self.connection.execute(
+                    "SELECT value FROM system_state WHERE key = ?",
+                    [self._STALE_SWEEP_CLAIM_KEY],
+                ).fetchone()
+                last = 0.0
+                if row and row[0] not in (None, ""):
+                    try:
+                        last = float(row[0])
+                    except (TypeError, ValueError):
+                        last = 0.0
+                now_ts = time.time()
+                if now_ts - last < float(interval_s):
+                    return False
+                self.connection.execute(
+                    """INSERT INTO system_state (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    [self._STALE_SWEEP_CLAIM_KEY, str(now_ts)],
+                )
+                return True
+        except Exception as exc:
+            logger.debug("claim_stale_review_pass failed: %s", exc)
+            return True
+
+    def note_stale_review_outcome(
+        self, candidate_id: str, *, attempts: int,
+        next_review_at: Optional[str] = None,
+    ) -> None:
+        """#425: persist sweep re-review bookkeeping on a candidate payload.
+
+        Records how many consecutive no-progress re-reviews the sweep has
+        made (``sweep_attempts``) and when the candidate becomes eligible
+        again (``sweep_next_review_at``). Kept separate from
+        ``review_candidate`` so sweep scheduling never conflates with the
+        trust record (status / reviewed_at).
+        """
+        try:
+            with self._state.lock:
+                assert self.connection is not None
+                row = self.connection.execute(
+                    "SELECT payload FROM memory_candidates WHERE candidate_id = ?",
+                    [candidate_id],
+                ).fetchone()
+                if row is None:
+                    return
+                payload = row[0]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except (TypeError, ValueError):
+                        payload = {}
+                payload = dict(payload or {})
+                payload["sweep_attempts"] = int(attempts)
+                if next_review_at:
+                    payload["sweep_next_review_at"] = str(next_review_at)
+                else:
+                    payload.pop("sweep_next_review_at", None)
+                self.connection.execute(
+                    """UPDATE memory_candidates SET payload = ?
+                       WHERE candidate_id = ?""",
+                    [json.dumps(payload), candidate_id],
+                )
+        except Exception as exc:
+            logger.debug("note_stale_review_outcome failed: %s", exc)
 
     # -- distillation data access (P4.2) ---------------------------------------
     # These encapsulate the SQL the distillation pass needs so it can run

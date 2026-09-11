@@ -1397,6 +1397,25 @@ class MemoryService:
             # marker. Only writes system_internal_sweep_dry_run_done.
             store.set_state("system_internal_sweep_dry_run_done", "1")
             return True
+        if method == "claim_stale_review_pass":
+            # #425: cross-process single-flight for the stale-review sweep.
+            # One pass per interval across ALL providers sharing the
+            # service (previously 43 daemon starts/day raced the same
+            # backlog: ~130 passes/h, concurrent passes 71 ms apart).
+            # The store does an atomic compare-and-set on
+            # stale_sweep_last_pass; fail-open on bookkeeping errors.
+            return bool(store.claim_stale_review_pass(
+                float(args.get("interval_s", 0) or 0),
+            ))
+        if method == "note_stale_review_outcome":
+            # #425: sweep re-review bookkeeping (attempts + next eligible
+            # review time) persisted on the candidate payload.
+            store.note_stale_review_outcome(
+                str(args.get("candidate_id", "")),
+                attempts=int(args.get("attempts", 0) or 0),
+                next_review_at=args.get("next_review_at"),
+            )
+            return True
         if method == "count_eligible_since":
             return store.count_eligible_since(
                 args.get("since"),

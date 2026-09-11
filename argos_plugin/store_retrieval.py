@@ -1304,10 +1304,13 @@ class StoreRetrievalMixin:
             # hits landed at the tail, beyond the recall band's head slice,
             # so the pool never saw them (11/9 instrumented). Prepended
             # hits enter the band, get CE-scored, and rank on merit.
-            # Probes only fire on intent-family matches (regex), so
-            # unrelated queries pay nothing extra.
+            # Probe order wins: the probe ranks in the RECORD's dialect, so
+            # a record buried deep in the primary pool (measured 11/9:
+            # rank ~190+, and the service's pool is ~10x the offline one,
+            # so the record is usually ALREADY inside the primary) must be
+            # RE-RANKED by the probe, not merely added — dedup-vs-primary
+            # would silently drop the re-rank and the wall stands.
             _probe_hits = []
-            _seen_prim = {r.memory_id for r in vector_results}
             for _probe in _vector_probe_queries(query):
                 try:
                     _pv = self._vector_search_raw(
@@ -1322,10 +1325,11 @@ class StoreRetrievalMixin:
                 except Exception:
                     continue
                 for _r in _pv[:15]:
-                    if _r.memory_id not in _seen_prim:
-                        _seen_prim.add(_r.memory_id)
+                    if not any(r.memory_id == _r.memory_id for r in _probe_hits):
                         _probe_hits.append(_r)
-            vector_results = _probe_hits + vector_results
+            _probe_ids = {r.memory_id for r in _probe_hits}
+            vector_results = _probe_hits + [r for r in vector_results
+                                            if r.memory_id not in _probe_ids]
 
         # Fuse or select.
         if vector_results and text_results:

@@ -326,6 +326,9 @@ class TestT2LoaderModelParity:
                 if name == "chain_unfold":
                     # Enum field: only off/auto/always. Use "auto" (non-default).
                     raw[name] = "auto"
+                elif name == "approval_mode":
+                    # Enum field: only auto/human. Use "human" (non-default).
+                    raw[name] = "human"
                 elif name == "expiry_ttl_days":
                     # JSON string — keep a valid JSON shape.
                     raw[name] = '{"context_note":60,"event":90,"goal":120}'

@@ -55,6 +55,9 @@ pytestmark = pytest.mark.xdist_group("shared_service")
 _GATE_CONFIG = {
     "local_embedding_model": "nonexistent-model-xyz",
     "reranker_enabled": "false",
+    # Spec-13 (#393): candidate-isolation checks pin the human write policy
+    # so saves queue (the auto default materializes them immediately).
+    "approval_mode": "human",
     "tenants": {
         "alpha": {
             "database_filename": "alpha_gate.duckdb",

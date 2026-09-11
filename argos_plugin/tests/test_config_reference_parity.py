@@ -49,6 +49,8 @@ class TestConfigReferenceParity:
             "true", "false", "auto", "off", "always", "full", "minimal",
             "shared_service", "direct", "cloud", "local", "cloud_pilot",
             "local_sku", "hybrid_memory.duckdb", "hybrid_memory_kuzu",
+            # #404: option VALUE (not a key) - store_derived_identifier_mode.
+            "redact", "gate",
         }
         # Also filter out pure numbers.
         return {k for k in raw if k not in non_keys and not k.isdigit()}

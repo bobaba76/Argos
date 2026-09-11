@@ -191,6 +191,11 @@ def _make_provider(store):
     provider._extraction_shadow_diff = False
     provider._auto_review = False
     provider._extraction_dup_threshold = 0.88
+    # Spec-13 (#393 S1): pin the human write policy so extraction queues
+    # candidates (with the default auto mode they materialize immediately
+    # and this suite's candidate-level dedup assertions have nothing to
+    # inspect).
+    provider._approval_mode = "human"
     return provider
 
 

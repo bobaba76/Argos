@@ -223,6 +223,7 @@ class StoreWriteMixin:
         grounding: Any = None,
         created_at: Any = None,
         record_class: str | None = None,
+        trust_class: str | None = None,
     ) -> MemoryRecord | None:
         """Insert a memory record. Returns None if deduped away.
 
@@ -466,6 +467,13 @@ class StoreWriteMixin:
                 content[:80],
             )
 
+        # Spec-13 (#393): trust class is server-set; unknown values fail
+        # closed to 'unreviewed' (never laundered into clean).
+        _trust_class = str(trust_class or "").strip().lower()
+        if _trust_class and _trust_class != "unreviewed":
+            _trust_class = "unreviewed"
+        _trust_class = _trust_class or None
+
         sql = """
             INSERT INTO memory_records
                 (memory_id, category, content, tags, payload, created_at, updated_at,
@@ -475,8 +483,9 @@ class StoreWriteMixin:
                  verified_state, verified_at,
                  retrieval_count, helpful_count, dismissed_count,
                  valid_from, provenance_origin, grounding,
-                 embedding_dim, embedder_id, embedded_at, record_class)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+                 embedding_dim, embedder_id, embedded_at, record_class,
+                 trust_class)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with self._state.lock:
             assert self.connection is not None
@@ -501,7 +510,7 @@ class StoreWriteMixin:
                     created_ts,  # valid_from = in-world creation time (issue #8)
                     prov, ground,
                     embedding_dim, embedder_id, embedded_at,
-                    record_class,
+                    record_class, _trust_class,
                 ])
                 # #347: record the creation event in the same transaction.
                 self._record_event(
@@ -1264,8 +1273,16 @@ class StoreWriteMixin:
         external: bool = False,
         provenance_origin: Any = None,
         grounding: Any = None,
+        approval_mode: str | None = None,
     ) -> dict | None:
         """Store a pending proposal without making it retrievable memory.
+
+        Spec-13 (#393 S1) *approval_mode*: "auto" materializes the save
+        immediately with a server-classified trust tier (no queue);
+        "human" (and any invalid value - fail closed) keeps the v1
+        review-queue behavior. Resolved server-side: the memory service
+        passes the tenant policy value; a client-supplied argument is
+        stripped at the RPC sanitize boundary.
 
         Trust-model (batch-2): *provenance_origin* (#43) and *grounding* (#40)
         are derived from the write path when not passed explicitly, and carried
@@ -1449,6 +1466,51 @@ class StoreWriteMixin:
             normalized_confidence = max(0.0, min(1.0, float(confidence)))
         except (TypeError, ValueError):
             normalized_confidence = 0.5
+        # Spec-13 (#393 S1): write policy. "human" - and any invalid value
+        # (fail closed) - keeps the v1 queue behavior: the candidate is
+        # stored and waits for review. "auto" materializes the save
+        # immediately (below, inside the same transaction): zero queue,
+        # with the trust tier classified server-side from deterministic
+        # signals only (trust_tier.classify_trust_tier - zero LLM).
+        _mode = str(approval_mode or "").strip().lower()
+        if _mode not in ("auto", "human"):
+            _mode = "human"
+        _tier: str = "clean"
+        _trust_reasons: List[str] = []
+        _trust_sensitive = False
+        if _mode == "auto" and candidate_status == "pending":
+            try:
+                if __package__:
+                    from .trust_tier import classify_trust_tier
+                else:
+                    from trust_tier import classify_trust_tier
+                _tier, _trust_reasons, _trust_sensitive = classify_trust_tier(
+                    content=content,
+                    category=category,
+                    source=source,
+                    evidence_text=evidence_text,
+                    external=is_external,
+                    payload=candidate_payload,
+                    confidence=normalized_confidence,
+                    grounding=ground,
+                    tags=tags,
+                )
+            except Exception as exc:
+                # Fail closed: an unclassifiable save is never clean.
+                logger.warning("Trust-tier classification failed: %s", exc)
+                _tier, _trust_reasons = "unreviewed", ["classifier_error"]
+            if _tier == "blocked":
+                candidate_status = "quarantined"
+                quarantine_reason = (
+                    "approval_mode_auto: deterministic quality gate: "
+                    + "; ".join(_trust_reasons)
+                )
+            else:
+                candidate_payload["trust"] = {
+                    "class": _tier,
+                    "reasons": list(_trust_reasons),
+                    "sensitivity": bool(_trust_sensitive),
+                }
         with self._state.lock:
             assert self.connection is not None
             # #347: wrap INSERT + event in an explicit transaction so a
@@ -1494,11 +1556,127 @@ class StoreWriteMixin:
                     namespace=namespace or "conversation",
                     client_scope=client_scope,
                 )
+                # Spec-13 (#393 S1): approval_mode="auto" materializes the
+                # save immediately - still inside this transaction, so the
+                # candidate row, the memory row, and both events commit
+                # together or not at all.
+                if _mode == "auto" and candidate_status == "pending":
+                    _mem_id, candidate_status = self._auto_materialize_candidate(
+                        candidate_id=candidate_id,
+                        category=category,
+                        content=content,
+                        tags=tags,
+                        candidate_payload=candidate_payload,
+                        source=source,
+                        confidence=normalized_confidence,
+                        durability=durability,
+                        scope=scope,
+                        project_id=project_id,
+                        namespace=namespace,
+                        client_scope=client_scope,
+                        doc_class=doc_class,
+                        prov=prov,
+                        ground=ground,
+                        tier=_tier,
+                    )
                 self._commit_if_started(_started)
             except Exception:
                 self._rollback_if_started(_started)
                 raise
         return self.list_candidates(candidate_id=candidate_id, limit=1)[0]
+
+    def _auto_materialize_candidate(
+        self,
+        *,
+        candidate_id: str,
+        category: str,
+        content: str,
+        tags: List[str] | None,
+        candidate_payload: Dict[str, Any],
+        source: str,
+        confidence: float,
+        durability: str | None,
+        scope: str | None,
+        project_id: str | None,
+        namespace: str | None,
+        client_scope: str | None,
+        doc_class: str | None,
+        prov: str,
+        ground: str,
+        tier: str,
+    ) -> tuple[str | None, str]:
+        """Spec-13 (#393 S1): materialize an auto-saved candidate NOW.
+
+        Called from save_candidate when approval_mode="auto"; joins the
+        caller's transaction. Mirrors review_candidate's approved branch -
+        remember() runs every downstream gate (dedup, tombstone, ghost,
+        embedding) exactly as on the review path - minus reviewer
+        semantics: no reviewer decision applies, so the candidate is
+        stamped auto_saved and the memory carries the server-set trust
+        tier. Returns (memory_id_or_None, final_candidate_status).
+        """
+        trust = "unreviewed" if tier == "unreviewed" else None
+        try:
+            memory = self.remember(
+                category=category,
+                content=content.strip(),
+                tags=list(tags or []),
+                payload=candidate_payload,
+                source=source,
+                confidence=confidence,
+                durability=durability or "durable",
+                scope=scope or "profile",
+                project_id=project_id,
+                namespace=namespace or "conversation",
+                client_scope=client_scope,
+                doc_class=doc_class,
+                source_doc_id=candidate_payload.get("source_doc_id"),
+                provenance_origin=prov,
+                grounding=ground,
+                trust_class=trust,
+            )
+        except ValueError as exc:
+            # remember() refuses injection/ghost-blocked content. The
+            # candidate was already drained of sanitized classes at entry,
+            # but a refusal must still leave an auditable, non-active row.
+            self.connection.execute(
+                "UPDATE memory_candidates SET status = ?, updated_at = ?, "
+                "quarantine_reason = ?, quarantined_at = ? WHERE candidate_id = ?",
+                ["quarantined", self._now(),
+                 f"auto-save refused: {exc}", self._now(), candidate_id],
+            )
+            return None, "quarantined"
+        if memory is None:
+            self.connection.execute(
+                "UPDATE memory_candidates SET status = ?, updated_at = ?, "
+                "review_model = ?, review_reason = ? WHERE candidate_id = ?",
+                ["deduplicated", self._now(), "approval_mode_auto",
+                 "auto-save: content deduplicated against existing memory",
+                 candidate_id],
+            )
+            return None, "deduplicated"
+        candidate_payload["materialized_memory_id"] = memory.memory_id
+        self.connection.execute(
+            "UPDATE memory_candidates SET status = ?, updated_at = ?, "
+            "review_model = ?, review_reason = ?, payload = ? WHERE candidate_id = ?",
+            ["auto_saved", self._now(), "approval_mode_auto",
+             f"approval_mode=auto (trust class: {tier})",
+             json.dumps(candidate_payload), candidate_id],
+        )
+        self._record_event(
+            event_type="candidate_auto_saved",
+            entity_type="candidate",
+            entity_key=candidate_id,
+            reason=f"approval_mode=auto, trust_class={trust or 'clean'}",
+            refs={
+                "candidate_id": candidate_id,
+                "memory_id": memory.memory_id,
+                "trust_class": trust,
+            },
+            namespace=namespace or "conversation",
+            client_scope=client_scope,
+        )
+        return memory.memory_id, "auto_saved"
 
     def save_api_candidate(
         self,
@@ -1508,6 +1686,7 @@ class StoreWriteMixin:
         payload: Dict[str, Any] | None = None,
         *,
         pre_scan_blocked: bool = False,
+        approval_mode: str | None = None,
     ) -> dict | None:
         """#422: API-proposal candidate with SERVER-stamped provenance.
 
@@ -1539,6 +1718,7 @@ class StoreWriteMixin:
                 GROUNDING_SPECULATIVE if pre_scan_blocked else GROUNDING_EXTRACTED
             ),
             external=True,
+            approval_mode=approval_mode,
         )
 
     def list_candidates(
@@ -3161,8 +3341,9 @@ class StoreWriteMixin:
                         verified_state, verified_at,
                         retrieval_count, helpful_count, dismissed_count,
                         valid_from, valid_to, superseded_by,
-                        provenance_origin, grounding, record_class)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)""",
+                        provenance_origin, grounding, record_class,
+                        trust_class)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)""",
                     [new_id, rec.category, new_content, new_tags,
                      json.dumps(new_payload), created_ts, now,
                      effective_expires,
@@ -3192,7 +3373,11 @@ class StoreWriteMixin:
                      # downgraded to internal/observed on edit.
                      getattr(rec, "provenance_origin", PROVENANCE_INTERNAL) or PROVENANCE_INTERNAL,
                      getattr(rec, "grounding", GROUNDING_OBSERVED) or GROUNDING_OBSERVED,
-                     getattr(rec, "record_class", None)],
+                     getattr(rec, "record_class", None),
+                     # Spec-13 (#393): carry the write-policy trust class
+                     # forward so edits can never launder an unreviewed
+                     # record into a clean one (never auto-promote).
+                     getattr(rec, "trust_class", None)],
                 )
                 # 2. Supersede the old version. D5 fix: guard with
                 #    AND valid_to IS NULL so an already-superseded record's

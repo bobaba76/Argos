@@ -24,7 +24,7 @@ def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
     from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
-        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz", "approval_mode": "human"}),
         encoding="utf-8",
     )
     store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
@@ -64,7 +64,7 @@ def test_argos_tool_review_uses_keyword_arguments(tmp_path):
     from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
-        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz", "approval_mode": "human"}),
         encoding="utf-8",
     )
     store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
@@ -106,7 +106,7 @@ def test_shared_store_delete_memory_forwards_to_service(tmp_path):
     from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
-        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz", "approval_mode": "human"}),
         encoding="utf-8",
     )
     store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
@@ -140,7 +140,7 @@ def test_shared_memory_tool_delete_works_with_shared_client(tmp_path):
     from argos.service_client import SharedMemoryStore
 
     (tmp_path / "hybrid_memory.json").write_text(
-        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz", "approval_mode": "human"}),
         encoding="utf-8",
     )
     store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)

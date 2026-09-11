@@ -176,8 +176,11 @@ def test_shared_graph_index_and_traverse_round_trip(tmp_path):
 def test_shared_store_review_candidate_forwards_keyword_arguments(tmp_path):
     from service_client import SharedMemoryStore
 
+    # Spec-13 (#393): this test exercises the REVIEW round-trip, which runs
+    # under the human write policy (saves queue, then the reviewer decides).
     (tmp_path / "hybrid_memory.json").write_text(
-        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz",
+                    "approval_mode": "human"}),
         encoding="utf-8",
     )
     store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)

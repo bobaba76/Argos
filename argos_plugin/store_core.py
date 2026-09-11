@@ -171,7 +171,15 @@ class StoreCoreMixin:
                     -- noise from clustering. NOT overloaded with `tier`
                     -- (lifecycle status) or `namespace` (partitioning). Zero-
                     -- migration: existing rows default NULL (eligible).
-                    record_class       VARCHAR
+                    record_class       VARCHAR,
+                    -- Spec-13 (#393): provider write-policy trust class.
+                    -- NULL = normal/clean memory. 'unreviewed' = auto-saved
+                    -- under approval_mode=auto with medium/high risk signals:
+                    -- retrievable but rank-penalized (<= 3 positions) and
+                    -- resolvable only by explicit human action (never
+                    -- auto-promoted). Zero-migration: existing rows default
+                    -- NULL (pre-policy records are untouched by the flip).
+                    trust_class        VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS memory_candidates (
                     candidate_id       VARCHAR PRIMARY KEY,
@@ -349,6 +357,8 @@ class StoreCoreMixin:
                 # 'system_internal' = engine-room noise excluded from
                 # distillation input. Additive ALTER for pre-existing stores.
                 "record_class": "VARCHAR",
+                # Spec-13 (#393): write-policy trust class for memory_records.
+                "trust_class": "VARCHAR",
             }
             candidate_columns = {
                 "user_scope": "VARCHAR",

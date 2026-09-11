@@ -70,6 +70,13 @@ class MemoryConfig(BaseModel):
     stale_review_interval_min: int = Field(15, ge=1, le=10080)
     stale_review_min_age_min: int = Field(30, ge=0, le=10080)
     stale_review_max_batch: int = Field(25, ge=1, le=500)
+    # Spec-13 (#393): write policy. "auto" (default): saves materialize
+    # immediately - medium/high-risk signals are stamped
+    # trust_class="unreviewed" (rank-penalized, never auto-promoted,
+    # resolvable only by explicit human action). "human": v1 behavior -
+    # nothing becomes active without human approval. Per-tenant override
+    # via the tenant policy; invalid values fail closed to "human".
+    approval_mode: str = "auto"
 
     # -- graph retrieval -------------------------------------------------------
     graph_aware_retrieval: bool = True
@@ -395,6 +402,13 @@ class MemoryConfig(BaseModel):
             if v not in {"off", "auto", "always"}:
                 v = "off"
             result["chain_unfold"] = v
+
+        # -- approval_mode: enum validation (Spec-13 #393) --------------------
+        if "approval_mode" in result and result["approval_mode"] is not None:
+            v = str(result["approval_mode"]).strip().lower()
+            if v not in {"auto", "human"}:
+                v = "human"  # fail closed: never auto-save on a bad value
+            result["approval_mode"] = v
 
         # -- storage_mode: lowercase ------------------------------------------
         if "storage_mode" in result and result["storage_mode"] is not None:

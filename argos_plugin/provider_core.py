@@ -313,6 +313,8 @@ class ProviderCoreMixin:
         self._llm_fallback: bool = True
         self._extraction_shadow_diff: bool = False
         self._auto_review: bool = True
+        # Spec-13 (#393): write policy for extraction-path saves.
+        self._approval_mode: str = "auto"
         self._graph_aware_retrieval: bool = True
         self._graph_retrieval_boost: float = 0.05
         self._graph_inject_candidates: bool = False
@@ -672,6 +674,7 @@ class ProviderCoreMixin:
         self._llm_fallback = cfg.llm_fallback
         self._extraction_shadow_diff = cfg.extraction_shadow_diff
         self._auto_review = cfg.auto_review
+        self._approval_mode = cfg.approval_mode
         # Guarded confirmation surfacing (#99 rework, 3/9): surface one
         # pending user-confirmation per non-trivial turn, genuine needs
         # only, never re-ask a candidate (ledger in system_state).

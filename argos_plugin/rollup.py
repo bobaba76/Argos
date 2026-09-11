@@ -258,13 +258,19 @@ def run_rollup(
     }
 
     # D4: egress gate — refuse in local_only mode (same as distillation).
+    # #404: gate_payload applies the store-derived identifier policy to
+    # the ACTUAL outgoing prompt (the early check below only sees a
+    # sample; the prompt carries all record content).
     try:
         from egress import gate as _egress_gate
+        from egress import gate_payload as _egress_gate_payload
     except ImportError:
         try:
             from .egress import gate as _egress_gate
+            from .egress import gate_payload as _egress_gate_payload
         except ImportError:
             _egress_gate = None
+            _egress_gate_payload = None
 
     # Cooldown gate.
     if _is_within_cooldown(store, interval_days):
@@ -312,6 +318,13 @@ def run_rollup(
     # reads inside the loop).
     now = datetime.now(timezone.utc)
     prompt = _build_rollup_prompt(records, now=now)
+    # #404: cleanse the real payload per the store-derived identifier
+    # policy — redact mode masks identifiers; gate mode refuses here.
+    if _egress_gate_payload is not None:
+        _egress_allowed, prompt = _egress_gate_payload("memory_rollup", prompt)
+        if not _egress_allowed:
+            report["skipped"] = "egress_gate"
+            return report
     try:
         # D3: use the same call_llm signature as distillation/reviewer —
         # messages=[...] kwarg, not a positional prompt arg.

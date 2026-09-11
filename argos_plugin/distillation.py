@@ -512,6 +512,7 @@ def run_distillation(
         "records_processed": 0,
     }
     from egress import gate as _egress_gate
+    from egress import gate_payload as _egress_gate_payload
     # D6: pass the concatenated record content through the egress gate
     # (not an empty string) so the gate actually checks for sensitive
     # content. We load a small sample first for the gate check; the full
@@ -595,6 +596,12 @@ def run_distillation(
             # Reserve 1 call for the high-signal scan.
             break
         prompt = _build_cluster_prompt(cluster)
+        # #404: store-derived identifier policy — redact (default) masks
+        # identifiers; gate refuses and the run stops with an egress skip.
+        _egress_allowed, prompt = _egress_gate_payload("distillation", prompt)
+        if not _egress_allowed:
+            report["skipped"] = "egress_gate"
+            return report
         try:
             response = call_llm(
                 task="distillation",
@@ -683,6 +690,10 @@ def run_distillation(
         high_signal = _load_high_signal_records(store, limit=20)  # D3: reused below
         if len(high_signal) >= 2:
             prompt = _build_high_signal_prompt(high_signal)
+            _egress_allowed, prompt = _egress_gate_payload("distillation", prompt)
+            if not _egress_allowed:
+                report["skipped"] = "egress_gate"
+                return report
             try:
                 response = call_llm(
                     task="distillation_high_signal",

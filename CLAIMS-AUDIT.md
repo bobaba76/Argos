@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 156 test modules in `argos_plugin/tests/` (2,952 `def test_` definitions; counts generated via AST 2026-09-08 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 162 test modules in `argos_plugin/tests/` (3,105 `def test_` definitions; counts generated via AST 2026-09-11 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -294,3 +294,10 @@ committed, re-runnable artifact:
   no rotation at 100k+, actor context, scope filtering, denial routing, export formats,
   candidate_created per proposal, ingest_versioned per version-chain write,
   conflict_resolved per resolution (keep_old/keep_new/remove_both/manual).
+
+- **2026-09-11 (#404)** — §2 test-suite row + README Verification bullet refreshed:
+  was 156 modules / 2,952 `def test_` definitions (08/9); now 162 / 3,105, counted the
+  same way (AST via `scripts/count_test_fns.py::count_suite`). The increase covers the
+  merge waves since the last refresh (#427/#428, #429, #425, #404 — trust-model,
+  tenant-policy, sweep-coordination, RPC and egress tests). No measurement claims
+  changed; the row's "last recorded full-suite green run" line is unchanged.

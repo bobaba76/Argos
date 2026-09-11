@@ -146,6 +146,17 @@ def _pid_alive(pid: int) -> bool:
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
         os.kill(pid, 0)
+        # POSIX: a zombie (dead but not yet reaped by its parent) still
+        # answers kill(pid, 0). CI spawns the service as a child of the
+        # pytest process and never reaps it, so zombies must count as
+        # terminated - they hold no resources and are not orphans.
+        try:
+            with open("/proc/%d/stat" % int(pid), "rb") as fh:
+                state = fh.read().split(b") ", 1)[-1].split(b" ", 1)[0]
+            if state == b"Z":
+                return False
+        except OSError:
+            pass
         return True
     except Exception:
         return False
@@ -529,9 +540,14 @@ class TestServiceLifecycle:
         _stop_service(store)
         # Endpoint should be gone.
         assert not endpoint.exists(), "Endpoint file should be removed on shutdown"
-        # Process should be dead.
+        # Process should be dead. Bounded wait: a loaded CI box may need
+        # a moment for the exit to land (and for POSIX reaping; zombies
+        # are already treated as terminated by _pid_alive).
         if pid:
-            time.sleep(0.5)
+            for _ in range(50):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.1)
             assert not _pid_alive(pid), "Service process should be terminated"
 
 

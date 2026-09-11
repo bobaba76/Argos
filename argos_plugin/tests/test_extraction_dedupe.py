@@ -27,14 +27,86 @@ if str(_plugin_dir) not in sys.path:
     sys.path.insert(0, str(_plugin_dir))
 
 
+# Content-token hashing embedder for the semantic-dedupe tests below.
+# Hermetic stand-in for the BGE model: CI runs with HF_HUB_OFFLINE=1 and
+# cannot download it (the #90/#98 convention). Restatements that swap
+# only function words or inflections ("User's"/"My", "prefers"/"prefer")
+# share content tokens and land at cosine 1.0; distinct facts stay near
+# zero. Purely mechanical: no model, no network, no torch. The
+# ``equivalences`` mapping lets a test DECLARE that two phrasings are
+# semantic twins (simulating what the real model judged, so the provider
+# dedup flow itself is exercised on CI too).
+_STOPWORDS = frozenset({
+    "a", "an", "and", "are", "be", "for", "from", "has", "i", "in", "is",
+    "it", "its", "my", "of", "on", "s", "that", "the", "their", "they",
+    "to", "user", "users", "was", "with", "you", "your",
+})
+
+
+def _content_tokens(text: str) -> list:
+    import re
+    toks = [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if t]
+    out = []
+    for tok in toks:
+        if tok in _STOPWORDS:
+            continue
+        if len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+            tok = tok[:-1]
+        out.append(tok)
+    return out
+
+
+class _ContentEmbedder:
+    """Duck-typed LocalEmbedder: content-token hashing trick (no model)."""
+
+    def __init__(self, dim: int = 256, equivalences=None) -> None:
+        self._dim = dim
+        self._canon = {}
+        for pair in equivalences or ():
+            a, b = pair
+            self._canon[str(a).strip().lower()] = str(b).strip().lower()
+
+    def _vec(self, text: str) -> list:
+        import hashlib
+        import math
+        canonical = self._canon.get(str(text or "").strip().lower())
+        if canonical is not None:
+            text = canonical
+        v = [0.0] * self._dim
+        for tok in _content_tokens(text):
+            h = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(h[:4], "little") % self._dim
+            sign = 1.0 if (h[4] & 1) == 0 else -1.0
+            v[idx] += sign
+        norm = math.sqrt(sum(x * x for x in v))
+        if norm > 0:
+            v = [x / norm for x in v]
+        return v
+
+    def embed(self, text: str, *, is_query: bool = False) -> list:
+        if not text or not text.strip():
+            return []
+        return self._vec(text)
+
+    def embed_batch(self, texts, *, is_query: bool = False) -> list:
+        return [self.embed(t, is_query=is_query) for t in texts]
+
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
+
+
 @pytest.fixture
 def store(tmp_path):
-    """A fresh DuckDBMemoryStore with the BGE embedder."""
+    """A fresh DuckDBMemoryStore with a hermetic content-token embedder."""
     from store import DuckDBMemoryStore
-    from embeddings import LocalEmbedder
-    embedder = LocalEmbedder("BAAI/bge-small-en-v1.5")
     s = DuckDBMemoryStore(
-        tmp_path / "test.duckdb", user_id="test_user", embedder=embedder,
+        tmp_path / "test.duckdb", user_id="test_user",
+        embedder=_ContentEmbedder(),
     )
     yield s
     s.close()
@@ -208,11 +280,21 @@ class TestProviderExtractionDedupe:
     def test_duplicate_fact_skipped_no_candidate(self, tmp_path):
         """A fact already active, restated differently → NO new candidate."""
         from store import DuckDBMemoryStore
-        from embeddings import LocalEmbedder
 
+        # The synonym pair is DECLARED equivalent on the hermetic embedder
+        # (the real BGE model scored it > 0.88 in the pre-CI-offline runs);
+        # this exercises the provider dedup flow itself on CI.
+        embedder = _ContentEmbedder(equivalences=(
+            ("I prefer concise technical answers",
+             "User prefers concise technical explanations"),
+            # The extractor transforms "I prefer X" -> "User prefers: X";
+            # that transformed string is what dedup compares.
+            ("User prefers: concise technical answers",
+             "User prefers concise technical explanations"),
+        ))
         store = DuckDBMemoryStore(
             tmp_path / "dedupe.duckdb", user_id="test_user",
-            embedder=LocalEmbedder("BAAI/bge-small-en-v1.5"),
+            embedder=embedder,
         )
         store.remember(
             category="preference",
@@ -230,11 +312,10 @@ class TestProviderExtractionDedupe:
     def test_new_fact_emits_candidate(self, tmp_path):
         """A genuinely new fact still produces a pending candidate."""
         from store import DuckDBMemoryStore
-        from embeddings import LocalEmbedder
 
         store = DuckDBMemoryStore(
             tmp_path / "newfact.duckdb", user_id="test_user",
-            embedder=LocalEmbedder("BAAI/bge-small-en-v1.5"),
+            embedder=_ContentEmbedder(),
         )
         store.remember(
             category="personal_fact",

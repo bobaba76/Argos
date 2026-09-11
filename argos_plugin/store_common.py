@@ -423,6 +423,12 @@ class MemoryRecord:
         # explainability pack to distinguish an actual reranker pass
         # from graph boost / importance expansion.
         "_reranked",
+        # #445: transient markers set during a retrieval pass (union-pool
+        # membership, normalized CE score, bounded CE-rescue flag). Not
+        # persisted — mirror the _reranked pattern.
+        "_ce_pool_member",
+        "_ce_norm",
+        "_ce_promoted",
     )
 
     def __init__(

@@ -20,6 +20,13 @@ BM25_B = 0.75
 # Monkeypatched in tests (test_retrieval_audit_fixes.py:221-227).
 RRF_K = 20
 
+# #445: bounded CE-rescue slots (store_retrieval reranker block).
+#   CE_PROMOTE_MIN — normalized cross-encoder floor for a rescue candidate
+#   CE_PROMOTE_MAX — max rescued records per query (never displaces the
+#                    strict ranking lane beyond the window tail)
+CE_PROMOTE_MIN = 0.95
+CE_PROMOTE_MAX = 2
+
 # -- Semantic dedup (store_retrieval._find_current_similar) ------------------
 # Cosine similarity above this means "same fact" — used to gate the
 # semantic dedup layer in save_candidate / ingest_versioned.

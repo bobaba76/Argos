@@ -185,6 +185,7 @@ def reconcile(
     graph: Any,
     *,
     sample_size: int = 10,
+    full_lists: bool = False,
 ) -> Dict[str, Any]:
     """Run the reconciliation probe.
 
@@ -215,7 +216,7 @@ def reconcile(
     missing_sample = sorted(missing)[:sample_size]
     extra_sample = extra[:sample_size]
 
-    return {
+    result = {
         "duckdb_count": len(duckdb_ids),
         "graph_count": len(graph_ids),
         "missing_in_graph_count": len(missing),
@@ -225,6 +226,12 @@ def reconcile(
         "detection_errors": detection_errors,
         "drift": bool(missing or extra),
     }
+    if full_lists:
+        # #329: the in-service drift watch heals from the FULL missing
+        # set; interactive/CLI callers keep the bounded sample.
+        result["missing_in_graph_all"] = sorted(missing)
+        result["extra_in_graph_all"] = sorted(extra)
+    return result
 
 
 def main() -> int:

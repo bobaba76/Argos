@@ -62,6 +62,11 @@ class MemoryConfig(BaseModel):
     confirmation_surfacing: bool = True
     extraction_dup_threshold: float = Field(0.88, ge=0.0, le=1.0)
     stale_review_sweep_enabled: bool = True
+    # #329: in-service DuckDB-to-Kuzu drift watch. Interval 0 disables
+    # the watch; auto-heal re-indexes missing memories via the graph
+    # MERGE path (derived data; idempotent — see drift_watch.py).
+    graph_drift_check_interval_min: int = Field(360, ge=0, le=10080)
+    graph_drift_auto_heal: bool = True
     stale_review_interval_min: int = Field(15, ge=1, le=10080)
     stale_review_min_age_min: int = Field(30, ge=0, le=10080)
     stale_review_max_batch: int = Field(25, ge=1, le=500)
@@ -264,12 +269,14 @@ class MemoryConfig(BaseModel):
         "rollup_enabled", "local_only",
         "external_sources_require_confirmation",
         "router_enabled", "router_subcall_enabled",
+        "graph_drift_auto_heal",
     })
 
     # Clamped int fields: {name: (lo, hi, default)}.
     _CLAMPED_INT_FIELDS: ClassVar[dict] = {
         "max_injected_items": (1, 512, 20),
         "inject_content_char_cap": (100, 5000, 800),
+        "graph_drift_check_interval_min": (0, 10080, 360),
         "stale_review_interval_min": (1, 10080, 15),
         "stale_review_min_age_min": (0, 10080, 30),
         "stale_review_max_batch": (1, 500, 25),

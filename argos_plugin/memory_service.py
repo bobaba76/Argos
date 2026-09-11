@@ -1671,6 +1671,21 @@ class MemoryService:
             except Exception:
                 subsystem_health = {}
                 degraded_subsystems = []
+            # #329: cached in-service drift-watch result (visible tenants
+            # only, mirroring the tenant_policies scoping above).
+            try:
+                try:
+                    from drift_watch import last_result as _drift_last
+                except ImportError:
+                    from .drift_watch import last_result as _drift_last
+                drift_all = _drift_last() or {}
+            except Exception:
+                drift_all = {}
+            visible_drift = {
+                name: res
+                for name, res in (drift_all.get("tenants") or {}).items()
+                if name in visible_tenants
+            }
             return {
                 "status": "ok",
                 "pid": os.getpid(),
@@ -1690,6 +1705,11 @@ class MemoryService:
                 "lock_wait_count": self._lock_wait_count,
                 "subsystem_health": subsystem_health,
                 "degraded_subsystems": degraded_subsystems,
+                "graph_drift": {
+                    "checked_at": drift_all.get("checked_at"),
+                    "drift": bool(drift_all.get("drift", False)),
+                    "tenants": visible_drift,
+                },
             }
         if request.get("method") == "stats":
             return {
@@ -2136,6 +2156,18 @@ def serve(home: Path, port: int = 0) -> None:
             except Exception:
                 pass  # graph hygiene is non-fatal; do not block service boot
     threading.Thread(target=_sweep, daemon=True).start()
+
+    # #329: periodic DuckDB-to-Kuzu drift watch (+ idempotent auto-heal).
+    # Interval/auto-heal come from config (0 min disables). First cycle
+    # is delayed inside the watch so boot work wins; non-fatal either way.
+    try:
+        try:
+            from drift_watch import start_drift_watch_thread as _start_drift
+        except ImportError:
+            from .drift_watch import start_drift_watch_thread as _start_drift
+        _start_drift(service)
+    except Exception:
+        pass  # drift watch is non-fatal; never block service boot
 
     def _stop(_signum, _frame) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()

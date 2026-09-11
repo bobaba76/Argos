@@ -220,6 +220,9 @@ def _record_from_dict(value: dict | None) -> MemoryRecord | None:
         valid_to=value.get("valid_to"),
         superseded_by=value.get("superseded_by"),
         record_class=value.get("record_class"),
+        # Spec-13 (#393): trust tier survives the RPC round-trip so
+        # consumers (probes, UI, session context) can see the class.
+        trust_class=value.get("trust_class"),
     )
 
 

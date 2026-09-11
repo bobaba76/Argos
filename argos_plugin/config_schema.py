@@ -121,6 +121,22 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             group="Extraction",
         ),
         ProviderField(
+            key="graph_drift_check_interval_min",
+            label="Graph drift check interval (min)",
+            kind=KIND_NUMBER,
+            default="360",
+            description="How often the in-service DuckDB-to-graph drift check runs (minutes). 0 disables the watch. Uses the same probe as scripts/reconcile_graph.py (#329).",
+            group="Lifecycle",
+        ),
+        ProviderField(
+            key="graph_drift_auto_heal",
+            label="Auto-heal graph drift",
+            kind=KIND_BOOL,
+            default="true",
+            description="When drift is detected, re-index missing memories into the graph automatically (idempotent; the Kuzu graph is derived data and source records are never modified).",
+            group="Lifecycle",
+        ),
+        ProviderField(
             key="stale_review_interval_min",
             label="Stale sweep interval (min)",
             kind=KIND_NUMBER,

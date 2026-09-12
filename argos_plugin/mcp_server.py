@@ -326,6 +326,48 @@ def _candidate_review_input_schema() -> Dict[str, Any]:
     }
 
 
+def _memory_review_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_review (class B, human only).
+
+    Spec-13 S3 (#393): promote (vouch -> clean class, rank penalty
+    removed) or dismiss (quarantine + rejection ledger) a memory saved
+    under the 'unreviewed' trust class. Human principal only - model
+    principals are denied (no self-vouch).
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["memory_id", "decision", "idempotency_key"],
+        "properties": {
+            "memory_id": {
+                "type": "string",
+                "description": "The memory to resolve.",
+                "maxLength": 256,
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["promote", "dismiss"],
+                "description": (
+                    "'promote' vouches the memory (clean class, rank "
+                    "penalty removed); 'dismiss' quarantines it and blocks "
+                    "re-assertion via the rejection ledger."
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason for the decision.",
+                "maxLength": 2000,
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Client-generated unique key for idempotency.",
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
 def _collection_create_input_schema() -> Dict[str, Any]:
     """Strict input schema for collection_create (class C, loopback only)."""
     return {
@@ -721,6 +763,29 @@ TOOL_DEFINITIONS: tuple = (
         },
     },
     {
+        "name": "memory_review",
+        "description": (
+            "Promote (vouch -> clean class) or dismiss (quarantine + "
+            "rejection ledger) a memory saved under the 'unreviewed' "
+            "trust class (Spec-13 resolution). Class B — HUMAN principal "
+            "only. A model principal cannot vouch its own memory."
+        ),
+        "inputSchema": _memory_review_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "memory_id": {"type": "string"},
+                "decision": {"type": "string"},
+                "changed": {"type": "boolean"},
+                "previous_trust_class": {"type": ["string", "null"]},
+                "previous_status": {"type": ["string", "null"]},
+                "reassertion_blocked": {"type": ["boolean", "null"]},
+                "reviewer": {"type": "string"},
+            },
+        },
+    },
+    {
         "name": "memory_save",
         "description": (
             "Save a fact directly to active memory (class C write — "
@@ -853,6 +918,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_save": "memory_save",
     "memory_update": "memory_update",
     "memory_candidate_review": "review_candidate",
+    "memory_review": "review_memory",
     "collection_list": "collection_list",
     "collection_items": "collection_items",
     "collection_create": "collection_create",
@@ -868,6 +934,7 @@ TOOLS_WITH_IDEMPOTENCY_KEY: frozenset = frozenset({
     "memory_save",
     "memory_update",
     "memory_candidate_review",
+    "memory_review",
     "collection_create",
     "collection_add_item",
     "collection_update_item",
@@ -1095,7 +1162,8 @@ class MCPServer:
                 "directly to active memory (loopback only), memory_update to "
                 "update a memory with version chaining, "
                 "memory_candidate_review to approve/reject candidates "
-                "(human only), collection_list/collection_items to list "
+                "(human only), memory_review to promote/dismiss unreviewed "
+                "memories (human only), collection_list/collection_items to list "
                 "collections and their items, and collection_create/"
                 "collection_add_item/collection_update_item/"
                 "collection_remove_item to manage collections (loopback "

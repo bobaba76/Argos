@@ -270,13 +270,19 @@ class TestNoSelfApproval:
     tools are not in the public allowlist."""
 
     def test_approve_tool_not_in_tool_definitions(self):
-        """There is no memory_approve or memory_review tool in the
-        public tool definitions."""
+        """No bare approve/reject/quarantine tools exist.
+
+        Resolution of memories (Spec-13 S3) lives on `memory_review` -
+        class B, human-only, mirroring `memory_candidate_review`. The
+        name pin from the pre-class-B era is updated deliberately: the
+        safety property is NOT tool-name absence but the principal gate
+        (see test_review_memory_is_forbidden below and the class-B
+        checks in test_review_memory.py)."""
         tool_names = {t["name"] for t in TOOL_DEFINITIONS}
         assert "memory_approve" not in tool_names
-        assert "memory_review" not in tool_names
         assert "memory_reject" not in tool_names
         assert "memory_quarantine" not in tool_names
+        assert "memory_review" in tool_names  # class B, human-only
 
     def test_approve_operation_not_in_public_operations(self):
         """The facade does not expose approve/reject as public operations,
@@ -285,6 +291,25 @@ class TestNoSelfApproval:
         assert "reject" not in PUBLIC_OPERATIONS
         assert "review_candidate" in PUBLIC_OPERATIONS
         assert "review_candidate" in PROPOSAL_OPERATIONS
+
+    def test_review_memory_is_forbidden(self):
+        """A model principal attempting to call review_memory through the
+        facade is rejected with forbidden (class B is human-only) - no
+        model self-vouch, mirrors review_candidate."""
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig())
+        auth = AuthContext(
+            principal="model-agent",
+            tenant="default",
+            user_id="model-user",
+            transport="mcp-stdio",
+            principal_type="model",
+            allowed_operations=READ_OPERATIONS | PROPOSAL_OPERATIONS,
+        )
+        with pytest.raises(APIError) as exc_info:
+            facade.execute(auth, "review_memory",
+                           {"memory_id": "mem-1", "decision": "promote"})
+        assert exc_info.value.code == "forbidden"
 
     def test_review_candidate_is_forbidden(self):
         """A model principal attempting to call review_candidate through

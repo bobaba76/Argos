@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 165 test modules in `argos_plugin/tests/` (3,201 `def test_` definitions; counts generated via AST 2026-09-11 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 168 test modules in `argos_plugin/tests/` (3,264 `def test_` definitions; counts generated via AST 2026-09-12 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -316,3 +316,12 @@ committed, re-runnable artifact:
   suite (`test_unreviewed_observability.py`: trust-class search filter, `unreviewed_stats`,
   RPC dispatch threading, facade scoping/restore, MCP + REST surfaces). No measurement
   claims changed.
+
+- **2026-09-12 (#393 S3 + wave merges)** — §2 test-suite row + README Verification bullet
+  refreshed again: 165 modules / 3,201 `def test_` definitions (the S2 refresh) now
+  168 / 3,264, counted the same way (AST via `scripts/count_test_fns.py::count_suite`).
+  The increase covers the overnight pipeline wave (#455-#470: retrieval-rescue, cost,
+  and search-latency suites) and #393 S3's resolution suite (`test_review_memory.py`:
+  promote/dismiss store semantics, rejection-ledger fingerprinting with the honest
+  slot-less flag, resolution invariant, RPC class derivation, facade/model-principal
+  gates, MCP + REST surfaces). No measurement claims changed.

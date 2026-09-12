@@ -114,6 +114,35 @@ Report the live unreviewed trust-class backlog: count and oldest age of memories
 }
 ```
 
+### `POST /v1/memories/{memory_id}/decision`
+
+Resolve a memory saved under the `unreviewed` trust class (Spec-13 S3 — medium-risk saves under `approval_mode: auto`). Class B — **human principal only**: the transport must declare `ARGOS_API_PRINCIPAL_TYPE=human`; model principals (the fail-closed default) are denied with `403 forbidden`. Resolution is audit-logged (`memory_promoted` / `memory_dismissed`).
+
+- `promote` — vouch the memory: the class marker is cleared and the bounded rank penalty is removed (clean class).
+- `dismiss` — quarantine the memory and fingerprint its claim slot in the rejection ledger. `reassertion_blocked` reports whether re-assertion is actually blocked — slot-less records cannot be fingerprinted (by design), so only the quarantine applies.
+
+**Auth:** required. **Idempotency-Key:** required.
+
+**Request:**
+
+```json
+{ "decision": "promote", "reason": "verified by user" }
+```
+
+**Response:**
+
+```json
+{
+  "memory_id": "mem-1",
+  "decision": "promoted",
+  "changed": true,
+  "previous_trust_class": "unreviewed",
+  "previous_status": null,
+  "reassertion_blocked": null,
+  "reviewer": "local"
+}
+```
+
 ### `GET /v1/memories/{memory_id}`
 
 Fetch a single memory by ID. ACL-enforced — out-of-scope memories return `404 not_found` (not `403`, to avoid leaking existence).

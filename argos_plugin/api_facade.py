@@ -114,6 +114,11 @@ PROPOSAL_OPERATIONS: Set[str] = {
     # reserved for review_source="tool"/"manual"; auto_review may only
     # set "reviewed_approved" (user confirmation still required).
     "review_candidate",
+    # Spec-13 (#393 S3): resolution of an auto-saved 'unreviewed' memory -
+    # promote (vouch -> clean class) or dismiss (quarantine + rejection
+    # ledger). Mirrors review_candidate: class B (human principal only),
+    # audited, and the storage layer refuses non-human review classes.
+    "review_memory",
 }
 
 # Feedback tier: separately scoped.
@@ -849,6 +854,48 @@ def _validate_review_candidate_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def _validate_review_memory_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate review_memory parameters (Spec-13 #393 S3).
+
+    Resolution of an 'unreviewed' memory: promote (vouch -> clean class)
+    or dismiss (quarantine + rejection ledger). Class B - human only;
+    model principals are denied in execute() (no self-vouch). The facade
+    always sets review_source="tool" - the UI is a human-driven
+    confirmation surface.
+    """
+    cleaned: Dict[str, Any] = {}
+    memory_id = str(params.get("memory_id", "")).strip()
+    if not memory_id:
+        raise APIError("invalid_input", "memory_id is required")
+    if len(memory_id) > MAX_MEMORY_ID_LENGTH:
+        raise APIError(
+            "invalid_input",
+            f"memory_id exceeds max length {MAX_MEMORY_ID_LENGTH}",
+        )
+    cleaned["memory_id"] = memory_id
+    decision = str(params.get("decision", "")).strip().lower()
+    if decision not in ("promote", "dismiss"):
+        raise APIError(
+            "invalid_input",
+            "decision must be 'promote' or 'dismiss'",
+        )
+    cleaned["decision"] = decision
+    reason = str(params.get("reason", "")).strip()
+    if len(reason) > MAX_CONTENT_LENGTH:
+        raise APIError(
+            "request_too_large",
+            f"reason exceeds max length {MAX_CONTENT_LENGTH}",
+        )
+    cleaned["reason"] = reason
+    for flag in FORBIDDEN_CLIENT_FLAGS:
+        if params.get(flag):
+            raise APIError(
+                "forbidden",
+                f"Parameter {flag} is not available on the public API.",
+            )
+    return cleaned
+
+
 def _validate_export_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Validate export parameters (#295 admin console, #294 portable export).
 
@@ -1339,6 +1386,19 @@ class ArgosAPIFacade:
                 request_id=request_id,
             )
 
+        # Spec-13 S3: memory resolution (promote/dismiss) is class B too -
+        # human-only, same posture as candidate approval.
+        if operation == "review_memory" and ctx.principal_type == "model":
+            self._audit(ctx, operation, request_id, "denied",
+                        denied_reason="model_principal_cannot_resolve")
+            raise APIError(
+                "forbidden",
+                "Model principals may not resolve memories (class B is "
+                "human-only). No model self-vouch, even with "
+                "review_source='tool'.",
+                request_id=request_id,
+            )
+
         # 3. Identity enforcement (D3): reject client-supplied identity
         # fields that attempt to widen access. The caller may narrow
         # (e.g. filter to a subset of their allowed client_scope) but
@@ -1381,6 +1441,8 @@ class ArgosAPIFacade:
                 validated = _validate_list_candidates_params(params)
             elif operation == "review_candidate":
                 validated = _validate_review_candidate_params(params)
+            elif operation == "review_memory":
+                validated = _validate_review_memory_params(params)
             elif operation == "memory_save":
                 validated = _validate_memory_save_params(params)
             elif operation == "memory_update":
@@ -1468,6 +1530,8 @@ class ArgosAPIFacade:
                 result = self._op_list_candidates(ctx, validated)
             elif operation == "review_candidate":
                 result = self._op_review_candidate(ctx, validated)
+            elif operation == "review_memory":
+                result = self._op_review_memory(ctx, validated)
             elif operation == "memory_save":
                 result = self._op_memory_save(ctx, validated)
             elif operation == "memory_update":
@@ -2170,6 +2234,54 @@ class ArgosAPIFacade:
             "review_reason": cand.get("review_reason"),
             "reviewed_at": cand.get("reviewed_at"),
             "memory_id": getattr(mem, "memory_id", None) if mem else None,
+            "reviewer": ctx.principal,  # server-derived identity
+        }
+
+    def _op_review_memory(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Proposal tier (Spec-13 #393 S3): resolve an 'unreviewed' memory.
+
+        promote -> vouch (clean class; the bounded rank penalty is
+        removed). dismiss -> quarantine + rejection ledger. Class B:
+        human principals only (model principals denied in execute()); the
+        storage layer refuses non-human review classes, so resolution
+        always carries an explicit human decision.
+
+        Server-derived identity (D4): the reviewer is ctx.principal, not
+        a client-supplied name.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "review_memory"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Memory review is not available on this store.",
+                )
+            result = self._store.review_memory(
+                memory_id=params["memory_id"],
+                decision=params["decision"],
+                reason=params.get("reason", ""),
+                review_source="tool",  # human-driven, never auto_review
+                reviewer=ctx.principal,
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        if result is None:
+            raise APIError(
+                "not_found",
+                "Memory not found (or not a head version in the caller's scope).",
+            )
+        return {
+            "memory_id": result.get("memory_id"),
+            "decision": result.get("decision"),
+            "changed": result.get("changed"),
+            "previous_trust_class": result.get("previous_trust_class"),
+            "previous_status": result.get("previous_status"),
+            "reassertion_blocked": result.get("reassertion_blocked"),
             "reviewer": ctx.principal,  # server-derived identity
         }
 

@@ -956,6 +956,17 @@ class SharedMemoryStore:
             value["memory"] = _record_from_dict(value["memory"]).to_dict()
         return value
 
+    def review_memory(self, **kwargs: Any) -> dict | None:
+        # Spec-13 S3 (#393): resolve an unreviewed memory (promote/dismiss).
+        # The user-confirmed privilege classes ride the gated channel
+        # (#423 pattern, mirrors review_candidate) - ungated callers are
+        # forced to auto_review server-side, where the storage resolution
+        # invariant refuses them loudly.
+        review_source = str(kwargs.get("review_source", "") or "")
+        if review_source in {"tool", "manual"}:
+            return self._rpc.call_gated("store", "review_memory", **kwargs)
+        return self._rpc.call("store", "review_memory", **kwargs)
+
     def find_supersede_candidates(
         self, candidate_id: str, limit: int = 3,
     ) -> List[dict]:

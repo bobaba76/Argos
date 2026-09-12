@@ -119,6 +119,18 @@ class CandidateDecisionRequest(BaseModel):
     reason: Optional[constr(max_length=2000)] = None
 
 
+class MemoryDecisionRequest(BaseModel):
+    """Strict request body for POST /v1/memories/{id}/decision.
+
+    Spec-13 S3 (#393) - resolution of an 'unreviewed' memory. Class B -
+    human principal only. Model principals are denied by the facade
+    (no self-vouch).
+    """
+    model_config = {"extra": "forbid"}
+    decision: constr(pattern=r"^(promote|dismiss)$")
+    reason: Optional[constr(max_length=2000)] = None
+
+
 class FeedbackRequest(BaseModel):
     """Strict request body for POST /v1/memories/{id}/feedback."""
     model_config = {"extra": "forbid"}
@@ -675,6 +687,33 @@ def create_app(
         try:
             result = facade.execute(ctx, "review_candidate", {
                 "candidate_id": candidate_id,
+                "decision": body.decision,
+                "reason": body.reason or "",
+            }, idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- POST /v1/memories/{memory_id}/decision — resolve (class B, human only)
+
+    @app.post("/v1/memories/{memory_id}/decision")
+    async def review_memory(
+        memory_id: str,
+        body: MemoryDecisionRequest,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ):
+        """Promote (vouch) or dismiss an unreviewed memory. Class B — human
+        principal only. Model principals are denied (no self-resolution)."""
+        if len(memory_id) > MAX_MEMORY_ID_LENGTH:
+            return _error_response(
+                "invalid_input", "memory_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            result = facade.execute(ctx, "review_memory", {
+                "memory_id": memory_id,
                 "decision": body.decision,
                 "reason": body.reason or "",
             }, idempotency_key=idempotency_key)

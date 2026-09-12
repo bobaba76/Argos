@@ -1001,8 +1001,23 @@ class KuzuGraphStore:
         with KuzuGraphStore._shared_lock:
             shared = KuzuGraphStore._shared.get(self._db_key)
             if shared is None:
-                # First instance in this process — open the database.
-                database = kuzu.Database(str(self.db_dir))
+                # First instance in this process - open the database.
+                # #459: cap the per-Database virtual-address reservation in
+                # tests. Kuzu reserves ``max_db_size`` (default 8 TiB) of
+                # address space per Database via VirtualAlloc; a full-suite
+                # run opening many graphs in one process exhausts the 128 TiB
+                # user address space and late-suite opens fail with
+                # "VirtualAlloc ... error code 8". Tests set
+                # ARGOS_KUZU_MAX_DB_SIZE_MB via tests/conftest.py; production
+                # leaves it unset (full default).
+                _db_kwargs: Dict[str, Any] = {}
+                _cap_mb = os.environ.get("ARGOS_KUZU_MAX_DB_SIZE_MB", "").strip()
+                if _cap_mb:
+                    try:
+                        _db_kwargs["max_db_size"] = int(float(_cap_mb)) * 1024 * 1024
+                    except ValueError:
+                        pass
+                database = kuzu.Database(str(self.db_dir), **_db_kwargs)
                 conn = kuzu.Connection(database)
                 lock = threading.Lock()
                 ref_count = 0

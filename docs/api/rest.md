@@ -224,6 +224,27 @@ Diagnose why a memory did NOT surface in retrieval (#320). Deterministic, read-o
 }
 ```
 
+### `POST /v1/ingest`
+
+Structured ingestion (#289) over REST (#386): JSON/CSV rows become memories with first-class provenance (server-set). Preview (default) validates and reports — writes nothing. Apply materializes ACTIVE records through the candidate/approval machinery and requires the literal `"confirm": true`; it is **class-C posture** — non-loopback callers get `403` on apply (fail-closed facade denial, `write_requires_loopback`). An `Idempotency-Key` header is required.
+
+**Auth:** required (preview at proposal tier; apply requires loopback + write tier)
+
+**Request:**
+
+```json
+{
+  "data": "name,employer\nAlice,Acme",
+  "fmt": "csv",
+  "source_name": "contacts-export",
+  "mapping": {"category": "context_note", "content_template": "{name} works at {employer}"},
+  "mode": "apply",
+  "confirm": true
+}
+```
+
+**Response:** the ingest report — `{ mode, source, mapping_id, total_rows, valid_rows, error_rows, inserted, superseded, duplicates, quarantined, blocked, rows, errors, wrote }`
+
 ## Error responses
 
 All errors use the stable envelope from the [API overview](index.md#error-envelope):

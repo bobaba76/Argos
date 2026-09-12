@@ -1,16 +1,18 @@
 # API reference
 
-Argos exposes a read tier (and a proposal tier) over MCP (stdio) and REST (HTTP). Both transports bind to loopback only and enforce a bearer token. The operation set is an explicit allowlist behind `ArgosAPIFacade` — auth context → ACL → validation → audit. No raw RPC passthrough; internal operations (shutdown, backup, set_state, purge, etc.) are never exposed.
+Argos exposes its facade tiers (read → proposal → feedback → write) over MCP (stdio) and REST (HTTP). Both transports bind to loopback only and enforce a bearer token. The operation set is an explicit allowlist behind `ArgosAPIFacade` — auth context → ACL → validation → audit. No raw RPC passthrough; internal operations (shutdown, backup, set_state, purge, etc.) are never exposed.
 
 ## Facade operation tiers
 
-The facade (`argos_plugin/api_facade.py`) defines three tiers:
+The facade (`argos_plugin/api_facade.py`) defines these tiers:
 
 | Tier | Operations | Description |
 |------|-----------|-------------|
-| **READ** | `search`, `fetch`, `fetch_history`, `capabilities`, `explain`, `explain_retrieval` | Available to all authenticated principals. |
-| **PROPOSAL** | `memory_propose`, `ingest`, `erase_request` | External caller → candidate → security scan → review queue. Never creates active memory directly. `erase_request` is destructive but shares the proposal tier for idempotency mechanics. |
+| **READ** | `search`, `fetch`, `fetch_history`, `capabilities`, `explain`, `explain_retrieval`; collection reads (`collection_list`, `collection_items`) | Available to all authenticated principals. |
+| **PROPOSAL** | `memory_propose`, `ingest`, `erase_request` | External caller → candidate → security scan → review queue. `erase_request` is destructive but shares the proposal tier for idempotency mechanics. `ingest` shares the tier for mechanics only — preview (default) writes nothing; **apply** self-approves through the candidate path and materializes ACTIVE records, so it requires loopback (class-C posture, #386). |
 | **FEEDBACK** | `record_feedback` | Separately scoped. |
+| **RESOLUTION (class B)** | `memory_review`, `memory_candidate_review` | Human principals only — model principals are denied (no self-approval). Resolutions are audit-logged. |
+| **WRITE (class C)** | `memory_save`, `memory_update`; collection writes (`collection_create`, `collection_add_item`, `collection_update_item`, `collection_remove_item`) | Trusted-local only: requires loopback transport and the write grant. |
 
 The union of all three tiers is `PUBLIC_OPERATIONS`. Operations not in this set (and explicitly in `FORBIDDEN_OPERATIONS`) return `method_not_allowed` — they are internal-only.
 
@@ -35,8 +37,8 @@ Every error carries a stable code and a `request_id`. The facade never leaks tra
 
 ## Transports
 
-- [MCP (stdio)](mcp.md) — JSON-RPC 2.0 over stdio. Tools: `memory_search`, `memory_fetch`, `memory_fetch_history`, `memory_explain`, `memory_why_not`, `memory_capabilities`, `memory_propose`.
-- [REST (HTTP)](rest.md) — FastAPI on `127.0.0.1`. Endpoints for health, ready, capabilities, search, fetch, history, explain, explain-retrieval.
+- [MCP (stdio)](mcp.md) — JSON-RPC 2.0 over stdio. 19 tools: 13 `memory_*` (`search`, `fetch`, `fetch_history`, `explain`, `why_not`, `capabilities`, `unreviewed`, `propose`, `ingest`, `save`, `update`, `review`, `candidate_review`) + 6 `collection_*` (`create`, `list`, `items`, `add_item`, `update_item`, `remove_item`).
+- [REST (HTTP)](rest.md) — FastAPI on `127.0.0.1`. Health/ready/capabilities; reads (search, unreviewed, fetch, history, explain, explain-retrieval); writes (`POST /v1/memories`, `POST /v1/ingest`, candidates list/decision, memory decision, feedback, collections).
 
 ## Security model
 

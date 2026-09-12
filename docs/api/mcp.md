@@ -67,6 +67,26 @@ Fetch the version history for a memory.
 
 - **Output:** `{ history: [{ memory_id, content, created_at, status }], count }`
 
+### `memory_ingest`
+
+Structured ingestion (#289): JSON/CSV rows become memories with first-class provenance (server-set `source=structured_ingest`, `grounding=extracted`). Preview (default) validates and reports — writes nothing. Apply materializes records via the candidate/approval machinery and requires the literal `confirm: true`; it is a **class-C (trusted-local) operation** — the facade denies apply on non-loopback transports (`403 forbidden`), so bridge/remote callers should use `memory_propose` for external writes. An idempotency key is required.
+
+- **Facade op:** `ingest`
+- **Input:**
+
+    | Field | Type | Required | Description |
+    |-------|------|----------|-------------|
+    | `data` | string | yes | Raw JSON array or CSV text (UTF-8, max 262144 bytes). |
+    | `fmt` | string | yes | `json` or `csv`. |
+    | `source_name` | string | yes | Source file/feed name — provenance + ingest namespace (max 200 chars). |
+    | `mapping` | object | yes | Field mapping: `category` + `content_template` (required); `tags`, `key_field`, per-field mappings (optional). |
+    | `mode` | string | no | `preview` (default, writes nothing) or `apply`. |
+    | `confirm` | boolean | no | Human-in-loop gate. Apply requires the literal `true`. |
+    | `client_scope` / `doc_class` / `project_id` | string | no | Optional scoping metadata. |
+    | `idempotency_key` | string | yes | Client-generated unique key (1–256 chars). |
+
+- **Output:** `{ mode, source, mapping_id, total_rows, valid_rows, error_rows, inserted, superseded, duplicates, quarantined, blocked, rows, errors, wrote }`
+
 ### `memory_propose`
 
 Propose a new memory for human review. The candidate enters the review queue — it does NOT become active memory until a human approves it. An idempotency key is required.
@@ -146,7 +166,22 @@ Every tool's `inputSchema` sets `additionalProperties: false`. Unknown fields ar
 
 ## Provenance fields are server-set
 
-`memory_propose` does NOT accept `source`, `provenance_origin`, or `grounding` — these are server-set. The facade rejects them if the caller attempts to set them. This is the D4 (server-derived identity) invariant: the caller cannot forge provenance.
+`memory_propose` and `memory_ingest` do NOT accept `source`, `provenance_origin`, or `grounding` — these are server-set. The facade rejects them if the caller attempts to set them. This is the D4 (server-derived identity) invariant: the caller cannot forge provenance. (`memory_ingest` additionally server-stamps `source=structured_ingest` and an `ingest:<source_name>` namespace on every row.)
+
+## Environment
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `ARGOS_API_USER_ID` | `default_user` | Store user scope the server reads/writes. Set it to your agent's user id (e.g. in the `mcpServers` env block) so external clients see the same memories as the native agent. |
+| `ARGOS_API_READ_ONLY` | unset | `1` restores the read-only surface (search/fetch/explain only). |
+| `ARGOS_API_PRINCIPAL_TYPE` | `model` | `human` enables class-B review ops (`memory_review`). |
+| `ARGOS_API_NO_LOOPBACK` | unset | `1` denies class-C ops — including `memory_ingest` apply. |
+
+Tier model in full: [Integration](integration.md).
+
+## Retrieval pipeline
+
+Retrieval runs entirely **service-side**: the server proxies every stage (embedding, reranker/blend, chains) to the shared memory service over RPC, so MCP search returns the same vector-backed pipeline as the native agent — verified byte-identical for the same store/user (#386; pinned by `tests/test_spec12_parity.py`). There is no client-side embedder and no opt-in needed.
 
 ## Registration
 

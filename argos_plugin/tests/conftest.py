@@ -202,6 +202,17 @@ _install_hermes_stubs_if_missing()
 
 
 # ---------------------------------------------------------------------------
+# #459: Kuzu address-space cap for tests
+# ---------------------------------------------------------------------------
+# Kuzu reserves max_db_size (default 8 TiB) of virtual address space per
+# open Database. A full-suite run (hundreds of graph opens across 168 files
+# in one process) exhausts the 128 TiB user address space, and late-suite
+# opens fail with "VirtualAlloc for size 8796093022208 failed". Tests never
+# need more than a few hundred MB per graph; production is unaffected.
+os.environ.setdefault("ARGOS_KUZU_MAX_DB_SIZE_MB", "256")
+
+
+# ---------------------------------------------------------------------------
 # Import-state hygiene (issue #51)
 # ---------------------------------------------------------------------------
 
@@ -209,7 +220,16 @@ _install_hermes_stubs_if_missing()
 # Exact keys, plus every submodule under the agent./tools. packages
 # (agent.auxiliary_client, agent.memory_provider, tools.registry, ...).
 _STUB_KEYS_EXACT = frozenset(
-    {"agent", "tools", "plugins", "service_client", "inbound_security", "argos.inbound_security"}
+    {
+        "agent", "tools", "plugins", "service_client", "inbound_security",
+        "argos.inbound_security",
+        # #459: embedding-stack modules that tests fake (test_batch_e). If
+        # they are not part of the guard snapshot, a leaked fake survives
+        # into later suites and every real embedder load dies with
+        # "No module named 'sentence_transformers.models'".
+        "sentence_transformers",
+        "sentence_transformers.models",
+    }
 )
 _STUB_KEYS_PREFIX = ("agent.", "tools.", "plugins.")
 
@@ -244,6 +264,43 @@ def _restore_import_state_after_test():
             sys.modules.pop(name, None)
     if list(sys.meta_path) != saved_meta_path:
         sys.meta_path[:] = saved_meta_path
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reap_leaked_test_services(tmp_path_factory):
+    """#459: reap memory_service children this run spawned and leaked.
+
+    Tests that fail (or are interrupted) mid-way can skip their service
+    teardown, leaving orphan ``memory_service.py`` processes behind (one
+    full-suite run leaked five pairs). Reaps ONLY services whose command
+    line references THIS run's pytest tmp root - never the live
+    hermes-home service, and never a concurrently running suite's
+    services.
+    """
+    yield
+    if sys.platform != "win32":
+        return
+    try:
+        base = str(tmp_path_factory.getbasetemp())
+    except Exception:
+        return
+    import subprocess
+    pattern = base.replace("'", "''")
+    script = (
+        "Get-CimInstance Win32_Process | Where-Object { "
+        "$_.Name -like 'python*' "
+        "-and $_.CommandLine -like '*memory_service*' "
+        "-and $_.CommandLine -like '*" + pattern + "*' } "
+        "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, timeout=120,
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

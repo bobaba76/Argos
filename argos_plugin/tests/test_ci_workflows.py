@@ -101,14 +101,24 @@ class TestTier2Workflow:
         )
         assert "retrieval" in wf["name"].lower()
 
-    def test_weekly_is_scheduled_and_dispatchable(self):
+    def test_weekly_is_on_demand_only_until_runner_exists(self):
+        """#403 (2026-09-10): the weekly schedule is deliberately DISABLED -
+        no self-hosted runner is registered, and a scheduled job with no
+        runner is silently skipped (the one failure mode the provisioning
+        preflight cannot catch). On-demand dispatch stays available.
+        Re-enable the schedule only together with a registered runner + a
+        provisioned artifact dir, and update this pin in the same change.
+        Rationale + upgrade path: docs/eval-gate-tier2.md."""
         wf = yaml.safe_load(
             (_REPO_ROOT / ".github" / "workflows" / "retrieval-weekly.yml")
             .read_text(encoding="utf-8")
         )
         on = wf.get(True) or wf.get("on") or {}
-        assert "schedule" in on, "tier 2 must be scheduled (weekly cron)"
         assert "workflow_dispatch" in on, "tier 2 must be dispatchable"
+        assert "schedule" not in on, (
+            "tier 2 schedule re-enabled without a registered runner (#403) "
+            "- see docs/eval-gate-tier2.md"
+        )
 
     def test_weekly_runs_existing_gate_delta_vs_baseline(self):
         wf = yaml.safe_load(
@@ -358,7 +368,9 @@ class TestTier2Workflow:
             s.get("run", "") for s in steps if "Provision" in s.get("name", ""))
         assert "hybrid_memory.duckdb" in prov_run
         assert "gate_baseline.json" in prov_run
-        assert "gold_v1.jsonl" in prov_run
+        # Pin tracks the current gold re-pin (v3 since the 2026-09-07
+        # expiry-aware re-pin); update together with the pin itself.
+        assert "gold_v3.jsonl" in prov_run
         # It fails loudly (exit 2) when an artifact is absent.
         assert "exit 2" in prov_run
 

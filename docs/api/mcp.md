@@ -178,6 +178,20 @@ Every tool's `inputSchema` sets `additionalProperties: false`. Unknown fields ar
 | `ARGOS_API_READ_ONLY` | unset | `1` restores the read-only surface (search/fetch/explain only). |
 | `ARGOS_API_PRINCIPAL_TYPE` | `model` | `human` enables class-B review ops (`memory_review`). |
 | `ARGOS_API_NO_LOOPBACK` | unset | `1` denies class-C ops — including `memory_ingest` apply. |
+| `ARGOS_API_CREDENTIAL` | unset | Name of a per-principal credential in `api_credential.json` (#387). When set, principal/tenant/user_id/principal_type/classes come from the credential file — the identity variables above are ignored — and the server refuses to start if the credential is missing, expired, or the file is invalid (fail-closed). |
+| `ARGOS_API_CREDENTIAL_FILE` | `<home>/api_credential.json` | Override the credential file path. |
+
+**Credentials (#387).** `api_credential.json` holds named entries
+(`name`, `token_sha256`, `tenant`, `user_id`, `principal_type`,
+`allowed_classes`, optional `expires_at`). Classes: `read`, `propose`,
+`ingest`, `erase`, `review` (class B — also requires
+`principal_type: human`), `write`, `feedback`, `collection_read`,
+`collection_write`; class C classes additionally require the loopback
+posture. On stdio the spawner *selects* one named credential — stdio has
+no per-request auth surface — so use a credential whose classes and
+user scope fit the client you are registering. Mint with
+`python scripts/mint_api_credential.py`; revoke by deleting the entry
+(MCP resolves at startup).
 
 Tier model in full: [Integration](../integration.md).
 

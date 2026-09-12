@@ -1372,6 +1372,30 @@ class ArgosAPIFacade:
                 request_id=request_id,
             )
 
+        # Spec-12 (#386): the `ingest` op sits in the proposal tier for
+        # its mechanics (idempotency + authorization), but its APPLY
+        # mode is a direct write in all but name — every row
+        # self-approves through the candidate path
+        # (review_source="tool") and materializes as ACTIVE memory.
+        # Verified semantics (2026-09-12): apply returns real memory_ids,
+        # not review-queue candidates. It therefore requires the class-C
+        # posture (loopback transport), same as WRITE_OPERATIONS.
+        # Preview writes nothing and stays reachable at proposal tier,
+        # so external callers can validate data before proposing.
+        if operation == "ingest":
+            _ingest_mode = str(params.get("mode", "preview")).strip().lower()
+            if _ingest_mode == "apply" and not ctx.is_loopback:
+                self._audit(ctx, operation, request_id, "denied",
+                            denied_reason="write_requires_loopback")
+                raise APIError(
+                    "forbidden",
+                    "ingest apply requires loopback transport (class C "
+                    "trusted-local). External callers may run preview to "
+                    "validate their data; for external writes use "
+                    "memory_propose (class A).",
+                    request_id=request_id,
+                )
+
         # #200 Spec-10: Class B (candidate approval) is human-only. A model
         # principal cannot approve its own candidate — even with
         # review_source="tool", the principal_type check denies it.

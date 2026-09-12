@@ -765,11 +765,25 @@ class SharedMemoryStore:
         return self._rpc.call("store", "save_api_candidate", **kwargs)
 
     def ingest_structured(self, **kwargs: Any) -> dict:
-        """#289: structured ingestion (JSON/CSV → memory with provenance)."""
-        result = self._rpc.call("store", "ingest_structured", **kwargs)
+        """#289/#386: structured ingestion (JSON/CSV → memory with provenance).
+
+        Apply mode is a gated write: the confirm authority rides the
+        _confirmed envelope flag via call_gated() (HMAC-signed), NOT a
+        client-supplied confirm arg — which _sanitize_args strips (the
+        #200 PR-2 rule). Routing apply through call() made confirm=True
+        unreachable service-side, so apply could never pass the store's
+        human-in-loop gate over RPC (#386 found this; no transport had
+        ever called the op). Preview needs no gate authority and stays
+        on the un-gated path.
+        """
+        kwargs.pop("confirm", None)  # strip — gate authority is in the envelope
+        mode = str(kwargs.get("mode", "preview"))
+        if mode == "apply":
+            result = self._rpc.call_gated("store", "ingest_structured", **kwargs)
+        else:
+            result = self._rpc.call("store", "ingest_structured", **kwargs)
         return result or {
-            "mode": kwargs.get("mode", "preview"), "wrote": False,
-            "rows": [], "errors": [],
+            "mode": mode, "wrote": False, "rows": [], "errors": [],
         }
 
     def erase_subject(self, **kwargs: Any) -> dict:

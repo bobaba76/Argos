@@ -108,6 +108,27 @@ class CreateMemoryRequest(BaseModel):
     tags: Optional[List[str]] = None
 
 
+class IngestRequest(BaseModel):
+    """Strict request body for POST /v1/ingest (#386, Spec-12).
+
+    Structured JSON/CSV ingestion (#289). Preview (default) writes
+    nothing. Apply materializes ACTIVE records via the self-approved
+    candidate path — class C posture: the facade denies apply on
+    non-loopback transports (fail-closed). Provenance fields are
+    server-set and forbidden here.
+    """
+    model_config = {"extra": "forbid"}
+    data: constr(min_length=1)
+    fmt: constr(pattern=r"^(json|csv)$")
+    source_name: constr(min_length=1, max_length=200)
+    mapping: Dict[str, Any]
+    mode: constr(pattern=r"^(preview|apply)$") = "preview"
+    confirm: bool = False
+    client_scope: Optional[constr(min_length=1, max_length=100)] = None
+    doc_class: Optional[constr(min_length=1, max_length=100)] = None
+    project_id: Optional[constr(min_length=1, max_length=100)] = None
+
+
 class CandidateDecisionRequest(BaseModel):
     """Strict request body for POST /v1/candidates/{id}/decision.
 
@@ -648,6 +669,43 @@ def create_app(
             # Loopback → memory_save (class C). Non-loopback → memory_propose (class A).
             operation = "memory_save" if ctx.is_loopback else "memory_propose"
             result = facade.execute(ctx, operation, params, idempotency_key=idempotency_key)
+            return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- POST /v1/ingest — structured ingestion (#289 op, #386 transport)
+
+    @app.post("/v1/ingest")
+    async def ingest(
+        body: IngestRequest,
+        ctx: AuthContext = Depends(auth),
+        idempotency_key: str = Depends(_require_idempotency_key),
+    ):
+        """Structured ingestion (#289) over REST (#386).
+
+        Preview (default) validates and reports — writes NOTHING.
+        Apply materializes ACTIVE records through the self-approved
+        candidate path; the facade denies apply on non-loopback
+        transports (class C posture, fail-closed per #386). Provenance
+        is server-set; the caller cannot claim it.
+        """
+        params: Dict[str, Any] = {
+            "data": body.data,
+            "fmt": body.fmt,
+            "source_name": body.source_name,
+            "mapping": body.mapping,
+            "mode": body.mode,
+            "confirm": body.confirm,
+        }
+        for opt_key in ("client_scope", "doc_class", "project_id"):
+            opt_val = getattr(body, opt_key)
+            if opt_val is not None:
+                params[opt_key] = opt_val
+        try:
+            result = facade.execute(
+                ctx, "ingest", params, idempotency_key=idempotency_key,
+            )
             return result
         except APIError as exc:
             status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)

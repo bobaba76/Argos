@@ -216,6 +216,78 @@ def _propose_input_schema() -> Dict[str, Any]:
     }
 
 
+def _ingest_input_schema() -> Dict[str, Any]:
+    """Strict input schema for memory_ingest (#386, Spec-12).
+
+    Structured JSON/CSV ingestion (#289) over MCP. Preview (default)
+    validates and reports — writes nothing. Apply materializes ACTIVE
+    records through the self-approved candidate path and is class-C
+    (loopback transports only); the facade denies apply on non-loopback.
+
+    Provenance fields (source, provenance_origin, grounding) are
+    server-set and intentionally absent from this schema — the facade
+    rejects them if the caller attempts to set them.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["data", "fmt", "source_name", "mapping", "idempotency_key"],
+        "properties": {
+            "data": {
+                "type": "string",
+                "description": (
+                    "Raw JSON array or CSV text to ingest. UTF-8 byte cap: "
+                    "262144 bytes (enforced by the facade)."
+                ),
+            },
+            "fmt": {"type": "string", "enum": ["json", "csv"]},
+            "source_name": {
+                "type": "string",
+                "description": (
+                    "Source file/feed name — stamped into the ingest "
+                    "namespace and provenance of every row."
+                ),
+                "minLength": 1,
+                "maxLength": 200,
+            },
+            "mapping": {
+                "type": "object",
+                "description": (
+                    "Field-mapping spec: requires 'category' and "
+                    "'content_template'; optional 'tags', 'key_field', and "
+                    "per-field mappings (see docs/api/mcp.md)."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["preview", "apply"],
+                "default": "preview",
+            },
+            "confirm": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Human-in-loop gate. Apply requires the literal "
+                    "boolean true (preview first, then confirm)."
+                ),
+            },
+            "client_scope": {"type": "string", "maxLength": 100},
+            "doc_class": {"type": "string", "maxLength": 100},
+            "project_id": {"type": "string", "maxLength": 100},
+            "idempotency_key": {
+                "type": "string",
+                "description": (
+                    "Client-generated unique key. Same key + same body → "
+                    "returns original result (no duplicate). Same key + "
+                    "different body → 409 conflict."
+                ),
+                "minLength": 1,
+                "maxLength": 256,
+            },
+        },
+    }
+
+
 def _save_input_schema() -> Dict[str, Any]:
     """Strict input schema for memory_save (class C write, loopback only).
 
@@ -740,6 +812,39 @@ TOOL_DEFINITIONS: tuple = (
         },
     },
     {
+        "name": "memory_ingest",
+        "description": (
+            "Structured ingestion (#289): JSON/CSV rows become memories "
+            "with first-class provenance. Preview (default) validates and "
+            "reports, writing nothing. Apply materializes records via the "
+            "candidate/approval machinery (requires the literal "
+            "confirm=true) and runs only on loopback transports (class C "
+            "trusted-local); non-loopback callers get 403 on apply. An "
+            "idempotency key is required."
+        ),
+        "inputSchema": _ingest_input_schema(),
+        "outputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "mode": {"type": "string"},
+                "source": {"type": "string"},
+                "mapping_id": {"type": "string"},
+                "total_rows": {"type": "integer"},
+                "valid_rows": {"type": "integer"},
+                "error_rows": {"type": "integer"},
+                "inserted": {"type": "integer"},
+                "superseded": {"type": "integer"},
+                "duplicates": {"type": "integer"},
+                "quarantined": {"type": "integer"},
+                "blocked": {"type": "integer"},
+                "rows": {"type": "array", "items": {"type": "object"}},
+                "errors": {"type": "array", "items": {"type": "object"}},
+                "wrote": {"type": "boolean"},
+            },
+        },
+    },
+    {
         "name": "memory_propose",
         "description": (
             "Propose a new memory for human review. The candidate enters "
@@ -914,6 +1019,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
     "memory_capabilities": "capabilities",
     "memory_unreviewed": "unreviewed",
     "memory_propose": "memory_propose",
+    "memory_ingest": "ingest",
     # #200 Spec-10 PR-3: write tier + collection tools.
     "memory_save": "memory_save",
     "memory_update": "memory_update",
@@ -931,6 +1037,7 @@ TOOL_TO_OPERATION: Dict[str, str] = {
 # as a separate keyword to facade.execute).
 TOOLS_WITH_IDEMPOTENCY_KEY: frozenset = frozenset({
     "memory_propose",
+    "memory_ingest",
     "memory_save",
     "memory_update",
     "memory_candidate_review",
@@ -1451,12 +1558,16 @@ def main() -> None:
     )
 
     # Build the store, facade, and auth context.
-    # M7: embedder=None means the MCP server degrades to text-only search
-    # (no vector search). This is intentional for v1 — the MCP server is
-    # a lightweight read/propose adapter. Loading the default embedder
-    # here would add startup latency and a model dependency that may not
-    # be available in all environments. Vector search can be added in a
-    # future version by loading the embedder from the config.
+    # #386 (Spec-12): verified 2026-09-12 — no client-side embedder is
+    # involved in shared mode. SharedMemoryStore proxies every retrieval
+    # stage (embedding, reranker/blend, chains) to the memory service
+    # over RPC, so MCP search already runs the full vector-backed
+    # pipeline; results are byte-identical to the native path for the
+    # same store/user (pinned by tests/test_spec12_parity.py). The
+    # embedder argument is kept for DuckDBMemoryStore signature
+    # compatibility and is unused here. (The former M7 comment claimed a
+    # text-only degradation — that predated the shared-service
+    # architecture and is obsolete.)
     store = SharedMemoryStore(args.home, user_id="default_user", embedder=None)
     acl = ACLConfig()  # v1: open store (trusted-local mode)
     facade = ArgosAPIFacade(store, acl=acl, api_mode=False)

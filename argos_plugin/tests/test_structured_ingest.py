@@ -645,6 +645,10 @@ class TestFacadeIngestOperation:
             transport="test",
             allowed_operations=set(READ_OPERATIONS) | set(PROPOSAL_OPERATIONS),
             can_propose=True,
+            # #386: ingest apply is class-C posture (a direct write via the
+            # self-approved candidate path) — trusted-local transports only.
+            # Non-loopback apply denial is pinned in test_spec12_parity.py.
+            is_loopback=True,
         )
 
     def test_facade_preview_and_apply(self, facade):
@@ -741,6 +745,7 @@ class TestFacadeIngestOperation:
             allowed_operations=set(READ_OPERATIONS) | set(PROPOSAL_OPERATIONS),
             can_propose=True,
             max_client_scope="client-a",
+            is_loopback=True,  # #386: ingest apply requires class-C posture
         )
         result = f.execute(ctx, "ingest", {
             "data": EMPLOYEE_JSON,

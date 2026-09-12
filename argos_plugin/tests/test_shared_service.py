@@ -349,3 +349,58 @@ def test_shared_service_list_memories_category_filter_rpc(tmp_path):
             store._rpc.stop_service()
         finally:
             time.sleep(0.5)
+
+
+def test_shared_service_ingest_apply_confirms_via_gated_envelope(tmp_path):
+    """#386 (Spec-12): ingest apply over the FULL RPC path.
+
+    The confirm authority must ride the HMAC-signed _confirmed envelope
+    flag (call_gated) — NOT a client-supplied confirm arg, which
+    _sanitize_args strips (#200 PR-2). Regression pin: routing apply
+    through the un-gated call() left the service-side dispatch with
+    confirm=False, so the store's human-in-loop gate rejected every
+    apply — latent since #289 because no transport called the op until
+    Spec-12 wired it. A raw un-gated RPC call with a forged
+    confirm=True in args must stay denied (fail-closed).
+    """
+    from service_client import SharedMemoryStore, SharedMemoryServiceError
+
+    (tmp_path / "hybrid_memory.json").write_text(
+        json.dumps({"local_embedding_model": "nonexistent-model-xyz"}),
+        encoding="utf-8",
+    )
+    store = SharedMemoryStore(tmp_path, user_id="test_user", embedder=None)
+    try:
+        data = "name,employer\nRivet Vane,Sluice Works"
+        mapping = {
+            "category": "context_note",
+            "content_template": "{name} works at {employer}",
+        }
+
+        preview = store.ingest_structured(
+            data=data, fmt="csv", mapping=mapping,
+            source_name="rpc-ingest-test", mode="preview",
+        )
+        assert preview["wrote"] is False
+        assert store.count() == 0
+
+        applied = store.ingest_structured(
+            data=data, fmt="csv", mapping=mapping,
+            source_name="rpc-ingest-test", mode="apply", confirm=True,
+        )
+        assert applied["wrote"] is True
+        assert applied["inserted"] == 1
+        assert store.count() == 1
+
+        # Forged confirm in raw args: sanitized away -> denied.
+        with pytest.raises(SharedMemoryServiceError):
+            store._rpc.call(
+                "store", "ingest_structured",
+                data=data, fmt="csv", mapping=mapping,
+                source_name="rpc-ingest-forged", mode="apply", confirm=True,
+            )
+    finally:
+        try:
+            store._rpc.stop_service()
+        finally:
+            time.sleep(0.5)

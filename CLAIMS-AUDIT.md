@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 169 test modules in `argos_plugin/tests/` (3,267 `def test_` definitions; counts generated via AST 2026-09-12 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 170 test modules in `argos_plugin/tests/` (3,279 `def test_` definitions; counts generated via AST 2026-09-12 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -336,3 +336,10 @@ committed, re-runnable artifact:
   import-state leak guard). #459's acceptance is a runtime property (a green
   full-suite run), not a count - evidence lives in the issue/PR thread. No
   measurement claims changed.
+
+- **2026-09-12 (#386, Spec-12)** — §2 test-suite row + README Verification
+  bullet refreshed: 169 / 3,267 → 170 / 3,279 (+1 module, +12: new
+  `test_spec12_parity.py` pinning transport retrieval parity — MCP/REST vs the
+  direct store, byte-identical ordered IDs — and the ingest wiring gates:
+  apply is loopback-only (class-C posture), preview writes nothing, idempotency
+  key required on both transports). No measurement claims changed.

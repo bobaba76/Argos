@@ -55,7 +55,22 @@ _HISTORICAL_AVAILABLE = (
     "Don't save the same fact in slightly different wording. One rich, "
     "well-reasoned memory is worth ten shallow flashcards.\n"
     "Use memory_graph_search to find relationships between people, tools, "
-    "and concepts in the user's life."
+    "and concepts in the user's life.\n"
+    "\n"
+    "## When records conflict or disagree\n"
+    "Memories were written at different times and some describe what was true "
+    "then, not now. Before answering a question where records disagree:\n"
+    "- An OBSERVATION or PREDICTION does not change anything on its own. \"X failed a "
+    "test\", \"probably moving to Y\", or \"X was the original choice\" describe a moment; "
+    "they do not revoke a decision.\n"
+    "- A later decision does NOT cancel an earlier one unless it explicitly "
+    "supersedes/revokes it, or a governing rule/policy makes the two mutually "
+    "exclusive. If nothing revoked the earlier record, both may still be current — say so.\n"
+    "- A claim that something was discontinued, removed, or scoped away ends the old "
+    "state; do not keep presenting the old wording as current.\n"
+    "- If the records genuinely cannot settle it (no explicit supersession, no "
+    "governing rule), say that you cannot determine it and name the uncertainty, "
+    "rather than inventing the most plausible ending."
 )
 
 _HISTORICAL_UNAVAILABLE = _HISTORICAL_AVAILABLE.replace(

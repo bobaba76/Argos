@@ -480,15 +480,29 @@ class CrossEncoderReranker:
         """
         if not query or not documents:
             return []
+        _all = self.score_multi([query], documents)
+        return _all[0] if _all else []
+
+    def score_multi(self, queries: List[str], documents: List[str]) -> List[List[float]]:
+        """Score several queries against the SAME document list in ONE
+        predict call (#460: the sentence-transformers pair loop re-tokenizes
+        every document per query; a second CE pass for a probe query was
+        measured at ~full single-pass cost. Batching two queries into one
+        call removes that second document pass).
+        """
+        queries = [q for q in queries if q]
+        if not queries or not documents:
+            return []
         self._ensure_loaded()
         with _SHARED_RERANKER_LOCK:
             model = _SHARED_RERANKERS.get(self._model_name)
         if model is None:
             return []
         try:
-            pairs = [(query, doc) for doc in documents]
-            scores = model.predict(pairs, show_progress_bar=False)
-            return [float(s) for s in scores]
+            pairs = [(q, d) for q in queries for d in documents]
+            raw = model.predict(pairs, show_progress_bar=False)
+            nq, nd = len(queries), len(documents)
+            return [[float(s) for s in raw[i * nd:(i + 1) * nd]] for i in range(nq)]
         except Exception as e:
-            logger.debug("Reranker scoring failed: %s", e)
+            logger.debug("Reranker multi-scoring failed: %s", e)
             return []

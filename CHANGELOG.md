@@ -6,6 +6,16 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 
 ### Added
 
+- **Admin console: keys page** (#484, Phase 2 — mint / list / revoke): a
+  **Keys** tab lists live credential state (name, type, classes, created,
+  expiry, status, plus the legacy transport-token row) and lets a human
+  operator mint a new full-class key (shown once, hash-at-rest) or revoke
+  any key — revocation applies on the very next request (per-request file
+  re-validation). The legacy transport token can be retired from disk too.
+  Mint/revoke render only for human principals and are disabled under
+  `ARGOS_API_READ_ONLY`; the console refuses to revoke the key backing its
+  own session; every mint/revoke writes a `transport=admin-console` audit row.
+
 - **Admin console: first-run setup mode** (#484, Phase 1 of the console-as-landing-page work): a fresh machine previously dead-ended — with no credential the console refused to start (`RuntimeError`, fail-closed) and the only path was hand-writing `api_credential.json`. The console now starts in **setup mode** when no credential exists anywhere (no `ARGOS_REST_TOKEN`, no file): it serves only `/setup` and `/health`; browsers get the "Create your admin key" page, API requests get `403 setup_required`, and `/login` redirects to `/setup`. Creating the key mints a **human** credential with the full class set (hash-at-rest, shown exactly once with a copy affordance), establishes the session immediately (no second paste), and the setup route **self-destructs** — once a credential exists it closes permanently (re-arm only by deleting the file by hand) and a refreshed success page can never mint a second bootstrap key. Boot is now credentials-only-capable across the console **and REST** (`expected_token=None` → auth runs on per-principal credentials; a truly empty machine still fails closed), so one key serves the UI, REST, MCP, and scripts. The show-once page is a POST response (Cache-Control: no-store, never re-rendered); loopback-only throughout. 10 tests.
 
 - **Admin console: browser sign-in** (#482): the console previously required an `Authorization: Bearer` header on every request — a human opening it in a browser could only ever see `401` (no browser auth path existed). The console now serves a `/login` form: paste the API credential once and it is exchanged for an HttpOnly, `SameSite=Strict` session cookie (token never appears in URLs or HTML; the header path for API clients is byte-for-byte unchanged). Unauthenticated browser navigations (`Accept: text/html`) are redirected to `/login`; sessions are re-validated per request (credential edits/revocation apply immediately) and die with the console process; a sign-out link clears the cookie. 9 tests.

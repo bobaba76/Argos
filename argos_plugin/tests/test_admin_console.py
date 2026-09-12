@@ -1157,3 +1157,157 @@ class TestSetupMode:
         r = client.get("/setup", follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"] == "/login"
+
+
+class TestKeysPage:
+    """#484 Phase 2: mint / list / revoke credentials from the UI."""
+
+    def _keys_client(self, tmp_path):
+        from api_credentials import credential_file_path, write_credential
+
+        home = tmp_path / "home"
+        home.mkdir()
+        _admin_tok, _ = write_credential(
+            credential_file_path(home),
+            name="admin", principal_type="human",
+            allowed_classes=["read", "review"], user_id="default_user",
+        )
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=home)
+        return TestClient(app), home, _admin_tok
+
+    def _signin(self, client, token):
+        r = client.post("/login", data={"token": token}, follow_redirects=False)
+        assert r.status_code == 303
+
+    def test_keys_requires_auth(self):
+        client = _make_client()  # legacy console, no credential file
+        r = client.get("/keys", follow_redirects=False)
+        assert r.status_code in (401, 303)
+
+    def test_keys_lists_credentials(self, tmp_path):
+        from api_credentials import credential_file_path, write_credential
+
+        client, home, admin_tok = self._keys_client(tmp_path)
+        write_credential(credential_file_path(home), name="worker",
+                         principal_type="human", allowed_classes=["read"],
+                         user_id="default_user")
+        self._signin(client, admin_tok)
+        r = client.get("/keys")
+        assert r.status_code == 200
+        assert "worker" in r.text and "admin" in r.text
+        assert "Mint a key" in r.text      # human principal, not read-only
+        assert "danger-btn" in r.text      # revoke affordance rendered
+        assert "argos_" not in r.text      # no key material on the page
+
+    def test_mint_shows_once_and_preserves_session(self, tmp_path):
+        from api_credentials import credential_file_path, parse_credentials_file
+
+        client, home, admin_tok = self._keys_client(tmp_path)
+        self._signin(client, admin_tok)
+        r = client.post("/keys", data={"name": "worker"}, follow_redirects=False)
+        assert r.status_code == 200
+        assert "worker" in r.text
+        assert re.search(r"argos_[A-Za-z0-9_\-]+", r.text)  # shown once
+        assert client.get("/").status_code == 200  # session not swapped
+        _, creds = parse_credentials_file(credential_file_path(home))
+        assert {c.name for c in creds} == {"admin", "worker"}
+        assert all(c.principal_type == "human" for c in creds)
+
+    def test_revoke_applies_immediately_and_blocks_self(self, tmp_path):
+        from api_credentials import (credential_file_path,
+                                     parse_credentials_file,
+                                     write_credential)
+
+        client, home, admin_tok = self._keys_client(tmp_path)
+        other_tok, _ = write_credential(
+            credential_file_path(home), name="other", principal_type="human",
+            allowed_classes=["read"], user_id="default_user",
+        )
+        self._signin(client, admin_tok)
+        r = client.post("/keys/revoke", data={"action": "revoke", "name": "other"},
+                        follow_redirects=False)
+        assert r.status_code == 303 and "/keys" in r.headers["location"]
+        _, creds = parse_credentials_file(credential_file_path(home))
+        assert [c.name for c in creds] == ["admin"]
+        # Revocation applies on the very next request.
+        r2 = client.get("/", headers={"Authorization": f"Bearer {other_tok}"})
+        assert r2.status_code == 401
+        # Self-revoke is refused; the file is untouched.
+        r3 = client.post("/keys/revoke", data={"action": "revoke", "name": "admin"},
+                         follow_redirects=False)
+        assert r3.status_code == 303 and "Cannot+revoke" in r3.headers["location"]
+        _, creds2 = parse_credentials_file(credential_file_path(home))
+        assert [c.name for c in creds2] == ["admin"]
+
+    def test_legacy_revoke_guarded_while_in_use(self, tmp_path):
+        import json as _json
+        from api_credentials import (
+            credential_file_path, parse_credentials_file, write_credential,
+        )
+
+        home = tmp_path / "home"
+        home.mkdir()
+        path = credential_file_path(home)
+        admin_tok, _ = write_credential(
+            path, name="admin", principal_type="human",
+            allowed_classes=["read", "review"], user_id="default_user",
+        )
+        data = _json.loads(path.read_text(encoding="utf-8"))
+        data["token"] = "legacy-secret"
+        path.write_text(_json.dumps(data), encoding="utf-8")
+
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token="legacy-secret", home=home)
+        client = TestClient(app)
+
+        # Signed in with the legacy token: the console refuses to retire
+        # the asset it is itself depending on this session.
+        client.post("/login", data={"token": "legacy-secret"})
+        r = client.post("/keys/revoke", data={"action": "revoke_legacy"},
+                        follow_redirects=False)
+        assert "signed+in+with+the+legacy" in r.headers["location"]
+        assert '"token"' in path.read_text(encoding="utf-8")
+
+        # Signed in with a key: retiring the legacy transport token works,
+        # per-principal credentials survive.
+        client.post("/login", data={"token": admin_tok})
+        r2 = client.post("/keys/revoke", data={"action": "revoke_legacy"},
+                         follow_redirects=False)
+        assert r2.status_code == 303 and "ok=" in r2.headers["location"]
+        assert '"token"' not in path.read_text(encoding="utf-8")
+        _, creds = parse_credentials_file(path)
+        assert [c.name for c in creds] == ["admin"]
+
+    def test_model_principal_is_keys_read_only(self, tmp_path):
+        from api_credentials import credential_file_path, write_credential
+
+        home = tmp_path / "home"
+        home.mkdir()
+        model_tok, _ = write_credential(
+            credential_file_path(home), name="bench", principal_type="model",
+            allowed_classes=["read"], user_id="default_user",
+        )
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=home)
+        client = TestClient(app)
+        client.post("/login", data={"token": model_tok})
+        r = client.get("/keys")
+        assert r.status_code == 200
+        assert "Mint a key" not in r.text
+        assert 'action="/keys/revoke"' not in r.text  # no revoke affordance
+        r2 = client.post("/keys", data={"name": "x"}, follow_redirects=False)
+        assert r2.status_code == 303 and "human" in r2.headers["location"]
+
+    def test_read_only_env_hides_management(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARGOS_API_READ_ONLY", "1")
+        client, _, admin_tok = self._keys_client(tmp_path)
+        self._signin(client, admin_tok)
+        r = client.get("/keys")
+        assert "Mint a key" not in r.text
+        assert 'action="/keys/revoke"' not in r.text
+        r2 = client.post("/keys", data={"name": "x"}, follow_redirects=False)
+        assert r2.status_code == 303 and "read-only" in r2.headers["location"]

@@ -45,10 +45,12 @@ from api_credentials import (  # noqa: E402
     CredentialFileError,
     build_context,
     credential_file_path,
+    drop_legacy_token,
     mint_token,
     parse_credentials_file,
     resolve_by_name,
     resolve_by_token,
+    revoke_credential,
     sha256_hex,
     write_credential,
 )
@@ -716,3 +718,55 @@ class TestFacadeIntegration:
             })
         assert exc.value.code == "forbidden"
         assert "loopback" in exc.value.message
+
+
+# -- Revocation (#484 Phase 2) ------------------------------------------------
+
+class TestRevocation:
+    """revoke_credential / drop_legacy_token — entry removal, atomic."""
+
+    def test_revoke_removes_only_that_entry(self, tmp_path: Path):
+        p = credential_file_path(tmp_path)
+        write_credential(p, name="a", principal_type="human",
+                         allowed_classes=["read"], user_id="default_user")
+        write_credential(p, name="b", principal_type="human",
+                         allowed_classes=["read"], user_id="default_user")
+        assert revoke_credential(p, "a") is True
+        _, creds = parse_credentials_file(p)
+        assert [c.name for c in creds] == ["b"]
+
+    def test_revoke_missing_entry_is_noop(self, tmp_path: Path):
+        p = credential_file_path(tmp_path)
+        write_credential(p, name="a", principal_type="human",
+                         allowed_classes=["read"], user_id="default_user")
+        assert revoke_credential(p, "nope") is False
+        _, creds = parse_credentials_file(p)
+        assert [c.name for c in creds] == ["a"]
+
+    def test_revoke_missing_file_raises(self, tmp_path: Path):
+        with pytest.raises(CredentialFileError):
+            revoke_credential(tmp_path / "nope.json", "a")
+
+    def test_revoke_malformed_file_raises(self, tmp_path: Path):
+        p = tmp_path / "api_credential.json"
+        p.write_text("{broken", encoding="utf-8")
+        with pytest.raises(CredentialFileError):
+            revoke_credential(p, "a")
+
+    def test_drop_legacy_preserves_credentials(self, tmp_path: Path):
+        p = credential_file_path(tmp_path)
+        write_credential(p, name="a", principal_type="human",
+                         allowed_classes=["read"], user_id="default_user")
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["token"] = "legacy-secret"
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        assert drop_legacy_token(p) is True
+        legacy, creds = parse_credentials_file(p)
+        assert legacy is None
+        assert [c.name for c in creds] == ["a"]
+
+    def test_drop_legacy_without_token_is_noop(self, tmp_path: Path):
+        p = credential_file_path(tmp_path)
+        write_credential(p, name="a", principal_type="human",
+                         allowed_classes=["read"], user_id="default_user")
+        assert drop_legacy_token(p) is False

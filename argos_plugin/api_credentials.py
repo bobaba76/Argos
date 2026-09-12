@@ -454,3 +454,85 @@ def write_credential(
     written = resolve_by_name(credentials, name)
     assert written is not None  # just parsed
     return (plaintext, written)
+
+
+# -- Revocation (#484 Phase 2) ------------------------------------------------
+
+def _rewrite_document(path: Path, merged: dict) -> None:
+    """Validate + atomically persist *merged* (mirrors write_credential).
+
+    A corrupt document is never clobbered: validation runs before any
+    write, exactly like write_credential.
+    """
+    _parse_dict(merged)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)  # best effort (POSIX); no-op on Windows
+    except OSError:
+        pass
+
+
+def revoke_credential(path: Path, name: str) -> bool:
+    """Remove the credential entry *name* (atomic; immediate revocation).
+
+    #387: revocation = remove the entry — REST/console re-read the file
+    per request, so a revoked token 401s on the very next call. The
+    legacy ``token`` key and every other entry are untouched. Returns
+    True when removed, False when *name* was not present; raises
+    CredentialFileError on an unreadable or malformed file.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise CredentialFileError(f"no credential file at {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise CredentialFileError(
+            f"refusing to modify unreadable credential file {path}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise CredentialFileError(
+            f"refusing to modify credential file {path}: not a JSON object"
+        )
+    entries = raw.get("credentials", [])
+    if not isinstance(entries, list):
+        raise CredentialFileError(
+            f"refusing to modify credential file {path}: 'credentials' not a list"
+        )
+    kept = [
+        e for e in entries
+        if not (isinstance(e, dict) and e.get("name") == name)
+    ]
+    if len(kept) == len(entries):
+        return False
+    merged = dict(raw)
+    merged["credentials"] = kept
+    _rewrite_document(path, merged)
+    return True
+
+
+def drop_legacy_token(path: Path) -> bool:
+    """Remove the legacy plaintext ``token`` key (per-principal entries stay).
+
+    Returns True when the key was present and removed; raises
+    CredentialFileError on an unreadable or malformed file. Used by the
+    keys page to retire the env-derived transport token from disk.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise CredentialFileError(f"no credential file at {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise CredentialFileError(
+            f"refusing to modify unreadable credential file {path}: {exc}"
+        ) from exc
+    if "token" not in raw:
+        return False
+    merged = dict(raw)
+    del merged["token"]
+    _rewrite_document(path, merged)
+    return True

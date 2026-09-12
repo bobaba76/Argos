@@ -28,6 +28,18 @@ Authorization: Bearer <token>
 
 Verified via `hmac.compare_digest`. Missing or invalid → `401 unauthenticated`.
 
+**Per-principal credentials (#387).** The bearer token may also be a
+named credential from `<home>/api_credential.json` (the server entrypoint
+passes `home`; see [MCP](mcp.md) for the file shape and
+`scripts/mint_api_credential.py` for minting). A matching credential
+supplies the principal, tenant, `user_id`, class-B eligibility
+(`principal_type`), and operation classes — env identity vars are
+ignored for it. The file is re-read when it changes, so **revocation**
+(delete the entry) and **expiry** (`expires_at`) apply on the next
+request without a restart. Expired credential → `401 Credential
+expired.`; malformed file → `500 invalid_credential_config`
+(fail-closed). The legacy `ARGOS_REST_TOKEN` path is unchanged.
+
 ## Endpoints
 
 ### `GET /v1/health`

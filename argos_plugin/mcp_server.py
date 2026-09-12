@@ -1413,6 +1413,61 @@ class MCPServer:
 
 # -- Entry point -------------------------------------------------------------
 
+def _load_credential_context(home: Path, cred_name: str) -> "AuthContext":
+    """Resolve a named per-principal credential (#387, Spec-12).
+
+    The spawner names the credential (ARGOS_API_CREDENTIAL); the file
+    holds the identity (principal, tenant, user_id, principal_type,
+    operation classes). Fail-closed: a missing, expired, or invalid
+    credential refuses to start - never a silent fallback to
+    env-derived identity.
+
+    Stdio threat model: the spawner still *selects* which credential
+    this process uses - stdio has no per-request auth surface. What the
+    credential file adds over raw env vars: scopes and revocation/expiry
+    live in an operator-controlled file, the principal is named and
+    auditable, and class-B unlock (human) is an explicit file value
+    rather than an ambient env typo.
+    """
+    from api_credentials import (
+        CredentialFileError,
+        build_context,
+        credential_file_path,
+        parse_credentials_file,
+        resolve_by_name,
+    )
+
+    override = os.environ.get("ARGOS_API_CREDENTIAL_FILE", "").strip()
+    path = Path(override) if override else credential_file_path(home)
+    try:
+        _, credentials = parse_credentials_file(path)
+    except CredentialFileError as exc:
+        raise SystemExit(
+            f"ARGOS_API_CREDENTIAL={cred_name!r} is set but {path} is "
+            f"invalid: {exc} - refusing to start (fail-closed)."
+        )
+    cred = resolve_by_name(credentials, cred_name)
+    if cred is None:
+        raise SystemExit(
+            f"ARGOS_API_CREDENTIAL={cred_name!r} not found in {path} - "
+            "refusing to start (fail-closed)."
+        )
+    if cred.is_expired():
+        raise SystemExit(
+            f"ARGOS_API_CREDENTIAL={cred_name!r} is expired in {path} - "
+            "refusing to start (fail-closed)."
+        )
+    is_loopback = os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
+    is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+    return build_context(
+        cred,
+        transport="mcp-stdio",
+        is_loopback=is_loopback,
+        env_principal_type=os.environ.get("ARGOS_API_PRINCIPAL_TYPE", ""),
+        is_read_only=is_read_only,
+    )
+
+
 def _load_auth_context(home: Path) -> "AuthContext":
     """Derive the auth context from the environment.
 
@@ -1441,14 +1496,28 @@ def _load_auth_context(home: Path) -> "AuthContext":
     workstation, MCP client spawned by the user's own shell). In a
     multi-process or hosted environment, the env vars are controlled by
     the spawner, not the user — a malicious spawner can impersonate
-    anyone. For non-trusted-local deployments, a credential file or
-    signed token MUST be used instead (tracked in #387).
+    anyone. For non-trusted-local deployments, set ARGOS_API_CREDENTIAL
+    to a named credential in {home}/api_credential.json (#387,
+    Spec-12): the file supplies principal, tenant, user_id,
+    principal_type, and operation classes, so scopes, expiry, and
+    revocation live in an operator-controlled file instead of
+    ambient env vars.
     """
     from api_facade import (
         AuthContext, READ_OPERATIONS, PROPOSAL_OPERATIONS,
         FEEDBACK_OPERATIONS, WRITE_OPERATIONS,
         COLLECTION_READ_OPERATIONS, COLLECTION_WRITE_OPERATIONS,
     )
+
+    # #387 (Spec-12): credential-backed identity. When
+    # ARGOS_API_CREDENTIAL names a credential, identity comes from
+    # {home}/api_credential.json (or ARGOS_API_CREDENTIAL_FILE) and
+    # the spawner-asserted env identity below is ignored for the
+    # principal/tenant/user_id/classes. Fail-closed: an unknown,
+    # expired, or invalid credential refuses to start.
+    cred_name = os.environ.get("ARGOS_API_CREDENTIAL", "").strip()
+    if cred_name:
+        return _load_credential_context(home, cred_name)
 
     principal = os.environ.get("ARGOS_API_PRINCIPAL", "local")
     tenant = os.environ.get("ARGOS_API_TENANT", "default")

@@ -58,6 +58,13 @@ from api_facade import (
     COLLECTION_WRITE_OPERATIONS,
 )
 from access_scoping import ACLConfig
+from api_credentials import (
+    CredentialFileError,
+    build_context as build_credential_context,
+    credential_file_path,
+    parse_credentials_file,
+    resolve_by_token,
+)
 
 logger = logging.getLogger("argos.rest")
 
@@ -244,10 +251,138 @@ class RESTAuth:
       treated as a model agent and cannot approve candidates.
     - is_loopback: REST is bound to 127.0.0.1 only, so it IS a loopback
       transport. Set ARGOS_API_NO_LOOPBACK=1 to disable (for testing).
+
+    #387 (Spec-12): per-principal credentials. A bearer token that does
+    not match the legacy transport token is looked up (SHA-256,
+    constant-time) among the credentials in {home}/api_credential.json.
+    The credential entry supplies the principal name, tenant, user_id,
+    principal_type, and operation classes; the env-derived context is
+    used only for the legacy token. The file is re-read when it changes
+    (mtime_ns+size cache), so revocation and expiry apply on the next
+    request without a restart. With home=None, or a file without
+    credentials, behavior is exactly the legacy env-based path.
     """
 
-    def __init__(self, expected_token: str) -> None:
+    def __init__(self, expected_token: str, home: Optional[Path] = None) -> None:
         self._expected = expected_token
+        self._home = Path(home) if home is not None else None
+        self._cred_cache: Optional[tuple] = None
+
+    def _is_loopback(self) -> bool:
+        # #200 PR-3: REST is bound to 127.0.0.1 -> loopback transport.
+        return os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
+
+    def _is_read_only(self) -> bool:
+        # Spec-11: ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
+        return os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+
+    def _credentials(self) -> tuple:
+        """Load (legacy_token, credentials) with an mtime_ns+size cache.
+
+        Raises CredentialFileError on a malformed file - fail closed,
+        never silently drop the credential surface.
+        """
+        if self._home is None:
+            return (None, [])
+        path = credential_file_path(self._home)
+        try:
+            stat = path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            self._cred_cache = None
+            return (None, [])
+        if self._cred_cache is not None and self._cred_cache[0] == key:
+            return (self._cred_cache[1], self._cred_cache[2])
+        token, creds = parse_credentials_file(path)
+        self._cred_cache = (key, token, creds)
+        return (token, creds)
+
+    def _credential_context(self, token: str, request_id: str) -> AuthContext:
+        """Resolve a per-principal credential token (#387)."""
+        try:
+            _, creds = self._credentials()
+        except CredentialFileError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": {
+                    "code": "invalid_credential_config",
+                    "message": f"Credential file is invalid: {exc}",
+                    "request_id": request_id,
+                }},
+            )
+        cred, expired = resolve_by_token(creds, token)
+        if cred is not None:
+            return build_credential_context(
+                cred,
+                transport="rest",
+                is_loopback=self._is_loopback(),
+                env_principal_type=os.environ.get("ARGOS_API_PRINCIPAL_TYPE", ""),
+                is_read_only=self._is_read_only(),
+            )
+        if expired:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": {
+                    "code": "unauthenticated",
+                    "message": "Credential expired.",
+                    "request_id": request_id,
+                }},
+            )
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {
+                "code": "unauthenticated",
+                "message": "Invalid credentials.",
+                "request_id": request_id,
+            }},
+        )
+
+    def _legacy_context(self) -> AuthContext:
+        """Env-derived context for the legacy transport token (unchanged)."""
+        # #200 PR-3 fix: wire principal_type - "model" (default) or "human".
+        # The default is "model" (fail-closed): a transport that forgets
+        # to set ARGOS_API_PRINCIPAL_TYPE is treated as a model agent and
+        # CANNOT approve candidates (class B denied). A human-driven UI
+        # MUST explicitly set ARGOS_API_PRINCIPAL_TYPE=human to unlock
+        # class B. This closes the self-approval spoof.
+        principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "model")
+        if principal_type not in ("human", "model"):
+            principal_type = "model"  # fail-closed: unknown -> model
+        is_loopback = self._is_loopback()
+        # Build the auth context. In v1 (trusted-local mode), the
+        # principal/tenant/user_id come from env vars and max_* scope
+        # fields are always None (open scope).
+        # Spec-11 (9/9): write tiers ON by default on loopback transports.
+        # Class A (propose) and Class C (direct write) are default-ON.
+        # Class B (feedback/approval) stays OFF - model self-approval, never.
+        # ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
+        is_read_only = self._is_read_only()
+
+        allowed = set(READ_OPERATIONS) | COLLECTION_READ_OPERATIONS
+        if not is_read_only:
+            allowed |= PROPOSAL_OPERATIONS
+            if is_loopback:
+                allowed |= WRITE_OPERATIONS
+                allowed |= COLLECTION_WRITE_OPERATIONS
+        # Explicit env vars still work as overrides.
+        if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
+            allowed |= PROPOSAL_OPERATIONS
+        if os.environ.get("ARGOS_API_CAN_FEEDBACK", "").lower() in ("true", "1", "yes"):
+            allowed |= FEEDBACK_OPERATIONS
+        if is_loopback and os.environ.get("ARGOS_API_CAN_WRITE", "").lower() in ("true", "1", "yes"):
+            allowed |= WRITE_OPERATIONS
+            allowed |= COLLECTION_WRITE_OPERATIONS
+        return AuthContext(
+            principal=os.environ.get("ARGOS_API_PRINCIPAL", "local"),
+            tenant=os.environ.get("ARGOS_API_TENANT", "default"),
+            user_id=os.environ.get("ARGOS_API_USER_ID", "default_user"),
+            transport="rest",
+            allowed_operations=allowed,
+            can_propose="memory_propose" in allowed,
+            can_feedback="record_feedback" in allowed,
+            principal_type=principal_type,
+            is_loopback=is_loopback,
+        )
 
     def __call__(self, authorization: str = Header(default="")) -> AuthContext:
         """Verify the bearer token and return an AuthContext.
@@ -285,60 +420,11 @@ class RESTAuth:
                     "request_id": request_id,
                 }},
             )
-        if not hmac.compare_digest(token, self._expected):
-            raise HTTPException(
-                status_code=401,
-                detail={"error": {
-                    "code": "unauthenticated",
-                    "message": "Invalid credentials.",
-                    "request_id": request_id,
-                }},
-            )
-        # #200 PR-3 fix: wire principal_type — "model" (default) or "human".
-        # The default is "model" (fail-closed): a transport that forgets
-        # to set ARGOS_API_PRINCIPAL_TYPE is treated as a model agent and
-        # CANNOT approve candidates (class B denied). A human-driven UI
-        # MUST explicitly set ARGOS_API_PRINCIPAL_TYPE=human to unlock
-        # class B. This closes the self-approval spoof.
-        principal_type = os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "model")
-        if principal_type not in ("human", "model"):
-            principal_type = "model"  # fail-closed: unknown → model
-        # #200 PR-3: REST is bound to 127.0.0.1 → loopback transport.
-        is_loopback = os.environ.get("ARGOS_API_NO_LOOPBACK", "").lower() not in ("true", "1", "yes")
-        # Build the auth context. In v1 (trusted-local mode), the
-        # principal/tenant/user_id come from env vars and max_* scope
-        # fields are always None (open scope).
-        # Spec-11 (9/9): write tiers ON by default on loopback transports.
-        # Class A (propose) and Class C (direct write) are default-ON.
-        # Class B (feedback/approval) stays OFF — model self-approval, never.
-        # ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
-        is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
-
-        allowed = set(READ_OPERATIONS) | COLLECTION_READ_OPERATIONS
-        if not is_read_only:
-            allowed |= PROPOSAL_OPERATIONS
-            if is_loopback:
-                allowed |= WRITE_OPERATIONS
-                allowed |= COLLECTION_WRITE_OPERATIONS
-        # Explicit env vars still work as overrides.
-        if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
-            allowed |= PROPOSAL_OPERATIONS
-        if os.environ.get("ARGOS_API_CAN_FEEDBACK", "").lower() in ("true", "1", "yes"):
-            allowed |= FEEDBACK_OPERATIONS
-        if is_loopback and os.environ.get("ARGOS_API_CAN_WRITE", "").lower() in ("true", "1", "yes"):
-            allowed |= WRITE_OPERATIONS
-            allowed |= COLLECTION_WRITE_OPERATIONS
-        return AuthContext(
-            principal=os.environ.get("ARGOS_API_PRINCIPAL", "local"),
-            tenant=os.environ.get("ARGOS_API_TENANT", "default"),
-            user_id=os.environ.get("ARGOS_API_USER_ID", "default_user"),
-            transport="rest",
-            allowed_operations=allowed,
-            can_propose="memory_propose" in allowed,
-            can_feedback="record_feedback" in allowed,
-            principal_type=principal_type,
-            is_loopback=is_loopback,
-        )
+        if hmac.compare_digest(token, self._expected):
+            # Legacy transport token -> env-derived context (unchanged).
+            return self._legacy_context()
+        # #387 (Spec-12): per-principal credential lookup.
+        return self._credential_context(token, request_id)
 
 
 # -- Concurrency limiter -----------------------------------------------------
@@ -366,6 +452,7 @@ def create_app(
     readiness_probe=None,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     allowed_origins: set[str] | None = None,
+    home: Path | None = None,
 ) -> FastAPI:
     """Build the FastAPI application.
 
@@ -378,6 +465,8 @@ def create_app(
         max_concurrent: maximum concurrent requests (semaphore).
         allowed_origins: set of exact origins allowed for CORS. If None,
             no CORS headers are emitted (no cross-origin requests).
+        home: Hermes home directory for per-principal credentials
+            (#387). If None, only the legacy transport token is accepted.
     """
     app = FastAPI(
         title="Argos Memory REST API",
@@ -386,7 +475,7 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
     )
-    auth = RESTAuth(auth_token)
+    auth = RESTAuth(auth_token, home=home)
     limiter = ConcurrencyLimiter(max_concurrent)
     origins = allowed_origins or set()
 
@@ -1059,6 +1148,7 @@ def main() -> None:
         facade,
         auth_token=token,
         max_concurrent=args.max_concurrent,
+        home=args.home,
     )
 
     # uvicorn with host=127.0.0.1 — never 0.0.0.0.

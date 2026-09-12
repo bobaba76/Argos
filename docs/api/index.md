@@ -44,6 +44,7 @@ Every error carries a stable code and a `request_id`. The facade never leaks tra
 
 - **Loopback only.** Both servers bind to `127.0.0.1`. Never `0.0.0.0`, never tunnel binding.
 - **Bearer token.** Required on every request. Verified via `hmac.compare_digest`. The token is separate from the internal service token — loaded from `ARGOS_REST_TOKEN` or `api_credential.json` in the Hermes home.
+- **Per-principal credentials (#387).** A bearer token that matches a named credential in `api_credential.json` grants exactly that credential's operation classes, user scope, and principal type — never more. Class C (write) additionally requires the loopback posture even when the class is listed, env vars can only narrow (never widen), revocation is entry removal, and expired entries never match. MCP selects one credential by name at startup (`ARGOS_API_CREDENTIAL`); REST resolves per request. Details in [REST](rest.md) and [MCP](mcp.md).
 - **Server-derived identity.** The facade does not accept client-supplied user identity. `AuthContext` is built from env vars / credential, not from the request body.
 - **ACL enforcement.** `scope_check` enforces project, client-scope, and namespace restrictions per principal.
 - **Audit.** Every facade operation is logged (no bearer tokens in logs; query text is hashed). Denied operations are routed to the durable `access_audit` table when the store exposes it.

@@ -1311,3 +1311,150 @@ class TestKeysPage:
         assert 'action="/keys/revoke"' not in r.text
         r2 = client.post("/keys", data={"name": "x"}, follow_redirects=False)
         assert r2.status_code == 303 and "read-only" in r2.headers["location"]
+
+
+class TestSettingsPage:
+    """#484 Phase 3: view-only effective-configuration page."""
+
+    def _settings_client(self, tmp_path):
+        from api_credentials import credential_file_path, write_credential
+
+        home = tmp_path / "home"
+        home.mkdir()
+        tok, _ = write_credential(
+            credential_file_path(home), name="admin", principal_type="human",
+            allowed_classes=["read", "review"], user_id="default_user",
+        )
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=home)
+        client = TestClient(app)
+        client.post("/login", data={"token": tok})
+        return client, home, tok
+
+    def test_settings_requires_auth(self):
+        client = _make_client()
+        r = client.get("/settings", follow_redirects=False)
+        assert r.status_code in (303, 401)
+
+    def test_settings_renders_effective_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ARGOS_API_READ_ONLY", "1")
+        client, home, _ = self._settings_client(tmp_path)
+        r = client.get("/settings")
+        assert r.status_code == 200
+        for needle in (
+            "ARGOS_API_READ_ONLY",
+            "hybrid_memory_service.json",
+            "view-only",
+            "principal",
+            "api_credential.json",
+            "1 key(s)",
+        ):
+            assert needle in r.text, f"missing {needle!r}"
+        assert "read-only" in r.text
+        # v1 settings render zero editable forms by design.
+        assert "<form" not in r.text
+
+    def test_settings_never_leaks_service_secret(self, tmp_path):
+        client, home, _ = self._settings_client(tmp_path)
+        ep = home / "hybrid_memory_service.json"
+        ep.write_text(json.dumps({
+            "host": "127.0.0.1", "port": 53397, "pid": 4242,
+            "version": "1.0.0", "token": "SUPERSECRETTOKEN",
+            "gate_secret": "GATESECRETVALUE",
+        }), encoding="utf-8")
+        r = client.get("/settings")
+        assert r.status_code == 200
+        assert "SUPERSECRETTOKEN" not in r.text
+        assert "GATESECRETVALUE" not in r.text
+        assert "4242" in r.text  # non-secret endpoint facts still render
+
+    def test_settings_model_principal_reads_without_edit_affordance(self, tmp_path):
+        from api_credentials import credential_file_path, write_credential
+
+        home = tmp_path / "home"
+        home.mkdir()
+        tok, _ = write_credential(
+            credential_file_path(home), name="bench", principal_type="model",
+            allowed_classes=["read"], user_id="default_user",
+        )
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=home)
+        client = TestClient(app)
+        client.post("/login", data={"token": tok})
+        r = client.get("/settings")
+        assert r.status_code == 200 and "bench" in r.text
+        assert "<form" not in r.text
+
+    def test_settings_without_home_is_graceful(self):
+        # Legacy-token console (no home): /settings still renders.
+        from admin_console import _settings_page  # noqa: F401 (smoke import)
+        client = _make_client()
+        r = client.get("/settings", follow_redirects=False)
+        assert r.status_code in (303, 401)
+
+
+class TestLogsPage:
+    """#484 Phase 3: console ring + service-log tail with the public-safe filter."""
+
+    def test_logs_requires_auth(self):
+        client = _make_client()
+        r = client.get("/logs", follow_redirects=False)
+        assert r.status_code in (303, 401)
+
+    def test_logs_renders_ring_and_filters_sensitive_lines(self, tmp_path, monkeypatch):
+        import logging as _logging
+
+        from api_credentials import credential_file_path, write_credential
+
+        home = tmp_path / "home"
+        home.mkdir()
+        tok, _ = write_credential(
+            credential_file_path(home), name="admin", principal_type="human",
+            allowed_classes=["read"], user_id="default_user",
+        )
+        log_path = tmp_path / "svc.err.log"
+        log_path.write_text(
+            "my-service operational line\n"
+            "WARN operation=audit token=secret filtered\n"
+            "finally a safe line\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("ARGOS_CONSOLE_SERVICE_LOG", str(log_path))
+
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=home)
+        client = TestClient(app)
+        client.post("/login", data={"token": tok})
+        # Ring entry (console's own logger) after wiring.
+        _logging.getLogger("argos.admin").info("console-line-marker")
+        r = client.get("/logs")
+        html = r.text
+        assert r.status_code == 200
+        assert "Console log" in html and "Memory service log" in html
+        assert "console-line-marker" in html           # ring captured
+        assert "my-service operational line" in html   # safe line kept
+        assert "finally a safe line" in html           # safe line kept
+        assert "audit token" not in html               # filtered line dropped
+        assert "filtered" not in html
+
+    def test_logs_without_service_file_shows_hint(self, tmp_path, monkeypatch):
+        from api_credentials import credential_file_path, write_credential
+
+        home = tmp_path / "home"
+        home.mkdir()
+        tok, _ = write_credential(
+            credential_file_path(home), name="admin", principal_type="human",
+            allowed_classes=["read"], user_id="default_user",
+        )
+        monkeypatch.setenv("ARGOS_CONSOLE_SERVICE_LOG", str(tmp_path / "nope"))
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=home)
+        client = TestClient(app)
+        client.post("/login", data={"token": tok})
+        r = client.get("/logs")
+        assert r.status_code == 200
+        assert "No memory-service log file found" in r.text

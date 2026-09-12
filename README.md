@@ -96,6 +96,16 @@ revocation applies on the next request. The console refuses to revoke the key it
 in with, the affordances are disabled under `ARGOS_API_READ_ONLY`, and the legacy transport
 token can be retired from disk.
 
+**Settings & Logs (Phase 3):** the **Settings** page shows the effective
+configuration — the runtime principal/operations, the `ARGOS_*` environment
+flags (token-like values show only set/unset), and the memory-service endpoint
+(host/port/pid/version — never the token or gate secret). v1 is view-only by
+design: nothing on the page edits anything yet; the small audited editable
+subset lands once the console earns trust (big edits stay file/CLI). The **Logs**
+page tails the console's in-process ring (last 200 lines) plus the newest
+`argos_hm_service_*.err.log`, with a public-safe filter that drops
+audit/egress/PII/token-bearing lines from what renders.
+
 ```bash
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8733/
 ```

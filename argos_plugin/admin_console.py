@@ -41,11 +41,15 @@ external CDN dependencies — local-first, POPIA: no cloud calls).
 """
 from __future__ import annotations
 
+import collections
 import html
+import json
 import logging
 import os
+import re
 import secrets
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -83,6 +87,225 @@ from api_credentials import (
 )
 
 logger = logging.getLogger("argos.admin")
+
+# -- Settings & Logs (Phase 3, #484) ----------------------------------------
+
+_LOG_RING_MAX = 400
+_LOG_RING: "collections.deque[str]" = collections.deque(maxlen=_LOG_RING_MAX)
+
+
+class _RingHandler(logging.Handler):
+    """Keeps the console's own recent log lines for the /logs page (Phase 3)."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            _LOG_RING.append(self.format(record))
+        except Exception:
+            pass
+
+
+_logging_wired = False
+
+
+def _ensure_console_logging() -> None:
+    """Attach the ring (+ file) handler once per process.
+
+    Covers the console logger plus uvicorn.access/error so /logs shows web
+    traffic and operational lines. Facade/audit internals stay out of this
+    public-safe view by not being attached.
+    """
+    global _logging_wired
+    if _logging_wired:
+        return
+    _logging_wired = True
+    logger.setLevel(logging.INFO)  # ring captures INFO even where root defaults to WARNING
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    targets = (logger, logging.getLogger("uvicorn.access"), logging.getLogger("uvicorn.error"))
+    ring = _RingHandler()
+    ring.setFormatter(fmt)
+    for target in targets:
+        target.addHandler(ring)
+    try:
+        log_path = Path(tempfile.gettempdir()) / "argos_admin_console.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        for target in targets:
+            target.addHandler(fh)
+    except OSError:
+        logger.warning("console log file unavailable at %s", log_path)
+
+
+_REDACT_RE = re.compile(
+    r"(audit|egress|pii|gate[ _-]?secret|bearer|api[ _-]?key|password|token)",
+    re.IGNORECASE,
+)
+
+
+def _filter_log_lines(lines: list[str]) -> list[str]:
+    return [ln for ln in lines if not _REDACT_RE.search(ln)]
+
+
+def _tail_file(path: Path, max_lines: int = 200) -> list[str]:
+    try:
+        size = path.stat().st_size
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            offset = max(0, size - 65536)
+            if offset:
+                fh.seek(offset)
+                fh.readline()  # discard a partial first line
+            raw = fh.readlines()
+    except OSError:
+        return []
+    return raw[-max_lines:]
+
+
+def _service_log_files(override: Optional[str] = None) -> list[Path]:
+    if override:
+        path = Path(override)
+        return [path] if path.exists() else []
+    tmp = Path(tempfile.gettempdir())
+    try:
+        files = sorted(
+            tmp.glob("argos_hm_service_*.err.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    return files[:2]
+
+
+_PLUGIN_VERSION = "1.0.0"  # mirror of plugin.yaml
+
+_PHASE3_NOTE = (
+    "Settings v1 is view-only by design: nothing on this page edits "
+    "anything yet. The small audited editable subset lands once the UI has "
+    "earned trust (issue #484, Phase 3). Big edits stay file/CLI."
+)
+
+_ENV_KEYS = (
+    "ARGOS_API_READ_ONLY",
+    "ARGOS_API_CAN_PROPOSE",
+    "ARGOS_API_PRINCIPAL_TYPE",
+    "ARGOS_API_PRINCIPAL",
+    "ARGOS_API_TENANT",
+    "ARGOS_API_USER_ID",
+    "ARGOS_API_CREDENTIAL_FILE",
+    "ARGOS_REST_TOKEN",
+)
+
+
+def _env_table() -> list[tuple[str, str]]:
+    """Environment flags with token-like values shown only as set/unset."""
+    rows = []
+    for key in _ENV_KEYS:
+        raw = os.environ.get(key, "")
+        if any(tag in key.upper() for tag in ("TOKEN", "KEY", "SECRET")):
+            rows.append((key, "set" if raw else "unset"))
+        else:
+            rows.append((key, raw or "unset"))
+    return rows
+
+
+def _service_endpoint_info(home: Optional[Path]) -> list[tuple[str, str]]:
+    """host/port/pid/version only — token and gate_secret never render."""
+    if home is None:
+        return [("service endpoint file", "no home configured")]
+    path = home / "hybrid_memory_service.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [("service endpoint file", "not found")]
+    return [(f"service {k}", str(data.get(k, "—")))
+            for k in ("host", "port", "pid", "spawner_pid", "version")]
+
+
+def _settings_page(
+    ctx: AuthContext,
+    home: Optional[Path],
+    legacy: bool,
+    creds: list,
+) -> str:
+    rows = [
+        ("principal", ctx.principal),
+        ("principal type", ctx.principal_type),
+        ("tenant", ctx.tenant),
+        ("user id", ctx.user_id),
+        ("transport", ctx.transport),
+        ("allowed operations", ", ".join(sorted(ctx.allowed_operations)) or "—"),
+        ("can propose", "yes" if ctx.can_propose else "no"),
+        ("read-only (ARGOS_API_READ_ONLY)", "yes" if _console_read_only() else "no"),
+    ]
+    if home is not None:
+        rows.append(("credential file", str(home / "api_credential.json")))
+        rows.append(("credentials on disk",
+                     f"{len(creds)} key(s)" + (" + legacy transport token" if legacy else "")))
+    body_rows = "".join(
+        f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>" for k, v in rows
+    )
+    env_rows = "".join(
+        f"<tr><th>{_esc(k)}</th><td><code>{_esc(v)}</code></td></tr>"
+        for k, v in _env_table()
+    )
+    svc_rows = "".join(
+        f"<tr><th>{_esc(k)}</th><td><code>{_esc(v)}</code></td></tr>"
+        for k, v in _service_endpoint_info(home)
+    )
+    return _base_page("Settings", f"""
+<div class="card">
+  <h2>Runtime</h2>
+  <table>{body_rows}</table>
+</div>
+<div class="card">
+  <h2>Environment</h2>
+  <p class="muted">Token-like values show only set/unset — never the value itself.</p>
+  <table>{env_rows}</table>
+</div>
+<div class="card">
+  <h2>Memory service endpoint</h2>
+  <table>{svc_rows}</table>
+  <p class="muted">Read from hybrid_memory_service.json in the home directory. The token and gate secret in that file are never rendered.</p>
+</div>
+<div class="card">
+  <h2>Build</h2>
+  <table>
+    <tr><th>plugin</th><td>argos {_PLUGIN_VERSION}</td></tr>
+    <tr><th>console</th><td>admin console (FastAPI)</td></tr>
+    <tr><th>settings and logs</th><td>Phase 3 (#484)</td></tr>
+  </table>
+  <p class="muted">{_PHASE3_NOTE}</p>
+</div>""", ctx)
+
+
+def _logs_page(ctx: AuthContext, service_log_override: Optional[str] = None) -> str:
+    ring_lines = list(_LOG_RING)[-200:]
+    ring_html = "".join(html.escape(ln) + "\n" for ln in ring_lines)
+    if not ring_html:
+        ring_html = "(no console log lines captured yet — lines accumulate from here on)"
+    svc_html = ""
+    for path in _service_log_files(service_log_override):
+        lines = _filter_log_lines(_tail_file(path, 200))
+        svc_html += f"<h3>{_esc(path.name)}</h3>"
+        if lines:
+            svc_html += "<pre>" + "".join(html.escape(ln) + "\n" for ln in lines) + "</pre>"
+        else:
+            svc_html += '<p class="muted">(empty or fully filtered)</p>'
+    if not svc_html:
+        svc_html = ('<p class="muted">No memory-service log file found. It appears when the '
+                    'service runs with stderr captured (argos_hm_service_*.err.log in the '
+                    'temp directory).</p>')
+    return _base_page("Logs", f"""
+<div class="card">
+  <h2>Console log (in-process ring, last 200)</h2>
+  <pre>{ring_html}</pre>
+</div>
+<div class="card">
+  <h2>Memory service log (tail)</h2>
+  {svc_html}
+  <p class="muted">Public-safe filter: lines matching audit / egress / PII / token / key / secret / bearer are dropped from this view.</p>
+</div>
+<p><a href="/logs">Refresh</a></p>""", ctx)
+
 
 # -- Config ------------------------------------------------------------------
 
@@ -471,6 +694,10 @@ def _base_page(title: str, body: str, ctx: Optional[AuthContext] = None) -> str:
     # Keys (#484 Phase 2) is a human-principal management surface.
     if ctx and ctx.principal_type == "human":
         nav_links.append('<a href="/keys">Keys</a>')
+    # Settings & Logs (Phase 3, #484): read-only surfaces, safe for any
+    # signed-in principal (human or model).
+    nav_links.append('<a href="/settings">Settings</a>')
+    nav_links.append('<a href="/logs">Logs</a>')
 
     nav = " | ".join(nav_links)
     return f"""<!DOCTYPE html>
@@ -846,6 +1073,7 @@ def create_app(
     )
     auth = AdminAuth(auth_token, home=home)
     limiter = ConcurrencyLimiter(max_concurrent)
+    _ensure_console_logging()  # Phase 3: ring + file for /logs
 
     @app.middleware("http")
     async def _middleware(request: Request, call_next):
@@ -1077,6 +1305,25 @@ def create_app(
                 )
             return RedirectResponse(url=_keys_redirect(err="No legacy token on file."), status_code=303)
         return RedirectResponse(url=_keys_redirect(err="Unknown action."), status_code=303)
+
+    # -- Settings & Logs (Phase 3, #484): read-only operational surfaces ----
+
+    @app.get("/settings", response_class=HTMLResponse)
+    async def settings_page(
+        request: Request,
+        ctx: AuthContext = Depends(auth),
+    ):
+        legacy, creds = auth.credentials()
+        return _settings_page(ctx, home=home, legacy=legacy, creds=creds)
+
+    @app.get("/logs", response_class=HTMLResponse)
+    async def logs_page(
+        request: Request,
+        ctx: AuthContext = Depends(auth),
+    ):
+        # Test/debug hook: point /logs at a specific service log file.
+        override = os.environ.get("ARGOS_CONSOLE_SERVICE_LOG")
+        return _logs_page(ctx, service_log_override=override)
 
     # -- Dashboard: GET / -------------------------------------------------
 

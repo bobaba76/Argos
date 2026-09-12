@@ -351,6 +351,105 @@ class TestVectorArmProbes:
             assert store.probes == 0, "no probes for an unrelated query"
 
 
+class _RawReranker:
+    """Assigns fixed per-content CE raws (query-independent), for testing
+    the rescue displacement rules with full control over raw ordering."""
+
+    def __init__(self, raw_markers: dict):
+        self._markers = raw_markers  # content-substring -> raw
+
+    def _raws(self, documents):
+        out = []
+        for d in documents:
+            raw = 0.0
+            for marker, v in self._markers.items():
+                if marker in d:
+                    raw = v
+                    break
+            out.append(raw)
+        return out
+
+    def score(self, query, documents):
+        return self._raws(documents)
+
+    def score_multi(self, queries, documents):
+        return [self._raws(documents) for _ in queries]
+
+
+class TestLimitInvariantRescue:
+    """#467: the rescue must never evict an in-window member on POSITION —
+    displacement is by CE-raw. Same query at limits 3..15: the answer stays
+    present at every limit (rescued into small windows, at its true rank in
+    wide ones) and the strict head is constant."""
+
+    def _store(self, rescue_enabled=True):
+        # Fused order (RRF): H1,H2,W1 (two-arm) then W2,F1,F2,F3, then the
+        # answer A at slot 8 (the old tail-eviction point at limit 8),
+        # then band-only B1/B2 (CE-strong, outside any <=8 window).
+        vector = [
+            _rec("mem-H1", "H1MARK alpha", 0.95),
+            _rec("mem-H2", "H2MARK beta", 0.90),
+            _rec("mem-W1", "W1MARK gamma", 0.88),
+            _rec("mem-W2", "W2MARK delta", 0.78),
+            _rec("mem-F1", "F1MARK one", 0.75),
+            _rec("mem-F2", "F2MARK two", 0.72),
+            _rec("mem-F3", "F3MARK three", 0.70),
+            _rec("mem-A", "AMARK semantic", 0.69),
+            _rec("mem-B1", "B1MARK epsilon", 0.60),
+            _rec("mem-B2", "B2MARK zeta", 0.59),
+            _rec("mem-F4", "F4MARK four", 0.55),
+        ]
+        text = [
+            _rec("mem-H1", "H1MARK alpha", 0.80),
+            _rec("mem-H2", "H2MARK beta", 0.80),
+            _rec("mem-W1", "W1MARK gamma", 0.80),
+        ]
+        rr = _RawReranker({
+            "H1MARK": 0.98, "H2MARK": 0.97, "W1MARK": 0.40, "W2MARK": 0.35,
+            "F1MARK": 0.30, "F2MARK": 0.30, "F3MARK": 0.30, "F4MARK": 0.33,
+            "AMARK": 0.99, "B1MARK": 0.96, "B2MARK": 0.95,
+        })
+        store, tmp = _build(vector, text, limit=3, top_n=2, reranker=rr)
+        store._ce_rescue_enabled = rescue_enabled
+        return store, tmp
+
+    def test_answer_present_at_every_limit(self):
+        q = "alpha beta gamma delta epsilon zeta semantic"
+        store, tmp = self._store()
+        with tmp:
+            base_off, tmp_off = self._store(rescue_enabled=False)
+            with tmp_off:
+                off8 = [r.memory_id for r in base_off.search(q, limit=8)]
+            pos_off8 = off8.index("mem-A") + 1 if "mem-A" in off8 else None
+            for lim in (3, 6, 8, 15):
+                rows = store.search(q, limit=lim)
+                ids = [r.memory_id for r in rows]
+                assert "mem-A" in ids, f"answer evicted at limit {lim} (#467)"
+                assert ids[0] == "mem-H1", f"strict head displaced at limit {lim}"
+            # wide window: answer at its true rank, never worse than
+            # rescue-off (a rescue may pull it UP, never push it down).
+            rows8 = store.search(q, limit=8)
+            pos8 = [r.memory_id for r in rows8].index("mem-A") + 1
+            assert pos_off8 is not None and pos8 <= pos_off8, (
+                f"rescue made the answer WORSE: on={pos8} off={pos_off8}"
+            )
+
+    def test_small_window_rescue_lands_at_tail(self):
+        q = "alpha beta gamma delta epsilon zeta semantic"
+        store, tmp = self._store()
+        with tmp:
+            rows = store.search(q, limit=3)
+            ids = [r.memory_id for r in rows]
+            # Head survives; the strong-raw band answer rescues INTO the
+            # 3-window and is flagged; the rescued slot is never the head.
+            assert ids[0] == "mem-H1", f"head displaced: {ids}"
+            assert "mem-A" in ids, f"answer not rescued: {ids}"
+            a_row = rows[ids.index("mem-A")]
+            assert getattr(a_row, "_ce_promoted", False), "answer not flagged"
+            promoted = [r.memory_id for r in rows if getattr(r, "_ce_promoted", False)]
+            assert set(promoted) <= {"mem-A", "mem-B1", "mem-B2"}, promoted
+
+
 class TestBatchedCeProbes:
     """#460: work-family queries batch query+probe into ONE score_multi
     predict call instead of two separate CE passes."""

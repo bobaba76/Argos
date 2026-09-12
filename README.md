@@ -114,6 +114,29 @@ The MCP/REST surface exposes the read subset of these through the facade.
 
 Protocols, dataset SHA-256, per-category denominators, model versions, prompts, exact commands, and judged outputs: [eval/repro/BENCHMARK_REPRODUCIBILITY.md](eval/repro/BENCHMARK_REPRODUCIBILITY.md).
 
+## Cost of running Argos
+
+The only LLM cost Argos adds per message is on the write path, and it's conditional: after each completed turn `extract_from_turn()` runs a free regex extraction stage, and only calls your configured LLM when the message is >= 60 chars **and** the regex found fewer than 2 facts (extractor.py:1718, 1868). The read/retrieval path calls the LLM zero times — embeddings and reranking run locally, and the trivial-query gate is deterministic.
+
+Measured per-message LLM overhead (reproducible, `benchmarks/`):
+
+| Metric | Value |
+|---|---|
+| LLM calls per message | 0 on reads; 0 or 1 on writes |
+| When the write call fires | message >= 60 chars AND regex found < 2 facts |
+| Prompt tokens per fired call | ~1,400 (system prompt ~4,865 chars + injection guard + user content) |
+| Completion asked | 800 max_tokens (extractor.py:1602); provider overshoot observed at ~1,000 on dense runs |
+| Est. spend per fired call (v4-flash, 2026-09-11 rates) | ~$0.00005–0.0002 (≈R0.001–0.004) |
+| Mixed-corpus average per message | ~$0.0001 (≈1% of a typical chat message) |
+
+Reproduce it: `python3 benchmarks/cost_overhead.py` (16-message deterministic corpus; `--dry-run` runs $0 without a provider key; `--refresh-rates` pulls live pricing). To see *where* the remaining calls are spent and what regex/gate work could avoid them: `python3 benchmarks/extract_audit.py --sample N` (bounded; Tier 1 costs $0).
+
+Honest boundaries that travel with the numbers:
+
+- Money rows are model- and price-date-specific (measured on deepseek-v4-flash-0731, OpenRouter rates 2026-09-11); re-measure for your model. Tokens are the durable, model-independent quantity.
+- Distillation, reviewer, and graph passes are batch- or conflict-only in production defaults — they are deliberately excluded from the per-message figure and are a follow-up session-level ledger.
+- Self-measured on the maintainer stack, same protocol rules as the scores above.
+
 ## Verification
 
 Every number and capability statement above is backed by a committed, re-runnable artifact — nothing is quoted without evidence.

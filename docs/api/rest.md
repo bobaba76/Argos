@@ -8,6 +8,8 @@ The REST server (`argos_plugin/rest_server.py`) exposes Argos over HTTP on `127.
 ARGOS_REST_TOKEN=<token> python -m argos_plugin.rest_server --home <hermes-home> --port 8732
 ```
 
+**From a source checkout?** The `-m` command needs the repo root and `argos_plugin/` on `PYTHONPATH` — or run script-mode: `cd argos_plugin && python rest_server.py --home <hermes-home> --port 8732`. See [Running from a source checkout](../integration.md#running-from-a-source-checkout).
+
 **CLI flags** (verified against `rest_server.py:main`):
 
 | Flag | Required | Default | Description |

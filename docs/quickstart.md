@@ -49,6 +49,8 @@ REST transports boot **read + write enabled** by default (spec-11): propose
 candidates, save/update memories, and manage collections without any env-var
 setup.
 
+**From a source checkout?** Add the repo root and `argos_plugin/` to `PYTHONPATH` first — or run the server scripts directly from `argos_plugin/`. See [Running from a source checkout](integration.md#running-from-a-source-checkout).
+
 ```bash
 # REST server (loopback-only, token-authenticated, read + write by default)
 ARGOS_REST_TOKEN=<your-token> python -m argos_plugin.rest_server --home <hermes-home> --port 8732

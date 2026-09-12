@@ -86,7 +86,7 @@ ARGOS_REST_TOKEN=<token> \
   python -m argos_plugin.admin_console --home <hermes-home> --port 8733
 ```
 
-Then authenticate every request with `Authorization: Bearer <token>` — a plain browser visit returns `401` **by design** (no token in URLs or HTML; the header doubles as the CSRF guard). Use curl, or a browser extension that injects the header:
+Then open `http://127.0.0.1:8733` in your browser — you'll land on the sign-in page; paste the token once and the console keeps you signed in (HttpOnly, SameSite=Strict session cookie; the token never appears in URLs or HTML). Bearer auth still works unchanged for scripts and API clients:
 
 ```bash
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8733/

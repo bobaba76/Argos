@@ -9,7 +9,10 @@ audit spine.
 Security model (same as rest_server.py):
   - Bound to 127.0.0.1 only (never 0.0.0.0, never tunnel binding).
   - Bearer token auth (separate credential from the internal service
-    token); verified via hmac.compare_digest. The bearer may be the
+    token); verified via hmac.compare_digest. The same token can be
+    exchanged for a browser session at /login (#482): an HttpOnly,
+    SameSite=Strict session cookie — tokens never appear in URLs or
+    HTML. Bearer header auth remains for API clients. The bearer may be the
     legacy transport token (env-derived context - an explicitly-local
     trusted UI) or a per-principal credential from api_credential.json
     (#387): principal, tenant, user_id, principal_type, and operation
@@ -35,14 +38,21 @@ from __future__ import annotations
 import html
 import logging
 import os
+import secrets
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends, Form
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 
 from api_facade import (
     APIError,
@@ -76,6 +86,16 @@ MUTATION_OPERATIONS: Set[str] = {
     "memory_propose",
     "ingest",
 }
+
+# Browser session cookie (#482): sessions live in this process only — a
+# console restart means signing in again. SameSite=Strict + HttpOnly keep
+# the cookie out of cross-site requests and the reach of page scripts.
+SESSION_COOKIE_NAME = "argos_admin_session"
+SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+
+
+class BrowserLoginRequired(Exception):
+    """A browser navigation with no valid session — redirect to /login (#482)."""
 
 
 # -- Error envelope (same stable shape as rest_server) -----------------------
@@ -128,6 +148,9 @@ class AdminAuth:
         self._expected = expected_token
         self._home = Path(home) if home is not None else None
         self._cred_cache: Optional[tuple] = None
+        # #482: browser sessions — session_id -> {"token", "expires"}.
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._session_lock = threading.Lock()
 
     def _credentials(self):
         """Load (legacy_token, credentials), cached on mtime+size.
@@ -178,9 +201,23 @@ class AdminAuth:
             principal_type=principal_type,
         )
 
-    def __call__(self, authorization: str = Header(default="")) -> AuthContext:
-        import hmac
+    def __call__(self, request: Request, authorization: str = Header(default="")) -> AuthContext:
+        """Authenticate a request: bearer header first, then the browser session."""
         request_id = str(uuid.uuid4())
+        if authorization:
+            return self._bearer_context(authorization, request_id)
+        session_ctx = self._context_from_session(request)
+        if session_ctx is not None:
+            return session_ctx
+        if self._browser_navigation(request):
+            # #482: send humans to the login form instead of a raw 401.
+            raise BrowserLoginRequired()
+        # No header and no session — fall through to the canonical 401.
+        return self._bearer_context(authorization, request_id)
+
+    def _bearer_context(self, authorization: str, request_id: str) -> AuthContext:
+        """Validate an Authorization header value (pre-#482 behavior, byte-for-byte)."""
+        import hmac
         if not authorization:
             raise HTTPException(
                 status_code=401,
@@ -250,6 +287,71 @@ class AdminAuth:
             }},
         )
 
+    # -- Browser sessions (#482) ----------------------------------------------
+
+    def _browser_navigation(self, request: Request) -> bool:
+        """True for an HTML GET navigation — the human browser path."""
+        accepts = (request.headers.get("accept") or "").lower()
+        return request.method == "GET" and "text/html" in accepts
+
+    def _context_from_session(self, request: Request) -> Optional[AuthContext]:
+        """Resolve a session cookie to an AuthContext (None when absent/expired).
+
+        The session's token is re-validated on every request, so credential
+        file edits (revocation, expiry, class changes) apply on the next call.
+        """
+        sid = request.cookies.get(SESSION_COOKIE_NAME)
+        if not sid:
+            return None
+        with self._session_lock:
+            entry = self._sessions.get(sid)
+        if entry is None:
+            return None
+        if entry["expires"] <= time.time():
+            with self._session_lock:
+                self._sessions.pop(sid, None)
+            return None
+        try:
+            return self._bearer_context(f"Bearer {entry['token']}", str(uuid.uuid4()))
+        except HTTPException:
+            with self._session_lock:
+                self._sessions.pop(sid, None)
+            return None
+
+    def create_session(self, token: str) -> str:
+        """Start a browser session for a validated token; returns the session id."""
+        sid = secrets.token_urlsafe(32)
+        with self._session_lock:
+            self._sessions[sid] = {"token": token, "expires": time.time() + SESSION_TTL_SECONDS}
+        return sid
+
+    def destroy_session(self, sid: str) -> None:
+        with self._session_lock:
+            self._sessions.pop(sid, None)
+
+    def check_token(self, token: str) -> Optional[str]:
+        """Validate a raw token for the login form.
+
+        Returns None when valid, else a human-readable message mirroring
+        the header path's 401 texts.
+        """
+        try:
+            self._bearer_context(f"Bearer {token}", str(uuid.uuid4()))
+            return None
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            return detail.get("error", {}).get("message", "Invalid credentials.")
+
+    def is_authenticated(self, request: Request, authorization: str = "") -> bool:
+        """True when the request carries a valid header or a valid session."""
+        if authorization:
+            try:
+                self._bearer_context(authorization, str(uuid.uuid4()))
+                return True
+            except HTTPException:
+                return False
+        return self._context_from_session(request) is not None
+
 
 # -- Concurrency limiter (same as rest_server) -------------------------------
 
@@ -281,6 +383,7 @@ def _base_page(title: str, body: str, ctx: Optional[AuthContext] = None) -> str:
     can_erase = ctx and "erase_request" in ctx.allowed_operations
     can_export = ctx and "export" in ctx.allowed_operations
     principal = _esc(ctx.principal) if ctx else "—"
+    signout = ' · <a href="/logout">sign out</a>' if ctx else ""
 
     nav_links = [
         ('<a href="/">Dashboard</a>'),
@@ -336,10 +439,53 @@ def _base_page(title: str, body: str, ctx: Optional[AuthContext] = None) -> str:
 <body>
 <nav class="nav">
   {nav}
-  <span class="principal">Principal: {principal}</span>
+  <span class="principal">Principal: {principal}{signout}</span>
 </nav>
 <div class="container">
   {body}
+</div>
+</body>
+</html>"""
+
+
+def _login_page(error: str = "") -> str:
+    """Sign-in page (#482) — no token material is ever rendered."""
+    err = f'<div class="flash flash-err">{_esc(error)}</div>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — Argos Admin Console</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #f8f9fa; color: #222; }}
+  .nav {{ background: #1a1a2e; padding: 0.5rem 1rem; color: #eee; }}
+  .container {{ max-width: 480px; margin: 3rem auto; padding: 0 1rem; }}
+  h1 {{ color: #1a1a2e; font-size: 1.3rem; }}
+  .card {{ background: #fff; border: 1px solid #dee2e6; border-radius: 4px; padding: 1rem; margin: 1rem 0; }}
+  .flash {{ padding: 0.5rem 1rem; border-radius: 3px; margin: 0.5rem 0; }}
+  .flash-err {{ background: #f8d7da; color: #721c24; }}
+  .muted {{ color: #888; font-size: 0.85rem; }}
+  label {{ font-size: 0.9rem; }}
+  input[type=password] {{ width: 100%; padding: 0.4rem 0.5rem; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; margin: 0.3rem 0 0.6rem; }}
+  button {{ padding: 0.4rem 1rem; border: 1px solid #ccc; border-radius: 3px; cursor: pointer; background: #1a1a2e; color: #eee; }}
+</style>
+</head>
+<body>
+<nav class="nav">Argos Admin Console</nav>
+<div class="container">
+  <h1>Sign in</h1>
+  {err}
+  <div class="card">
+    <form method="post" action="/login" autocomplete="off">
+      <label for="token">API credential</label>
+      <input type="password" id="token" name="token" autofocus autocomplete="off">
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="muted">Paste the token from <code>api_credential.json</code> in your
+    Hermes home (or the value of <code>ARGOS_REST_TOKEN</code>). It is exchanged
+    for a local session cookie and never appears in URLs or page source.</p>
+  </div>
 </div>
 </body>
 </html>"""
@@ -407,6 +553,47 @@ def create_app(
         rid = str(uuid.uuid4())
         logger.exception("Unhandled error (request_id=%s): %s", rid, exc)
         return _error_json("internal_error", "Internal server error.", rid, 500)
+
+    @app.exception_handler(BrowserLoginRequired)
+    async def _login_required_handler(request: Request, exc: BrowserLoginRequired):
+        return RedirectResponse(url="/login", status_code=303)
+
+    # -- Browser login (#482): GET/POST /login, GET /logout --------------
+
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_form(request: Request, authorization: str = Header(default="")):
+        if auth.is_authenticated(request, authorization):
+            return RedirectResponse(url="/", status_code=303)
+        return _login_page()
+
+    @app.post("/login", response_class=HTMLResponse)
+    async def login_submit(token: str = Form(default="")):
+        token = token.strip()
+        if not token:
+            return HTMLResponse(_login_page(error="Enter the API credential token."), status_code=401)
+        err = auth.check_token(token)
+        if err is not None:
+            return HTMLResponse(_login_page(error=err), status_code=401)
+        sid = auth.create_session(token)
+        response = RedirectResponse(url="/", status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            sid,
+            max_age=SESSION_TTL_SECONDS,
+            path="/",
+            httponly=True,
+            samesite="strict",
+        )
+        return response
+
+    @app.get("/logout")
+    async def logout(request: Request):
+        sid = request.cookies.get(SESSION_COOKIE_NAME)
+        if sid:
+            auth.destroy_session(sid)
+        response = RedirectResponse(url="/login", status_code=303)
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        return response
 
     # -- Dashboard: GET / -------------------------------------------------
 

@@ -62,6 +62,13 @@ class StoreMixinState:
     Incremented in ``store_retrieval._record_scale_metric``; read in
     ``get_scale_metrics``."""
 
+    scale_warning_active: bool = False
+    """True while the rolling window currently breaches a threshold.
+    Set in ``store_retrieval._record_scale_metric``. A warning fires only
+    on the crossing INTO breach and the flag suppresses further warnings
+    until the window drops back under (then it re-arms) — #460 made the
+    'once per crossing' promise real instead of warning on every query."""
+
     scale_last_count_check: int = 0
     """``scale_queries`` value at the last record-count check.
     Updated in ``store_retrieval._record_scale_metric`` to avoid

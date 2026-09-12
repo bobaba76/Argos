@@ -36,6 +36,7 @@ class TestStoreMixinStateStructural:
         r"self\._scale_latencies\b",
         r"self\._scale_queries\b",
         r"self\._scale_warnings_fired\b",
+        r"self\._scale_warning_active\b",
         r"self\._scale_last_count_check\b",
         r"self\._scale_record_count\b",
     ]
@@ -46,6 +47,7 @@ class TestStoreMixinStateStructural:
         s = StoreMixinState()
         assert hasattr(s, "lock")
         assert hasattr(s, "scale_warn_latency_ms")
+        assert hasattr(s, "scale_warning_active")
         assert hasattr(s, "scale_latencies")
         assert hasattr(s, "alias_cache")
         assert hasattr(s, "read_only")

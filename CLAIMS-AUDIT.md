@@ -61,7 +61,7 @@ headline is answerer-conditional (GLM direct / flash composed).
 | Local embeddings, offline | ✓ | `bge-small-en-v1.5`, local-first cache-path resolution (no network HEAD-check); `embeddings.py`. |
 | LLM calls via configured cloud model only; no native local-LLM | ✓ | consistent with egress gating (`tests/test_egress.py`, `SITES` registry). |
 | License: BSL 1.1 → Apache-2.0 on 2030-08-21 | ✓ | `LICENSE.md` (BSL 1.1, MariaDB text); production/commercial use requires a licence (per BSL terms). |
-| Test suite | ✓ | 168 test modules in `argos_plugin/tests/` (3,264 `def test_` definitions; counts generated via AST 2026-09-12 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
+| Test suite | ✓ | 168 test modules in `argos_plugin/tests/` (3,265 `def test_` definitions; counts generated via AST 2026-09-12 by `scripts/count_test_fns.py`, guarded by `test_claims_audit_parity.py`; last recorded full-suite green run 2026-08-30 via `pytest tests/ -q -n 4` — not re-run for this refresh). Covers gate verdicts, egress, inbound security, adversarial chains, contradiction matrix, shared-service RPC, multitenant Cells, mutation_events audit log. |
 | Public repo contains no personal data | ✓ verified | gold freeze sha documented in `eval/gold/README.md`. |
 
 ---
@@ -325,3 +325,7 @@ committed, re-runnable artifact:
   promote/dismiss store semantics, rejection-ledger fingerprinting with the honest
   slot-less flag, resolution invariant, RPC class derivation, facade/model-principal
   gates, MCP + REST surfaces). No measurement claims changed.
+- **2026-09-12 (#460 close-out)** — section 2 test-suite row + README Verification
+  bullet refreshed: 168 / 3,265 (+1: `test_scale_warning_fires_once_per_crossing`).
+  The #460 latency claims (warm p50=76ms / p95=202ms, warnings_fired=0 live) are
+  runtime measurements, not suite counts; recorded in the issue thread.

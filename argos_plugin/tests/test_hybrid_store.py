@@ -146,6 +146,38 @@ class TestDuckDBStore:
         assert m2["warn_records"] == 999
         store.close()
 
+    def test_scale_warning_fires_once_per_crossing(self, tmp_path):
+        """#460: sustained slowness warns once on the crossing, not per query;
+        dropping back under the thresholds re-arms the next crossing."""
+        from store import DuckDBMemoryStore
+
+        store = DuckDBMemoryStore(tmp_path / "test.duckdb", user_id="test_user")
+        store.set_scale_thresholds(50.0, 10**9)  # tight latency bar, huge record bar
+        st = store._state
+        st.scale_latencies.clear()
+        st.scale_warnings_fired = 0
+        st.scale_warning_active = False
+        for _ in range(5):
+            store._record_scale_metric(0.2)  # 200ms > 50ms threshold
+        assert st.scale_warnings_fired == 1
+        assert st.scale_warning_active is True
+        # sustained breach: no additional warnings
+        for _ in range(5):
+            store._record_scale_metric(0.2)
+        assert st.scale_warnings_fired == 1
+        # age the slow samples fully out of the 50-slot window (10 slow + 60 fast)
+        for _ in range(60):
+            store._record_scale_metric(0.001)
+        assert st.scale_warning_active is False
+        # re-cross: exactly one more warning
+        for _ in range(5):
+            store._record_scale_metric(0.2)
+        assert st.scale_warnings_fired == 2
+        m = store.get_scale_metrics()
+        assert "warning_active" in m
+        assert m["warning_active"] is True
+        store.close()
+
     def test_text_search(self, tmp_path):
         from store import DuckDBMemoryStore
 

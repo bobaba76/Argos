@@ -6,6 +6,21 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 
 ### Added
 
+- **One-shot onboarding: `scripts/single.bat`** (#485): a single Windows batch
+  file that takes a machine already running Hermes agent from "plugin not
+  installed" to "console open in the browser, creating the admin key". Locates
+  the Hermes home (`%LOCALAPPDATA%\hermes`, or `/home:` / `SINGLE_HOME`),
+  deploys `argos_plugin` into `plugins\hybrid_memory` (idempotent: re-deploy
+  skipped when the files match), syncs python deps (`argos_plugin/requirements.txt`,
+  pinned to `plugin.yaml`), points `memory.provider` at hybrid_memory via the
+  hermes CLI, then asks whether to enable the web UI — on Yes installs a
+  per-user ONLOGON scheduled task (`Argos Admin Console`) that starts the
+  console on port 8733 and waits on `/health` before opening the browser.
+  `/check` is a verify-only dry run that creates nothing; missing home exits
+  3 with a clear message. No manual Python, no hand-edited config, safe to
+  re-run. Tests: structure markers, CRLF enforcement, side-effect-free
+  `/check` (Windows-gated).
+
 - **Admin console: settings + logs pages** (#484, Phase 3 — console-as-landing work): the **Settings** page is a view-only effective-configuration readout — runtime principal/operations, the `ARGOS_*` environment flags (token-like values render only as set/unset, never the value), and the memory-service endpoint (host/port/pid/version from `hybrid_memory_service.json` — the token and gate secret are never rendered). v1 adopts the view-mostly contract: zero editable fields, the audited safe subset lands later (big edits stay file/CLI), stated on the page. The **Logs** page tails the console's in-process ring (last 200, captured via a logging handler wired at app boot) plus the newest `argos_hm_service_*.err.log` (tail ~64KiB window), with a public-safe filter dropping lines matching audit / egress / PII / token / key / secret / bearer before render. Both pages are auth-gated and read-only for any signed-in principal (human or model). 8 tests.
 
 - **Admin console: keys page** (#484, Phase 2 — mint / list / revoke): a

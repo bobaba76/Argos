@@ -969,6 +969,21 @@ class MemoryService:
                         + str(args.get("reason", ""))
                     ).strip()
             return store.review_candidate(**args)
+        if method == "review_memory":
+            # Spec-13 S3: resolution ops (promote/dismiss) are human-made
+            # decisions. The review class is SERVER-DERIVED (#423 pattern,
+            # mirrors review_candidate): gated calls (HMAC-verified via
+            # call_gated) may claim tool/manual; ungated raw RPC callers
+            # are forced to auto_review, where the storage resolution
+            # invariant refuses them loudly (no clock-as-evidence, no
+            # model self-vouch; resolution only via explicit human action).
+            args = dict(args)  # don't mutate the caller's dict
+            _claimed_source = str(args.pop("review_source", "") or "")
+            if confirmed and _claimed_source in _GATED_REVIEW_SOURCES:
+                args["review_source"] = _claimed_source
+            else:
+                args["review_source"] = "auto_review"
+            return store.review_memory(**args)
         if method == "find_supersede_candidates":
             return store.find_supersede_candidates(
                 candidate_id=args.get("candidate_id", ""),

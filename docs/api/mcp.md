@@ -84,6 +84,23 @@ Propose a new memory for human review. The candidate enters the review queue —
 - **Output:** `{ candidate_id, status, reason, scan_summary }`
 - **Statuses:** `pending`, `quarantined`, `error`
 
+### `memory_review`
+
+Resolve a memory saved under the `unreviewed` trust class (Spec-13 S3). `promote` vouches it — the class marker is cleared and the bounded rank penalty is removed; `dismiss` quarantines it and fingerprints its claim slot in the rejection ledger (`reassertion_blocked` reports whether re-assertion is actually blocked — slot-less records cannot be fingerprinted by design, so only the quarantine applies).
+
+- **Facade op:** `review_memory`
+- **Class:** B — human principal only (model principals are denied; no self-vouch). Resolution is audit-logged.
+- **Input:**
+
+    | Field | Type | Required | Description |
+    |-------|------|----------|-------------|
+    | `memory_id` | string | yes | The memory to resolve. |
+    | `decision` | string | yes | `promote` or `dismiss`. |
+    | `reason` | string | no | Reason for the decision (max 2000 chars). |
+    | `idempotency_key` | string | yes | Client-generated unique key. |
+
+- **Output:** `{ memory_id, decision, changed, previous_trust_class, previous_status, reassertion_blocked, reviewer }`
+
 ### `memory_search`
 
 Search memories by natural-language query.

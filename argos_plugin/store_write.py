@@ -2931,6 +2931,175 @@ class StoreWriteMixin:
         cur.close()
         return 1  # pre-checked: no existing row, so the insert succeeded
 
+    def review_memory(
+        self,
+        memory_id: str,
+        decision: str,
+        reason: str = "",
+        *,
+        review_source: str = "manual",
+        reviewer: str = "",
+    ) -> dict | None:
+        """Spec-13 (#393 S3): resolve an 'unreviewed' memory - promote or dismiss.
+
+        promote: vouch the record - clears trust_class (clean class), which
+        also removes the bounded rank penalty at retrieval.
+        dismiss: quarantine the record AND fingerprint its claim slot in the
+        rejection ledger (when the slot is identifiable - slot-less records
+        cannot be fingerprinted by design; see rejection_key), so
+        paraphrased re-assertions cannot resurrect it.
+
+        Resolution happens only via an explicit human decision: any review
+        source other than tool/manual is refused loudly with an event
+        (mirrors the candidate auto-approval refusal - a clock is not
+        evidence, and a model cannot vouch its own memory).
+
+        Returns a summary dict, or None when the memory does not exist as a
+        head version in the caller's scope (mirrors review_candidate).
+        """
+        decision = decision.strip().lower()
+        if decision not in {"promote", "dismiss"}:
+            raise ValueError("invalid memory review decision")
+        _source = str(review_source or "").strip().lower()
+        if _source not in {"tool", "manual"}:
+            with self._state.lock:
+                assert self.connection is not None
+                self._record_event(
+                    event_type="memory_review_refused",
+                    entity_type="memory",
+                    entity_key=memory_id,
+                    reason=(
+                        "resolution invariant: only tool/manual review may "
+                        "promote or dismiss"
+                    ),
+                    refs={"memory_id": memory_id, "review_source": _source},
+                )
+            raise ValueError(
+                "resolution invariant: review_source must be 'tool' or "
+                "'manual' - resolution requires an explicit human decision"
+            )
+        now = self._now()
+        with self._state.lock:
+            assert self.connection is not None
+            row = self.connection.execute(
+                """SELECT trust_class, status, category, payload
+                   FROM memory_records
+                   WHERE memory_id = ?
+                     AND (user_scope IS NULL OR user_scope = ?)
+                     AND valid_to IS NULL""",
+                [memory_id, self.user_id],
+            ).fetchone()
+            if not row:
+                return None
+            prev_trust = str(row[0]).strip().lower() if row[0] else None
+            prev_status = row[1]
+            category = row[2]
+            payload_raw = row[3]
+            if decision == "promote":
+                if prev_trust != "unreviewed":
+                    # Idempotent no-op: already clean - report, change nothing.
+                    return {
+                        "memory_id": memory_id,
+                        "decision": "promoted",
+                        "previous_trust_class": prev_trust,
+                        "changed": False,
+                    }
+                # #347: UPDATE + event inside one explicit transaction.
+                _started = self._begin_transaction_if_needed()
+                try:
+                    self.connection.execute(
+                        """UPDATE memory_records
+                           SET trust_class = NULL, updated_at = ?
+                           WHERE memory_id = ?
+                             AND (user_scope IS NULL OR user_scope = ?)""",
+                        [now, memory_id, self.user_id],
+                    )
+                    self._record_event(
+                        event_type="memory_promoted",
+                        entity_type="memory",
+                        entity_key=memory_id,
+                        reason=reason or "review: vouch (unreviewed -> clean)",
+                        refs={
+                            "previous_trust_class": prev_trust,
+                            "review_source": _source,
+                            "reviewer": reviewer,
+                        },
+                    )
+                    self._commit_if_started(_started)
+                except Exception:
+                    self._rollback_if_started(_started)
+                    raise
+                return {
+                    "memory_id": memory_id,
+                    "decision": "promoted",
+                    "previous_trust_class": prev_trust,
+                    "changed": True,
+                }
+            # dismiss: quarantine + rejection ledger (mirrors rejected
+            # candidates - the claim slot is fingerprinted so it cannot
+            # come back through extraction).
+            payload = None
+            if payload_raw:
+                try:
+                    payload = (
+                        json.loads(payload_raw)
+                        if isinstance(payload_raw, str)
+                        else payload_raw
+                    )
+                except (TypeError, ValueError):
+                    payload = None
+            _started = self._begin_transaction_if_needed()
+            try:
+                self.connection.execute(
+                    """UPDATE memory_records
+                       SET status = 'quarantined', quarantine_reason = ?,
+                           quarantined_at = ?, updated_at = ?
+                       WHERE memory_id = ?
+                         AND (user_scope IS NULL OR user_scope = ?)""",
+                    [
+                        reason or "dismissed via memory review",
+                        now, now, memory_id, self.user_id,
+                    ],
+                )
+                self.record_rejection(
+                    category,
+                    payload,
+                    reason="memory dismissed: " + (reason or "review:dismiss"),
+                )
+                # Honest ledger semantics: rejection_key returns empty for
+                # slot-less records (by design - a bare-category block
+                # would freeze a whole category), so re-assertion blocking
+                # exists only when the claim slot is identifiable. Report
+                # which, instead of implying a block that may not exist.
+                _key = rejection_key(
+                    {"category": category, "payload": payload or {},
+                     "user_scope": self.user_id}
+                )
+                _blocked = bool(_key[0] and _key[1])
+                self._record_event(
+                    event_type="memory_dismissed",
+                    entity_type="memory",
+                    entity_key=memory_id,
+                    reason=reason or "review: dismiss (quarantine + rejection ledger)",
+                    refs={
+                        "previous_status": prev_status,
+                        "review_source": _source,
+                        "reviewer": reviewer,
+                        "rejection_ledger": _blocked,
+                    },
+                )
+                self._commit_if_started(_started)
+            except Exception:
+                self._rollback_if_started(_started)
+                raise
+            return {
+                "memory_id": memory_id,
+                "decision": "dismissed",
+                "previous_status": prev_status,
+                "changed": True,
+                "reassertion_blocked": _blocked,
+            }
+
     def quarantine_memory(self, memory_id: str, reason: str) -> bool:
         """Hide a memory from retrieval without deleting its record.
 

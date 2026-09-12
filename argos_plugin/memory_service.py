@@ -847,8 +847,15 @@ class MemoryService:
             # as-is (trusted-local boundary, same as save_candidate).
             args = _sanitize_args(args)
             # Strict bool (#289 fix): bool("false") is True — only the
-            # literal boolean True passes the human-in-loop gate.
-            confirm = args.get("confirm", False) is True
+            # literal boolean True passes the human-in-loop gate. #386:
+            # "confirm" is in _FORBIDDEN_CLIENT_ARGS (the #200 PR-2 rule —
+            # a client-supplied confirm is not gate authority), so the
+            # reachable authority is the _confirmed envelope flag set by
+            # _SharedRPC.call_gated (HMAC-verified against gate_secret;
+            # a raw token holder cannot forge it). Without this leg the
+            # store's gate could never see True over RPC and apply was
+            # unreachable. Mirrors erase_subject/facade_delete_memory.
+            confirm = confirmed or (args.get("confirm", False) is True)
             return store.ingest_structured(
                 data=str(args.get("data", "")),
                 fmt=str(args.get("fmt", "")),

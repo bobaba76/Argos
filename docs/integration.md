@@ -135,9 +135,10 @@ writing to the store.
 }
 ```
 
-**Class B (candidate approval):** `ARGOS_API_PRINCIPAL_TYPE` controls
-`review_candidate`. The default is `model` (fail-closed): a model principal
-cannot approve its own candidates. **Do not set this to `human` for
+**Class B (candidate approval + memory resolution):** `ARGOS_API_PRINCIPAL_TYPE`
+controls `review_candidate` and `memory_review` (Spec-13 S3). The default is
+`model` (fail-closed): a model principal cannot approve its own candidates
+or vouch/dismiss its own unreviewed memories. **Do not set this to `human` for
 model-driven clients** — it unlocks self-approval, the exact hole spec-09
 closes. Only set `human` for a single-user, local, human-driven UI where a
 human is actually at the keyboard. Generic MCP clients should omit it
@@ -146,6 +147,50 @@ entirely; candidate review flows through a human via class A proposals.
 **Non-loopback deployments:** `ARGOS_API_NO_LOOPBACK=1` disables class C
 direct writes even with write tiers ON — class C requires loopback
 regardless of the default flip. Class A (propose) still works.
+
+## Reference agent pattern — surfacing the unreviewed backlog (#393)
+
+Under `approval_mode: auto` (the default), medium-risk saves materialize
+immediately under the `unreviewed` trust class — retrievable, never blocking,
+carrying only a bounded rank penalty while they wait. Resolution is the
+human's call; **surfacing that call is the agent's job.** Argos ships the
+primitives; the harness owns delivery.
+
+**1. Check periodically — one cheap call, safe to poll.**
+
+- MCP: `memory_unreviewed` → `{ "count": N, "oldest_age_days": ... }`
+- REST: `GET /v1/memory/unreviewed` → same shape
+- (the health/status payload also carries the per-tenant backlog if you'd
+  rather piggyback an existing poll)
+
+**2. Surface, don't nag.** When the count is non-zero, fold it into a natural
+checkpoint — session start, a daily wrap-up — instead of interrupting flow.
+A prompt snippet for your system prompt or scheduled task:
+
+> **Memory review check:** call `memory_unreviewed`. If the count is greater
+> than 0, tell the user: "I'm holding N fact(s) I wasn't sure about — want to
+> review?" and show up to 5 of them (search with `trust_class="unreviewed"`).
+> Let the user say what to keep and what to drop, then resolve each via
+> `memory_review` (`promote` = keep / vouch, `dismiss` = drop). Never resolve
+> on your own — resolution requires the user's decision. When the count is 0,
+> say nothing.
+
+**3. Resolve on the human's word.**
+
+- MCP: `memory_review` · REST: `POST /v1/memories/{memory_id}/decision`
+  (`Idempotency-Key` required)
+- `promote` — vouch: the class marker clears and the rank penalty stops
+  applying. `dismiss` — quarantine + rejection-ledger fingerprint
+  (`reassertion_blocked` reports whether re-assertion of the same claim slot
+  is actually blocked — some records have no identifiable slot).
+- Both are class B — **human principal only**, same rules as candidate
+  approval above (`ARGOS_API_PRINCIPAL_TYPE=human` behind an actual human).
+  The agent asks, the human decides; a model principal is refused.
+
+Digest-style notifications are **not** the default answer — any digest
+schedule is opt-in configuration owned by the harness, and the agent-mediated
+pattern above is the mechanism that works in every deployment (the agent is
+the only guaranteed-present actor).
 
 ## Adapters roadmap (#277)
 

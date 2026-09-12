@@ -91,6 +91,11 @@ def _build(vector_arm, text_arm, *, limit=3, top_n=2, rescue_enabled=True,
         def _vector_search_raw(self, *args, **kwargs):
             return list(vector_arm)
 
+        def _vector_probe_search(self, *args, **kwargs):
+            # #460: the probe loop now uses the lightweight (memory_id, sim)
+            # scan — mirror the crafted arm so probe semantics are unchanged.
+            return [(r.memory_id, r.similarity) for r in vector_arm]
+
         def _text_search_raw(self, *args, **kwargs):
             return list(text_arm)
 
@@ -279,16 +284,22 @@ class TestVectorArmProbes:
         assert _vector_probe_queries("alpha beta gamma") == []
 
     def test_probe_wiring_fires_vector_searches(self):
-        # A work-family query must issue 1 + (work probes) vector searches
-        # (the primary plus the template probes); an unrelated query exactly
-        # 1. The probe results are unioned (empty arms here, so just count).
+        # A work-family query must issue 1 primary vector search + 1
+        # lightweight probe scan (the template probe); an unrelated query
+        # exactly 1 primary and zero probe scans (mirrors the pre-#460
+        # wiring, where the probe loop issued full _vector_search_raw calls).
         class _Counting(DuckDBMemoryStore):
             def __init__(self, *a, **k):
                 super().__init__(*a, **k)
-                self.calls = 0
+                self.raw = 0
+                self.probes = 0
 
             def _vector_search_raw(self, *args, **kwargs):
-                self.calls += 1
+                self.raw += 1
+                return []
+
+            def _vector_probe_search(self, *args, **kwargs):
+                self.probes += 1
                 return []
 
         tmp = tempfile.TemporaryDirectory()
@@ -296,7 +307,10 @@ class TestVectorArmProbes:
                           embedder=_HashEmbedder())
         with tmp:
             store.search("what do I currently work as", limit=3)
-            assert store.calls == 2, "primary + 1 work probe"
-            store.calls = 0
+            assert store.raw == 1, "primary vector search"
+            assert store.probes == 1, "primary + 1 work probe scan"
+            store.raw = 0
+            store.probes = 0
             store.search("alpha beta gamma", limit=3)
-            assert store.calls == 1, "no probes for an unrelated query"
+            assert store.raw == 1, "primary only for unrelated query"
+            assert store.probes == 0, "no probes for an unrelated query"

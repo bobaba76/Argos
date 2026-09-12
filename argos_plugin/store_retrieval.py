@@ -46,9 +46,9 @@ from liveness import record_subsystem_failure, record_subsystem_ok
 
 # #248: tuning constants consolidated in tuning.py
 try:
-    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES, VECTOR_PROBE_ALIASES
+    from .tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES, CE_MAX_DOC_CHARS, VECTOR_PROBE_ALIASES
 except ImportError:  # store_retrieval.py imported as a top-level module
-    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES, VECTOR_PROBE_ALIASES
+    from tuning import BM25_K1, BM25_B, DEDUP_SIMILARITY_THRESHOLD, MAX_EMBEDDING_DIM, RRF_K, CE_PROMOTE_MAX, CE_PROBE_ALIASES, CE_MAX_DOC_CHARS, VECTOR_PROBE_ALIASES
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +511,60 @@ class StoreRetrievalMixin:
                 continue
             out.append(r)
         return out
+
+    def _vector_probe_search(
+        self, emb: List[float], limit: int, excluded: set[str],
+        category_filter: str | None = None,
+        project_id: str | None = None,
+        namespace: str | None = None,
+        client_scope: str | None = None,
+        as_of: str | None = None,
+        include_expired: bool = False,
+        include_closed: bool = False,
+        include_archived: bool = False,
+        trust_class: str | None = None,
+    ) -> List[tuple[str, float]]:
+        """#460: lightweight vector-arm probe scan — (memory_id, sim) pairs only.
+
+        The #445 template-dialect probes only consume the top-N probe hits
+        (prepended to the vector candidate set), but the previous path ran a
+        full ``_vector_search_raw`` per probe: a ~1500-row SELECT * fetch with
+        per-row MemoryRecord construction (~170-230ms per probe, measured
+        11/9). This variant fetches only ``memory_id`` + the SQL-computed
+        cosine for the probe's top-*limit* rows (~15-30ms), keeping the exact
+        same WHERE filters and ranking. Callers materialize records from the
+        primary pool (or by-id fetch) so probe semantics are unchanged.
+        """
+        if not emb or len(emb) > self._MAX_EMBEDDING_DIM:
+            return []
+        vec_text = "[" + ",".join(repr(float(x)) for x in emb) + "]"
+        expiry_ref = as_of if as_of else self._now()
+        where_sql, where_params = _build_memory_where(
+            user_scope=self.user_id,
+            project_id=project_id,
+            namespace=namespace,
+            client_scope=client_scope,
+            category=category_filter,
+            excluded=excluded if excluded else None,
+            tier=None if include_archived else "active",
+            as_of=as_of,
+            include_closed=include_closed,
+            include_expired=include_expired,
+            now=expiry_ref,
+            trust_class=trust_class,
+            extra_sql="AND embedding IS NOT NULL",
+        )
+        sql = (
+            f"SELECT memory_id, list_cosine_similarity(embedding, "
+            f"CAST(? AS DOUBLE[{len(emb)}])) AS sim "
+            f"FROM memory_records WHERE {where_sql} "
+            "ORDER BY sim DESC "
+            "LIMIT ?"
+        )
+        with self._state.lock:
+            assert self.connection is not None
+            result = self.connection.execute(sql, [vec_text, *where_params, limit])
+            return [(str(r[0]), float(r[1])) for r in result.fetchall()]
 
     def find_semantic_duplicate(
         self,
@@ -1311,10 +1365,11 @@ class StoreRetrievalMixin:
             # RE-RANKED by the probe, not merely added — dedup-vs-primary
             # would silently drop the re-rank and the wall stands.
             _probe_hits = []
+            _primary_by_id = {r.memory_id: r for r in vector_results}
             for _probe in _vector_probe_queries(query):
                 try:
-                    _pv = self._vector_search_raw(
-                        self.embedder.embed(_probe, is_query=True), pool_size, excluded,
+                    _pv_ids = self._vector_probe_search(
+                        self.embedder.embed(_probe, is_query=True), 15, excluded,
                         category_filter, project_id=project_id,
                         namespace=namespace, client_scope=client_scope,
                         as_of=as_of, include_expired=include_expired,
@@ -1324,9 +1379,24 @@ class StoreRetrievalMixin:
                     )
                 except Exception:
                     continue
-                for _r in _pv[:15]:
-                    if not any(r.memory_id == _r.memory_id for r in _probe_hits):
-                        _probe_hits.append(_r)
+                for _probe_id, _probe_sim in _pv_ids:
+                    if any(r.memory_id == _probe_id for r in _probe_hits):
+                        continue
+                    _rec = _primary_by_id.get(_probe_id)
+                    if _rec is None:
+                        # #456 pool-entry class: a probe hit outside the
+                        # primary pool must still enter (rare at LIMIT 1536,
+                        # but the semantics must not depend on the primary's
+                        # cutoff). Fetch full record by id, keep probe sim.
+                        _fetched = self.get_memories_by_ids([_probe_id])
+                        if not _fetched:
+                            continue
+                        _rec = _fetched[0]
+                    # Probe order wins: carry the PROBE's similarity so the
+                    # record ranks on the probe dialect (same behavior as the
+                    # pre-#460 full probe scan, which ranked by probe sim).
+                    _rec.similarity = _probe_sim
+                    _probe_hits.append(_rec)
             _probe_ids = {r.memory_id for r in _probe_hits}
             vector_results = _probe_hits + [r for r in vector_results
                                             if r.memory_id not in _probe_ids]
@@ -1384,7 +1454,15 @@ class StoreRetrievalMixin:
                         _r._ce_pool_member = True
                         union_added.append(_r)
             rerank_pool = rerank_pool + union_added
-            documents = [r.content for r in rerank_pool]
+            # #460: bound CE input length BEFORE the tokenizer. SentencePiece
+            # (Python-side) tokenizes the full string before the model's own
+            # 512-token truncation; long records dominate the pass cost
+            # (measured 11/9: ~30us/char — a few 2.5k-char records in the
+            # pool added ~0.5s). The cap only affects CE input; the records
+            # keep their full content everywhere else.
+            _ce_cap = getattr(self, "_ce_max_doc_chars", CE_MAX_DOC_CHARS)
+            documents = [(r.content or "")[:_ce_cap] for r in rerank_pool]
+            documents = [d if d else "" for d in documents]
             # #275 LP2: increment the rerank_calls counter.
             try:
                 try:

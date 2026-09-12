@@ -52,19 +52,31 @@ VECTOR_PROBE_ALIASES = {
 # ("What is user's job title?") scores it 0.99 (measured 11/9). Each
 # family: (intent regex, probe list). Probes are scored per record and
 # the MAX is kept — unrelated queries pay nothing (no regex hit).
+# Perf (#460, 11/9): trimmed to ONE measured-star probe per family —
+# every extra probe is a full extra CE pass over the pool (each pass is
+# the dominant search cost; the vector-arm probes already guarantee pool
+# entry, so the CE probe only needs to bridge the phrasing gap, which the
+# star probe does).
 CE_PROBE_ALIASES = {
     "work": (
         r"\b(work as|job title|current role|job|role|employed|occupation|"
         r"profession|position)\b",
-        ("what is user's job title", "what does user work as",
-         "what is user's current role"),
+        ("what is user's job title",),
     ),
     "location": (
         r"\b(live|lives|living|address|resid(?:e|ence)|located|stay(?:ing)?)\b",
-        ("where does user live", "what is user's address",
-         "where is user located"),
+        ("where does user live",),
     ),
 }
+
+# #460: CE input truncation cap (chars). The cross-encoder tokenizer
+# (SentencePiece, Python-side) processes the FULL document string before
+# the model's own max_length=512 truncation — on real memory content the
+# tokenizer pass, not the GPU matmul, dominates the per-pass cost
+# (measured 11/9: ~30us/char; a 56-doc pool with a few 2.5k-char records
+# cost 1.07s, truncating at 700 chars halved it). The cap bounds input
+# before tokenization; records shorter than the cap are untouched.
+CE_MAX_DOC_CHARS = 700
 
 # -- Semantic dedup (store_retrieval._find_current_similar) ------------------
 # Cosine similarity above this means "same fact" — used to gate the

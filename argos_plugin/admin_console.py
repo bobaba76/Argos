@@ -9,7 +9,13 @@ audit spine.
 Security model (same as rest_server.py):
   - Bound to 127.0.0.1 only (never 0.0.0.0, never tunnel binding).
   - Bearer token auth (separate credential from the internal service
-    token); verified via hmac.compare_digest.
+    token); verified via hmac.compare_digest. The bearer may be the
+    legacy transport token (env-derived context - an explicitly-local
+    trusted UI) or a per-principal credential from api_credential.json
+    (#387): principal, tenant, user_id, principal_type, and operation
+    classes come from the credential entry. A human credential
+    (principal_type: human) is the recommended identity for review
+    actions; model principals are refused class B by the facade.
   - Server-derived identity: the UI does NOT accept client-supplied
     user identity. The AuthContext is built from env vars / credential,
     same as the REST server.
@@ -46,6 +52,13 @@ from api_facade import (
     PROPOSAL_OPERATIONS,
 )
 from access_scoping import ACLConfig
+from api_credentials import (
+    CredentialFileError,
+    build_context as build_credential_context,
+    credential_file_path,
+    parse_credentials_file,
+    resolve_by_token,
+)
 
 logger = logging.getLogger("argos.admin")
 
@@ -98,17 +111,72 @@ FACADE_ERROR_TO_HTTP: Dict[str, int] = {
 class AdminAuth:
     """Bearer token auth for the admin console.
 
-    Same model as rest_server.RESTAuth: the credential is separate from
-    the internal service token, loaded from ARGOS_REST_TOKEN or
-    api_credential.json. Server-derived identity from env vars.
+    Same model as rest_server.RESTAuth (#387): the bearer token is
+    either the legacy transport token (env-derived context - an
+    explicitly-local, human-driven UI) or a per-principal credential
+    from {home}/api_credential.json. A human credential
+    (principal_type: human) is the recommended identity for review
+    actions; model principals are refused class B by the facade.
 
-    The admin console grants proposal-tier operations by default (spec-11).
-    Set ARGOS_API_READ_ONLY=1 to make the console read-only (spec-09
-    default).
+    The admin console grants proposal-tier operations by default
+    (spec-11). ARGOS_API_READ_ONLY=1 makes it read-only (spec-09
+    default). ARGOS_API_PRINCIPAL_TYPE=model narrows an env-context
+    principal (no review actions); it never upgrades a credential.
     """
 
-    def __init__(self, expected_token: str) -> None:
+    def __init__(self, expected_token: str, home: Optional[Path] = None) -> None:
         self._expected = expected_token
+        self._home = Path(home) if home is not None else None
+        self._cred_cache: Optional[tuple] = None
+
+    def _credentials(self):
+        """Load (legacy_token, credentials), cached on mtime+size.
+
+        Raises api_credentials.CredentialFileError on a malformed file
+        (fail closed - never fall back to the legacy token path).
+        """
+        if self._home is None:
+            return (None, [])
+        path = credential_file_path(self._home)
+        try:
+            stat = path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            self._cred_cache = None
+            return (None, [])
+        if self._cred_cache is not None and self._cred_cache[0] == key:
+            return (self._cred_cache[1], self._cred_cache[2])
+        token, creds = parse_credentials_file(path)
+        self._cred_cache = (key, token, creds)
+        return (token, creds)
+
+    def _legacy_context(self) -> AuthContext:
+        """Env-derived context for the legacy transport token.
+
+        Spec-11 (9/9): propose ON by default (class A).
+        ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
+        The local console is an explicitly-local, human-driven UI; an
+        explicit ARGOS_API_PRINCIPAL_TYPE=model narrows it (review
+        actions off) -- env never widens anything.
+        """
+        is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+        allowed = set(READ_OPERATIONS)
+        if not is_read_only:
+            allowed |= PROPOSAL_OPERATIONS
+        if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
+            allowed |= PROPOSAL_OPERATIONS
+        principal_type = "human"
+        if os.environ.get("ARGOS_API_PRINCIPAL_TYPE", "").strip().lower() == "model":
+            principal_type = "model"
+        return AuthContext(
+            principal=os.environ.get("ARGOS_API_PRINCIPAL", "local"),
+            tenant=os.environ.get("ARGOS_API_TENANT", "default"),
+            user_id=os.environ.get("ARGOS_API_USER_ID", "default_user"),
+            transport="admin-console",
+            allowed_operations=allowed,
+            can_propose="memory_propose" in allowed,
+            principal_type=principal_type,
+        )
 
     def __call__(self, authorization: str = Header(default="")) -> AuthContext:
         import hmac
@@ -141,32 +209,45 @@ class AdminAuth:
                     "request_id": request_id,
                 }},
             )
-        if not hmac.compare_digest(token, self._expected):
+        if hmac.compare_digest(token, self._expected):
+            return self._legacy_context()
+        # #387/#390: per-principal credential lookup (same as RESTAuth).
+        try:
+            _, creds = self._credentials()
+        except CredentialFileError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"error": {
+                    "code": "invalid_credential_config",
+                    "message": f"Credential file is invalid: {exc}",
+                    "request_id": request_id,
+                }},
+            )
+        cred, expired = resolve_by_token(creds, token)
+        if cred is not None:
+            return build_credential_context(
+                cred,
+                transport="admin-console",
+                is_loopback=True,  # console is loopback-only by construction
+                env_principal_type=os.environ.get("ARGOS_API_PRINCIPAL_TYPE", ""),
+                is_read_only=os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes"),
+            )
+        if expired:
             raise HTTPException(
                 status_code=401,
                 detail={"error": {
                     "code": "unauthenticated",
-                    "message": "Invalid credentials.",
+                    "message": "Credential expired.",
                     "request_id": request_id,
                 }},
             )
-        # Build the auth context — server-derived identity.
-        # Spec-11 (9/9): propose ON by default (class A).
-        # ARGOS_API_READ_ONLY=1 restores the spec-09 read-only default.
-        is_read_only = os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
-
-        allowed = set(READ_OPERATIONS)
-        if not is_read_only:
-            allowed |= PROPOSAL_OPERATIONS
-        if os.environ.get("ARGOS_API_CAN_PROPOSE", "").lower() in ("true", "1", "yes"):
-            allowed |= PROPOSAL_OPERATIONS
-        return AuthContext(
-            principal=os.environ.get("ARGOS_API_PRINCIPAL", "local"),
-            tenant=os.environ.get("ARGOS_API_TENANT", "default"),
-            user_id=os.environ.get("ARGOS_API_USER_ID", "default_user"),
-            transport="admin-console",
-            allowed_operations=allowed,
-            can_propose="memory_propose" in allowed,
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {
+                "code": "unauthenticated",
+                "message": "Invalid credentials.",
+                "request_id": request_id,
+            }},
         )
 
 
@@ -196,7 +277,7 @@ def _base_page(title: str, body: str, ctx: Optional[AuthContext] = None) -> str:
     The nav bar shows mutation links only when the principal has the
     relevant operation in allowed_operations (read-only for non-admin).
     """
-    can_review = ctx and "review_candidate" in ctx.allowed_operations
+    can_review = ctx and "review_candidate" in ctx.allowed_operations and ctx.principal_type == "human"
     can_erase = ctx and "erase_request" in ctx.allowed_operations
     can_export = ctx and "export" in ctx.allowed_operations
     principal = _esc(ctx.principal) if ctx else "—"
@@ -271,6 +352,7 @@ def create_app(
     *,
     auth_token: str,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
+    home: Optional[Path] = None,
 ) -> FastAPI:
     """Build the admin console FastAPI application.
 
@@ -280,6 +362,8 @@ def create_app(
         auth_token: the API credential (separate from the internal
             service token). The same token as the REST server.
         max_concurrent: maximum concurrent requests.
+        home: Hermes home directory (per-principal credentials, #387).
+            When omitted, only the legacy transport token is accepted.
     """
     app = FastAPI(
         title="Argos Admin Console",
@@ -288,7 +372,7 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
     )
-    auth = AdminAuth(auth_token)
+    auth = AdminAuth(auth_token, home=home)
     limiter = ConcurrencyLimiter(max_concurrent)
 
     @app.middleware("http")
@@ -330,7 +414,7 @@ def create_app(
     async def dashboard(ctx: AuthContext = Depends(auth)):
         caps = facade.execute(ctx, "capabilities", {})
         ops = caps.get("operations", [])
-        can_review = "review_candidate" in ops
+        can_review = "review_candidate" in ops and ctx.principal_type == "human"
         can_erase = "erase_request" in ops
         can_export = "export" in ops
         body = f"""
@@ -574,7 +658,7 @@ def create_app(
     ):
         result = facade.execute(ctx, "list_candidates", {"status": status})
         candidates = result.get("candidates", [])
-        can_review = "review_candidate" in ctx.allowed_operations
+        can_review = "review_candidate" in ctx.allowed_operations and ctx.principal_type == "human"
         rows = ""
         for c in candidates:
             cid = _esc(c.get("candidate_id", ""))
@@ -631,7 +715,7 @@ def create_app(
           <tr><th>ID</th><th>Category</th><th>Content</th><th>Source</th><th>Conf</th><th>Status</th><th>Provenance</th><th>Created</th><th>Actions</th></tr>
           {rows}
         </table>
-        <p class="muted">{result.get('count', 0)} candidates. {"Review actions enabled." if can_review else "Read-only — set ARGOS_API_READ_ONLY=0 (or unset) to enable review actions."}</p>
+        <p class="muted">{result.get('count', 0)} candidates. {"Review actions enabled." if can_review else "Read-only — review actions require a human identity (see docs/api)."}</p>
         """
         return _base_page("Review Queue", body, ctx)
 
@@ -843,7 +927,10 @@ def main() -> None:
     The same ARGOS_REST_TOKEN / api_credential.json as the REST server
     is used for auth. Mutation actions (review/erase) are enabled by
     default (spec-11); set ARGOS_API_READ_ONLY=1 to make the console
-    read-only.
+    read-only. Review actions should use a human credential (#387):
+    mint one with scripts/mint_api_credential.py --principal-type
+    human --classes read,review; the legacy env path remains for
+    explicitly-local trusted UIs.
     """
     import argparse
     import uvicorn
@@ -875,6 +962,7 @@ def main() -> None:
         facade,
         auth_token=token,
         max_concurrent=args.max_concurrent,
+        home=args.home,
     )
 
     # uvicorn with host=127.0.0.1 — never 0.0.0.0.

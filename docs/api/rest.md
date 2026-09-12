@@ -130,7 +130,7 @@ Report the live unreviewed trust-class backlog: count and oldest age of memories
 
 ### `POST /v1/memories/{memory_id}/decision`
 
-Resolve a memory saved under the `unreviewed` trust class (Spec-13 S3 — medium-risk saves under `approval_mode: auto`). Class B — **human principal only**: the transport must declare `ARGOS_API_PRINCIPAL_TYPE=human`; model principals (the fail-closed default) are denied with `403 forbidden`. Resolution is audit-logged (`memory_promoted` / `memory_dismissed`).
+Resolve a memory saved under the `unreviewed` trust class (Spec-13 S3 — medium-risk saves under `approval_mode: auto`). Class B — **human principal only**: authenticate with a human credential (`principal_type: human`, see #387) — or, for an explicitly-local trusted UI only, declare `ARGOS_API_PRINCIPAL_TYPE=human`; model principals (the fail-closed default) are denied with `403 forbidden`. Resolution is audit-logged (`memory_promoted` / `memory_dismissed`).
 
 - `promote` — vouch the memory: the class marker is cleared and the bounded rank penalty is removed (clean class).
 - `dismiss` — quarantine the memory and fingerprint its claim slot in the rejection ledger. `reassertion_blocked` reports whether re-assertion is actually blocked — slot-less records cannot be fingerprinted (by design), so only the quarantine applies.

@@ -6,10 +6,12 @@ All notable changes to Argos. Format: [Keep a Changelog](https://keepachangelog.
 
 ### Added
 
+- **Admin console: settings + logs pages** (#484, Phase 3 — console-as-landing work): the **Settings** page is a view-only effective-configuration readout — runtime principal/operations, the `ARGOS_*` environment flags (token-like values render only as set/unset, never the value), and the memory-service endpoint (host/port/pid/version from `hybrid_memory_service.json` — the token and gate secret are never rendered). v1 adopts the view-mostly contract: zero editable fields, the audited safe subset lands later (big edits stay file/CLI), stated on the page. The **Logs** page tails the console's in-process ring (last 200, captured via a logging handler wired at app boot) plus the newest `argos_hm_service_*.err.log` (tail ~64KiB window), with a public-safe filter dropping lines matching audit / egress / PII / token / key / secret / bearer before render. Both pages are auth-gated and read-only for any signed-in principal (human or model). 8 tests.
+
 - **Admin console: keys page** (#484, Phase 2 — mint / list / revoke): a
   **Keys** tab lists live credential state (name, type, classes, created,
   expiry, status, plus the legacy transport-token row) and lets a human
-  operator mint a new full-class key (shown once, hash-at-rest) or revoke
+  operator mint a new key (shown once, hash-at-rest) or revoke
   any key — revocation applies on the very next request (per-request file
   re-validation). The legacy transport token can be retired from disk too.
   Mint/revoke render only for human principals and are disabled under

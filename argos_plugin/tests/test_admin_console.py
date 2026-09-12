@@ -814,3 +814,175 @@ class TestDocsStart:
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Credential auth (#387/#390): per-principal credentials on the console
+# ---------------------------------------------------------------------------
+
+class TestCredentialAuth:
+    """#387/#390: the console accepts per-principal credentials.
+
+    - A human credential with the review class unlocks review actions
+      (buttons render; POST routes through the facade).
+    - A model credential is refused class B by the facade even when it
+      has the review class (no self-approval) and sees no buttons.
+    - A read-only credential sees no mutation buttons.
+    - The legacy env path is preserved as the explicitly-local trusted
+      UI (human by default; an explicit ARGOS_API_PRINCIPAL_TYPE=model
+      narrows it).
+    """
+
+    def _client(self, home, store=None):
+        from fastapi.testclient import TestClient
+        store = store or StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token="test-admin-token", home=home)
+        return TestClient(app), store
+
+    def _mint(self, home, name, classes, principal_type="human", expires_at=None):
+        from api_credentials import credential_file_path, write_credential
+        token, _cred = write_credential(
+            credential_file_path(home), name=name, user_id="default_user",
+            principal_type=principal_type, allowed_classes=classes,
+            expires_at=expires_at,
+        )
+        return token
+
+    def test_human_credential_sees_review_buttons(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        token = self._mint(home, "human-reviewer", ["read", "review"])
+        store = StubStore()
+        _seed_store(store)
+        client, _ = self._client(home, store)
+        r = client.get("/review", headers=_auth_headers(token))
+        assert r.status_code == 200
+        assert "Approve" in r.text
+        assert "Review actions enabled." in r.text
+
+    def test_human_credential_approve_routes_through_facade(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        token = self._mint(home, "human-reviewer", ["read", "review"])
+        store = StubStore()
+        _seed_store(store)
+        cid = list(store._candidates.keys())[0]
+        client, _ = self._client(home, store)
+        r = client.post(f"/review/{cid}",
+                        data={"decision": "approved", "reason": "credential review"},
+                        headers=_auth_headers(token))
+        assert r.status_code == 200
+        assert "Review Result" in r.text
+        review_calls = [c for c in store.calls if c["method"] == "review_candidate"]
+        assert len(review_calls) == 1
+        assert review_calls[0]["args"]["review_source"] == "tool"
+
+    def test_model_credential_refused_class_b(self, tmp_path):
+        """No self-approval: a model credential with the review class
+        gets no buttons and the facade refuses the action."""
+        home = tmp_path / "home"
+        home.mkdir()
+        token = self._mint(home, "model-agent", ["read", "review"], principal_type="model")
+        store = StubStore()
+        _seed_store(store)
+        cid = list(store._candidates.keys())[0]
+        client, _ = self._client(home, store)
+        r = client.get("/review", headers=_auth_headers(token))
+        assert r.status_code == 200
+        assert "Approve" not in r.text
+        r = client.post(f"/review/{cid}",
+                        data={"decision": "approved"},
+                        headers=_auth_headers(token))
+        assert r.status_code == 403
+        assert not [c for c in store.calls if c["method"] == "review_candidate"]
+
+    def test_read_class_credential_no_mutation_buttons(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        token = self._mint(home, "reader", ["read"])
+        store = StubStore()
+        _seed_store(store)
+        client, _ = self._client(home, store)
+        r = client.get("/review", headers=_auth_headers(token))
+        assert r.status_code == 200
+        assert "Approve" not in r.text
+        assert "read-only" in r.text.lower()
+
+    def test_credential_principal_shown_on_dashboard(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        token = self._mint(home, "simone", ["read"])
+        client, _ = self._client(home)
+        r = client.get("/", headers=_auth_headers(token))
+        assert r.status_code == 200
+        assert "simone" in r.text
+
+    def test_expired_credential_401(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+        home = tmp_path / "home"
+        home.mkdir()
+        past = datetime.now(timezone.utc) - timedelta(hours=1)
+        token = self._mint(home, "old", ["read"], expires_at=past)
+        client, _ = self._client(home)
+        r = client.get("/", headers=_auth_headers(token))
+        assert r.status_code == 401
+        assert "expired" in r.text.lower()
+
+    def test_revoked_credential_401_next_request(self, tmp_path):
+        """Removing the entry revokes it without a restart (live re-read)."""
+        import json
+        from api_credentials import credential_file_path
+        home = tmp_path / "home"
+        home.mkdir()
+        token = self._mint(home, "temp", ["read"])
+        client, _ = self._client(home)
+        assert client.get("/", headers=_auth_headers(token)).status_code == 200
+        path = credential_file_path(home)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["credentials"] = [c for c in data.get("credentials", [])
+                               if c.get("name") != "temp"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        r = client.get("/", headers=_auth_headers(token))
+        assert r.status_code == 401
+
+    def test_legacy_env_default_preserved(self, tmp_path, monkeypatch):
+        """Existing behavior: the legacy token is the local trusted UI —
+        human by construction, review enabled by default (spec-11)."""
+        monkeypatch.delenv("ARGOS_API_PRINCIPAL_TYPE", raising=False)
+        home = tmp_path / "home"
+        home.mkdir()
+        store = StubStore()
+        _seed_store(store)
+        client, _ = self._client(home, store)
+        r = client.get("/review", headers=_auth_headers())
+        assert r.status_code == 200
+        assert "Approve" in r.text
+
+    def test_legacy_env_model_narrows(self, tmp_path, monkeypatch):
+        """An explicit ARGOS_API_PRINCIPAL_TYPE=model on the legacy path
+        is honored (review actions off) — env can only narrow."""
+        monkeypatch.setenv("ARGOS_API_PRINCIPAL_TYPE", "model")
+        home = tmp_path / "home"
+        home.mkdir()
+        store = StubStore()
+        _seed_store(store)
+        cid = list(store._candidates.keys())[0]
+        client, _ = self._client(home, store)
+        r = client.get("/review", headers=_auth_headers())
+        assert r.status_code == 200
+        assert "Approve" not in r.text
+        r = client.post(f"/review/{cid}",
+                        data={"decision": "approved"},
+                        headers=_auth_headers())
+        assert r.status_code == 403
+
+    def test_invalid_credential_file_500(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        from api_credentials import credential_file_path
+        credential_file_path(home).write_text("{broken", encoding="utf-8")
+        client, _ = self._client(home)
+        r = client.get("/", headers=_auth_headers("some-token"))
+        assert r.status_code == 500
+        assert "invalid_credential_config" in r.text

@@ -147,14 +147,28 @@ writing to the store.
 }
 ```
 
-**Class B (candidate approval + memory resolution):** `ARGOS_API_PRINCIPAL_TYPE`
-controls `review_candidate` and `memory_review` (Spec-13 S3). The default is
-`model` (fail-closed): a model principal cannot approve its own candidates
-or vouch/dismiss its own unreviewed memories. **Do not set this to `human` for
-model-driven clients** — it unlocks self-approval, the exact hole spec-09
-closes. Only set `human` for a single-user, local, human-driven UI where a
-human is actually at the keyboard. Generic MCP clients should omit it
-entirely; candidate review flows through a human via class A proposals.
+**Class B (candidate approval + memory resolution):** `review_candidate` and
+`memory_review` (Spec-13 S3) are refused for model principals — no
+self-approval, ever. For external clients the mechanism is a **human
+credential** (#387): mint one with `scripts/mint_api_credential.py
+--principal-type human --classes read,review` and use its token (REST bearer
+token / MCP `ARGOS_API_CREDENTIAL`). The credential file is the identity
+record — scopes, expiry, and revocation live there, and a model principal
+cannot present a human credential's identity. The legacy env path
+(`ARGOS_API_PRINCIPAL_TYPE` + the transport token) remains valid **only for
+an explicitly-local, human-driven UI** where a human is actually at the
+keyboard; never set it for model-driven clients. Generic MCP clients should
+omit it entirely — candidate review flows through a human via class A
+proposals.
+
+**The human click surface (#390):** the local admin console
+([README](../README.md#admin-console-295)) is the reference surface for that
+human — run it locally (loopback-only) and authenticate with a human
+credential; approve/reject buttons render only for a human principal (a
+model or read-only principal sees the queue but no actions). The console is
+optional: any UI that authenticates a human credential and calls
+`review_candidate` / `memory_review` through the facade gets the identical
+guarantees.
 
 **Non-loopback deployments:** `ARGOS_API_NO_LOOPBACK=1` disables class C
 direct writes even with write tiers ON — class C requires loopback
@@ -196,7 +210,7 @@ A prompt snippet for your system prompt or scheduled task:
   (`reassertion_blocked` reports whether re-assertion of the same claim slot
   is actually blocked — some records have no identifiable slot).
 - Both are class B — **human principal only**, same rules as candidate
-  approval above (`ARGOS_API_PRINCIPAL_TYPE=human` behind an actual human).
+  approval above (a human credential behind an actual human — see Class B).
   The agent asks, the human decides; a model principal is refused.
 
 Digest-style notifications are **not** the default answer — any digest

@@ -176,7 +176,7 @@ Every tool's `inputSchema` sets `additionalProperties: false`. Unknown fields ar
 |----------|---------|--------|
 | `ARGOS_API_USER_ID` | `default_user` | Store user scope the server reads/writes. Set it to your agent's user id (e.g. in the `mcpServers` env block) so external clients see the same memories as the native agent. |
 | `ARGOS_API_READ_ONLY` | unset | `1` restores the read-only surface (search/fetch/explain only). |
-| `ARGOS_API_PRINCIPAL_TYPE` | `model` | `human` enables class-B review ops (`memory_review`). |
+| `ARGOS_API_PRINCIPAL_TYPE` | `model` | `human` enables class-B review ops (`memory_review`) **for explicitly-local trusted UIs only** — external clients should use a human credential (`principal_type: human` + the `review` class, see `ARGOS_API_CREDENTIAL`). Never set for model-driven clients. |
 | `ARGOS_API_NO_LOOPBACK` | unset | `1` denies class-C ops — including `memory_ingest` apply. |
 | `ARGOS_API_CREDENTIAL` | unset | Name of a per-principal credential in `api_credential.json` (#387). When set, principal/tenant/user_id/principal_type/classes come from the credential file — the identity variables above are ignored — and the server refuses to start if the credential is missing, expired, or the file is invalid (fail-closed). |
 | `ARGOS_API_CREDENTIAL_FILE` | `<home>/api_credential.json` | Override the credential file path. |

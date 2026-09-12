@@ -82,7 +82,7 @@ A local web UI for browsing, searching, reviewing candidates, and triggering ops
 ```bash
 # One-command start (same token as REST, one port above; the token can come
 # from ARGOS_REST_TOKEN or api_credential.json in the Hermes home):
-ARGOS_REST_TOKEN=<token> ARGOS_API_CAN_PROPOSE=1 \
+ARGOS_REST_TOKEN=<token> \
   python -m argos_plugin.admin_console --home <hermes-home> --port 8733
 ```
 
@@ -101,7 +101,7 @@ _Source checkout: same `PYTHONPATH` note as [External API](#external-api) above 
 - **Erase** — POPIA erase-request with preview-first and strict confirm (#293).
 - **Export** — portable JSONL + Markdown export (#294).
 
-Security: bound to `127.0.0.1` only (never `0.0.0.0`); server-derived identity (no client-supplied user identity); write-enabled by default (spec-11 — set `ARGOS_API_READ_ONLY=1` for read-only); `Cache-Control: no-store` on all responses; no tokens in HTML output.
+Security: bound to `127.0.0.1` only (never `0.0.0.0`); server-derived identity (no client-supplied user identity); write-enabled by default (spec-11 — set `ARGOS_API_READ_ONLY=1` for read-only); `Cache-Control: no-store` on all responses; no tokens in HTML output. Review actions render only for a human identity — authenticate with a human credential (`scripts/mint_api_credential.py --principal-type human --classes read,review`); model principals are refused by the facade (#387/#390).
 
 ## Tools
 
@@ -160,7 +160,7 @@ Every number and capability statement above is backed by a committed, re-runnabl
 - **Independent review** — Argos is profiled in [agent-memory-atlas](https://neoneye.github.io/agent-memory-atlas/systems/argos/), a code-grounded catalog of agent-memory systems (reports pinned to a reviewed commit, capability marks backed by source evidence).
 - **Claims audit** — [CLAIMS-AUDIT.md](CLAIMS-AUDIT.md) maps every claim to its evidence and separates three tiers: *measured* (committed judged artifacts), *structural* (checked against source), and *aspirational* (not claims yet). It is updated whenever a claim changes.
 - **Reproducibility gate** — `./eval/repro/verify_repro.sh` re-verifies the committed judged artifacts + dataset SHA and fails on any drift (it re-counts committed result files; it does not re-run the pipelines behind them). Reproducing a number fully needs the committed judged artifacts **plus** the documented external run data: the sibling LongMemEval dataset checkout and the phase-A retrieval caches (see §1 → §8 of the reproducibility doc). Last gate run: **2026-09-03, all checks PASS**.
-- **Test suite** — 3,337 test functions across 171 test modules (as of 2026-09-12), covering the store, retrieval, security gates, API facade, multitenancy, mutation_events audit log, and eval harness; runs hermetically on a fresh clone without a live Hermes runtime. The gate forces hermetic mode (`ARGOS_HERMETIC_TESTS=1` in the runner) so unmocked LLM-path tests can never make real calls, even in venvs that resolve the Hermes runtime. Run it in a visible, live-updating window (GPU venv + bounded parallel workers with the shared-service grouping, per #98): `powershell -File scripts/run_tests_visible.ps1`. Manual equivalent from `argos_plugin/`: `"%LOCALAPPDATA%/hermes/hermes-agent/venv-cuda/Scripts/python.exe" -m pytest tests/ -q -n 4 --dist loadgroup`.
+- **Test suite** — 3,347 test functions across 171 test modules (as of 2026-09-12), covering the store, retrieval, security gates, API facade, multitenancy, mutation_events audit log, and eval harness; runs hermetically on a fresh clone without a live Hermes runtime. The gate forces hermetic mode (`ARGOS_HERMETIC_TESTS=1` in the runner) so unmocked LLM-path tests can never make real calls, even in venvs that resolve the Hermes runtime. Run it in a visible, live-updating window (GPU venv + bounded parallel workers with the shared-service grouping, per #98): `powershell -File scripts/run_tests_visible.ps1`. Manual equivalent from `argos_plugin/`: `"%LOCALAPPDATA%/hermes/hermes-agent/venv-cuda/Scripts/python.exe" -m pytest tests/ -q -n 4 --dist loadgroup`.
 
 Honest boundaries that travel with the claims:
 

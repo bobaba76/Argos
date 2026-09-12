@@ -54,7 +54,7 @@ Yes. Set `local_embedding_model` in `hybrid_memory.json` to any sentence-transfo
 
 ### Can I access Argos from a non-Hermes agent?
 
-Yes. Start the REST server (`python -m argos_plugin.rest_server --home <hermes-home>`) or the MCP server (`python -m argos_plugin.mcp_server --home <hermes-home>`) and connect from any HTTP or MCP client. See [Integration guides](integration.md).
+Yes. Start the REST server (`python -m argos_plugin.rest_server --home <hermes-home>`) or the MCP server (`python -m argos_plugin.mcp_server --home <hermes-home>`) and connect from any HTTP or MCP client. See the [Integration guides](integration.md#running-from-a-source-checkout) — including the `PYTHONPATH` note for source checkouts.
 
 ### Can I write memories over the API?
 

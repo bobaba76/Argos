@@ -16,6 +16,18 @@ The REST server is the primary integration path for scripts, web apps, and non-M
 
 See [REST API reference](api/rest.md) for the full endpoint list.
 
+## Running from a source checkout
+
+A fresh clone is not pip-installed, so the `python -m argos_plugin.*` commands used throughout these docs need the repo root **and** `argos_plugin/` on `PYTHONPATH`. Without it, the servers fail at start with `ModuleNotFoundError` (the plugin modules import top-level siblings such as `liveness` and `api_facade`):
+
+```bash
+set PYTHONPATH=C:\path\to\Argos;C:\path\to\Argos\argos_plugin     # Windows (cmd)
+$env:PYTHONPATH="C:\path\to\Argos;C:\path\to\Argos\argos_plugin"  # Windows (PowerShell)
+export PYTHONPATH=/path/to/Argos:/path/to/Argos/argos_plugin      # macOS / Linux
+```
+
+Or skip `PYTHONPATH` entirely and run the server scripts from the plugin directory — `cd argos_plugin && python rest_server.py --home <hermes-home> --port 8732` (same for `mcp_server.py` and `admin_console.py`).
+
 ## Adapter patterns
 
 ### Python script

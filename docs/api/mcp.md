@@ -8,6 +8,8 @@ The MCP server (`argos_plugin/mcp_server.py`) exposes Argos over JSON-RPC 2.0 on
 python -m argos_plugin.mcp_server --home <hermes-home>
 ```
 
+**From a source checkout?** The `-m` command needs the repo root and `argos_plugin/` on `PYTHONPATH` — or run script-mode: `cd argos_plugin && python mcp_server.py --home <hermes-home>`. See [Running from a source checkout](../integration.md#running-from-a-source-checkout).
+
 **CLI flags** (verified against `mcp_server.py:main`):
 
 | Flag | Required | Default | Description |
@@ -177,7 +179,7 @@ Every tool's `inputSchema` sets `additionalProperties: false`. Unknown fields ar
 | `ARGOS_API_PRINCIPAL_TYPE` | `model` | `human` enables class-B review ops (`memory_review`). |
 | `ARGOS_API_NO_LOOPBACK` | unset | `1` denies class-C ops — including `memory_ingest` apply. |
 
-Tier model in full: [Integration](integration.md).
+Tier model in full: [Integration](../integration.md).
 
 ## Retrieval pipeline
 

@@ -41,12 +41,21 @@ The API is a **read + write tier** (spec-09/10: transports are trust boundaries,
 - **Defaults (spec-11, 9/9):** MCP/REST transports boot **write-enabled** — Class A (propose→review) and Class C (direct write) are ON by default on loopback transports; `ARGOS_API_READ_ONLY=1` restores read-only for conservative/shared deployments. Class B (approvals) stays OFF — model self-approval, never.
 
 - **MCP (stdio):** `argos_plugin/mcp_server.py` — JSON-RPC 2.0 over stdio. Read: `memory_search`, `memory_fetch`, `memory_fetch_history`, `memory_explain`, `memory_why_not`, `memory_capabilities`, `collection_list`, `collection_items`. Write (loopback): `memory_save`, `memory_update`, `collection_create`, `collection_add_item`, `collection_update_item`, `collection_remove_item`. Review: `memory_candidate_review` (human only). Propose: `memory_propose`. Register with any MCP client.
-- **REST (HTTP):** `argos_plugin/rest_server.py` — bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `rest_token` in the Hermes home config); origin and content-length checks.
+- **REST (HTTP):** `argos_plugin/rest_server.py` — bound to `127.0.0.1` only; token from `ARGOS_REST_TOKEN` (or `api_credential.json` in the Hermes home directory); origin and content-length checks.
   - Read: `GET /v1/health`, `GET /v1/ready`, `GET /v1/capabilities`, `POST /v1/memory/search`, `POST /v1/memory/explain-retrieval`, `GET /v1/memories/{memory_id}`, `GET /v1/memories/{memory_id}/history`, `GET /v1/memories/{memory_id}/explain`, `GET /v1/candidates`, `GET /v1/collections`, `GET /v1/collections/{collection_id}/items`.
   - Write (loopback): `POST /v1/memories` (class C direct write on loopback; class A propose on non-loopback), `POST /v1/collections`, `POST /v1/collections/{collection_id}/items`, `PATCH /v1/collections/{collection_id}/items/{item_id}`, `DELETE /v1/collections/{collection_id}/items/{item_id}`.
   - Review: `POST /v1/candidates/{candidate_id}/decision` (human only).
   - Feedback: `POST /v1/memories/{memory_id}/feedback`.
   - `Idempotency-Key` header required on all POSTs/PATCHes/DELETEs. CAS via `If-Match` header on PATCH/DELETE → 409 on conflict.
+
+**Running from a source checkout?** A fresh clone isn't pip-installed, so the `-m` commands below need the repo root **and** `argos_plugin/` on `PYTHONPATH` — otherwise they fail at start with `ModuleNotFoundError`:
+
+```bash
+set PYTHONPATH=C:\path\to\Argos;C:\path\to\Argos\argos_plugin    # Windows (cmd)
+export PYTHONPATH=/path/to/Argos:/path/to/Argos/argos_plugin      # macOS / Linux
+```
+
+Or skip `PYTHONPATH` entirely and run the server scripts directly: `cd argos_plugin && python rest_server.py --home <hermes-home> --port 8732`. Details: [Running from a source checkout](docs/integration.md#running-from-a-source-checkout).
 
 ```bash
 # REST (read + write on loopback — write-enabled by default, spec-11)
@@ -71,12 +80,19 @@ ARGOS_API_READ_ONLY=1 python -m argos_plugin.mcp_server --home <hermes-home>
 A local web UI for browsing, searching, reviewing candidates, and triggering ops (erase/export) — all through the same `ArgosAPIFacade` (auth → ACL → validation → audit). Loopback-only, same bearer token as the REST server.
 
 ```bash
-# One-command start (same token as REST, one port above):
+# One-command start (same token as REST, one port above; the token can come
+# from ARGOS_REST_TOKEN or api_credential.json in the Hermes home):
 ARGOS_REST_TOKEN=<token> ARGOS_API_CAN_PROPOSE=1 \
   python -m argos_plugin.admin_console --home <hermes-home> --port 8733
 ```
 
-Then open `http://127.0.0.1:8733` in your browser.
+Then authenticate every request with `Authorization: Bearer <token>` — a plain browser visit returns `401` **by design** (no token in URLs or HTML; the header doubles as the CSRF guard). Use curl, or a browser extension that injects the header:
+
+```bash
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:8733/
+```
+
+_Source checkout: same `PYTHONPATH` note as [External API](#external-api) above — or run script-mode: `cd argos_plugin && python admin_console.py --home <hermes-home> --port 8733`._
 
 - **Browse** — list memories by category/namespace, scoped to your user/tenant.
 - **Search** — full-text + semantic search through the facade.

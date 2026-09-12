@@ -1,0 +1,18 @@
+[
+  {"label": "short chit-chat", "text": "ok sounds good"},
+  {"label": "short chat", "text": "Yeah let's do that, sounds great to me"},
+  {"label": "memory-control command", "text": "bin it"},
+  {"label": "fact-dense: possession/location/work/relationship", "text": "I live in Roodepoort, work at Sensor Security, drive a Toyota Corolla, and my sister Simone is a web designer."},
+  {"label": "fact in prose: maintenance/plan", "text": "One thing I should remember: the rivets on the roller door at the warehouse need replacing before the rainy season hits us next month."},
+  {"label": "opinion-only (junk gate)", "text": "Honestly this weather is doing my head in, twenty degrees at nine in the morning and clear as a bell, you'd never guess it's almost summer."},
+  {"label": "narrative, no durable fact", "text": "I've been rewatching Battlestar Galactica this week. Season three drags a lot in the middle but the final episode genuinely surprised me, I did not expect that ending at all and it made me rethink the whole show."},
+  {"label": "behavioral self-fact in prose", "text": "Now random but the other day I realized I'm actually quite good at reading people's moods, been that way for years, comes from growing up with a mom who never said what she meant."},
+  {"label": "project/state fact", "text": "The Argos cost harness is going to land as a PR tonight, it benchmarks how many tokens the extractor spends per message."},
+  {"label": "question (no durable fact)", "text": "Do you think we should price the SaaS by user or by message? I can't decide and it's been bugging me for days."},
+  {"label": "preference fact", "text": "I prefer flat whites over cappuccino, and I never drink coffee after four in the afternoon."},
+  {"label": "code-like text", "text": "class CostHarness: def run(self): return sum(m.cost for m in self.messages) if self.messages else 0"},
+  {"label": "empty-ish", "text": "ok"},
+  {"label": "long opinion, repeated", "text": "I keep saying this and I'll say it again: the open plan office is the worst thing that ever happened to deep work, nobody can concentrate, meetings are endless, and the noise never stops."},
+  {"label": "multi-fact biography", "text": "I studied at Wits, started at Sensor in 2019, moved to Roodepoort in 2021, got married to Simone in 2023, and we got Misa the cat last December."},
+  {"label": "negation/state change", "text": "I cancelled the cloud subscription last week so from now on everything runs local only."}
+]

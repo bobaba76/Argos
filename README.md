@@ -88,6 +88,8 @@ ARGOS_REST_TOKEN=<token> \
 
 Then open `http://127.0.0.1:8733` in your browser — you'll land on the sign-in page; paste the token once and the console keeps you signed in (HttpOnly, SameSite=Strict session cookie; the token never appears in URLs or HTML). Bearer auth still works unchanged for scripts and API clients:
 
+**First run (no credential anywhere):** the console starts in **setup mode** — open it and you get a "Create your admin key" page instead of the sign-in form. The key is shown exactly once, signs you in immediately (no paste), and doubles as the REST/MCP/script credential for the machine. Setup closes permanently once a key exists (re-arm only by deleting the credential file by hand). A machine whose credential file has per-principal credentials but no legacy `token` field boots the same way — auth runs on the credentials.
+
 ```bash
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8733/
 ```

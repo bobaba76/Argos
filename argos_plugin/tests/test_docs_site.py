@@ -435,9 +435,14 @@ class TestRESTTokenFilename:
     def test_rest_token_loading_matches_live_code(self):
         """The docs must not contradict rest_server.py:_load_rest_token."""
         source = _read_source("rest_server.py")
-        # The live code loads api_credential.json with key 'token'.
+        # The live code loads api_credential.json — the legacy 'token'
+        # key or per-principal credentials[] (#387) — or ARGOS_REST_TOKEN.
+        # #484: the parsing moved to api_credentials.parse_credentials_file
+        # (the loader delegates; a credentials-only file boots with
+        # expected_token=None).
         assert "api_credential.json" in source
-        assert 'data.get("token"' in source
+        assert "parse_credentials_file" in source
+        assert "legacy_token" in source
         assert "ARGOS_REST_TOKEN" in source
 
 

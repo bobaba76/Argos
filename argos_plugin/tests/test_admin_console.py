@@ -21,6 +21,7 @@ Coverage:
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -1060,3 +1061,99 @@ class TestCredentialAuth:
         r = client.get("/", headers=_auth_headers("some-token"))
         assert r.status_code == 500
         assert "invalid_credential_config" in r.text
+
+
+# ---------------------------------------------------------------------------
+# #484: first-run setup mode
+# ---------------------------------------------------------------------------
+
+class TestSetupMode:
+    """#484 Phase 1: no credential → setup mode; create-key flow."""
+
+    def _make_setup_client(self, tmp_path: Path) -> TestClient:
+        store = StubStore()
+        facade = ArgosAPIFacade(store, acl=ACLConfig(), api_mode=False)
+        app = create_app(facade, auth_token=None, home=tmp_path)
+        return TestClient(app)
+
+    def test_setup_mode_routes_browsers_to_setup(self, tmp_path):
+        client = self._make_setup_client(tmp_path)
+        assert client.get("/health").status_code == 200
+        r = client.get("/", headers={"Accept": "text/html"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/setup"
+        r = client.get("/login", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/setup"
+
+    def test_setup_mode_refuses_api_requests(self, tmp_path):
+        client = self._make_setup_client(tmp_path)
+        r = client.get("/", headers={"Accept": "application/json"},
+                      follow_redirects=False)
+        assert r.status_code == 403
+        assert "setup_required" in r.text
+
+    def test_setup_page_renders_form_without_token_material(self, tmp_path):
+        client = self._make_setup_client(tmp_path)
+        r = client.get("/setup")
+        assert r.status_code == 200
+        assert "Create" in r.text
+        assert "argos_" not in r.text
+
+    def test_setup_creates_key_shows_once_and_signs_in(self, tmp_path):
+        client = self._make_setup_client(tmp_path)
+        r = client.post("/setup", data={"name": "admin"})
+        assert r.status_code == 200
+        match = re.search(r"argos_[A-Za-z0-9_\-]+", r.text)
+        assert match, "the key must be shown exactly once on the success page"
+        token = match.group(0)
+
+        # Auto sign-in: the session cookie rode on the setup response.
+        dash = client.get("/", headers={"Accept": "text/html"})
+        assert dash.status_code == 200
+        assert "Argos Admin Console" in dash.text
+
+        # On disk: one human credential, full class set, hash only.
+        raw = (tmp_path / "api_credential.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+        [cred] = data["credentials"]
+        assert cred["name"] == "admin"
+        assert cred["principal_type"] == "human"
+        assert set(cred["allowed_classes"]) == {
+            "read", "propose", "ingest", "erase", "review",
+            "write", "feedback", "collection_read", "collection_write",
+        }
+        assert "token_sha256" in cred
+        assert token not in raw
+
+    def test_setup_key_works_as_bearer(self, tmp_path):
+        client = self._make_setup_client(tmp_path)
+        r = client.post("/setup", data={"name": "admin"})
+        token = re.search(r"argos_[A-Za-z0-9_\-]+", r.text).group(0)
+        fresh = self._make_setup_client(tmp_path)  # new app, no cookies
+        authed = fresh.get(
+            "/", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert authed.status_code == 200
+
+    def test_setup_self_destructs_and_never_duplicates(self, tmp_path):
+        client = self._make_setup_client(tmp_path)
+        assert client.post("/setup", data={"name": "admin"}).status_code == 200
+        # Refresh / revisit: no second mint, both routes are closed.
+        again = client.post("/setup", data={"name": "admin"},
+                            follow_redirects=False)
+        assert again.status_code == 303
+        assert again.headers["location"] == "/login"
+        page = client.get("/setup", follow_redirects=False)
+        assert page.status_code == 303
+        assert page.headers["location"] == "/login"
+        data = json.loads(
+            (tmp_path / "api_credential.json").read_text(encoding="utf-8")
+        )
+        assert len(data["credentials"]) == 1
+
+    def test_configured_console_has_no_setup(self):
+        client = _make_client()  # legacy-token console
+        r = client.get("/setup", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/login"

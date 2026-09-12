@@ -64,10 +64,12 @@ from api_facade import (
 from access_scoping import ACLConfig
 from api_credentials import (
     CredentialFileError,
+    VALID_CLASSES,
     build_context as build_credential_context,
     credential_file_path,
     parse_credentials_file,
     resolve_by_token,
+    write_credential,
 )
 
 logger = logging.getLogger("argos.admin")
@@ -95,7 +97,16 @@ SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 
 
 class BrowserLoginRequired(Exception):
-    """A browser navigation with no valid session — redirect to /login (#482)."""
+    """A browser navigation that needs the sign-in flow (#482/#484).
+
+    ``target`` is the redirect destination: ``/login`` for a missing
+    session in a configured console, ``/setup`` in first-run setup
+    mode (#484).
+    """
+
+    def __init__(self, target: str = "/login") -> None:
+        super().__init__(target)
+        self.target = target
 
 
 # -- Error envelope (same stable shape as rest_server) -----------------------
@@ -144,7 +155,10 @@ class AdminAuth:
     principal (no review actions); it never upgrades a credential.
     """
 
-    def __init__(self, expected_token: str, home: Optional[Path] = None) -> None:
+    def __init__(self, expected_token: Optional[str], home: Optional[Path] = None) -> None:
+        # #484: expected_token=None means "no legacy transport token" —
+        # the legacy compare is skipped and auth runs on per-principal
+        # credentials alone (first-run setup mode when nothing exists).
         self._expected = expected_token
         self._home = Path(home) if home is not None else None
         self._cred_cache: Optional[tuple] = None
@@ -172,6 +186,26 @@ class AdminAuth:
         token, creds = parse_credentials_file(path)
         self._cred_cache = (key, token, creds)
         return (token, creds)
+
+    def setup_required(self) -> bool:
+        """True when NO credential exists anywhere — first-run setup (#484).
+
+        Setup mode serves only /setup and /health; every other route
+        refuses. Recomputed per request (the credential file is cached
+        on mtime+size), so the console leaves setup mode the moment the
+        bootstrap key is created. A malformed file raises
+        CredentialFileError — never treated as "empty" (fail closed).
+        """
+        if self._expected:
+            return False
+        legacy_token, creds = self._credentials()
+        return not legacy_token and not creds
+
+    def credential_path(self) -> Path:
+        """Path of {home}/api_credential.json (setup mode requires home)."""
+        if self._home is None:
+            raise RuntimeError("admin console setup requires --home")
+        return credential_file_path(self._home)
 
     def _legacy_context(self) -> AuthContext:
         """Env-derived context for the legacy transport token.
@@ -204,6 +238,21 @@ class AdminAuth:
     def __call__(self, request: Request, authorization: str = Header(default="")) -> AuthContext:
         """Authenticate a request: bearer header first, then the browser session."""
         request_id = str(uuid.uuid4())
+        # #484: first-run setup mode — no credential exists yet, so no
+        # request can be authenticated (there is nothing to match
+        # against). Route humans to /setup and refuse everything else.
+        if self.setup_required():
+            if self._browser_navigation(request):
+                raise BrowserLoginRequired(target="/setup")
+            raise HTTPException(
+                status_code=403,
+                detail={"error": {
+                    "code": "setup_required",
+                    "message": "The admin console is in setup mode. "
+                               "Create an admin key at /setup.",
+                    "request_id": request_id,
+                }},
+            )
         if authorization:
             return self._bearer_context(authorization, request_id)
         session_ctx = self._context_from_session(request)
@@ -246,7 +295,7 @@ class AdminAuth:
                     "request_id": request_id,
                 }},
             )
-        if hmac.compare_digest(token, self._expected):
+        if self._expected is not None and hmac.compare_digest(token, self._expected):
             return self._legacy_context()
         # #387/#390: per-principal credential lookup (same as RESTAuth).
         try:
@@ -491,12 +540,108 @@ def _login_page(error: str = "") -> str:
 </html>"""
 
 
+def _setup_page(error: str = "") -> str:
+    """First-run setup page (#484) — create the bootstrap admin key.
+
+    Rendered only while NO credential exists (setup mode). Same visual
+    language as the sign-in page; no token material (none exists yet).
+    """
+    err = f'<div class="flash flash-err">{_esc(error)}</div>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — Argos Admin Console</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #f8f9fa; color: #222; }}
+  .nav {{ background: #1a1a2e; padding: 0.5rem 1rem; color: #eee; }}
+  .container {{ max-width: 520px; margin: 3rem auto; padding: 0 1rem; }}
+  h1 {{ color: #1a1a2e; font-size: 1.3rem; }}
+  .card {{ background: #fff; border: 1px solid #dee2e6; border-radius: 4px; padding: 1rem; margin: 1rem 0; }}
+  .flash {{ padding: 0.5rem 1rem; border-radius: 3px; margin: 0.5rem 0; }}
+  .flash-err {{ background: #f8d7da; color: #721c24; }}
+  .muted {{ color: #888; font-size: 0.85rem; }}
+  label {{ font-size: 0.9rem; }}
+  input[type=text] {{ width: 100%; padding: 0.4rem 0.5rem; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; margin: 0.3rem 0 0.6rem; }}
+  button {{ padding: 0.4rem 1rem; border: 1px solid #ccc; border-radius: 3px; cursor: pointer; background: #1a1a2e; color: #eee; }}
+</style>
+</head>
+<body>
+<nav class="nav">Argos Admin Console</nav>
+<div class="container">
+  <h1>First-run setup</h1>
+  {err}
+  <div class="card">
+    <p>No credential exists on this machine yet — nothing can sign in.</p>
+    <p>Create your <b>admin key</b>: it signs you in here and works as the
+    bearer token for the REST API and MCP on this machine.</p>
+    <form method="post" action="/setup" autocomplete="off">
+      <label for="name">Key name</label>
+      <input type="text" id="name" name="name" value="admin" autofocus autocomplete="off">
+      <button type="submit">Create my admin key</button>
+    </form>
+    <p class="muted">The key is stored hashed at rest and shown exactly once,
+    right after you create it. This page closes permanently once a key
+    exists (re-arm only by deleting the credential file by hand).</p>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+def _setup_key_page(principal: str, token: str) -> str:
+    """Show-once page (#484) — the ONLY rendering of the plaintext key.
+
+    Delivered as the POST response to /setup, with the session cookie
+    riding along. Never reachable again: /setup redirects as soon as
+    the credential exists, and all responses are Cache-Control:
+    no-store.
+    """
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your admin key — Argos</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #f8f9fa; color: #222; }}
+  .nav {{ background: #1a1a2e; padding: 0.5rem 1rem; color: #eee; }}
+  .container {{ max-width: 640px; margin: 3rem auto; padding: 0 1rem; }}
+  h1 {{ color: #1a1a2e; font-size: 1.3rem; }}
+  .card {{ background: #fff; border: 1px solid #dee2e6; border-radius: 4px; padding: 1rem; margin: 1rem 0; }}
+  .keybox {{ background: #f1f3f5; border: 1px solid #ced4da; border-radius: 4px; padding: 0.8rem; margin: 0.8rem 0; font-family: ui-monospace, Consolas, monospace; font-size: 0.95rem; word-break: break-all; }}
+  .muted {{ color: #888; font-size: 0.85rem; }}
+  button {{ padding: 0.4rem 1rem; border: 1px solid #ccc; border-radius: 3px; cursor: pointer; background: #1a1a2e; color: #eee; }}
+</style>
+</head>
+<body>
+<nav class="nav">Argos Admin Console</nav>
+<div class="container">
+  <h1>Admin key created — copy it now</h1>
+  <div class="card">
+    <p>Key for <b>{_esc(principal)}</b>. <b>This is the only time it will be
+    shown</b> — the server keeps only a hash of it.</p>
+    <div class="keybox" id="key">{_esc(token)}</div>
+    <p>
+      <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('key').textContent)">Copy key</button>
+      &nbsp;<a href="/">Continue to the console &rarr;</a>
+    </p>
+    <p class="muted">Store it in your password manager now. You can mint
+    additional keys later, but this one cannot be recovered — only
+    replaced.</p>
+  </div>
+</div>
+</body>
+</html>"""
+
+
 # -- App factory --------------------------------------------------------------
 
 def create_app(
     facade: ArgosAPIFacade,
     *,
-    auth_token: str,
+    auth_token: Optional[str],
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     home: Optional[Path] = None,
 ) -> FastAPI:
@@ -505,8 +650,10 @@ def create_app(
     Args:
         facade: the ArgosAPIFacade instance (same facade the REST
             server uses — auth → ACL → validation → audit spine).
-        auth_token: the API credential (separate from the internal
-            service token). The same token as the REST server.
+        auth_token: the legacy transport token (same as the REST
+            server). None means "no legacy token" — auth runs on
+            per-principal credentials, and an empty home starts in
+            first-run setup mode (#484).
         max_concurrent: maximum concurrent requests.
         home: Hermes home directory (per-principal credentials, #387).
             When omitted, only the legacy transport token is accepted.
@@ -556,18 +703,24 @@ def create_app(
 
     @app.exception_handler(BrowserLoginRequired)
     async def _login_required_handler(request: Request, exc: BrowserLoginRequired):
-        return RedirectResponse(url="/login", status_code=303)
+        return RedirectResponse(url=exc.target, status_code=303)
 
     # -- Browser login (#482): GET/POST /login, GET /logout --------------
 
     @app.get("/login", response_class=HTMLResponse)
     async def login_form(request: Request, authorization: str = Header(default="")):
+        if auth.setup_required():
+            # #484: nothing to sign in to yet — create the first key.
+            return RedirectResponse(url="/setup", status_code=303)
         if auth.is_authenticated(request, authorization):
             return RedirectResponse(url="/", status_code=303)
         return _login_page()
 
     @app.post("/login", response_class=HTMLResponse)
     async def login_submit(token: str = Form(default="")):
+        if auth.setup_required():
+            # #484: no credential exists; the setup page is the door.
+            return RedirectResponse(url="/setup", status_code=303)
         token = token.strip()
         if not token:
             return HTMLResponse(_login_page(error="Enter the API credential token."), status_code=401)
@@ -593,6 +746,46 @@ def create_app(
             auth.destroy_session(sid)
         response = RedirectResponse(url="/login", status_code=303)
         response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+        return response
+
+    # -- Setup mode (#484): first-run key creation -------------------------
+
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_form():
+        if not auth.setup_required():
+            # Self-destructed: a credential exists, so this route is
+            # closed. Re-arm only by removing the credential file by
+            # hand and restarting.
+            return RedirectResponse(url="/login", status_code=303)
+        return HTMLResponse(_setup_page())
+
+    @app.post("/setup", response_class=HTMLResponse)
+    async def setup_submit(name: str = Form(default="")):
+        if not auth.setup_required():
+            # Someone refreshed the success page after the key was
+            # created — never mint a second bootstrap credential.
+            return RedirectResponse(url="/login", status_code=303)
+        principal = (name or "").strip() or "admin"
+        token, cred = write_credential(
+            auth.credential_path(),
+            name=principal,
+            principal_type="human",
+            allowed_classes=sorted(VALID_CLASSES),
+            user_id="default_user",
+        )
+        # Auto sign-in: the session cookie rides on the show-once page,
+        # so the dashboard is one click away with no second paste.
+        sid = auth.create_session(token)
+        response = HTMLResponse(_setup_key_page(cred.name, token))
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            sid,
+            max_age=SESSION_TTL_SECONDS,
+            path="/",
+            httponly=True,
+            samesite="strict",
+        )
+        logger.info("setup: created bootstrap credential %r", cred.name)
         return response
 
     # -- Dashboard: GET / -------------------------------------------------
@@ -1081,26 +1274,26 @@ def create_app(
 
 # -- Entry point --------------------------------------------------------------
 
-def _load_token(home: Path) -> str:
-    """Load the API credential (same as rest_server._load_rest_token)."""
+def _load_token(home: Path) -> Optional[str]:
+    """Load the legacy transport token; None when only credentials exist.
+
+    #484: the console also starts in first-run SETUP MODE — None with
+    no credential file at all means every route except /setup and
+    /health refuses until the browser flow creates the bootstrap key.
+    A malformed credential file fails loud (never masked as "empty").
+    """
     token = os.environ.get("ARGOS_REST_TOKEN", "")
     if token:
         return token
-    cred_file = home / "api_credential.json"
-    if cred_file.exists():
-        import json
-        try:
-            data = json.loads(cred_file.read_text(encoding="utf-8"))
-            token = data.get("token", "")
-        except (json.JSONDecodeError, OSError):
-            pass
-    if not token:
-        raise RuntimeError(
-            "No API credential found. Set ARGOS_REST_TOKEN or create "
-            "api_credential.json in HERMES_HOME. The admin console refuses "
-            "to start without a credential (fail-closed)."
+    try:
+        legacy_token, _creds = parse_credentials_file(
+            credential_file_path(home)
         )
-    return token
+    except CredentialFileError as exc:
+        raise RuntimeError(
+            f"api_credential.json is invalid: {exc}"
+        ) from exc
+    return legacy_token
 
 
 def main() -> None:
@@ -1112,7 +1305,10 @@ def main() -> None:
         python argos_plugin/admin_console.py --home $HERMES_HOME
 
     The same ARGOS_REST_TOKEN / api_credential.json as the REST server
-    is used for auth. Mutation actions (review/erase) are enabled by
+    is used for auth. First run with no credential at all starts in
+    SETUP MODE: only /setup and /health are served until the browser
+    flow creates the bootstrap admin key (#484). Mutation actions
+    (review/erase) are enabled by
     default (spec-11); set ARGOS_API_READ_ONLY=1 to make the console
     read-only. Review actions should use a human credential (#387):
     mint one with scripts/mint_api_credential.py --principal-type
@@ -1141,6 +1337,24 @@ def main() -> None:
     )
 
     token = _load_token(args.home)
+    if token is None:
+        try:
+            _legacy, _creds = parse_credentials_file(
+                credential_file_path(args.home)
+            )
+        except CredentialFileError:
+            _creds = []
+        if _creds:
+            logger.info(
+                "No legacy transport token — authenticating with "
+                "per-principal credentials (#387)."
+            )
+        else:
+            logger.info(
+                "No credential found — starting in SETUP MODE. Open "
+                "http://127.0.0.1:%d in a browser to create the admin key.",
+                args.port,
+            )
     store = SharedMemoryStore(args.home, user_id="default_user", embedder=None)
     acl = ACLConfig()
     facade = ArgosAPIFacade(store, acl=acl, api_mode=False)

@@ -596,3 +596,48 @@ class TestCORS:
         r = client.get("/v1/health",
                        headers={"Origin": "https://evil.com"})
         assert "access-control-allow-origin" not in {k.lower() for k in r.headers}
+
+
+# ---------------------------------------------------------------------------
+# #484: credentials-only boot (no legacy transport token)
+# ---------------------------------------------------------------------------
+
+class TestCredentialsOnlyBoot:
+    """#484: a credentials-only file boots; a truly empty machine refuses."""
+
+    def test_loader_returns_none_with_credentials_only(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARGOS_REST_TOKEN", raising=False)
+        from api_credentials import write_credential
+        from rest_server import _load_rest_token
+
+        write_credential(
+            tmp_path / "api_credential.json",
+            name="admin",
+            principal_type="human",
+            allowed_classes=["read"],
+            user_id="default_user",
+        )
+        assert _load_rest_token(tmp_path) is None
+
+    def test_loader_refuses_empty_machine(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("ARGOS_REST_TOKEN", raising=False)
+        from rest_server import _load_rest_token
+
+        with pytest.raises(RuntimeError):
+            _load_rest_token(tmp_path)
+
+    def test_rest_auth_resolves_credential_without_legacy_token(self, tmp_path):
+        from api_credentials import write_credential
+        from rest_server import RESTAuth
+
+        token, _cred = write_credential(
+            tmp_path / "api_credential.json",
+            name="admin",
+            principal_type="human",
+            allowed_classes=["read"],
+            user_id="default_user",
+        )
+        auth = RESTAuth(None, home=tmp_path)
+        ctx = auth(f"Bearer {token}")
+        assert ctx.principal == "admin"
+        assert ctx.principal_type == "human"

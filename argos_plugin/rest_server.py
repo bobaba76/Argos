@@ -263,7 +263,7 @@ class RESTAuth:
     credentials, behavior is exactly the legacy env-based path.
     """
 
-    def __init__(self, expected_token: str, home: Optional[Path] = None) -> None:
+    def __init__(self, expected_token: Optional[str], home: Optional[Path] = None) -> None:
         self._expected = expected_token
         self._home = Path(home) if home is not None else None
         self._cred_cache: Optional[tuple] = None
@@ -420,7 +420,7 @@ class RESTAuth:
                     "request_id": request_id,
                 }},
             )
-        if hmac.compare_digest(token, self._expected):
+        if self._expected is not None and hmac.compare_digest(token, self._expected):
             # Legacy transport token -> env-derived context (unchanged).
             return self._legacy_context()
         # #387 (Spec-12): per-principal credential lookup.
@@ -448,7 +448,7 @@ class ConcurrencyLimiter:
 def create_app(
     facade: ArgosAPIFacade,
     *,
-    auth_token: str,
+    auth_token: Optional[str],
     readiness_probe=None,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     allowed_origins: set[str] | None = None,
@@ -458,8 +458,9 @@ def create_app(
 
     Args:
         facade: the ArgosAPIFacade instance.
-        auth_token: the REST API credential (separate from the internal
-            service token).
+        auth_token: the legacy REST transport token (separate from the
+            internal service token). None = credentials-only mode
+            (#484): requests authenticate via per-principal credentials.
         readiness_probe: a callable that returns a dict with readiness
             info. If None, a basic probe is used.
         max_concurrent: maximum concurrent requests (semaphore).
@@ -1088,31 +1089,37 @@ def create_app(
 
 # -- Entry point -------------------------------------------------------------
 
-def _load_rest_token(home: Path) -> str:
+def _load_rest_token(home: Path) -> Optional[str]:
     """Load the REST API credential from a file or env var.
 
     The REST credential is SEPARATE from the internal service token.
     It's loaded from {home}/api_credential.json or the ARGOS_REST_TOKEN
-    env var. If neither is set, the server refuses to start (fail-closed).
+    env var. #484: a credentials-only file (no legacy "token" field)
+    boots in credential-resolve mode — ``None`` means "no legacy token;
+    authenticate via per-principal credentials". A machine with no
+    credential at all still refuses to start (fail-closed); create the
+    first key via the admin console setup page or
+    scripts/mint_api_credential.py.
     """
     token = os.environ.get("ARGOS_REST_TOKEN", "")
     if token:
         return token
-    cred_file = home / "api_credential.json"
-    if cred_file.exists():
-        import json
-        try:
-            data = json.loads(cred_file.read_text(encoding="utf-8"))
-            token = data.get("token", "")
-        except (json.JSONDecodeError, OSError):
-            pass
-    if not token:
+    try:
+        legacy_token, creds = parse_credentials_file(credential_file_path(home))
+    except CredentialFileError as exc:
         raise RuntimeError(
-            "No REST API credential found. Set ARGOS_REST_TOKEN or "
-            "create api_credential.json in HERMES_HOME. The REST server "
-            "refuses to start without a credential (fail-closed)."
-        )
-    return token
+            f"api_credential.json is invalid: {exc}"
+        ) from exc
+    if legacy_token:
+        return legacy_token
+    if creds:
+        return None
+    raise RuntimeError(
+        "No REST API credential found. Set ARGOS_REST_TOKEN, run the "
+        "admin console first-run setup, or mint a credential with "
+        "scripts/mint_api_credential.py. The REST server refuses to "
+        "start without a credential (fail-closed)."
+    )
 
 
 def main() -> None:
@@ -1140,6 +1147,11 @@ def main() -> None:
     )
 
     token = _load_rest_token(args.home)
+    if token is None:
+        logger.info(
+            "No legacy transport token — authenticating with "
+            "per-principal credentials (#387)."
+        )
     store = SharedMemoryStore(args.home, user_id="default_user", embedder=None)
     acl = ACLConfig()
     facade = ArgosAPIFacade(store, acl=acl, api_mode=False)

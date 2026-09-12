@@ -90,6 +90,12 @@ Then open `http://127.0.0.1:8733` in your browser — you'll land on the sign-in
 
 **First run (no credential anywhere):** the console starts in **setup mode** — open it and you get a "Create your admin key" page instead of the sign-in form. The key is shown exactly once, signs you in immediately (no paste), and doubles as the REST/MCP/script credential for the machine. Setup closes permanently once a key exists (re-arm only by deleting the credential file by hand). A machine whose credential file has per-principal credentials but no legacy `token` field boots the same way — auth runs on the credentials.
 
+**Keys (Phase 2):** the **Keys** tab lists every key (type, classes, created, expiry, live state)
+and lets a human operator mint a new key (shown once, full classes) or revoke any key —
+revocation applies on the next request. The console refuses to revoke the key it is signed
+in with, the affordances are disabled under `ARGOS_API_READ_ONLY`, and the legacy transport
+token can be retired from disk.
+
 ```bash
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8733/
 ```

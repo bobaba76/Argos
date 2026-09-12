@@ -1140,7 +1140,9 @@ class StoreRetrievalMixin:
         The measured trigger for expensive-engine gating (ANN/BM25, fact
         families): a rolling p95 latency window and the active record count.
         Warnings fire once per crossing and are actionable — they name the
-        threshold that was exceeded, not a vague "slow".
+        threshold that was exceeded, not a vague "slow". A sustained breach
+        does not re-warn per query (#460); dropping back under the
+        thresholds re-arms the next crossing.
         """
         try:
             self._state.scale_latencies.append(elapsed_s * 1000.0)
@@ -1160,7 +1162,9 @@ class StoreRetrievalMixin:
             p95_ms = sorted(self._state.scale_latencies)[int(n * 0.95) - 1]
             over_latency = p95_ms > self._state.scale_warn_latency_ms
             over_count = (self._state.scale_record_count or 0) > self._state.scale_warn_records
-            if over_latency or over_count:
+            over = over_latency or over_count
+            if over and not self._state.scale_warning_active:
+                self._state.scale_warning_active = True
                 self._state.scale_warnings_fired += 1
                 logger.warning(
                     "ARGOS_SCALE: p95=%.0fms avg=%.0fms (warn>%.0fms) "
@@ -1171,6 +1175,9 @@ class StoreRetrievalMixin:
                     self._state.scale_record_count, self._state.scale_warn_records,
                     "latency" if over_latency else "corpus-size",
                 )
+            elif not over and self._state.scale_warning_active:
+                # Back under the thresholds — re-arm the next crossing.
+                self._state.scale_warning_active = False
         except Exception:
             pass  # metrics must never break retrieval
 
@@ -1191,6 +1198,7 @@ class StoreRetrievalMixin:
             "max_latency_ms": round(max(self._state.scale_latencies), 1) if n else 0.0,
             "record_count": self._state.scale_record_count,
             "warnings_fired": self._state.scale_warnings_fired,
+            "warning_active": self._state.scale_warning_active,
             "warn_latency_ms": self._state.scale_warn_latency_ms,
             "warn_records": self._state.scale_warn_records,
         }

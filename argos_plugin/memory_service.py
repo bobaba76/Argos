@@ -2235,6 +2235,41 @@ def serve(home: Path, port: int = 0) -> None:
     except Exception:
         pass  # drift watch is non-fatal; never block service boot
 
+    # #460: warm the retrieval path OFF the interactive path. The embedder
+    # and cross-encoder (re)load lazily on first use (~4-6s cold on this
+    # host), so without warmup the first query after every respawn pays it
+    # inside its own latency budget. Load once here, on a daemon thread.
+    # Deliberately NOT via store.search() so the slow warmup sample never
+    # enters the rolling scale-metrics window; the components carry their
+    # own load locks, so a concurrent first query simply shares the load.
+    def _warmup() -> None:
+        _tw = time.time()
+        try:
+            for tenant in service._tenants.values():
+                store_obj = getattr(tenant, "store", None)
+                if store_obj is None:
+                    continue
+                emb = getattr(store_obj, "embedder", None)
+                if emb is not None:
+                    if hasattr(emb, "_ensure_loaded"):
+                        emb._ensure_loaded()
+                    if hasattr(emb, "embed"):
+                        emb.embed("warmup", is_query=True)
+                rr = getattr(store_obj, "reranker", None)
+                if rr is not None:
+                    if hasattr(rr, "_ensure_loaded"):
+                        rr._ensure_loaded()
+                    if hasattr(rr, "score"):
+                        rr.score("warmup query", ["warmup document"])
+            logger.info(
+                "retrieval warmup complete in %.1fs (embedder + reranker)",
+                time.time() - _tw,
+            )
+        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+            logger.debug("retrieval warmup skipped: %s", exc)
+
+    threading.Thread(target=_warmup, name="retrieval-warmup", daemon=True).start()
+
     def _stop(_signum, _frame) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()
 

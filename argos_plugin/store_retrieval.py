@@ -1444,7 +1444,13 @@ class StoreRetrievalMixin:
             # the cross-encoder has to actually SEE the best semantic
             # candidates. The band adds at most one head per arm beyond the
             # pool, and rescues stay bounded (CE_PROMOTE_MAX, tail-only).
-            _band = max(reranker_top_n * 3, 30)
+            # #460: band 30->max(top_n*2, 15): the rescue lane exists for
+            # per-arm head records the fused cut loses (11/9: answering
+            # record at vector rank ~13); records at arm ranks 16-30 beyond
+            # the new band still appear in widened pools/windows, they just
+            # lose the small-window rescue lane (measured: pool 40->30 docs,
+            # ~25% CE tokenizer cost cut).
+            _band = max(reranker_top_n * 2, 15)
             union_added: List[MemoryRecord] = []
             _seen_ids = {r.memory_id for r in rerank_pool}
             for _src in (vector_results, text_results):

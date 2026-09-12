@@ -323,6 +323,80 @@ class TestAuth:
 
 
 # ---------------------------------------------------------------------------
+# Browser login tests (#482)
+# ---------------------------------------------------------------------------
+
+class TestBrowserLogin:
+    """Browser login form, session cookie, and login-page invariants."""
+
+    def test_html_navigation_without_auth_redirects_to_login(self):
+        client = _make_client()
+        r = client.get("/", headers={"Accept": "text/html"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/login"
+
+    def test_api_request_without_html_accept_still_401(self):
+        client = _make_client()
+        r = client.get("/", headers={"Accept": "application/json"})
+        assert r.status_code == 401
+
+    def test_login_form_renders_without_token_material(self):
+        client = _make_client(token="secret-token-12345")
+        r = client.get("/login")
+        assert r.status_code == 200
+        assert 'name="token"' in r.text
+        assert "secret-token-12345" not in r.text
+
+    def test_login_wrong_token_rejected(self):
+        client = _make_client()
+        r = client.post("/login", data={"token": "wrong-token"})
+        assert r.status_code == 401
+        assert "Invalid credentials." in r.text
+
+    def test_login_empty_token_rejected(self):
+        client = _make_client()
+        r = client.post("/login", data={"token": "   "})
+        assert r.status_code == 401
+        assert "Enter the API credential token." in r.text
+
+    def test_login_valid_token_sets_strict_cookie_and_grants_access(self):
+        client = _make_client()
+        r = client.post("/login", data={"token": "test-admin-token"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+        cookie = r.headers.get("set-cookie", "").lower()
+        assert "argos_admin_session=" in cookie
+        assert "httponly" in cookie
+        assert "samesite=strict" in cookie
+        # The client cookie jar now carries the session — HTML navigation works.
+        r2 = client.get("/", headers={"Accept": "text/html"})
+        assert r2.status_code == 200
+        assert "Argos Admin Console" in r2.text
+        assert "sign out" in r2.text
+
+    def test_logout_clears_session(self):
+        client = _make_client()
+        client.post("/login", data={"token": "test-admin-token"})
+        r = client.get("/logout", follow_redirects=False)
+        assert r.status_code == 303
+        r2 = client.get("/", headers={"Accept": "text/html"}, follow_redirects=False)
+        assert r2.status_code == 303
+        assert r2.headers["location"] == "/login"
+
+    def test_login_page_while_authed_redirects_home(self):
+        client = _make_client()
+        r = client.get("/login", headers=_auth_headers(), follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/"
+
+    def test_forged_session_cookie_ignored(self):
+        client = _make_client()
+        client.cookies.set("argos_admin_session", "forged-session-id")
+        r = client.get("/", headers={"Accept": "text/html"}, follow_redirects=False)
+        assert r.status_code == 303  # back to the login form, not a 500
+
+
+# ---------------------------------------------------------------------------
 # Browse tests
 # ---------------------------------------------------------------------------
 

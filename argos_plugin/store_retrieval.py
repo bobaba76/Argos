@@ -1597,12 +1597,44 @@ class StoreRetrievalMixin:
                 ]
                 rescue.sort(key=lambda r: r._ce_raw, reverse=True)
                 rescue = rescue[:self._CE_PROMOTE_MAX]
-                if rescue:
-                    _rescue_ids = {r.memory_id for r in rescue}
-                    fused = [r for r in fused if r.memory_id not in _rescue_ids]
-                    for r in rescue:
-                        r._ce_promoted = True
-                    fused = fused[:limit - len(rescue)] + rescue
+                # #467: displace by CE-raw, IN PLACE, not by window tail
+                # position. The old `fused[:limit - len(rescue)] + rescue`
+                # evicted the positional tail: at a WIDER limit the window
+                # contains the very record the rescue exists to surface
+                # (the work-family answer sat at fused position ~8 with CE
+                # raw 0.99), weaker band members cleared the lower bar, and
+                # their tail-insertion pushed the strong record OUT of the
+                # window (measured 12/9: #2 at limit 3, GONE at limit 8).
+                # Each candidate now replaces the weakest SCORED in-window
+                # member it beats on raw, taking that member's position —
+                # stronger members are never displaced, and the same query
+                # yields the same head order at every limit.
+                _demoted = set()
+                _swap_order: List[MemoryRecord] = []
+                for _cand in rescue:
+                    _weakest = min(
+                        (r for r in _scored_in_window
+                         if r.memory_id not in _demoted
+                         and r._ce_raw < _cand._ce_raw),
+                        key=lambda r: r._ce_raw,
+                        default=None,
+                    )
+                    if _weakest is None:
+                        continue
+                    _demoted.add(_weakest.memory_id)
+                    _cand._ce_promoted = True
+                    _swap_order.append(_weakest)
+                if _swap_order:
+                    # Assembly: demoted members (the weakest SCORED
+                    # in-window records — by raw, NOT by position) drop out
+                    # of the window and continue below it; the rescued
+                    # records enter at the WINDOW TAIL in raw order. The
+                    # strict head and every stronger in-window member keep
+                    # their slots at every limit.
+                    _demote_ids = {r.memory_id for r in _swap_order}
+                    _clean = [r for r in fused if r.memory_id not in _demote_ids]
+                    _ins_at = min(limit, len(_clean)) - len(rescue)
+                    fused = _clean[:_ins_at] + rescue + _clean[_ins_at:]
         final = fused[:limit]
         # #142: clamp final similarity to [0, 1] — additive stages (phrase-lift,
         # importance, graph boost) can push a high base similarity above 1.0.

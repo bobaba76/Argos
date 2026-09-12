@@ -110,6 +110,26 @@ audit/egress/PII/token-bearing lines from what renders.
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8733/
 ```
 
+**One-shot onboarding (single.bat, #485):** on any machine that already runs
+Hermes agent, `scripts/single.bat` goes from "plugin not installed" to the
+console open in the browser in one double-click — no manual Python, no
+hand-edited config, safe to re-run (idempotent). It locates the Hermes home
+(`%LOCALAPPDATA%\hermes`, or `/home:` / `SINGLE_HOME`), deploys
+`argos_plugin` into `plugins\hybrid_memory`, syncs python dependencies from
+`requirements.txt`, and points `memory.provider` at hybrid_memory. It then
+asks whether to enable the web UI; on Yes it installs a per-user **logon
+scheduled task** (`Argos Admin Console`, port 8733) and re-opens the
+loopback URL. First open lands on "Create your admin key" (setup mode —
+#484). Flags: `/check` (verify-only, changes nothing), `/auto`, `/nui`,
+`/port:N`, `/src:<checkout>`. Missing Hermes home exits 3 with a clear
+message and creates nothing.
+
+```bash
+# Windows cmd (from a checkout, or copy scripts/single.bat anywhere):
+scripts\single.bat /check   # dry run — prints state, changes nothing
+scripts\single.bat           # deploy + ask about the UI
+```
+
 _Source checkout: same `PYTHONPATH` note as [External API](#external-api) above — or run script-mode: `cd argos_plugin && python admin_console.py --home <hermes-home> --port 8733`._
 
 - **Browse** — list memories by category/namespace, scoped to your user/tenant.

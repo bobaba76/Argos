@@ -17,3 +17,7 @@
 # #247: template files must stay LF — CRLF would change runtime prompt bytes
 # and silently invalidate the prompt cache.
 *.txt       text eol=lf
+# Windows batch scripts must stay CRLF — cmd.exe parses some REM lines
+# incorrectly under LF and batch files are executed in-place on Windows.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf

@@ -125,6 +125,10 @@ class MemoryConfig(BaseModel):
     query_expansion_enabled: bool = True
     query_expansion_similarity_floor: float = Field(0.3, ge=0.0, le=1.0)
 
+    # -- LLM call trace (cost ledger, #454) ------------------------------------
+    llm_trace_enabled: bool = False
+    llm_trace_path: str = ""
+
     # -- LLM endpoints ---------------------------------------------------------
     llm_model: str = ""
     llm_provider: str = ""

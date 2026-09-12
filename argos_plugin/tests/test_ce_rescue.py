@@ -62,6 +62,41 @@ class _KeywordReranker:
                 out.append(0.0)
         return out
 
+    def score_multi(self, queries, documents):
+        out = []
+        for q in queries:
+            row = []
+            for d in documents:
+                if any(k in q and k in d for k in self._strong):
+                    row.append(10.0)
+                elif "gamma" in d:
+                    row.append(-5.0)
+                else:
+                    row.append(0.0)
+            out.append(row)
+        return out
+
+
+class _CountingReranker(_KeywordReranker):
+    """Counts predict entries: one per score() call vs one per score_multi()
+    call (the #460 batched-CE regression: a work-family query must issue ONE
+    score_multi with query+probe, not two separate score passes)."""
+
+    def __init__(self):
+        super().__init__()
+        self.score_calls = 0
+        self.multi_calls = 0
+        self.multi_queries = []
+
+    def score(self, query, documents):
+        self.score_calls += 1
+        return super().score(query, documents)
+
+    def score_multi(self, queries, documents):
+        self.multi_calls += 1
+        self.multi_queries.append(list(queries))
+        return super().score_multi(queries, documents)
+
 
 class _HashEmbedder:
     """Deterministic token-hash embedder (no model): keeps the vector arm
@@ -84,7 +119,7 @@ class _HashEmbedder:
 
 
 def _build(vector_arm, text_arm, *, limit=3, top_n=2, rescue_enabled=True,
-           strong=("semantic",)):
+           strong=("semantic",), reranker=None):
     tmp = tempfile.TemporaryDirectory()
 
     class _S(DuckDBMemoryStore):
@@ -101,7 +136,7 @@ def _build(vector_arm, text_arm, *, limit=3, top_n=2, rescue_enabled=True,
 
     store = _S(os.path.join(tmp.name, "r.duckdb"), user_id="test",
                embedder=_HashEmbedder())
-    store.reranker = _KeywordReranker(strong=strong)
+    store.reranker = reranker if reranker is not None else _KeywordReranker(strong=strong)
     store._reranker_top_n = top_n
     store._ce_rescue_enabled = rescue_enabled
     return store, tmp
@@ -314,3 +349,65 @@ class TestVectorArmProbes:
             store.search("alpha beta gamma", limit=3)
             assert store.raw == 1, "primary only for unrelated query"
             assert store.probes == 0, "no probes for an unrelated query"
+
+
+class TestBatchedCeProbes:
+    """#460: work-family queries batch query+probe into ONE score_multi
+    predict call instead of two separate CE passes."""
+
+    def _arms(self):
+        # D is a strong vector+text record ranking 2nd; a work-family probe
+        # must reach the CE block (not just the vector probe prepend).
+        vector = [
+            _rec("A", "alpha beta", similarity=0.95),
+            _rec("D", "semantic job title record", similarity=0.80),
+        ]
+        text = [_rec("D", "semantic job title record", similarity=0.80)]
+        return vector, text
+
+    def test_work_family_uses_one_batched_predict(self):
+        vector, text = self._arms()
+        rr = _CountingReranker()
+        store, tmp = _build(vector, text, top_n=2, reranker=rr)
+        with tmp:
+            store.search("what do I currently work as", limit=3)
+            assert rr.multi_calls >= 1, "batched path must be used"
+            assert rr.score_calls == 0, "no unbatched per-query pass"
+            # query + the single work-family star probe, exactly
+            assert rr.multi_queries[-1][0] == "what do I currently work as"
+            assert len(rr.multi_queries[-1]) == 2, "query + 1 probe"
+
+    def test_unrelated_query_no_probe_pass(self):
+        vector, text = self._arms()
+        rr = _CountingReranker()
+        store, tmp = _build(vector, text, top_n=2, reranker=rr)
+        with tmp:
+            store.search("alpha beta gamma", limit=3)
+            assert rr.multi_calls == 0, "no family -> plain score path"
+            assert rr.score_calls >= 1, "main query still CE-scored"
+
+    def test_score_multi_chunking(self):
+        # Real CrossEncoderReranker shape: one predict over (queries x docs)
+        # pairs, re-chunked per query in the ORIGINAL order.
+        from embeddings import CrossEncoderReranker, _SHARED_RERANKERS
+
+        class _FakeModel:
+            def predict(self, pairs, show_progress_bar=False):
+                # 2 queries x 3 docs (first call) then 1 query x 2 docs
+                # (delegated score() call): accept any pair count, return
+                # index-scaled floats so chunk order is checkable.
+                return [float(10 * i) for i in range(len(pairs))]
+
+        _SHARED_RERANKERS["bge-test"] = _FakeModel()
+        try:
+            rr = CrossEncoderReranker("bge-test",
+                                      hermes_home=r"C:/Users/michael/AppData/Local/hermes")
+            out = rr.score_multi(["q1", "q2"], ["d1", "d2", "d3"])
+            assert len(out) == 2 and all(len(o) == 3 for o in out), "2x3 shape"
+            assert out[0] == [0.0, 10.0, 20.0], "query 1 rows in order"
+            assert out[1] == [30.0, 40.0, 50.0], "query 2 rows in order"
+            # score() delegates to the same batched path
+            one = rr.score("q1", ["d1", "d2"])
+            assert one == [0.0, 10.0]
+        finally:
+            _SHARED_RERANKERS.pop("bge-test", None)

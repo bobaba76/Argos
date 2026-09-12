@@ -1487,12 +1487,27 @@ class StoreRetrievalMixin:
             for _fam_re, _alt in CE_PROBE_ALIASES.values():
                 if re.search(_fam_re, _ql):
                     probes.extend(_alt)
-            scores = self.reranker.score(query, documents)
             if len(probes) > 1:
-                for _probe in probes[1:]:
-                    _ps = self.reranker.score(_probe, documents)
-                    if _ps and len(_ps) == len(scores):
-                        scores = [max(a, b) for a, b in zip(scores, _ps)]
+                # #460: batch query + family probes into ONE predict call
+                # (score_multi). The old loop re-tokenized every document
+                # per probe — a second full CE pass cost. Fall back to the
+                # per-probe loop only if the batched path is unavailable.
+                _batched = []
+                if hasattr(self.reranker, "score_multi"):
+                    _batched = self.reranker.score_multi(probes, documents)
+                if _batched and len(_batched) == len(probes):
+                    scores = _batched[0]
+                    for _ps in _batched[1:]:
+                        if _ps and len(_ps) == len(scores):
+                            scores = [max(a, b) for a, b in zip(scores, _ps)]
+                else:
+                    scores = self.reranker.score(query, documents)
+                    for _probe in probes[1:]:
+                        _ps = self.reranker.score(_probe, documents)
+                        if _ps and len(_ps) == len(scores):
+                            scores = [max(a, b) for a, b in zip(scores, _ps)]
+            else:
+                scores = self.reranker.score(query, documents)
             if scores and len(scores) == len(rerank_pool):
                 min_s, max_s = min(scores), max(scores)
                 range_s = max_s - min_s

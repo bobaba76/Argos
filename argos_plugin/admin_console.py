@@ -27,6 +27,12 @@ Security model (same as rest_server.py):
   - Read-only for non-admin roles: mutation buttons (approve/reject,
     erase, export) are only rendered when the principal's
     allowed_operations include the relevant operation.
+  - Keys page (#484 Phase 2): mint/revoke render only for human
+    principals on a non-read-only console (ARGOS_API_READ_ONLY). A
+    minted key is shown once; revocation applies on the next request
+    (per-request file re-validation). The console refuses to revoke
+    the key backing its own session. Mint/revoke are credential-file
+    operations, so each logs a console audit row (transport=admin-console).
   - Audit trail: every facade.execute() call is audited by the facade
     (one row per operation, hashed query, no tokens).
 
@@ -43,8 +49,10 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends, Form
 from fastapi.responses import (
@@ -67,8 +75,10 @@ from api_credentials import (
     VALID_CLASSES,
     build_context as build_credential_context,
     credential_file_path,
+    drop_legacy_token,
     parse_credentials_file,
     resolve_by_token,
+    revoke_credential,
     write_credential,
 )
 
@@ -378,6 +388,18 @@ class AdminAuth:
         with self._session_lock:
             self._sessions.pop(sid, None)
 
+    def session_token_for(self, sid: Optional[str]) -> Optional[str]:
+        """The raw token bound to a session id (None when absent)."""
+        if not sid:
+            return None
+        with self._session_lock:
+            entry = self._sessions.get(sid)
+        return entry["token"] if entry else None
+
+    def credentials(self):
+        """(legacy_token, credentials) — the live state shown on /keys."""
+        return self._credentials()
+
     def check_token(self, token: str) -> Optional[str]:
         """Validate a raw token for the login form.
 
@@ -446,6 +468,9 @@ def _base_page(title: str, body: str, ctx: Optional[AuthContext] = None) -> str:
         nav_links.append('<a href="/ops/erase">Erase</a>')
     if can_export:
         nav_links.append('<a href="/ops/export">Export</a>')
+    # Keys (#484 Phase 2) is a human-principal management surface.
+    if ctx and ctx.principal_type == "human":
+        nav_links.append('<a href="/keys">Keys</a>')
 
     nav = " | ".join(nav_links)
     return f"""<!DOCTYPE html>
@@ -636,6 +661,160 @@ def _setup_key_page(principal: str, token: str) -> str:
 </html>"""
 
 
+# -- Keys page (#484 Phase 2) ------------------------------------------------
+
+def _console_read_only() -> bool:
+    """ARGOS_API_READ_ONLY=1 makes the entire console read-only (spec-09)."""
+    return os.environ.get("ARGOS_API_READ_ONLY", "").lower() in ("true", "1", "yes")
+
+
+def _keys_redirect(**params: str) -> str:
+    """/keys with urlencoded ok/err banners."""
+    q = urlencode(params)
+    return f"/keys?{q}" if q else "/keys"
+
+
+def _short_dt(value: Any) -> str:
+    """Compact ISO datetimes for tables (datetime or ISO string)."""
+    if not value:
+        return "—"
+    try:
+        dt = value
+        if isinstance(dt, str):
+            dt = datetime.fromisoformat(dt)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _keys_page(
+    ctx: AuthContext,
+    *,
+    legacy_token: Optional[str],
+    creds: Any,
+    flash: str = "",
+    flash_ok: bool = False,
+) -> str:
+    """Render /keys — live credential state + mint/revoke affordances.
+
+    Mint/revoke render ONLY for human principals on a non-read-only
+    console (Phase 2 acceptance). Every mint/revoke writes a console
+    log row — these are credential-file operations, so the console log
+    IS the audit for them (the facade audit spine sees facade ops only).
+    """
+    can_manage = ctx.principal_type == "human" and not _console_read_only()
+
+    flash_html = ""
+    if flash:
+        flash_html = (
+            f'<div class="flash {"flash-ok" if flash_ok else "flash-err"}">'
+            f"{_esc(flash)}</div>"
+        )
+
+    manage_note = ""
+    mint_card = ""
+    if can_manage:
+        manage_note = (
+            '<p class="muted">Mint a new key (shown once), or revoke any key '
+            "except the one you are signed in with — revocation applies on "
+            "the next request (every call re-validates against this file).</p>"
+        )
+        mint_card = """<div class="card">
+  <h2>Mint a key</h2>
+  <form method="post" action="/keys">
+    <input type="text" name="name" placeholder="key name (e.g. backup-script)" autocomplete="off" required>
+    <button type="submit">Mint key</button>
+  </form>
+  <p class="muted">A human principal with the same full credential classes
+  as the bootstrap key — shown exactly once, stored hashed. Expiring or
+  class-scoped keys are minted from the terminal
+  (<code>scripts/mint_api_credential.py</code>).</p>
+</div>"""
+    else:
+        manage_note = (
+            '<p class="muted">Keys are read-only here: '
+            + (
+                "the console is read-only (ARGOS_API_READ_ONLY)."
+                if _console_read_only()
+                else "sign in with a human principal to manage keys."
+            )
+            + "</p>"
+        )
+
+    rows = ""
+    for cred in sorted(creds, key=lambda c: c.name):
+        status_html = (
+            '<span class="badge badge-active">active</span>'
+            if not cred.is_expired()
+            else '<span class="badge badge-rejected">expired</span>'
+        )
+        current = (
+            ' <span class="badge badge-active">in use</span>'
+            if cred.name == ctx.principal
+            else ""
+        )
+        manage = ""
+        if can_manage:
+            if cred.name == ctx.principal:
+                manage = '<span class="muted">(this session)</span>'
+            else:
+                manage = (
+                    '<form method="post" action="/keys/revoke" style="display:inline" '
+                    f'onsubmit="return confirm(\'Revoke {_esc(cred.name)}? '
+                    "Requests using it will 401 immediately.')\">"
+                    '<input type="hidden" name="action" value="revoke">'
+                    f'<input type="hidden" name="name" value="{_esc(cred.name)}">'
+                    '<button type="submit" class="danger-btn">Revoke</button>'
+                    "</form>"
+                )
+        rows += (
+            f"<tr><td><b>{_esc(cred.name)}</b>{current}</td>"
+            f"<td>{_esc(cred.principal_type)}</td>"
+            f"<td>{_esc(', '.join(sorted(cred.allowed_classes))) or '—'}</td>"
+            f"<td>{_short_dt(getattr(cred, 'created_at', None))}</td>"
+            f"<td>{_short_dt(getattr(cred, 'expires_at', None))}</td>"
+            f"<td>—</td>"
+            f"<td>{status_html} {manage}</td></tr>"
+        )
+
+    legacy_row = ""
+    if legacy_token:
+        manage_legacy = ""
+        if can_manage:
+            manage_legacy = (
+                '<form method="post" action="/keys/revoke" style="display:inline" '
+                'onsubmit="return confirm(\'Revoke the legacy transport token? '
+                "It stops at the next restart; sessions using it 401 immediately.')\">"
+                '<input type="hidden" name="action" value="revoke_legacy">'
+                '<button type="submit" class="danger-btn">Revoke</button>'
+                "</form>"
+            )
+        legacy_row = (
+            "<tr><td><b>— legacy transport token —</b></td>"
+            "<td>env</td><td>read + propose (spec-11)</td>"
+            "<td>—</td><td>—</td><td>—</td>"
+            f'<td><span class="badge badge-active">active</span> {manage_legacy}</td></tr>'
+        )
+
+    body = f"""<h1>Keys</h1>
+{flash_html}
+<div class="card">
+  <h2>Keys — api_credential.json</h2>
+  {manage_note}
+  <table>
+    <tr><th>Name</th><th>Type</th><th>Classes</th><th>Created</th><th>Expires</th><th>Last used</th><th>Status</th></tr>
+    {rows}
+    {legacy_row}
+  </table>
+</div>
+{mint_card}
+<p class="muted">&ldquo;Last used&rdquo; is not tracked in the memory layer yet —
+it lands with the audit side (Themis). &ldquo;In use&rdquo; is the key this
+session is signed in with; the console refuses to revoke it. Every call
+re-validates against this file, so revocation is immediate.</p>"""
+    return _base_page("Keys", body, ctx)
+
+
 # -- App factory --------------------------------------------------------------
 
 def create_app(
@@ -787,6 +966,117 @@ def create_app(
         )
         logger.info("setup: created bootstrap credential %r", cred.name)
         return response
+
+    # -- Keys page (#484 Phase 2): mint, list, revoke ---------------------
+
+    @app.get("/keys", response_class=HTMLResponse)
+    async def keys_page(request: Request, ctx: AuthContext = Depends(auth)):
+        flash = request.query_params.get("ok") or request.query_params.get("err") or ""
+        legacy_token, creds = auth.credentials()
+        return _keys_page(
+            ctx,
+            legacy_token=legacy_token,
+            creds=creds,
+            flash=flash,
+            flash_ok=bool(request.query_params.get("ok")),
+        )
+
+    @app.post("/keys", response_class=HTMLResponse)
+    async def keys_mint(
+        name: str = Form(default=""),
+        ctx: AuthContext = Depends(auth),
+    ):
+        if _console_read_only():
+            return RedirectResponse(
+                url=_keys_redirect(err="Console is read-only (ARGOS_API_READ_ONLY); minting is disabled."),
+                status_code=303,
+            )
+        if ctx.principal_type != "human":
+            return RedirectResponse(
+                url=_keys_redirect(err="Sign in with a human principal to mint keys."),
+                status_code=303,
+            )
+        name = (name or "").strip()
+        if not name:
+            return RedirectResponse(url=_keys_redirect(err="Key name is required."), status_code=303)
+        token, cred = write_credential(
+            auth.credential_path(),
+            name=name,
+            principal_type="human",
+            allowed_classes=sorted(VALID_CLASSES),
+            user_id="default_user",
+        )
+        logger.info("keys.mint: created %r (by %s)", cred.name, ctx.principal)
+        # Show-once, same contract as the bootstrap flow: the plaintext is
+        # rendered a single time and never persisted. No session change —
+        # the operator stays signed in with their current key.
+        return HTMLResponse(_setup_key_page(cred.name, token))
+
+    @app.post("/keys/revoke", response_class=HTMLResponse)
+    async def keys_revoke(
+        request: Request,
+        action: str = Form(default=""),
+        name: str = Form(default=""),
+        ctx: AuthContext = Depends(auth),
+    ):
+        if _console_read_only():
+            return RedirectResponse(
+                url=_keys_redirect(err="Console is read-only (ARGOS_API_READ_ONLY); revocation is disabled."),
+                status_code=303,
+            )
+        if ctx.principal_type != "human":
+            return RedirectResponse(
+                url=_keys_redirect(err="Sign in with a human principal to revoke keys."),
+                status_code=303,
+            )
+        if action == "revoke":
+            if not name:
+                return RedirectResponse(url=_keys_redirect(err="Key name is required."), status_code=303)
+            if name == ctx.principal:
+                return RedirectResponse(
+                    url=_keys_redirect(err="Cannot revoke the key you are signed in with. Sign in with another key first."),
+                    status_code=303,
+                )
+            try:
+                changed = revoke_credential(auth.credential_path(), name)
+            except CredentialFileError as exc:
+                return RedirectResponse(
+                    url=_keys_redirect(err=f"Revocation failed: {str(exc)[:200]}"),
+                    status_code=303,
+                )
+            if changed:
+                logger.info("keys.revoke removed %r (by %s)", name, ctx.principal)
+                return RedirectResponse(
+                    url=_keys_redirect(ok=f"Revoked {name}. Its next request returns 401."),
+                    status_code=303,
+                )
+            return RedirectResponse(
+                url=_keys_redirect(err=f"No credential named {name!r}."),
+                status_code=303,
+            )
+        if action == "revoke_legacy":
+            sid = request.cookies.get(SESSION_COOKIE_NAME)
+            in_use = bool(auth._expected) and auth.session_token_for(sid) == auth._expected
+            if in_use:
+                return RedirectResponse(
+                    url=_keys_redirect(err="You are signed in with the legacy token. Sign in with a key first, then revoke it."),
+                    status_code=303,
+                )
+            try:
+                changed = drop_legacy_token(auth.credential_path())
+            except CredentialFileError as exc:
+                return RedirectResponse(
+                    url=_keys_redirect(err=f"Revocation failed: {str(exc)[:200]}"),
+                    status_code=303,
+                )
+            if changed:
+                logger.info("keys.revoke dropped the legacy transport token (by %s)", ctx.principal)
+                return RedirectResponse(
+                    url=_keys_redirect(ok="Legacy transport token revoked. Sign in with a per-principal key from here on."),
+                    status_code=303,
+                )
+            return RedirectResponse(url=_keys_redirect(err="No legacy token on file."), status_code=303)
+        return RedirectResponse(url=_keys_redirect(err="Unknown action."), status_code=303)
 
     # -- Dashboard: GET / -------------------------------------------------
 

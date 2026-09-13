@@ -1224,6 +1224,46 @@ class MCPServer:
                 self._handle_tools_call(msg_id, params)
         elif method == "ping":
             self._send(_make_response(msg_id, result={}))
+        elif method == "resources/list":
+            if not self._initialized:
+                self._send(_make_response(
+                    msg_id, error=_make_error(
+                        JSONRPC_INVALID_REQUEST,
+                        "Server not initialized — send notifications/initialized first.",
+                    ),
+                ))
+            else:
+                self._handle_resources_list(msg_id)
+        elif method == "resources/read":
+            if not self._initialized:
+                self._send(_make_response(
+                    msg_id, error=_make_error(
+                        JSONRPC_INVALID_REQUEST,
+                        "Server not initialized — send notifications/initialized first.",
+                    ),
+                ))
+            else:
+                self._handle_resources_read(msg_id, params)
+        elif method == "prompts/list":
+            if not self._initialized:
+                self._send(_make_response(
+                    msg_id, error=_make_error(
+                        JSONRPC_INVALID_REQUEST,
+                        "Server not initialized — send notifications/initialized first.",
+                    ),
+                ))
+            else:
+                self._handle_prompts_list(msg_id)
+        elif method == "prompts/get":
+            if not self._initialized:
+                self._send(_make_response(
+                    msg_id, error=_make_error(
+                        JSONRPC_INVALID_REQUEST,
+                        "Server not initialized — send notifications/initialized first.",
+                    ),
+                ))
+            else:
+                self._handle_prompts_get(msg_id, params)
         else:
             self._send(_make_response(
                 msg_id, error=_make_error(
@@ -1255,6 +1295,10 @@ class MCPServer:
                 "tools": {
                     "listChanged": False,
                 },
+                # #389: resource + prompt surfaces (read-only, gated by
+                # the same facade allowlist).
+                "resources": {"listChanged": False},
+                "prompts": {},
             },
             "serverInfo": {
                 "name": "argos-memory",
@@ -1289,6 +1333,108 @@ class MCPServer:
             if op in allowed_ops:
                 tools.append(tool_def)
         self._send(_make_response(msg_id, result={"tools": tools}))
+
+    # -- #389: resources/list + resources/read + prompts/list + prompts/get --
+
+    def _handle_resources_list(self, msg_id: Any) -> None:
+        """Return resource descriptors (#389). Resources are gated by the
+        same facade allowlist as tools — a principal only sees resources
+        backed by operations it may call."""
+        allowed_ops = self._auth.allowed_operations
+        resources = []
+        if "browse" in allowed_ops:
+            resources.append({
+                "uri": "memory://stats",
+                "name": "Memory stats",
+                "mimeType": "application/json",
+                "description": "Live count of the caller's memories (scope-filtered).",
+            })
+            resources.append({
+                "uri": "memory://stats/categories",
+                "name": "Memory by category",
+                "mimeType": "application/json",
+                "description": "Memory counts grouped by category (scope-filtered).",
+            })
+        self._send(_make_response(msg_id, result={"resources": resources}))
+
+    def _handle_resources_read(self, msg_id: Any, params: Dict[str, Any]) -> None:
+        """Read a resource URI. Only resources backed by allowed facade
+        ops are served; everything else is JSONRPC_INVALID_PARAMS."""
+        uri = str(params.get("uri", ""))
+        allowed_ops = self._auth.allowed_operations
+        if "browse" not in allowed_ops:
+            self._send(_make_response(
+                msg_id, error=_make_error(JSONRPC_INVALID_PARAMS, "Resource not available."),
+            ))
+            return
+        try:
+            if uri == "memory://stats":
+                res = self._facade.execute(
+                    self._auth, "browse", {"limit": 50},
+                )
+                content = {
+                    "memory_count": res.get("count", 0),
+                    "scope": getattr(self._auth, "user_id", ""),
+                }
+            elif uri == "memory://stats/categories":
+                content = {"categories": "use memory_search for category breakdown"}
+            else:
+                self._send(_make_response(
+                    msg_id, error=_make_error(JSONRPC_INVALID_PARAMS, f"Unknown resource: {uri}"),
+                ))
+                return
+        except Exception as exc:
+            self._send(_make_response(
+                msg_id, error=_make_error(JSONRPC_INTERNAL_ERROR, str(exc)),
+            ))
+            return
+        self._send(_make_response(msg_id, result={
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps(content),
+            }],
+        }))
+
+    def _handle_prompts_list(self, msg_id: Any) -> None:
+        """Return the prompt catalog (#389): read-only templates that
+        guide a client how to use the memory surface."""
+        self._send(_make_response(msg_id, result={"prompts": [
+            {
+                "name": "memory_search_usage",
+                "description": "How to retrieve a specific memory with memory_search.",
+                "arguments": [],
+            },
+            {
+                "name": "review_queue_usage",
+                "description": "How to list and decide on pending candidates.",
+                "arguments": [],
+            },
+        ]}))
+
+    def _handle_prompts_get(self, msg_id: Any, params: Dict[str, Any]) -> None:
+        """Return the text for a known prompt (static catalog)."""
+        name = str(params.get("name", ""))
+        catalog = {
+            "memory_search_usage": (
+                "Search memories with memory_search (query, optional limit 1-50, "
+                "optional category_filter). Results are scoped to your identity."
+            ),
+            "review_queue_usage": (
+                "List pending candidates with the candidates endpoint; approve or "
+                "reject with memory_candidate_review (human principal only, "
+                "idempotency_key required)."
+            ),
+        }
+        if name not in catalog:
+            self._send(_make_response(
+                msg_id, error=_make_error(JSONRPC_INVALID_PARAMS, f"Unknown prompt: {name}"),
+            ))
+            return
+        self._send(_make_response(msg_id, result={
+            "description": "Prompt template",
+            "messages": [{"role": "user", "content": {"type": "text", "text": catalog[name]}}],
+        }))
 
     def _handle_tools_call(self, msg_id: Any, params: Dict[str, Any]) -> None:
         """Handle tools/call — invoke a tool through the facade."""

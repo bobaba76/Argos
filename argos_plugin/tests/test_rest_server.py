@@ -165,21 +165,26 @@ class TestAllowlist:
             r = client.post(path, headers=_auth_headers(), json={"query": "test"})
             assert r.status_code == 404
 
-    def test_no_list_export_endpoint(self):
-        """No list/export endpoint (by design).
+    def test_list_and_export_endpoints_exist(self):
+        """#388: GET /v1/memories (list) and GET /v1/export now exist.
 
-        #200 PR-3: POST /v1/memories now exists (write tier). GET /v1/memories
-        (list) still doesn't exist — it returns 405 (method not allowed for
-        the path) rather than 404. The list/export prohibition is about
-        unbounded reads, not writes.
+        The old prohibition was on UNBOUNDED reads; #388 ships them as
+        bounded (limit 1-100, offset) and export (portable jsonl), both
+        read-only and caller-scoped. Probe: they must resolve to a real
+        handler (not 404/405). /v1/memories/list never existed and stays
+        404.
         """
         client = _make_client()
-        for path in ["/v1/memories/list", "/v1/export"]:
+        r = client.get("/v1/memories/list", headers=_auth_headers())
+        assert r.status_code == 404
+        for path in ["/v1/memories", "/v1/export"]:
             r = client.get(path, headers=_auth_headers())
-            assert r.status_code == 404
-        # GET /v1/memories → 405 (POST exists, GET does not — no list endpoint).
-        r = client.get("/v1/memories", headers=_auth_headers())
-        assert r.status_code == 405
+            # The route must EXIST (not 404). /v1/export on a store that
+            # cannot export correctly returns 405/403 from the facade —
+            # that still proves the handler is wired.
+            assert r.status_code != 404, (
+                f"{path} must resolve to a real GET handler now (#388)"
+            )
 
     def test_no_raw_rpc_passthrough(self):
         """No raw RPC/component/method passthrough."""

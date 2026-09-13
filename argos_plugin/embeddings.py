@@ -44,6 +44,43 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
+
+def _pick_device() -> str:
+    """GPU-first per house rule: CUDA when torch can see it, CPU fallback."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _log_runtime_ground_truth() -> None:
+    """One-line log of which torch/interpreter the service actually runs.
+
+    13/9: the service was silently loading models on CPU because the venv
+    launcher stub spawned the base interpreter with the venv's site-packages
+    (torch 2.13.0+cpu). This line makes the device story visible in logs.
+    """
+    import platform
+    import sys
+
+    try:
+        import torch
+
+        torch_ver = torch.__version__
+        cuda_ok = torch.cuda.is_available()
+        device_name = torch.cuda.get_device_name(0) if cuda_ok else "n/a"
+        logger.info(
+            "runtime: python=%s torch=%s cuda=%s device=%s exe=%s",
+            platform.python_version(), torch_ver, cuda_ok, device_name,
+            sys.executable,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("runtime ground-truth probe failed: %s", exc)
+
 # Retry-with-backoff for transient model-load failures (issue #83).
 # A previous version set a permanent ``_load_failed`` flag on the first
 # exception (CUDA init race, HF cache lock contention, transient OOM),
@@ -292,7 +329,11 @@ class LocalEmbedder:
                     "Loading embedding model: %s (local_files_only=%s)",
                     resolved, use_local_only,
                 )
-                model = SentenceTransformer(resolved, local_files_only=use_local_only)
+                model = SentenceTransformer(
+                    resolved,
+                    local_files_only=use_local_only,
+                    device=_pick_device(),
+                )
                 # Probe dimension with a dummy encode.
                 test = model.encode(
                     ["dimension probe"], normalize_embeddings=True,
@@ -459,6 +500,7 @@ class CrossEncoderReranker:
                 model = CrossEncoder(
                     resolved, max_length=512,
                     local_files_only=use_local_only,
+                    device=_pick_device(),
                 )
                 with _SHARED_RERANKER_LOCK:
                     _SHARED_RERANKERS[self._model_name] = model

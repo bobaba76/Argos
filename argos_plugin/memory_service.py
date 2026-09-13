@@ -370,9 +370,24 @@ class _Tenant:
                 "Tenant %r: startup restore-recovery check failed: %s",
                 name, exc,
             )
+        # 13/9: budget the DuckDB buffer pool from config (default 512MB).
+        # Previously uncapped → DuckDB cached up to ~80% of RAM, turning
+        # one local service into a multi-digit GB process. DuckDB validates
+        # the string at connect ("512MB", "1GB") and errors on garbage.
+        # NOTE: ONLY ONE DuckDBMemoryStore may open the tenant DB per
+        # process — DuckDB refuses a second connection to the same file
+        # with a DIFFERENT memory_limit config ("Can't open a connection
+        # to same database file with a different configuration"). The
+        # earlier dup store here crashed startup the moment the config
+        # limit diverged from the default. This is the single store.
+        try:
+            mem_limit = str(config.get("duckdb_memory_limit", "512MB"))
+        except (TypeError, ValueError):
+            mem_limit = "512MB"
         self.store = DuckDBMemoryStore(
             home / db_name, user_id=self.default_scope,
             embedder=embedder, reranker=reranker,
+            memory_limit=mem_limit,
         )
         try:
             self.store._reranker_top_n = max(
@@ -2252,6 +2267,18 @@ def serve(home: Path, port: int = 0) -> None:
     def _warmup() -> None:
         _tw = time.time()
         try:
+            try:
+                # The service runs as a SCRIPT (python memory_service.py),
+                # so __package__ is None and the relative import below
+                # raises ImportError inside warmup. Probe both ways.
+                if __package__:
+                    from .embeddings import _log_runtime_ground_truth
+                else:
+                    from embeddings import _log_runtime_ground_truth
+
+                _log_runtime_ground_truth()
+            except Exception:  # noqa: BLE001
+                pass
             for tenant in service._tenants.values():
                 store_obj = getattr(tenant, "store", None)
                 if store_obj is None:

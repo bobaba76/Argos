@@ -629,6 +629,50 @@ def create_app(
 
     # -- Fetch: GET /v1/memories/{memory_id} ---------------------------------
 
+    @app.get("/v1/memories")
+    async def list_memories(
+        ctx: AuthContext = Depends(auth),
+        limit: int = Query(50, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+        category: str | None = Query(None, max_length=100),
+    ):
+        """#388: bounded, paginated list of memories (browse parity).
+
+        Read-only, scoped to the caller's user_id. category optional.
+        Offset+limit enable bounded paging without loading the whole
+        store into the response.
+        """
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if category:
+            params["category"] = category
+        try:
+            return facade.execute(ctx, "browse", params)
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    @app.get("/v1/export")
+    async def export_memories(
+        ctx: AuthContext = Depends(auth),
+    ):
+        """#388: portable export (jsonl) — browse what the transport can.
+
+        Returns the portable export payload as a text download (the
+        facade's export op produces jsonl + markdown; we serve the
+        JSONL line-stream).
+        """
+        try:
+            result = facade.execute(ctx, "export", {})
+            data = result.get("jsonl", "")
+            return PlainTextResponse(
+                content=data,
+                media_type="text/plain",
+                headers={"Content-Disposition": 'attachment; filename="argos-export.jsonl"'},
+            )
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
     @app.get("/v1/memories/{memory_id}")
     async def fetch_memory(
         memory_id: str,
@@ -806,15 +850,27 @@ def create_app(
     @app.get("/v1/candidates")
     async def list_candidates(
         ctx: AuthContext = Depends(auth),
+        limit: int = Query(20, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+        status: str | None = Query(None),
     ):
-        """List pending candidates for the review queue. Read-only,
-        scoped to the caller's user_id."""
+        """#388: list candidates for the review queue — now bounded and
+        paginated (limit/offset/status). Read-only, scoped to the
+        caller's user_id."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if status:
+            if status not in ("pending", "accepted", "rejected", "quarantined"):
+                return _error_response(
+                    "invalid_input", "status must be pending|accepted|rejected|quarantined",
+                    str(uuid.uuid4()), 422,
+                )
+            params["status"] = status
         try:
-            result = facade.execute(ctx, "list_candidates", {})
+            result = facade.execute(ctx, "list_candidates", params)
             return result
         except APIError as exc:
-            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
-            return _error_response(exc.code, exc.message, exc.request_id, status)
+            status_code = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status_code)
 
     # -- #447: POPIA audit evidence surface — GET /v1/audit/* ---------------
     # Read-only, scope-filtered by the store; every call is a facade

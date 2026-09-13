@@ -370,14 +370,16 @@ class _Tenant:
                 "Tenant %r: startup restore-recovery check failed: %s",
                 name, exc,
             )
-        store = DuckDBMemoryStore(
-            home / db_name, user_id=self.default_scope,
-            embedder=embedder, reranker=reranker,
-        )
         # 13/9: budget the DuckDB buffer pool from config (default 512MB).
         # Previously uncapped → DuckDB cached up to ~80% of RAM, turning
-        # one local service into a multi-GB process. DuckDB validates the
-        # string at connect ("512MB", "1GB") and errors on garbage.
+        # one local service into a multi-digit GB process. DuckDB validates
+        # the string at connect ("512MB", "1GB") and errors on garbage.
+        # NOTE: ONLY ONE DuckDBMemoryStore may open the tenant DB per
+        # process — DuckDB refuses a second connection to the same file
+        # with a DIFFERENT memory_limit config ("Can't open a connection
+        # to same database file with a different configuration"). The
+        # earlier dup store here crashed startup the moment the config
+        # limit diverged from the default. This is the single store.
         try:
             mem_limit = str(config.get("duckdb_memory_limit", "512MB"))
         except (TypeError, ValueError):

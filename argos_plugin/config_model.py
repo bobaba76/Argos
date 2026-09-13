@@ -244,6 +244,7 @@ class MemoryConfig(BaseModel):
         "chain_unfold_arc_min_similarity",
         "consolidation_auto_apply",
         "evidence_retention",
+        "llm_trace_enabled", "llm_trace_path",  # optional egress LLM trace (ops instrumentation, Off by default)
         "graph_ppr_enabled", "graph_ppr_damping", "graph_ppr_boost",
         "phrase_lift_alpha", "phrase_lift_pool",
         "router_temporal_threshold", "router_multihop_threshold",

@@ -42,7 +42,15 @@ def fake_agent(monkeypatch):
     agent_mod.auxiliary_client = aux
     monkeypatch.setitem(sys.modules, "agent", agent_mod)
     monkeypatch.setitem(sys.modules, "agent.auxiliary_client", aux)
-    return aux
+    # Hermeticity: egress installs the trace at *import time* when the live
+    # config already has llm_trace_enabled=true (egress.py module tail). That
+    # import-time install wraps the import-time agent object — NOT this fresh
+    # fixture fake — and the idempotent-guard in install_trace() then
+    # early-returns, leaving the fake unwrapped. Always reset so each test
+    # deterministically installs onto the fixture's fake.
+    egress.uninstall_trace()
+    yield aux
+    egress.uninstall_trace()
 
 
 def _trace_cfg(tmp_path, enabled=True):

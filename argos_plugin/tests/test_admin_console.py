@@ -366,7 +366,7 @@ class TestBrowserLogin:
         assert r.status_code == 303
         assert r.headers["location"] == "/"
         cookie = r.headers.get("set-cookie", "").lower()
-        assert "argos_admin_session=" in cookie
+        assert "opconsole_session=" in cookie
         assert "httponly" in cookie
         assert "samesite=strict" in cookie
         # The client cookie jar now carries the session — HTML navigation works.
@@ -392,7 +392,7 @@ class TestBrowserLogin:
 
     def test_forged_session_cookie_ignored(self):
         client = _make_client()
-        client.cookies.set("argos_admin_session", "forged-session-id")
+        client.cookies.set("opconsole_session", "forged-session-id")
         r = client.get("/", headers={"Accept": "text/html"}, follow_redirects=False)
         assert r.status_code == 303  # back to the login form, not a 500
 

@@ -79,6 +79,14 @@ READ_OPERATIONS: Set[str] = {
     # user_id. The export carries records, evidence, candidates, and
     # governance tables (tombstones/receipts/rejections/aliases).
     "export",
+    # #447: POPIA audit evidence surface — mutation_events + deletion
+    # receipts. Read-only, scope-filtered by the store (no cross-tenant
+    # leak): the caller can answer "what was stored/deleted, when, by
+    # whom" for evidence production on demand.
+    "audit_events",
+    "audit_export",
+    "audit_receipts",
+    "audit_verify_receipt",
 }
 
 # Proposal tier: external caller → candidate → security scan → review queue.
@@ -896,6 +904,72 @@ def _validate_review_memory_params(params: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def _validate_audit_events_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate audit_events parameters (#447 POPIA evidence surface).
+
+    Read-only paginated read of mutation_events, scope-filtered to the
+    caller by the store. Optional event_type filter; no internal flags.
+    """
+    cleaned: Dict[str, Any] = {}
+    limit = params.get("limit", 50)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise APIError("invalid_input", "limit must be an integer")
+    if limit < MIN_LIMIT or limit > MAX_LIMIT:
+        raise APIError(
+            "invalid_input", f"limit must be between {MIN_LIMIT} and {MAX_LIMIT}",
+        )
+    cleaned["limit"] = limit
+    try:
+        offset = int(params.get("offset", 0))
+    except (TypeError, ValueError):
+        raise APIError("invalid_input", "offset must be an integer")
+    if offset < 0:
+        raise APIError("invalid_input", "offset must be non-negative")
+    cleaned["offset"] = offset
+    event_type = params.get("event_type")
+    if event_type is not None:
+        event_type = str(event_type).strip()
+        if len(event_type) > 64:
+            raise APIError("invalid_input", "event_type is too long")
+        if not event_type:
+            raise APIError("invalid_input", "event_type must not be empty")
+        cleaned["event_type"] = event_type
+    for flag in FORBIDDEN_CLIENT_FLAGS:
+        if params.get(flag):
+            raise APIError(
+                "forbidden",
+                f"Parameter {flag} is not available on the public API.",
+            )
+    return cleaned
+
+
+def _validate_audit_export_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """#447: export mutation_events as JSONL or CSV (scope-filtered)."""
+    cleaned = _validate_audit_events_params(params)
+    fmt = str(params.get("format", "jsonl")).strip().lower()
+    if fmt not in ("jsonl", "csv"):
+        raise APIError("invalid_input", "format must be 'jsonl' or 'csv'")
+    cleaned["format"] = fmt
+    return cleaned
+
+
+def _validate_audit_receipts_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """#447: list #293 deletion receipts (scope-filtered, read-only)."""
+    return {}
+
+
+def _validate_audit_verify_receipt_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """#447: verify a single deletion receipt against the live store."""
+    receipt_id = str(params.get("receipt_id", "")).strip()
+    if not receipt_id:
+        raise APIError("invalid_input", "receipt_id is required")
+    if len(receipt_id) > 200:
+        raise APIError("invalid_input", "receipt_id is too long")
+    return {"receipt_id": receipt_id}
+
+
 def _validate_export_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Validate export parameters (#295 admin console, #294 portable export).
 
@@ -1487,6 +1561,14 @@ class ArgosAPIFacade:
                 validated = _validate_collection_remove_item_params(params)
             elif operation == "export":
                 validated = _validate_export_params(params)
+            elif operation == "audit_events":
+                validated = _validate_audit_events_params(params)
+            elif operation == "audit_export":
+                validated = _validate_audit_export_params(params)
+            elif operation == "audit_receipts":
+                validated = _validate_audit_receipts_params(params)
+            elif operation == "audit_verify_receipt":
+                validated = _validate_audit_verify_receipt_params(params)
             else:
                 raise APIError(
                     "method_not_allowed",
@@ -1576,6 +1658,14 @@ class ArgosAPIFacade:
                 result = self._op_collection_remove_item(ctx, validated)
             elif operation == "export":
                 result = self._op_export(ctx, validated)
+            elif operation == "audit_events":
+                result = self._op_audit_events(ctx, validated)
+            elif operation == "audit_export":
+                result = self._op_audit_export(ctx, validated)
+            elif operation == "audit_receipts":
+                result = self._op_audit_receipts(ctx, validated)
+            elif operation == "audit_verify_receipt":
+                result = self._op_audit_verify_receipt(ctx, validated)
             else:
                 raise APIError(
                     "internal_error",
@@ -2348,7 +2438,151 @@ class ArgosAPIFacade:
             "markdown": result.get("markdown", ""),
         }
 
-    # -- #200 Spec-10: Class C write operations -------------------------------
+    # -- #447: POPIA audit evidence surface (read-only, caller-scoped) ----------
+
+    def _op_audit_events(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier (#447): paginated mutation_events read for POPIA.
+
+        Scope-filtered by the store (`user_scope IS NULL OR user_scope = ?`
+        with the caller's scope) — no cross-tenant leak. The caller can
+        prove "what was stored, when, by whom" on demand.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "list_mutation_events"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Audit events are not available on this store.",
+                )
+            events = self._store.list_mutation_events(
+                limit=params["limit"],
+                offset=params["offset"],
+                event_type=params.get("event_type"),
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        items = []
+        for e in events:
+            row = dict(e) if isinstance(e, dict) else e.to_dict() if hasattr(e, "to_dict") else dict(e)
+            # Never leak raw refs/delta blobs beyond the evidence fields.
+            items.append({
+                "event_id": row.get("event_id"),
+                "seq": row.get("seq"),
+                "ts": row.get("ts"),
+                "actor": row.get("actor"),
+                "actor_type": row.get("actor_type"),
+                "event_type": row.get("event_type"),
+                "entity_type": row.get("entity_type"),
+                "entity_key": row.get("entity_key"),
+                "content_hash": row.get("content_hash"),
+                "reason": row.get("reason"),
+                "namespace": row.get("namespace"),
+                "client_scope": row.get("client_scope"),
+            })
+        return {"events": items, "count": len(items)}
+
+    def _op_audit_export(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier (#447): JSONL/CSV export of mutation_events.
+
+        Same caller scope filter as audit_events. Returns the serialized
+        payload as text — the transport (REST/console) decides whether
+        to serve it as a download.
+        """
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "export_mutation_events"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Audit export is not available on this store.",
+                )
+            payload = self._store.export_mutation_events(
+                limit=params["limit"],
+                offset=params["offset"],
+                event_type=params.get("event_type"),
+                format=params["format"],
+            )
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        payload = payload or ""
+        row_count = sum(1 for line in payload.splitlines() if line.strip()) if payload else 0
+        return {"format": params["format"], "data": payload, "row_count": row_count}
+
+    def _op_audit_receipts(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier (#447): list #293 deletion receipts (caller-scoped)."""
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "list_deletion_receipts"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Deletion receipts are not available on this store.",
+                )
+            receipts = self._store.list_deletion_receipts() or []
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        items = []
+        for r in receipts:
+            row = dict(r) if isinstance(r, dict) else r.to_dict() if hasattr(r, "to_dict") else r
+            items.append({
+                "receipt_id": row.get("receipt_id"),
+                "subject": row.get("subject"),
+                "ts": row.get("ts"),
+                "mode": row.get("mode"),
+                "principal": row.get("principal"),
+                "content_hash": row.get("content_hash"),
+                "user_scope": row.get("user_scope"),
+            })
+        return {"receipts": items, "count": len(items)}
+
+    def _op_audit_verify_receipt(
+        self, ctx: AuthContext, params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read tier (#447): verify one deletion receipt against the store."""
+        _scope_before = getattr(self._store, "user_id", None)
+        try:
+            if hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(ctx.user_id)
+            if not hasattr(self._store, "verify_erase_receipt"):
+                raise APIError(
+                    "method_not_allowed",
+                    "Receipt verification is not available on this store.",
+                )
+            result = self._store.verify_erase_receipt(receipt_id=params["receipt_id"])
+        finally:
+            if _scope_before is not None and hasattr(self._store, "set_user_scope"):
+                self._store.set_user_scope(_scope_before)
+        if result is None:
+            raise APIError("not_found", "No deletion receipt with that id.")
+        row = dict(result) if isinstance(result, dict) else result.to_dict() if hasattr(result, "to_dict") else result
+        valid = bool(row.get("valid", row.get("verified", False)))
+        if not valid and str(row.get("reason", "")) == "receipt not found":
+            raise APIError("not_found", "No deletion receipt with that id.")
+        out: Dict[str, Any] = {
+            "receipt_id": row.get("receipt_id"),
+            "verified": valid,
+            "subject": row.get("subject"),
+            "ts": row.get("ts"),
+        }
+        for k in ("mode", "content_hash", "user_scope", "message", "reason"):
+            if k in row and row[k] is not None:
+                out[k] = row[k]
+        return out
+
+    # -- #200 Spec-10: Class-level write operations -------------------------------
 
     def _op_memory_save(
         self, ctx: AuthContext, params: Dict[str, Any],

@@ -42,8 +42,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, Depends
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Depends
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, conint, constr
 
 from api_facade import (
@@ -812,6 +812,81 @@ def create_app(
         try:
             result = facade.execute(ctx, "list_candidates", {})
             return result
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    # -- #447: POPIA audit evidence surface — GET /v1/audit/* ---------------
+    # Read-only, scope-filtered by the store; every call is a facade
+    # operation (audit_events / audit_export / audit_receipts /
+    # audit_verify_receipt) with auth + ACL + per-operation audit rows.
+
+    @app.get("/v1/audit/events")
+    async def audit_events(
+        ctx: AuthContext = Depends(auth),
+        limit: int = Query(50, ge=1, le=50),
+        offset: int = Query(0, ge=0),
+        event_type: str | None = Query(None, max_length=64),
+    ):
+        """#447: paginated mutation_events read (scope-filtered)."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        if event_type:
+            params["event_type"] = event_type
+        try:
+            return facade.execute(ctx, "audit_events", params)
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    @app.get("/v1/audit/events/export")
+    async def audit_export(
+        ctx: AuthContext = Depends(auth),
+        limit: int = Query(50, ge=1, le=50),
+        offset: int = Query(0, ge=0),
+        event_type: str | None = Query(None, max_length=64),
+        format: str = Query("jsonl", pattern="^(jsonl|csv)$"),
+    ):
+        """#447: JSONL/CSV export of mutation_events (same scope filter)."""
+        params: Dict[str, Any] = {"limit": limit, "offset": offset,
+                                  "format": format}
+        if event_type:
+            params["event_type"] = event_type
+        try:
+            result = facade.execute(ctx, "audit_export", params)
+            data = result.get("data", "")
+            return PlainTextResponse(
+                content=data,
+                media_type="text/plain",
+                headers={"Content-Disposition": f'attachment; filename="argos-audit-{format}.txt"'},
+            )
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    @app.get("/v1/audit/receipts")
+    async def audit_receipts(
+        ctx: AuthContext = Depends(auth),
+    ):
+        """#447: list #293 deletion receipts (scope-filtered)."""
+        try:
+            return facade.execute(ctx, "audit_receipts", {})
+        except APIError as exc:
+            status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
+            return _error_response(exc.code, exc.message, exc.request_id, status)
+
+    @app.get("/v1/audit/receipts/{receipt_id}/verify")
+    async def audit_verify_receipt(
+        receipt_id: str,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """#447: verify one deletion receipt against the live store."""
+        if len(receipt_id) > 200:
+            return _error_response(
+                "invalid_input", "receipt_id is too long.",
+                str(uuid.uuid4()), 422,
+            )
+        try:
+            return facade.execute(ctx, "audit_verify_receipt", {"receipt_id": receipt_id})
         except APIError as exc:
             status = FACADE_ERROR_TO_HTTP.get(exc.code, 500)
             return _error_response(exc.code, exc.message, exc.request_id, status)

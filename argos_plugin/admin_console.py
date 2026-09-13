@@ -830,6 +830,8 @@ def _base_page(title: str, body: str, ctx: Optional[AuthContext] = None) -> str:
     # Keys (#484 Phase 2) is a human-principal management surface.
     if ctx and ctx.principal_type == "human":
         nav_links.append('<a href="/keys">Keys</a>')
+    nav_links.append('<a href="/audit">Audit</a>')
+    nav_links.append('<a href="/audit/receipts">Receipts</a>')
     # Settings & Logs (Phase 3, #484): read-only surfaces, safe for any
     # signed-in principal (human or model).
     nav_links.append('<a href="/settings">Settings</a>')
@@ -1556,6 +1558,131 @@ def create_app(
         <p class="muted">{result.get('count', 0)} memories shown (scoped to your user/tenant).</p>
         """
         return _base_page("Browse", body, ctx)
+
+    # -- #447: POPIA audit evidence — GET /audit, /audit/export, /audit/receipts ----
+
+    @app.get("/audit", response_class=HTMLResponse)
+    async def audit(
+        event_type: str = "",
+        limit: int = 50,
+        offset: int = 0,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """#447: paginated mutation_events evidence table (read-only)."""
+        limit = min(max(int(limit), 1), 50)
+        params: Dict[str, Any] = {"limit": limit, "offset": max(0, int(offset))}
+        if event_type:
+            params["event_type"] = event_type
+        result = facade.execute(ctx, "audit_events", params)
+        events = result.get("events", [])
+        et = _esc(event_type)
+        rows = ""
+        for ev in events:
+            rows += f"""<tr>
+              <td class="muted">{_esc(ev.get("ts", ""))}</td>
+              <td>{_esc(ev.get("actor", ""))}</td>
+              <td>{_esc(ev.get("actor_type", ""))}</td>
+              <td><span class="badge">{_esc(ev.get("event_type", ""))}</span></td>
+              <td>{_esc(ev.get("entity_type", ""))}</td>
+              <td><code>{_esc(ev.get("entity_key", ""))}</code></td>
+              <td class="muted">{_esc((ev.get("reason", "") or "")[:80])}</td>
+            </tr>"""
+        if not rows:
+            rows = '<tr><td colspan="7" class="muted">No mutation events in your scope.</td></tr>'
+        prev = max(0, offset - limit)
+        nxt = offset + limit
+        body = f"""
+        <h1>Audit Log</h1>
+        <p class="muted">POPIA evidence: what was stored/deleted, when, and by whom — append-only, scope-filtered to your tenant. Read-only.</p>
+        <div class="card">
+          <form method="get" action="/audit">
+            <label>Event type: <input type="text" name="event_type" value="{et}" placeholder="write, review, erase, ..."></label>
+            <label>Limit: <input type="text" name="limit" value="{_esc(limit)}" size="4"></label>
+            <button type="submit">Filter</button>
+            <span class="muted">
+              <a href="/audit?event_type={et}&limit={limit}&offset={prev}">← newer</a>
+              &nbsp;·&nbsp;
+              <a href="/audit?event_type={et}&limit={limit}&offset={nxt}">older →</a>
+            </span>
+          </form>
+        </div>
+        <p><a href="/audit/export?event_type={et}&limit={limit}&offset={offset}">Export as JSONL</a> ·
+           <a href="/audit/export?event_type={et}&format=csv&limit={limit}&offset={offset}">Export as CSV</a></p>
+        <table>
+          <tr><th>Timestamp</th><th>Actor</th><th>Type</th><th>Event</th><th>Entity</th><th>Key</th><th>Reason</th></tr>
+          {rows}
+        </table>
+        <p class="muted">{result.get('count', 0)} rows (scoped to your user/tenant).</p>
+        """
+        return _base_page("Audit", body, ctx)
+
+    @app.get("/audit/export", response_class=PlainTextResponse)
+    async def audit_export(
+        event_type: str = "",
+        format: str = "jsonl",
+        limit: int = 50,
+        offset: int = 0,
+        ctx: AuthContext = Depends(auth),
+    ):
+        """#447: download mutation_events as JSONL/CSV (same scope filter)."""
+        params: Dict[str, Any] = {
+            "limit": max(1, min(int(limit), 5000)),
+            "offset": max(0, int(offset)),
+            "format": format if format in ("jsonl", "csv") else "jsonl",
+        }
+        if event_type:
+            params["event_type"] = event_type
+        try:
+            result = facade.execute(ctx, "audit_export", params)
+            return PlainTextResponse(
+                content=result.get("data", ""),
+                media_type="text/plain",
+                headers={"Content-Disposition": f'attachment; filename="argos-audit.{format}"'},
+            )
+        except APIError as exc:
+            return PlainTextResponse(content=f"error: {exc.message}", media_type="text/plain", status_code=200)
+
+    @app.get("/audit/receipts", response_class=HTMLResponse)
+    async def audit_receipts(
+        verify: str = "",
+        ctx: AuthContext = Depends(auth),
+    ):
+        """#447: #293 deletion receipts with verify status."""
+        result = facade.execute(ctx, "audit_receipts", {})
+        receipts = result.get("receipts", [])
+        flash = ""
+        if verify:
+            try:
+                v = facade.execute(ctx, "audit_verify_receipt", {"receipt_id": verify})
+                ok = v.get("verified")
+                flash = (f'<div class="flash {"flash-ok" if ok else "flash-err"}">'
+                         f'receipt {_esc(verify)}: {"VERIFIED" if ok else "INVALID"}</div>')
+            except Exception as exc:  # APIError / not found
+                flash = f'<div class="flash flash-err">receipt {_esc(verify)}: {_esc(str(exc))}</div>'
+        rows = ""
+        for r in receipts:
+            rid = _esc(r.get("receipt_id", ""))
+            rows += f"""<tr>
+              <td><code>{rid}</code></td>
+              <td>{_esc(r.get("subject", ""))}</td>
+              <td class="muted">{_esc(r.get("ts", ""))}</td>
+              <td>{_esc(r.get("mode", ""))}</td>
+              <td>{_esc(r.get("principal", ""))}</td>
+              <td><a href="/audit/receipts?verify={rid}">Verify</a></td>
+            </tr>"""
+        if not rows:
+            rows = '<tr><td colspan="6" class="muted">No deletion receipts in your scope.</td></tr>'
+        body = f"""
+        <h1>Deletion Receipts</h1>
+        <p class="muted">Append-only receipts proving records were erased — POPIA obligation evidence.</p>
+        {flash}
+        <table>
+          <tr><th>Receipt</th><th>Subject</th><th>Date</th><th>Mode</th><th>Principal</th><th></th></tr>
+          {rows}
+        </table>
+        <p class="muted">{result.get('count', 0)} receipts (scoped to your user/tenant).</p>
+        """
+        return _base_page("Deletion Receipts", body, ctx)
 
     # -- Search: GET /search ---------------------------------------------
 

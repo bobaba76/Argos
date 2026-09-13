@@ -38,7 +38,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -550,6 +552,174 @@ def site_live(site: dict, cfg: dict | None = None) -> str:
     if site.get("gate") is None:
         return "ON"
     return "ON" if _flag(cfg, site["gate"], site["default"]) else "OFF"
+
+
+# ---------------------------------------------------------------------------
+# LLM call trace (cost ledger, #454).
+# ---------------------------------------------------------------------------
+# Optional JSONL trace of every plugin-owned LLM call. Off by default; when
+# on, wraps agent.auxiliary_client.call_llm so ALL sites are captured at the
+# single choke point (no per-site changes). Rows carry {ts, task, kind,
+# model, prompt_tokens, completion_tokens, cached_tokens, ok, error} —
+# enough to rebuild per-message and per-day cost ledgers.
+
+_TASK_KIND = {
+    "extraction": "extractor",
+    "memory_review": "reviewer",
+    "graph_entity_extraction": "graph_typing",
+    "query_expansion": "query_expansion",
+    "conflict_judge": "conflict_judge",
+    "temporal": "temporal_subcall",
+    "role_word_classification": "role_word",
+    "distillation": "distillation",
+    "watcher_extraction": "watcher_extraction",
+    "rollup": "rollup",
+    "compaction": "compaction",
+}
+
+_trace_lock = threading.Lock()
+_trace_installed = False
+
+
+def _trace_enabled(cfg: dict | None = None) -> bool:
+    return _flag(cfg if cfg is not None else load_config(), "llm_trace_enabled", False)
+
+
+def _trace_path(cfg: dict | None = None) -> str:
+    cfg = cfg if cfg is not None else load_config()
+    raw = cfg.get("llm_trace_path")
+    if raw:
+        return str(raw)
+    return str(_hermes_home() / "llm_trace.jsonl")
+
+
+def _append_trace_row(row: dict) -> None:
+    """Append one JSONL row; never raises (tracing must not break calls)."""
+    try:
+        import json
+
+        path = _trace_path()
+        with _trace_lock:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        logger.debug("llm trace: append failed", exc_info=True)
+
+
+def _usage_tokens(response):
+    """Pull (prompt_tokens, completion_tokens, cached_tokens) defensively."""
+
+    def _u(obj, name):
+        try:
+            return getattr(obj, name, None) or obj.get(name)
+        except Exception:
+            return None
+
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        if usage is None:
+            return None, None, None
+        pt = _u(usage, "prompt_tokens")
+        ct = _u(usage, "completion_tokens")
+        cached = None
+        details = _u(usage, "prompt_tokens_details")
+        if details:
+            cached = _u(details, "cached_tokens")
+        return pt, ct, cached
+    except Exception:
+        return None, None, None
+
+
+def install_trace(cfg: dict | None = None) -> bool:
+    """Wrap agent.auxiliary_client.call_llm so every plugin LLM call is logged.
+
+    Idempotent. Returns True when the trace is active. Fails soft (no patch)
+    when the host module is unavailable or tracing is disabled in config.
+    """
+    global _trace_installed
+    cfg = cfg if cfg is not None else load_config()
+    if not _trace_enabled(cfg):
+        return False
+    if _trace_installed:
+        return True
+    try:
+        from agent import auxiliary_client
+    except Exception:
+        logger.debug("llm trace: agent.auxiliary_client unavailable", exc_info=True)
+        return False
+    original = getattr(auxiliary_client, "call_llm", None)
+    if original is None:
+        return False
+    if not hasattr(auxiliary_client, "_argos_llm_trace_original"):
+        auxiliary_client._argos_llm_trace_original = original
+
+    def _traced(*args, **kwargs):
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        task = kwargs.get("task") or (args[0] if args else "unknown")
+        model = kwargs.get("model")
+        try:
+            response = original(*args, **kwargs)
+            pt, ct, cached = _usage_tokens(response)
+            _append_trace_row(
+                {
+                    "ts": ts,
+                    "task": task,
+                    "kind": _TASK_KIND.get(task, task),
+                    "model": model,
+                    "prompt_tokens": pt,
+                    "completion_tokens": ct,
+                    "cached_tokens": cached,
+                    "ok": True,
+                }
+            )
+            return response
+        except Exception as exc:
+            _append_trace_row(
+                {
+                    "ts": ts,
+                    "task": task,
+                    "kind": _TASK_KIND.get(task, task),
+                    "model": model,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "cached_tokens": None,
+                    "ok": False,
+                    "error": str(exc)[:200],
+                }
+            )
+            raise
+
+    auxiliary_client.call_llm = _traced
+    _trace_installed = True
+    logger.info("llm trace: active -> %s", _trace_path(cfg))
+    return True
+
+
+def uninstall_trace() -> None:
+    """Test hook: restore the original call_llm (if we patched it)."""
+    global _trace_installed
+    if not _trace_installed:
+        return
+    try:
+        from agent import auxiliary_client
+    except Exception:
+        _trace_installed = False
+        return
+    original = getattr(auxiliary_client, "_argos_llm_trace_original", None)
+    if original is not None:
+        auxiliary_client.call_llm = original
+    _trace_installed = False
+
+
+# #454: install the optional LLM call trace when enabled in config. Runs at
+# import time so every site (which imports this module for the gate) is
+# covered; disabled installs are a no-op.
+try:
+    install_trace()
+except Exception:
+    logger.debug("llm trace: install skipped", exc_info=True)
 
 
 def report(cfg: dict | None = None) -> str:

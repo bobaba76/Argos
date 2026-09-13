@@ -38,12 +38,18 @@ class StoreCoreMixin:
         user_id: str = "default_user",
         embedder=None,
         reranker=None,
+        memory_limit: str = "512MB",
     ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.user_id = (user_id or "default_user").strip()
         self.embedder = embedder
         self.reranker = reranker
+        # DuckDB resource budget (desktop-hostile defaults fixed 13/9): cap
+        # the buffer pool and spill to disk instead of letting DuckDB cache
+        # up to ~80% of RAM. Any caller may override before construction.
+        self._memory_limit: str = memory_limit
+        self._temp_directory: Path = Path(db_path).parent / ".duckdb-tmp"
         # #249-slice: shared state lives in one documented dataclass.
         self._state = StoreMixinState()
         self.connection: Optional[duckdb.DuckDBPyConnection] = None
@@ -89,7 +95,16 @@ class StoreCoreMixin:
     def _connect(self) -> None:
         self._state.read_only = False
         try:
-            self.connection = duckdb.connect(str(self.db_path))
+            self.connection = duckdb.connect(
+                str(self.db_path),
+                config={
+                    # Explicit buffer-pool cap instead of DuckDB's default
+                    # (~80% of RAM as cache): pages spill to temp_directory
+                    # over budget instead of ballooning the process RSS.
+                    "memory_limit": self._memory_limit,
+                    "temp_directory": str(self._temp_directory),
+                },
+            )
         except Exception as exc:
             if self._is_lock_error(exc):
                 # SC1: track read-only state and log ERROR (not WARNING) —
@@ -100,7 +115,14 @@ class StoreCoreMixin:
                     "will fail until the lock is released."
                 )
                 self._state.read_only = True
-                self.connection = duckdb.connect(str(self.db_path), read_only=True)
+                self.connection = duckdb.connect(
+                    str(self.db_path),
+                    read_only=True,
+                    config={
+                        "memory_limit": self._memory_limit,
+                        "temp_directory": str(self._temp_directory),
+                    },
+                )
             else:
                 raise
 

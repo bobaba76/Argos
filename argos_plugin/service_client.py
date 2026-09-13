@@ -107,6 +107,38 @@ def _start_lock_is_stale(lock_path: Path) -> bool:
     return (time.time() - ts) > _START_LOCK_STALE_SECS
 
 
+def _pick_service_interpreter() -> str:
+    """Deterministic interpreter for the memory-service child.
+
+    13/9 (GPU fix): the old spawn used bare ``sys.executable``. On
+    Windows a venv launcher stub re-execs the BASE interpreter as a child
+    and that child imports the VENV's site-packages — so whoever spawned
+    the service silently decided whether torch was CUDA-capable. The
+    hermes ``venv`` carries torch 2.13.0+cpu (CPU-only) → the real service
+    process saw ``cuda.is_available() == False`` → models loaded into RAM
+    (4.6 GB process). Every probe that bypassed the spawn chain saw CUDA
+    fine and reported "fixed" — it never was.
+
+    Fix: prefer the venv that is KNOWN to be CUDA-capable (``venv-cuda``,
+    torch 2.6.0+cu124, verified) whenever it exists, falling back to
+    ``sys.executable``. ``venv-cuda`` ships its own cu124 torch + the
+    service deps (duckdb, sentence-transformers) verified.
+    """
+    try:
+        agent_root = _find_agent_root()
+        if agent_root:
+            candidates = [
+                Path(agent_root) / "venv-cuda" / "Scripts" / "python.exe",
+                Path(agent_root) / "venv" / "Scripts" / "python.exe",
+            ]
+            for cand in candidates:
+                if cand.is_file():
+                    return str(cand)
+    except Exception:  # noqa: BLE001 - never let resolution break spawning
+        pass
+    return sys.executable
+
+
 def _find_agent_root() -> str | None:
     """Best-effort location of the hermes-agent checkout (the directory
     containing the ``agent`` package). Returns None when not found.
@@ -242,6 +274,23 @@ class _SharedRPC:
     @user_id.setter
     def user_id(self, value: str) -> None:
         self._scope.user_id = value or "default_user"
+
+    def _service_log_stream(self):
+        """Append-mode file stream for the service's stdout+stderr.
+
+        The memory service previously launched with stdout/stderr → DEVNULL,
+        making every diagnosis guesswork. The service logs its warmup,
+        model loads, and failures through logging.basicConfig → stderr;
+        capture that to {home}/logs/memory_service.log.
+        """
+        import io
+
+        try:
+            log_dir = Path(self.home) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return open(log_dir / "memory_service.log", "ab", buffering=0)
+        except OSError:
+            return io.BytesIO()  # fail-soft: don't block the spawn
 
     def _request(self, request: dict, timeout: float = _DEFAULT_TIMEOUT) -> Any:
         """Send one request; retry once on connection-refused (#20) or
@@ -414,9 +463,24 @@ class _SharedRPC:
         env["HERMES_SERVICE_SPAWNER_PID"] = str(os.getpid())
         agent_root = _find_agent_root()
         if agent_root:
-            parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+            # 13/9 GPU fix: strip any site-packages entry that would shadow
+            # the CUDA torch. A caller running inside the CPU ``venv``
+            # carries ``<root>/venv/Lib/site-packages`` (torch 2.13.0+cpu)
+            # on PYTHONPATH; if it precedes the venv-cuda site-packages in
+            # the child's sys.path, the service imports CPU torch again —
+            # the exact 4.6 GB regression. Drop the hermes ``venv``
+            # site-packages from the child's PYTHONPATH; the interpreter we
+            # pick (venv-cuda) provides its own CUDA torch on its normal
+            # site-packages.
+            stale = [
+                p
+                for p in env.get("PYTHONPATH", "").split(os.pathsep)
+                if p and "venv" in p and "venv-cuda" not in p
+            ]
+            parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p not in stale]
             if agent_root not in parts:
-                env["PYTHONPATH"] = os.pathsep.join([agent_root] + parts)
+                parts.insert(0, agent_root)
+            env["PYTHONPATH"] = os.pathsep.join(parts)
         return env
 
     def _ensure_service(self) -> None:
@@ -457,12 +521,14 @@ class _SharedRPC:
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 child_env = self._service_child_env()
                 subprocess.Popen(
-                    [sys.executable, str(script), "--home", str(self.home)],
+                    [_pick_service_interpreter(), str(script), "--home", str(self.home)],
                     cwd=str(script.parent),
                     env=child_env,
                     stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    # 13/9: capture the service's stdout/stderr to a REAL log
+                    # file (was DEVNULL — every diagnosis was guesswork).
+                    stdout=self._service_log_stream(),
+                    stderr=subprocess.STDOUT,
                     creationflags=creationflags,
                 )
             except Exception:

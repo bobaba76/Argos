@@ -47,7 +47,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import sys
 import tempfile
 import threading
@@ -322,11 +321,122 @@ MUTATION_OPERATIONS: Set[str] = {
     "ingest",
 }
 
-# Browser session cookie (#482): sessions live in this process only — a
-# console restart means signing in again. SameSite=Strict + HttpOnly keep
-# the cookie out of cross-site requests and the reach of page scripts.
-SESSION_COOKIE_NAME = "argos_admin_session"
+# Browser session cookie (#482 → #47 cross-console SSO, 13/9): a signed,
+# SELF-VALIDATING cookie — no in-process session store, so restarts do NOT
+# log you out. Shared with the Themis (8740) and DocBench (8750) consoles:
+# browsers scope cookies per-HOST (127.0.0.1), not per-port, so ONE cookie
+# is sent to all three. SameSite=Strict + HttpOnly keep it out of
+# cross-site requests and page scripts. Keys are HMAC-SHA256 over
+# version+expiry+digest, signed with {home}/.console_session_key (the
+# SAME file all three consoles share).
+SESSION_COOKIE_NAME = "opconsole_session"  # SHARED with Themis + workbench
 SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+_SESSION_VERSION = b"v2"  # v2: v2.<expiry>.<token_sha256>.<hmac>
+_CONSOLE_SESSION_KEY_FILE = ".console_session_key"  # SHARED signing key file
+
+
+def _session_key(home: Optional[Path], legacy_token: Optional[str] = None) -> Optional[bytes]:
+    """HMAC key for the cross-session cookie (machine-bound, STABLE).
+
+    Key material: {home}/.console_session_key (32 random bytes, created on
+    first login if absent) — IDENTICAL file for the Themis/workbench
+    consoles, so all three derive the same key and ONE cookie validates
+    everywhere. A dedicated key file (not the credential file) means
+    minting/revoking API keys does NOT log anyone out, and restarts do
+    not either. Deleting the key file IS the master switch: next request
+    every session dies (new key).
+
+    Fallback (no home — legacy-only test/deploy): sha256 of the legacy
+    token, stable for the process; file-less consoles have no SSO.
+    """
+    if home is not None:
+        import hashlib
+        import secrets as _secrets
+
+        key_path = home / _CONSOLE_SESSION_KEY_FILE
+        try:
+            data = key_path.read_bytes()
+        except OSError:
+            data = _secrets.token_bytes(32)
+            try:
+                key_path.write_bytes(data)
+            except OSError:
+                return None
+        if len(data) >= 32:
+            return hashlib.sha256(data).digest()
+    if legacy_token:
+        import hashlib
+
+        return hashlib.sha256(b"opconsole-legacy:" + legacy_token.encode("utf-8")).digest()
+    return None
+
+
+def _session_sign(
+    home: Optional[Path],
+    digest: str = "",
+    now: Optional[float] = None,
+    legacy_token: Optional[str] = None,
+) -> Optional[str]:
+    """Sign a session cookie value: v2.<expiry>.<token_sha256>.<hmac>.
+
+    The digest field lets this console re-resolve WHICH credential signed
+    in (per-request revocation parity); it is the sha256 of the token,
+    never the token. HMAC covers version+expiry+digest with the
+    shared-credential-file key. None when no credential file (setup mode).
+    """
+    key = _session_key(home, legacy_token)
+    if key is None:
+        return None
+    if not digest:
+        digest = "0" * 64
+    import hashlib
+    import hmac
+
+    expires = int((now if now is not None else time.time()) + SESSION_TTL_SECONDS)
+    payload = _SESSION_VERSION + b"." + str(expires).encode("ascii") + b"." + digest.encode("ascii")
+    tag = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return (payload + b"." + tag.encode("ascii")).decode("ascii")
+
+
+def _session_valid(
+    cookie: str,
+    home: Optional[Path],
+    now: Optional[float] = None,
+    legacy_token: Optional[str] = None,
+) -> bool:
+    """Signature + expiry check (no live token needed)."""
+    if not cookie:
+        return False
+    key = _session_key(home, legacy_token)
+    if key is None:
+        return False
+    try:
+        version, exp_s, digest, tag = cookie.split(".", 3)
+        if version.encode("ascii") != _SESSION_VERSION:
+            return False
+        expires = int(exp_s)
+        if len(digest) != 64:
+            return False
+    except (ValueError, TypeError):
+        return False
+    if expires <= (now if now is not None else time.time()):
+        return False
+    import hashlib
+    import hmac
+
+    payload = version.encode("ascii") + b"." + exp_s.encode("ascii") + b"." + digest.encode("ascii")
+    expected = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, tag)
+
+
+def _session_digest_of(cookie: str) -> Optional[str]:
+    """The token_sha256 digested into a valid-format cookie (for identity).
+    Callers verify with _session_valid first; this only parses the field."""
+    try:
+        _v, _exp, digest, _tag = cookie.split(".", 3)
+        return digest if len(digest) == 64 else None
+    except (ValueError, TypeError):
+        return None
 
 
 class BrowserLoginRequired(Exception):
@@ -395,9 +505,9 @@ class AdminAuth:
         self._expected = expected_token
         self._home = Path(home) if home is not None else None
         self._cred_cache: Optional[tuple] = None
-        # #482: browser sessions — session_id -> {"token", "expires"}.
-        self._sessions: Dict[str, Dict[str, Any]] = {}
-        self._session_lock = threading.Lock()
+        # #482→#47 (13/9): browser sessions are now a SINGLE shared signed
+        # cookie (module-level _session_sign/_session_valid) — no in-memory
+        # store, so restarts don't log you out.
 
     def _credentials(self):
         """Load (legacy_token, credentials), cached on mtime+size.
@@ -579,45 +689,71 @@ class AdminAuth:
     def _context_from_session(self, request: Request) -> Optional[AuthContext]:
         """Resolve a session cookie to an AuthContext (None when absent/expired).
 
-        The session's token is re-validated on every request, so credential
-        file edits (revocation, expiry, class changes) apply on the next call.
+        The cookie is a signed, self-validating v2 token carrying the
+        sha256 of the token that signed in (never the token itself). Each
+        request re-resolves that digest against the CURRENT credential
+        file, so revocation, expiry, and class changes apply on the next
+        call — same revocation parity as the pre-#47 in-memory sessions,
+        minus the logout-on-restart behavior.
         """
-        sid = request.cookies.get(SESSION_COOKIE_NAME)
-        if not sid:
+        cookie = request.cookies.get(SESSION_COOKIE_NAME)
+        if not cookie or not _session_valid(cookie, self._home, legacy_token=self._expected):
             return None
-        with self._session_lock:
-            entry = self._sessions.get(sid)
-        if entry is None:
+        digest = _session_digest_of(cookie)
+        if not digest:
             return None
-        if entry["expires"] <= time.time():
-            with self._session_lock:
-                self._sessions.pop(sid, None)
-            return None
+        import hashlib
+        import hmac
+
+        # 1) legacy transport token path (env-derived context)
+        if (
+            self._expected is not None
+            and hmac.compare_digest(
+                hashlib.sha256(self._expected.encode("utf-8")).hexdigest(), digest
+            )
+        ):
+            return self._legacy_context()
+        # 2) per-principal credential path — resolve digest -> credential.
         try:
-            return self._bearer_context(f"Bearer {entry['token']}", str(uuid.uuid4()))
-        except HTTPException:
-            with self._session_lock:
-                self._sessions.pop(sid, None)
+            _, creds = self._credentials()
+        except CredentialFileError:
             return None
+        for cred in creds:
+            if cred.token_sha256 and hmac.compare_digest(cred.token_sha256, digest):
+                if cred.is_expired():
+                    return None
+                return build_credential_context(
+                    cred,
+                    transport="admin-console",
+                    is_loopback=True,
+                    env_principal_type=os.environ.get("ARGOS_API_PRINCIPAL_TYPE", ""),
+                    is_read_only=os.environ.get("ARGOS_API_READ_ONLY", "").lower()
+                    in ("true", "1", "yes"),
+                )
+        return None
 
-    def create_session(self, token: str) -> str:
-        """Start a browser session for a validated token; returns the session id."""
-        sid = secrets.token_urlsafe(32)
-        with self._session_lock:
-            self._sessions[sid] = {"token": token, "expires": time.time() + SESSION_TTL_SECONDS}
-        return sid
+    def create_session(self, token: str) -> Optional[str]:
+        """Start a browser session; returns a signed cookie VALUE (not a sid),
+        embedding the token's sha256 for cross-console identity. None when
+        the credential file is missing (setup mode)."""
+        import hashlib
 
-    def destroy_session(self, sid: str) -> None:
-        with self._session_lock:
-            self._sessions.pop(sid, None)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return _session_sign(self._home, digest=digest, legacy_token=self._expected)
+
+    def destroy_session(self, sid: Optional[str]) -> None:
+        """No-op: the shared cookie is stateless; browsers drop it via the
+        Delete-Cookie on /logout. Kept for route compatibility."""
 
     def session_token_for(self, sid: Optional[str]) -> Optional[str]:
-        """The raw token bound to a session id (None when absent)."""
+        """Digest of the token backing a valid-format cookie (None when absent).
+
+        The old signature returned the RAW token from an in-memory store;
+        the shared cookie only carries the sha256 digest, so callers must
+        compare digests, not raw tokens."""
         if not sid:
             return None
-        with self._session_lock:
-            entry = self._sessions.get(sid)
-        return entry["token"] if entry else None
+        return _session_digest_of(sid)
 
     def credentials(self):
         """(legacy_token, credentials) — the live state shown on /keys."""
@@ -1284,7 +1420,14 @@ def create_app(
             )
         if action == "revoke_legacy":
             sid = request.cookies.get(SESSION_COOKIE_NAME)
-            in_use = bool(auth._expected) and auth.session_token_for(sid) == auth._expected
+            import hashlib
+
+            expected_digest = (
+                hashlib.sha256(auth._expected.encode("utf-8")).hexdigest()
+                if auth._expected
+                else None
+            )
+            in_use = bool(auth._expected) and auth.session_token_for(sid) == expected_digest
             if in_use:
                 return RedirectResponse(
                     url=_keys_redirect(err="You are signed in with the legacy token. Sign in with a key first, then revoke it."),
